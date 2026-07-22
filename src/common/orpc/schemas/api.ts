@@ -2482,6 +2482,10 @@ const DevToolsEventSchema = z.discriminatedUnion("type", [
     step: DevToolsStepSchema,
   }),
   z.object({
+    type: z.literal("runs-evicted"),
+    runIds: z.array(z.string()),
+  }),
+  z.object({
     type: z.literal("cleared"),
   }),
 ]);
