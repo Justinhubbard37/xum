@@ -292,12 +292,12 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
     }
   };
 
-  // Resolve display properties for the trigger pill
+  // Resolve display properties for the trigger chip. Per the Figma chat-dialog design
+  // the chip keeps a neutral border while the icon + label carry the agent color.
   const activeDisplayName = activeOption?.name ?? formatAgentIdLabel(normalizedAgentId);
-  const activeStyle: React.CSSProperties | undefined = activeOption?.uiColor
-    ? { borderColor: activeOption.uiColor }
+  const activeColorStyle: React.CSSProperties | undefined = activeOption?.uiColor
+    ? { color: activeOption.uiColor }
     : undefined;
-  const activeClassName = activeOption?.uiColor ? "" : "border-exec-mode";
   const TriggerIcon = getAgentIcon(normalizedAgentId);
 
   return (
@@ -319,17 +319,12 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
                 openPicker();
               }
             }}
-            style={activeStyle}
-            className={cn(
-              "text-foreground hover:bg-hover flex items-center gap-1.5 rounded-sm border-[0.5px] px-1.5 py-0.5 text-[11px] font-medium transition-[background-color] duration-150",
-              activeClassName
-            )}
+            className="text-foreground hover:bg-hover border-border-light flex h-[30px] items-center gap-1.5 rounded-md border px-2 py-0 text-xs font-medium transition-[background-color] duration-150"
           >
-            <TriggerIcon
-              className="h-3 w-3 shrink-0"
-              style={activeOption?.uiColor ? { color: activeOption.uiColor } : undefined}
-            />
-            <span className="max-w-[clamp(4.5rem,30vw,130px)] truncate">{activeDisplayName}</span>
+            <TriggerIcon className="h-3.5 w-3.5 shrink-0" style={activeColorStyle} />
+            <span className="max-w-[clamp(4.5rem,30vw,130px)] truncate" style={activeColorStyle}>
+              {activeDisplayName}
+            </span>
             {!isAgentLocked && (
               <ChevronDown
                 className={cn(

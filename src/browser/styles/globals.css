@@ -346,6 +346,22 @@
 
   --plan-mode-rgb: 31, 107, 184;
 
+  /* Chat composer glow ("Mux exploration" Figma, chat dialog style 3): a faint teal
+     bloom rising from the bottom of the composer. Derived from --color-border-pending
+     so custom themes inherit a matching hue; light themes opt out below. */
+  --chat-composer-glow:
+    radial-gradient(
+      120% 140% at 12% 100%,
+      color-mix(in srgb, var(--color-border-pending) 9%, transparent) 0%,
+      color-mix(in srgb, var(--color-border-pending) 4%, transparent) 40%,
+      transparent 68%
+    ),
+    radial-gradient(
+      90% 100% at 88% 100%,
+      color-mix(in srgb, var(--color-border-pending) 5%, transparent) 0%,
+      transparent 55%
+    );
+
   --font-primary:
     -apple-system, BlinkMacSystemFont, "Geist", system-ui, "Segoe UI", "Roboto", "Helvetica Neue",
     Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol";
@@ -357,6 +373,9 @@
 
 :root[data-theme="light"] {
   color-scheme: light;
+
+  /* The composer glow is a dark-theme treatment; light themes stay flat. */
+  --chat-composer-glow: none;
 
   --color-plan-mode: hsl(210 70% 40%);
   --color-plan-mode-hover: hsl(210 70% 52%);
@@ -604,6 +623,9 @@
 /* Flexoki themes (https://stephango.com/flexoki) */
 :root[data-theme="flexoki-light"] {
   color-scheme: light;
+
+  /* The composer glow is a dark-theme treatment; light themes stay flat. */
+  --chat-composer-glow: none;
 
   /* Mode colors */
   --color-plan-mode: #205ea6; /* Flexoki blue-600 */

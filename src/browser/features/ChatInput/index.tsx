@@ -136,7 +136,7 @@ import {
   type ModelSelectorRef,
 } from "@/browser/components/ModelSelector/ModelSelector";
 import { useModelsFromSettings } from "@/browser/hooks/useModelsFromSettings";
-import { SendHorizontal } from "lucide-react";
+import { ChevronDown, SendHorizontal } from "lucide-react";
 import { AttachFileButton } from "./AttachFileButton";
 import { VimTextArea } from "@/browser/components/VimTextArea/VimTextArea";
 import { ChatAttachments, type ChatAttachment } from "@/browser/features/ChatInput/ChatAttachments";
@@ -1155,6 +1155,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const {
     isOpen: isSendModeMenuOpen,
     onContextMenu: openSendModeMenuFromContext,
+    onOpenChange: setSendModeMenuOpen,
     touchHandlers: sendModeMenuTouchHandlers,
     suppressClickIfLongPress: suppressSendClickIfLongPress,
     close: closeSendModeMenu,
@@ -3220,16 +3221,28 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       <div
         ref={chatInputSectionRef}
         className={cn(
-          "relative flex flex-col gap-1",
+          // `isolate` scopes the glow overlay's negative z-index so it paints above this
+          // section's background but below all composer content.
+          "relative isolate flex flex-col gap-1",
           variant === "creation"
             ? "bg-surface-primary w-full max-w-3xl rounded-lg border border-border-light px-6 py-5 shadow-lg"
-            : `bg-surface-primary border-border-light px-4 
-              pb-[max(8px,min(env(safe-area-inset-bottom,0px),40px))] 
+            : `bg-surface-primary border-border-light px-4
+              pb-[max(8px,min(env(safe-area-inset-bottom,0px),40px))]
               mb-[calc(-1*min(env(safe-area-inset-bottom,0px),40px))]`
         )}
         data-component="ChatInputSection"
         data-autofocus-state="done"
       >
+        {variant === "workspace" && (
+          // Figma "Mux exploration" chat dialog (style 3): a faint teal bloom behind the
+          // composer. Light themes disable it via --chat-composer-glow: none.
+          <div
+            aria-hidden
+            data-component="ComposerGlow"
+            className="pointer-events-none absolute inset-0 -z-10"
+            style={{ background: "var(--chat-composer-glow)" }}
+          />
+        )}
         <div className={cn("w-full", variant !== "creation" && "mx-auto max-w-4xl")}>
           {/* Toasts (overlay) */}
           <div className="pointer-events-none absolute right-[15px] bottom-full left-[15px] z-[1000] mb-2 flex flex-col gap-2 [&>*]:pointer-events-auto">
@@ -3382,11 +3395,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                     (showSkillSuggestions && skillSuggestions.length > 0) ||
                     (showSymbolSuggestions && symbolSuggestions.length > 0)
                   }
-                  className={variant === "creation" ? "min-h-28" : "min-h-16"}
+                  className={variant === "creation" ? "min-h-28" : "min-h-24"}
                 />
-                {/* Keep shortcuts visible in both creation + workspace without bloating the footer or crowding it. */}
+                {/* Keep shortcuts visible in both creation + workspace without bloating the footer.
+                    Right-aligned so they never collide with the attach/voice icons bottom-left. */}
                 {input.trim() === "" && !editingMessageForUi && (
-                  <div className="mobile-hide-shortcut-hints text-muted @container pointer-events-none absolute right-2 bottom-3 left-2 flex flex-nowrap items-center gap-4 overflow-hidden text-[11px] whitespace-nowrap">
+                  <div className="mobile-hide-shortcut-hints text-muted @container pointer-events-none absolute right-3 bottom-3.5 left-16 flex flex-nowrap items-center justify-end gap-4 overflow-hidden text-[11px] whitespace-nowrap">
                     <span className="shrink-0">
                       <span className="font-mono">{formatKeybind(KEYBINDS.FOCUS_CHAT)}</span>
                       <span> - focus chat</span>
@@ -3401,6 +3415,26 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                     </span>
                   </div>
                 )}
+                {/* Attach/voice sit inside the input box (bottom-left) per the Figma
+                    chat-dialog layout; the textarea reserves bottom padding for them. */}
+                <div
+                  className="absolute bottom-2.5 left-3 z-10 flex items-center gap-1"
+                  data-component="InputMethodGroup"
+                >
+                  <AttachFileButton
+                    onFiles={handleAttachFiles}
+                    disabled={disabled || sendInFlightBlocksInput || !!editingMessageForUi}
+                  />
+                  <VoiceInputButton
+                    state={voiceInput.state}
+                    isAvailable={voiceInput.isAvailable}
+                    shouldShowUI={voiceInput.shouldShowUI}
+                    requiresSecureContext={voiceInput.requiresSecureContext}
+                    onToggle={voiceInput.toggle}
+                    disabled={disabled || sendInFlightBlocksInput}
+                    agentColor={focusBorderColor}
+                  />
+                </div>
               </>
             )}
           </div>
@@ -3476,7 +3510,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
               </div>
 
               <div
-                className="flex min-w-0 items-center justify-end gap-1.5"
+                className="flex min-w-0 items-center justify-end gap-2"
                 data-component="ModelControls"
                 data-tutorial="mode-selector"
               >
@@ -3497,90 +3531,89 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                 </div>
 
                 {/*
-                  Input-method icons (attach, voice) cluster tightly with the Send button so
-                  the trailing actions read as one unit, rather than as small icons stranded
-                  inside the row's gap-1.5 cadence. They live below the textarea (not as an
-                  absolute overlay) so they can never visually intersect typed/wrapped text.
+                  Split send button (Figma chat dialog, style 3): send action + a visible
+                  chevron that opens the dispatch-mode menu, sharing one bordered chip.
+                  Right-click/long-press on the send half still opens the same menu.
                 */}
-                <div className="flex shrink-0 items-center gap-0" data-component="InputMethodGroup">
-                  <AttachFileButton
-                    onFiles={handleAttachFiles}
-                    disabled={disabled || sendInFlightBlocksInput || !!editingMessageForUi}
-                  />
-                  <VoiceInputButton
-                    state={voiceInput.state}
-                    isAvailable={voiceInput.isAvailable}
-                    shouldShowUI={voiceInput.shouldShowUI}
-                    requiresSecureContext={voiceInput.requiresSecureContext}
-                    onToggle={voiceInput.toggle}
-                    disabled={disabled || sendInFlightBlocksInput}
-                    agentColor={focusBorderColor}
-                  />
-                </div>
+                <div ref={sendModeMenuContainerRef} className="relative shrink-0">
+                  <div className="border-border-light flex h-[30px] items-stretch overflow-hidden rounded-md border">
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          type="button"
+                          onClick={() => {
+                            if (suppressSendClickIfLongPress()) {
+                              return;
+                            }
 
-                {/*
-                  Pull the Send button flush against the input-method icons (override the
-                  parent's gap-1.5 with a negative margin) so they form a single trailing
-                  cluster.
-                */}
-                <div ref={sendModeMenuContainerRef} className="relative -ml-1.5">
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Button
-                        type="button"
-                        onClick={() => {
-                          if (suppressSendClickIfLongPress()) {
-                            return;
-                          }
-
-                          void handleSend();
-                        }}
-                        onContextMenu={openSendModeMenuFromContext}
-                        onTouchStart={sendModeMenuTouchHandlers.onTouchStart}
-                        onTouchEnd={sendModeMenuTouchHandlers.onTouchEnd}
-                        onTouchMove={sendModeMenuTouchHandlers.onTouchMove}
-                        onTouchCancel={sendModeMenuTouchHandlers.onTouchEnd}
-                        disabled={!canSend}
-                        aria-label="Send message"
-                        aria-expanded={canChooseDispatchMode ? isSendModeMenuOpen : undefined}
-                        aria-haspopup={canChooseDispatchMode ? "menu" : undefined}
-                        size="xs"
-                        variant="ghost"
-                        className={cn(
-                          "text-muted hover:text-foreground hover:bg-hover inline-flex items-center justify-center rounded-sm px-1.5 py-0.5 font-medium transition-colors duration-200 disabled:opacity-50",
-                          // Touch: wider tap target, keep icon centered.
-                          "[@media(hover:none)_and_(pointer:coarse)]:h-9 [@media(hover:none)_and_(pointer:coarse)]:w-11 [@media(hover:none)_and_(pointer:coarse)]:px-0 [@media(hover:none)_and_(pointer:coarse)]:py-0 [@media(hover:none)_and_(pointer:coarse)]:text-sm"
-                        )}
-                      >
-                        <SendHorizontal
-                          className="h-3.5 w-3.5 [@media(hover:none)_and_(pointer:coarse)]:h-4 [@media(hover:none)_and_(pointer:coarse)]:w-4"
-                          strokeWidth={2.5}
-                        />
-                      </Button>
-                    </TooltipTrigger>
-                    <TooltipContent align="start" className="max-w-80 whitespace-normal">
-                      <strong>Send message ({formatKeybind(KEYBINDS.SEND_MESSAGE)})</strong>
-                      {variant === "workspace" && (
-                        <>
-                          <br />
-                          <br />
-                          <strong>Right-click or long-press for advanced send modes:</strong>
-                          {runningGoalActive && !editingMessageForUi && (
-                            <>
-                              <br />
-                              Manual sends pause the current goal; use Resume to continue it.
-                            </>
+                            void handleSend();
+                          }}
+                          onContextMenu={openSendModeMenuFromContext}
+                          onTouchStart={sendModeMenuTouchHandlers.onTouchStart}
+                          onTouchEnd={sendModeMenuTouchHandlers.onTouchEnd}
+                          onTouchMove={sendModeMenuTouchHandlers.onTouchMove}
+                          onTouchCancel={sendModeMenuTouchHandlers.onTouchEnd}
+                          disabled={!canSend}
+                          aria-label="Send message"
+                          size="xs"
+                          variant="ghost"
+                          className={cn(
+                            "text-muted hover:text-foreground hover:bg-hover inline-flex h-full items-center justify-center rounded-none px-2.5 py-0 font-medium transition-colors duration-200 disabled:opacity-50",
+                            // Touch: wider tap target, keep icon centered.
+                            "[@media(hover:none)_and_(pointer:coarse)]:px-3.5"
                           )}
-                          {SEND_DISPATCH_MODES.map((entry) => (
-                            <React.Fragment key={entry.mode}>
-                              <br />
-                              {entry.label}: <kbd>{formatKeybind(entry.keybind)}</kbd>
-                            </React.Fragment>
-                          ))}
-                        </>
-                      )}
-                    </TooltipContent>
-                  </Tooltip>
+                        >
+                          <SendHorizontal
+                            className="h-4 w-4 [@media(hover:none)_and_(pointer:coarse)]:h-4 [@media(hover:none)_and_(pointer:coarse)]:w-4"
+                            strokeWidth={2}
+                          />
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent align="start" className="max-w-80 whitespace-normal">
+                        <strong>Send message ({formatKeybind(KEYBINDS.SEND_MESSAGE)})</strong>
+                        {variant === "workspace" && (
+                          <>
+                            <br />
+                            <br />
+                            <strong>Right-click or long-press for advanced send modes:</strong>
+                            {runningGoalActive && !editingMessageForUi && (
+                              <>
+                                <br />
+                                Manual sends pause the current goal; use Resume to continue it.
+                              </>
+                            )}
+                            {SEND_DISPATCH_MODES.map((entry) => (
+                              <React.Fragment key={entry.mode}>
+                                <br />
+                                {entry.label}: <kbd>{formatKeybind(entry.keybind)}</kbd>
+                              </React.Fragment>
+                            ))}
+                          </>
+                        )}
+                      </TooltipContent>
+                    </Tooltip>
+                    <div aria-hidden className="bg-border-light w-px shrink-0" />
+                    <Button
+                      type="button"
+                      aria-label="Send options"
+                      aria-haspopup="menu"
+                      aria-expanded={isSendModeMenuOpen}
+                      disabled={!canChooseDispatchMode}
+                      onClick={() =>
+                        isSendModeMenuOpen ? closeSendModeMenu() : setSendModeMenuOpen(true)
+                      }
+                      size="xs"
+                      variant="ghost"
+                      className="text-muted hover:text-foreground hover:bg-hover inline-flex h-full items-center justify-center rounded-none px-1.5 py-0 transition-colors duration-200 disabled:opacity-50"
+                    >
+                      <ChevronDown
+                        className={cn(
+                          "h-3.5 w-3.5 transition-transform duration-150",
+                          isSendModeMenuOpen && "rotate-180"
+                        )}
+                      />
+                    </Button>
+                  </div>
 
                   {canChooseDispatchMode && isSendModeMenuOpen && (
                     <div className="bg-separator border-border-light absolute right-0 bottom-full z-[1020] mb-1 min-w-[12.5rem] rounded-md border p-1.5 shadow-md">

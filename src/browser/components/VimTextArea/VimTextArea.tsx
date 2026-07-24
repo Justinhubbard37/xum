@@ -247,8 +247,11 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
 
     const textareaStyle: React.CSSProperties & { "--focus-border-color"?: string } = {
       // Mirror textarea defaults in inline styles so ghost hint overlay can reuse exact metrics.
-      padding: "0.375rem 0.5rem",
-      fontSize: "13px",
+      // Metrics follow the Figma chat-dialog composer: 12px padding, 14px/1.5 text, with
+      // extra bottom padding reserving room for the attach/voice icons overlaid bottom-left.
+      padding: "0.75rem 0.75rem 2.5rem",
+      fontSize: "14px",
+      lineHeight: "1.5",
       ...(rest.style ?? {}),
       // Focus border color from agent definition
       "--focus-border-color": !isEditing ? focusBorderColor : undefined,
@@ -290,7 +293,7 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
             {...rest}
             style={textareaStyle}
             className={cn(
-              "w-full border text-light py-1.5 px-2 rounded text-[13px] resize-none min-h-8 max-h-[50vh] overflow-y-auto",
+              "w-full border text-light p-3 rounded-md text-sm resize-none min-h-8 max-h-[50vh] overflow-y-auto",
               vimEnabled ? "font-monospace" : "font-sans",
               "placeholder:text-placeholder",
               "focus:outline-none",
@@ -307,7 +310,7 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
             <div
               className={cn(
                 "pointer-events-none absolute top-0 left-0 right-0",
-                "overflow-hidden whitespace-pre text-[13px]",
+                "overflow-hidden whitespace-pre text-sm",
                 vimEnabled ? "font-monospace" : "font-sans"
               )}
               // Match textarea padding/font metrics so the ghost hint starts exactly after input text.
@@ -324,7 +327,7 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
             </div>
           )}
           {vimEnabled && vimMode === "normal" && value.length === 0 && (
-            <div className="pointer-events-none absolute top-1.5 left-2 h-4 w-2 bg-white/50" />
+            <div className="pointer-events-none absolute top-3 left-3 h-5 w-2 bg-white/50" />
           )}
         </div>
       </div>

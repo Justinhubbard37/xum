@@ -271,9 +271,11 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
 
     const isBoxVariant = variant === "box";
     const containerClassName = cn("relative flex items-center gap-1", isBoxVariant && "w-full");
+    // Default (chat composer) variant renders as a bordered chip per the Figma
+    // chat-dialog design; the box variant keeps its settings-form styling.
     const triggerClassName = isBoxVariant
       ? cn("border-border-medium h-9 flex-1 min-w-0 rounded border", className)
-      : cn("bg-background rounded-sm text-[11px]", className ?? "w-32");
+      : cn("border-border-light h-[30px] rounded-md border text-xs", className ?? "w-32");
 
     const hasValue = value.trim().length > 0;
     const explicitGateway = hasValue ? getExplicitGatewayPrefix(value) : undefined;
@@ -302,7 +304,7 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
               type="button"
               className={cn(
                 triggerClassName,
-                "text-foreground hover:bg-hover flex cursor-pointer items-center justify-between gap-1 px-1.5 py-0.5 transition-colors duration-300"
+                "text-foreground hover:bg-hover flex cursor-pointer items-center justify-between gap-1 px-2 py-0 transition-colors duration-300"
               )}
               role="combobox"
               aria-expanded={isOpen}
@@ -314,7 +316,7 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
                 {selectedProvider && (
                   <ProviderIcon
                     provider={selectedProvider}
-                    className="h-3 w-3 shrink-0 opacity-70"
+                    className="h-3.5 w-3.5 shrink-0 opacity-70"
                   />
                 )}
                 <span className="min-w-0 truncate">{displayValue}</span>
