@@ -127,6 +127,9 @@
 
     /* Code */
     --color-code-bg: hsl(0 6.43% 8.04%);
+    /* Slate accent for monospace identifiers (file paths, code tokens) in tool cards,
+       per the Figma chat-dialog file-change cards. */
+    --color-code-accent: hsl(215 20% 65%); /* #94a3b8 - slate-400 */
 
     /* Buttons */
     --color-button-bg: hsl(0 0% 24%);
@@ -438,6 +441,7 @@
   --color-surface-sky: hsla(191, 67%, 89%, 1);
 
   --color-code-bg: hsl(210 40% 96%);
+  --color-code-accent: hsl(215 16% 47%); /* #64748b - slate-500 */
 
   --color-button-bg: hsl(210 35% 94%);
   --color-button-text: hsl(210 20% 20%);
@@ -692,6 +696,7 @@
   --color-surface-sky: color-mix(in srgb, var(--color-info) 16%, var(--color-background) 84%);
 
   --color-code-bg: #f2f0e5;
+  --color-code-accent: #575653; /* Flexoki base-700, matches content-secondary */
 
   --color-button-bg: #e6e4d9;
   --color-button-text: #100f0f;
@@ -918,6 +923,7 @@
   --color-surface-sky: color-mix(in srgb, var(--color-info) 16%, var(--color-background) 84%);
 
   --color-code-bg: #1c1b1a;
+  --color-code-accent: #878580; /* Flexoki base-500, matches content-secondary */
 
   --color-button-bg: #282726;
   --color-button-text: #cecdc3;
@@ -1117,6 +1123,34 @@ body {
 .scrollbar-none {
   scrollbar-width: none;
   scrollbar-color: auto;
+}
+
+/*
+ * Chat transcript scrollbar as a rounded pill (Figma "Mux exploration" chat dialog).
+ * The standard scrollbar-width/color properties disable ::-webkit-scrollbar styling
+ * in Chromium, so reset them here to let the pill rules below take effect.
+ */
+.transcript-scrollbar {
+  scrollbar-width: auto;
+  scrollbar-color: auto;
+}
+.transcript-scrollbar::-webkit-scrollbar {
+  width: 10px;
+}
+.transcript-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.transcript-scrollbar::-webkit-scrollbar-thumb {
+  /* 2px transparent border + padding-box clip = a 6px-wide inset pill thumb. */
+  background: var(--color-surface-tertiary);
+  border: 2px solid transparent;
+  border-radius: 9999px;
+  background-clip: padding-box;
+}
+.transcript-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: var(--color-surface-quaternary);
+  border: 2px solid transparent;
+  background-clip: padding-box;
 }
 
 /* Root container */

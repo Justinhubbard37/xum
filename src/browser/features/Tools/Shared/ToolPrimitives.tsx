@@ -53,9 +53,11 @@ interface ToolContainerProps extends React.HTMLAttributes<HTMLDivElement> {
 export const ToolContainer: React.FC<ToolContainerProps> = ({ expanded, className, ...props }) => (
   <div
     className={cn(
-      "my-2 rounded font-mono text-[11px] transition-all duration-200",
+      // Figma "Mux exploration" chat dialog: tool calls read as distinct cards on a
+      // secondary surface (#18181b in the dark theme) rather than chromeless rows.
+      "bg-surface-secondary my-2 rounded font-mono text-[11px] transition-all duration-200",
       "[container-type:inline-size]",
-      expanded ? "py-2 px-3" : "py-1 px-3",
+      expanded ? "py-2 px-3" : "py-1.5 px-3",
       className
     )}
     {...props}

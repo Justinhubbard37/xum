@@ -17,6 +17,10 @@ import { OperationalBundleMessage } from "@/browser/features/Messages/Operationa
 import { MarkdownRenderer } from "@/browser/features/Messages/MarkdownRenderer";
 import { useTranscriptContextMenu } from "@/browser/features/Messages/useTranscriptContextMenu";
 import type { UserMessageNavigation } from "@/browser/features/Messages/UserMessage";
+import {
+  TranscriptTimeline,
+  type TranscriptTimelineMarker,
+} from "@/browser/components/ChatPane/TranscriptTimeline";
 import { InterruptedBarrier } from "@/browser/features/Messages/ChatBarrier/InterruptedBarrier";
 import { useResumeStream } from "@/browser/hooks/useResumeStream";
 import { EditCutoffBarrier } from "@/browser/features/Messages/ChatBarrier/EditCutoffBarrier";
@@ -761,6 +765,25 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     return navigationByHistoryId;
   }, [deferredMessages, handleNavigateToMessage]);
 
+  // Timeline ticks beside the scrollbar: one per user prompt, plus destructive
+  // ticks for stream errors (Figma chat-dialog transcript navigation).
+  const timelineMarkers: TranscriptTimelineMarker[] = [];
+  for (const message of deferredMessages) {
+    if (message.type === "user") {
+      timelineMarkers.push({
+        historyId: message.historyId,
+        kind: "prompt",
+        label: message.content.trim().replace(/\s+/g, " ").slice(0, 80),
+      });
+    } else if (message.type === "stream-error") {
+      timelineMarkers.push({
+        historyId: message.historyId,
+        kind: "error",
+        label: message.error.trim().replace(/\s+/g, " ").slice(0, 80),
+      });
+    }
+  }
+
   // ChatInput API for focus management
   const chatInputAPI = useRef<ChatInputAPI | null>(null);
 
@@ -1347,7 +1370,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
             // for visibility — using a container query rather than a viewport media
             // query means sidebars opening/closing correctly hide the TOC even when
             // the viewport width is unchanged. See `.plan-toc-aside` in globals.css.
-            className="@container/transcript flex h-full flex-col overflow-x-hidden overflow-y-auto px-[15px] pt-[15px] leading-[1.5] break-words whitespace-pre-wrap"
+            className="transcript-scrollbar @container/transcript flex h-full flex-col overflow-x-hidden overflow-y-auto px-[15px] pt-[15px] leading-[1.5] break-words whitespace-pre-wrap"
           >
             <div
               // While locked, opt the whole transcript subtree out of scroll
@@ -1663,6 +1686,11 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
               </div>
             </PerfRenderMarker>
           </div>
+          <TranscriptTimeline
+            scrollportRef={contentRef}
+            markers={timelineMarkers}
+            onNavigate={handleNavigateToMessage}
+          />
           {transcriptContextMenu.menu}
         </div>
       </PerfRenderMarker>
