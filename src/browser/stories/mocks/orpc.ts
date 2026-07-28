@@ -1457,6 +1457,16 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         get: () => Promise.resolve(null),
         set: () => Promise.resolve({ success: true, data: undefined }),
       },
+      timeline: {
+        list: () => Promise.resolve({ events: [], nextCursor: null, hasOlder: false }),
+        subscribe: () =>
+          Promise.resolve(
+            (function* () {
+              yield { type: "snapshot" as const, events: [], nextCursor: null, hasOlder: false };
+            })()
+          ),
+        preview: () => Promise.resolve(null),
+      },
       // Goal board (multi-goal queue) endpoints. Stories that want the
       // GoalTab's Upcoming / Completed / Archived sections populated
       // pass a snapshot via `goalBoardSnapshots` keyed by workspaceId;

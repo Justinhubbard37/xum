@@ -2148,6 +2148,24 @@ export const TOOL_DEFINITIONS = {
       "Do not use it for the final result—the final assistant message completes the sub-agent task.",
     schema: AgentReportToolArgsSchema,
   },
+  timeline_event: {
+    description:
+      "Record one notable step on the durable workspace timeline, which is a birds-eye record of the work rather than a tool log. " +
+      "Call it when: a notable implementation step landed; work was committed, pushed, or opened as a PR; " +
+      "external input was picked up, such as a review comment, CI failure, or issue; " +
+      "the approach changed, including why; a blocker was hit or resolved; work was handed off. " +
+      "Describe what happened in one plain sentence. " +
+      "Prompts, goals, heartbeats, sub-agents, and workflows are already recorded automatically, so do not restate them or narrate routine tool use.",
+    schema: z
+      .object({
+        description: z.string().min(1).max(300).describe("One sentence describing what happened."),
+        category: z
+          .enum(["picked_up", "milestone", "decision", "blocker", "handoff"])
+          .nullish()
+          .describe("Optional event category."),
+      })
+      .strict(),
+  },
   set_goal: {
     description:
       "Create or replace a durable goal for this current parent workspace when the user explicitly asks for multi-turn, verifiable work. " +
@@ -3009,6 +3027,7 @@ export function getAvailableTools(
     enableDynamicWorkflows?: boolean;
     /** Whether the agent memory tool is available (memory experiment enabled). */
     enableMemory?: boolean;
+    enableTimelineEvent?: boolean;
     /** Whether tool_catalog_search is available (tool-search experiment + deferred MCP tools present). */
     enableToolSearch?: boolean;
     /**
@@ -3028,6 +3047,7 @@ export function getAvailableTools(
   const enableAdvisor = options?.enableAdvisor ?? false;
   const enableDynamicWorkflows = options?.enableDynamicWorkflows ?? false;
   const enableMemory = options?.enableMemory ?? false;
+  const enableTimelineEvent = options?.enableTimelineEvent ?? false;
   const enableToolSearch = options?.enableToolSearch ?? false;
   const enableReviewPane = options?.enableReviewPane ?? true;
 
@@ -3059,6 +3079,7 @@ export function getAvailableTools(
     // "file_edit_replace_lines", // DISABLED: causes models to break repo state
     "file_edit_insert",
     ...(enableMemory ? ["memory"] : []),
+    ...(enableTimelineEvent ? ["timeline_event"] : []),
     ...(enableAdvisor ? ["advisor"] : []),
     ...(enableToolSearch ? ["tool_catalog_search"] : []),
     "ask_user_question",

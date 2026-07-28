@@ -26,6 +26,8 @@ import type {
   FrontendWorkspaceMetadataSchemaType,
   SendMessageOptions,
 } from "@/common/orpc/types";
+import type { TimelineSubscriptionEvent } from "@/common/orpc/schemas/timeline";
+import { TIMELINE_DEFAULT_PAGE_LIMIT } from "@/node/services/timelineService";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { SshPromptEvent, SshPromptRequest } from "@/common/orpc/schemas/ssh";
 import {
@@ -4048,6 +4050,82 @@ export const router = (authToken?: string) => {
           }
           return { success: true };
         }),
+      timeline: {
+        list: t
+          .input(schemas.workspace.timeline.list.input)
+          .output(schemas.workspace.timeline.list.output)
+          .handler(({ context, input }) => {
+            const { workspaceId, ...listInput } = input;
+            return context.timelineService.list(workspaceId, listInput);
+          }),
+        subscribe: t
+          .input(schemas.workspace.timeline.subscribe.input)
+          .output(schemas.workspace.timeline.subscribe.output)
+          .handler(async function* ({ context, input, signal }) {
+            const queue = createAsyncEventQueue<TimelineSubscriptionEvent>();
+            const pendingEvents: TimelineSubscriptionEvent["events"] = [];
+            let snapshotSequence: number | undefined;
+            const onAppended = (event: {
+              workspaceId: string;
+              events: TimelineSubscriptionEvent["events"];
+            }) => {
+              if (event.workspaceId !== input.workspaceId) {
+                return;
+              }
+              const currentSequence = snapshotSequence;
+              if (currentSequence == null) {
+                pendingEvents.push(...event.events);
+                return;
+              }
+              const events = event.events.filter((item) => item.seq > currentSequence);
+              if (events.length > 0) {
+                queue.push({ type: "appended", events });
+              }
+            };
+            context.timelineService.on("appended", onAppended);
+            const onAbort = () => queue.end();
+            if (signal) {
+              if (signal.aborted) {
+                onAbort();
+              } else {
+                signal.addEventListener("abort", onAbort, { once: true });
+              }
+            }
+
+            try {
+              const snapshotMaxSequence = await context.timelineService.getLastSequence(
+                input.workspaceId
+              );
+              snapshotSequence = snapshotMaxSequence;
+              const snapshot = await context.timelineService.list(input.workspaceId, {
+                cursor: snapshotMaxSequence + 1,
+                limit: TIMELINE_DEFAULT_PAGE_LIMIT,
+              });
+              const appended = pendingEvents.filter((event) => event.seq > snapshotMaxSequence);
+              if (appended.length > 0) {
+                queue.push({ type: "appended", events: appended });
+              }
+              yield {
+                type: "snapshot" as const,
+                events: snapshot.events,
+                nextCursor: snapshot.nextCursor,
+                hasOlder: snapshot.hasOlder,
+              };
+              yield* queue.iterate();
+            } finally {
+              queue.end();
+              signal?.removeEventListener("abort", onAbort);
+              context.timelineService.off("appended", onAppended);
+            }
+          }),
+        preview: t
+          .input(schemas.workspace.timeline.preview.input)
+          .output(schemas.workspace.timeline.preview.output)
+          .handler(({ context, input }) => {
+            const { workspaceId, ...anchor } = input;
+            return context.timelineService.previewAnchor(workspaceId, anchor);
+          }),
+      },
       heartbeat: {
         get: t
           .input(schemas.workspace.heartbeat.get.input)

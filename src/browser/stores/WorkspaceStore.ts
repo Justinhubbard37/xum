@@ -14,6 +14,7 @@ import type { AppRouter } from "@/node/orpc/router";
 import type { TodoItem } from "@/common/types/tools";
 import type { AssistedReviewHunk } from "@/common/types/review";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
+import type { TimelineEvent, TimelineSubscriptionEvent } from "@/common/orpc/schemas/timeline";
 import { applyWorkspaceChatEventToAggregator } from "@/browser/utils/messages/applyWorkspaceChatEventToAggregator";
 import {
   StreamingMessageAggregator,
@@ -95,12 +96,45 @@ import { isWorkflowRunEmittingToolName } from "@/common/utils/workflowRunMessage
 /** Stable empty reference returned when a workspace has no assisted hunks; keeps useSyncExternalStore snapshot identity stable. */
 const EMPTY_ASSISTED_REVIEW: AssistedReviewHunk[] = [];
 
+function mergeTimelineEvents(
+  preferred: TimelineEvent[],
+  fallback: TimelineEvent[]
+): TimelineEvent[] {
+  const preferredIds = new Set(preferred.map((event) => event.id));
+  return [...preferred, ...fallback.filter((event) => !preferredIds.has(event.id))].toSorted(
+    (a, b) => b.seq - a.seq
+  );
+}
+
+export interface WorkspaceTimelineSnapshot {
+  events: TimelineEvent[];
+  nextCursor: number | null;
+  hasOlder: boolean;
+  initialized: boolean;
+  loadingOlder: boolean;
+  loadError: string | null;
+  // A dead subscription needs a retry to recover; a failed page can just be requested again.
+  loadErrorKind: "subscription" | "pagination" | null;
+}
+
+const EMPTY_TIMELINE_SNAPSHOT: WorkspaceTimelineSnapshot = {
+  events: [],
+  nextCursor: null,
+  hasOlder: false,
+  initialized: false,
+  loadingOlder: false,
+  loadError: null,
+  loadErrorKind: null,
+};
+
 export type AutoRetryStatus = Extract<
   WorkspaceChatMessage,
   | { type: "auto-retry-scheduled" }
   | { type: "auto-retry-starting" }
   | { type: "auto-retry-abandoned" }
 >;
+
+export type HistoryLoadResult = "loaded" | "exhausted" | "busy" | "unavailable" | "failed";
 
 export interface WorkspaceState {
   name: string; // User-facing workspace name (e.g., "feature-branch")
@@ -716,6 +750,12 @@ export class WorkspaceStore {
   // Per-workspace listener refcount for useWorkspaceStatsSnapshot().
   // Used to only subscribe to backend stats when something in the UI is actually reading them.
   private statsListenerCounts = new Map<string, number>();
+
+  private workspaceTimelines = new Map<string, WorkspaceTimelineSnapshot>();
+  private timelineStore = new MapStore<string, WorkspaceTimelineSnapshot>();
+  private timelineUnsubscribers = new Map<string, () => void>();
+  private timelineListenerCounts = new Map<string, number>();
+
   // Cumulative session usage (from session-usage.json)
 
   private sessionUsage = new Map<string, z.infer<typeof SessionUsageFileSchema>>();
@@ -1277,6 +1317,10 @@ export class WorkspaceStore {
       unsubscribe();
     }
     this.statsUnsubscribers.clear();
+    for (const unsubscribe of this.timelineUnsubscribers.values()) {
+      unsubscribe();
+    }
+    this.timelineUnsubscribers.clear();
 
     this.client = client;
     this.clientChangeController.abort();
@@ -1300,6 +1344,9 @@ export class WorkspaceStore {
     // Re-subscribe any workspaces that already have UI consumers.
     for (const workspaceId of this.statsListenerCounts.keys()) {
       this.subscribeToStats(workspaceId);
+    }
+    for (const workspaceId of this.timelineListenerCounts.keys()) {
+      this.subscribeToTimeline(workspaceId);
     }
 
     this.ensureActiveOnChatSubscription();
@@ -1638,6 +1685,80 @@ export class WorkspaceStore {
     })();
 
     this.statsUnsubscribers.set(workspaceId, () => {
+      controller.abort();
+      void iterator?.return?.();
+    });
+  }
+
+  private subscribeToTimeline(workspaceId: string): void {
+    const client = this.client;
+    if (
+      !client ||
+      !this.isWorkspaceRegistered(workspaceId) ||
+      (this.timelineListenerCounts.get(workspaceId) ?? 0) <= 0 ||
+      this.timelineUnsubscribers.has(workspaceId)
+    ) {
+      return;
+    }
+
+    const controller = new AbortController();
+    const { signal } = controller;
+    let iterator: AsyncIterator<TimelineSubscriptionEvent> | null = null;
+
+    (async () => {
+      try {
+        const subscribedIterator = await client.workspace.timeline.subscribe(
+          { workspaceId },
+          { signal }
+        );
+        iterator = subscribedIterator;
+        if (signal.aborted) {
+          await subscribedIterator.return?.();
+          return;
+        }
+
+        for await (const update of subscribedIterator) {
+          if (signal.aborted) break;
+          queueMicrotask(() => {
+            if (signal.aborted) return;
+
+            // The snapshot is the initial page: it establishes pagination, and an empty one still
+            // has to mark the timeline initialized so the panel can render its empty state.
+            if (update.type === "snapshot") {
+              this.workspaceTimelines.set(workspaceId, {
+                events: update.events,
+                nextCursor: update.nextCursor,
+                hasOlder: update.hasOlder,
+                initialized: true,
+                loadingOlder: false,
+                loadError: null,
+                loadErrorKind: null,
+              });
+              this.timelineStore.bump(workspaceId);
+              return;
+            }
+
+            if (update.events.length === 0) return;
+            const current = this.workspaceTimelines.get(workspaceId) ?? EMPTY_TIMELINE_SNAPSHOT;
+            const events = mergeTimelineEvents(update.events, current.events);
+            this.workspaceTimelines.set(workspaceId, { ...current, events, initialized: true });
+            this.timelineStore.bump(workspaceId);
+          });
+        }
+      } catch (error) {
+        if (signal.aborted || isAbortError(error)) return;
+        console.warn(`[WorkspaceStore] Error in timeline subscription for ${workspaceId}:`, error);
+        this.workspaceTimelines.set(workspaceId, {
+          ...(this.workspaceTimelines.get(workspaceId) ?? EMPTY_TIMELINE_SNAPSHOT),
+          initialized: true,
+          loadError: error instanceof Error ? error.message : "Failed to load timeline",
+          loadErrorKind: "subscription",
+        });
+        this.timelineStore.bump(workspaceId);
+      }
+    })();
+
+    this.timelineUnsubscribers.set(workspaceId, () => {
       controller.abort();
       void iterator?.return?.();
     });
@@ -2257,7 +2378,7 @@ export class WorkspaceStore {
     this.states.bump(workspaceId);
   }
 
-  async loadOlderHistory(workspaceId: string): Promise<void> {
+  async loadOlderHistory(workspaceId: string): Promise<HistoryLoadResult> {
     assert(
       typeof workspaceId === "string" && workspaceId.length > 0,
       "loadOlderHistory requires a non-empty workspaceId"
@@ -2266,7 +2387,7 @@ export class WorkspaceStore {
     const client = this.client;
     if (!client) {
       console.warn(`[WorkspaceStore] Cannot load older history for ${workspaceId}: no ORPC client`);
-      return;
+      return "unavailable";
     }
 
     const paginationState = this.historyPagination.get(workspaceId);
@@ -2274,18 +2395,21 @@ export class WorkspaceStore {
       console.warn(
         `[WorkspaceStore] Cannot load older history for ${workspaceId}: pagination state is not initialized`
       );
-      return;
+      return "unavailable";
     }
 
-    if (!paginationState.hasOlder || paginationState.loading) {
-      return;
+    if (!paginationState.hasOlder) {
+      return "exhausted";
+    }
+    if (paginationState.loading) {
+      return "busy";
     }
 
     if (!this.aggregators.has(workspaceId)) {
       console.warn(
         `[WorkspaceStore] Cannot load older history for ${workspaceId}: workspace is not registered`
       );
-      return;
+      return "unavailable";
     }
 
     const requestedCursor = paginationState.nextCursor
@@ -2316,7 +2440,7 @@ export class WorkspaceStore {
         !latestPagination.loading ||
         !areHistoryPaginationCursorsEqual(latestPagination.nextCursor, requestedCursor)
       ) {
-        return;
+        return "busy";
       }
 
       if (result.hasOlder) {
@@ -2347,6 +2471,7 @@ export class WorkspaceStore {
         hasOlder: result.hasOlder,
         loading: false,
       });
+      return "loaded";
     } catch (error) {
       console.error(`[WorkspaceStore] Failed to load older history for ${workspaceId}:`, error);
 
@@ -2357,6 +2482,7 @@ export class WorkspaceStore {
           loading: false,
         });
       }
+      return "failed";
     } finally {
       if (this.isWorkspaceRegistered(workspaceId)) {
         this.states.bump(workspaceId);
@@ -2712,6 +2838,96 @@ export class WorkspaceStore {
       }
 
       this.statsListenerCounts.set(workspaceId, currentCount - 1);
+    };
+  }
+
+  getWorkspaceTimeline(workspaceId: string): WorkspaceTimelineSnapshot {
+    return this.timelineStore.get(
+      workspaceId,
+      () => this.workspaceTimelines.get(workspaceId) ?? EMPTY_TIMELINE_SNAPSHOT
+    );
+  }
+
+  retryTimeline(workspaceId: string): void {
+    // Tear the failed subscription down first: subscribeToTimeline no-ops while an unsubscriber for
+    // this workspace is still registered.
+    this.timelineUnsubscribers.get(workspaceId)?.();
+    this.timelineUnsubscribers.delete(workspaceId);
+    this.workspaceTimelines.set(workspaceId, { ...EMPTY_TIMELINE_SNAPSHOT });
+    this.timelineStore.bump(workspaceId);
+    this.subscribeToTimeline(workspaceId);
+  }
+
+  async loadOlderTimeline(workspaceId: string): Promise<void> {
+    const client = this.client;
+    const current = this.workspaceTimelines.get(workspaceId);
+    if (!client || !current?.hasOlder || current.loadingOlder || current.nextCursor == null) {
+      return;
+    }
+
+    const requestedCursor = current.nextCursor;
+    this.workspaceTimelines.set(workspaceId, {
+      ...current,
+      loadingOlder: true,
+      loadError: null,
+      loadErrorKind: null,
+    });
+    this.timelineStore.bump(workspaceId);
+
+    try {
+      const page = await client.workspace.timeline.list({
+        workspaceId,
+        cursor: requestedCursor,
+      });
+      const latest = this.workspaceTimelines.get(workspaceId);
+      if (latest?.nextCursor !== requestedCursor || !latest.loadingOlder) return;
+
+      this.workspaceTimelines.set(workspaceId, {
+        ...latest,
+        events: mergeTimelineEvents(latest.events, page.events),
+        nextCursor: page.nextCursor,
+        hasOlder: page.hasOlder,
+        loadingOlder: false,
+      });
+      this.timelineStore.bump(workspaceId);
+    } catch (error) {
+      const latest = this.workspaceTimelines.get(workspaceId);
+      if (latest?.nextCursor !== requestedCursor) return;
+      this.workspaceTimelines.set(workspaceId, {
+        ...latest,
+        loadingOlder: false,
+        loadError: error instanceof Error ? error.message : "Failed to load older events",
+        loadErrorKind: "pagination",
+      });
+      this.timelineStore.bump(workspaceId);
+    }
+  }
+
+  subscribeTimeline(workspaceId: string, listener: () => void): () => void {
+    const unsubscribeFromStore = this.timelineStore.subscribeKey(workspaceId, listener);
+    const previousCount = this.timelineListenerCounts.get(workspaceId) ?? 0;
+    this.timelineListenerCounts.set(workspaceId, previousCount + 1);
+
+    if (previousCount === 0) {
+      this.subscribeToTimeline(workspaceId);
+    }
+
+    return () => {
+      unsubscribeFromStore();
+      const currentCount = this.timelineListenerCounts.get(workspaceId);
+      if (!currentCount) return;
+
+      if (currentCount === 1) {
+        this.timelineListenerCounts.delete(workspaceId);
+        this.timelineUnsubscribers.get(workspaceId)?.();
+        this.timelineUnsubscribers.delete(workspaceId);
+        this.workspaceTimelines.delete(workspaceId);
+        this.timelineStore.bump(workspaceId);
+        this.timelineStore.delete(workspaceId);
+        return;
+      }
+
+      this.timelineListenerCounts.set(workspaceId, currentCount - 1);
     };
   }
 
@@ -3783,6 +3999,7 @@ export class WorkspaceStore {
 
     // Stats snapshots are subscribed lazily via subscribeStats().
     this.subscribeToStats(workspaceId);
+    this.subscribeToTimeline(workspaceId);
 
     this.ensureActiveOnChatSubscription();
 
@@ -3832,6 +4049,11 @@ export class WorkspaceStore {
       statsUnsubscribe();
       this.statsUnsubscribers.delete(workspaceId);
     }
+    const timelineUnsubscribe = this.timelineUnsubscribers.get(workspaceId);
+    if (timelineUnsubscribe) {
+      timelineUnsubscribe();
+      this.timelineUnsubscribers.delete(workspaceId);
+    }
 
     const unsubscribe = this.ipcUnsubscribers.get(workspaceId);
     if (unsubscribe) {
@@ -3864,6 +4086,9 @@ export class WorkspaceStore {
     this.workspaceStats.delete(workspaceId);
     this.statsStore.delete(workspaceId);
     this.statsListenerCounts.delete(workspaceId);
+    this.workspaceTimelines.delete(workspaceId);
+    this.timelineStore.delete(workspaceId);
+    this.timelineListenerCounts.delete(workspaceId);
     this.historyPagination.delete(workspaceId);
     this.preReplayUsageSnapshot.delete(workspaceId);
     this.sessionUsage.delete(workspaceId);
@@ -3918,6 +4143,10 @@ export class WorkspaceStore {
       unsubscribe();
     }
     this.statsUnsubscribers.clear();
+    for (const unsubscribe of this.timelineUnsubscribers.values()) {
+      unsubscribe();
+    }
+    this.timelineUnsubscribers.clear();
 
     for (const unsubscribe of this.ipcUnsubscribers.values()) {
       unsubscribe();
@@ -3956,6 +4185,9 @@ export class WorkspaceStore {
     this.workspaceStats.clear();
     this.statsStore.clear();
     this.statsListenerCounts.clear();
+    this.workspaceTimelines.clear();
+    this.timelineStore.clear();
+    this.timelineListenerCounts.clear();
     this.historyPagination.clear();
     this.preReplayUsageSnapshot.clear();
     this.sessionUsage.clear();
@@ -4894,6 +5126,20 @@ export function useWorkspaceStatsSnapshot(workspaceId: string): WorkspaceStatsSn
   );
 
   return useSyncExternalStore(subscribe, getSnapshot);
+}
+
+export function useWorkspaceTimeline(workspaceId: string): WorkspaceTimelineSnapshot {
+  const store = getStoreInstance();
+
+  // NOTE: subscribeTimeline() is refcounted; dropping the last listener closes the ORPC
+  // subscription and discards the loaded page. useSyncExternalStore resubscribes whenever this
+  // identity changes, so this useCallback is for correctness, not performance.
+  const subscribe = useCallback(
+    (listener: () => void) => store.subscribeTimeline(workspaceId, listener),
+    [store, workspaceId]
+  );
+
+  return useSyncExternalStore(subscribe, () => store.getWorkspaceTimeline(workspaceId));
 }
 
 /**

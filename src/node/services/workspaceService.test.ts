@@ -5,6 +5,7 @@ import type { AgentSession } from "./agentSession";
 import { askUserQuestionManager } from "./askUserQuestionManager";
 import { WorkspaceLifecycleHooks } from "./workspaceLifecycleHooks";
 import { EventEmitter } from "events";
+import { existsSync } from "fs";
 import * as fsPromises from "fs/promises";
 import { tmpdir } from "os";
 import path from "path";
@@ -7931,6 +7932,46 @@ describe("WorkspaceService remove desktop session cleanup", () => {
     expect(result.success).toBe(true);
     expect(close).toHaveBeenCalledTimes(1);
     expect(close).toHaveBeenCalledWith(workspaceId);
+  });
+
+  test("remove() reopens the timeline when removal aborts with the workspace still configured", async () => {
+    await fsPromises.mkdir(path.join(tempRoot, "sessions", workspaceId), { recursive: true });
+    const reopened: string[] = [];
+    workspaceService.setTimelineRecorder({
+      record: () => undefined,
+      closeWorkspace: () => Promise.resolve(),
+      reopenWorkspace: (id) => reopened.push(id),
+    });
+    removeWorkspaceMock.mockImplementation(() => {
+      throw new Error("config write failed");
+    });
+
+    const result = await workspaceService.remove(workspaceId);
+
+    expect(result.success).toBe(false);
+    expect(reopened).toEqual([workspaceId]);
+  });
+
+  test("remove() flushes the timeline before deleting the session directory", async () => {
+    const sessionDir = path.join(tempRoot, "sessions", workspaceId);
+    await fsPromises.mkdir(sessionDir, { recursive: true });
+    const order: string[] = [];
+    workspaceService.setTimelineRecorder({
+      record: () => undefined,
+      closeWorkspace: () => {
+        // A queued append recreates the session directory, so closing is only useful while the
+        // directory still exists.
+        order.push(existsSync(sessionDir) ? "closed-before-delete" : "closed-after-delete");
+        return Promise.resolve();
+      },
+      reopenWorkspace: () => undefined,
+    });
+
+    const result = await workspaceService.remove(workspaceId);
+
+    expect(result.success).toBe(true);
+    expect(order).toEqual(["closed-before-delete"]);
+    expect(existsSync(sessionDir)).toBe(false);
   });
 
   test("remove() continues when desktop session cleanup fails", async () => {

@@ -7,7 +7,7 @@ import type {
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { HeartbeatToolArgs, HeartbeatToolResult } from "@/common/types/tools";
 import { getErrorMessage } from "@/common/utils/errors";
-import { formatHeartbeatInterval, resolveHeartbeatSchedulePolicy } from "@/constants/heartbeat";
+import { HEARTBEAT_REMOVED_SUMMARY, summarizeHeartbeatSettings } from "@/constants/heartbeat";
 import { requireWorkspaceId } from "./toolUtils";
 
 function hasProvided<K extends keyof HeartbeatToolArgs>(
@@ -20,20 +20,9 @@ function hasProvided<K extends keyof HeartbeatToolArgs>(
 function summarize(
   result: Pick<HeartbeatToolResult & { success: true }, "action" | "settings">
 ): string {
-  if (result.action === "unset") {
-    return "Heartbeat settings removed for this workspace.";
-  }
-
-  const settings = result.settings;
-  if (!settings) {
-    return "No heartbeat settings are configured for this workspace.";
-  }
-
-  const status = settings.enabled ? "enabled" : "disabled";
-  // Mention the schedule shape only when it deviates from the default idle trigger.
-  const scheduleSuffix =
-    resolveHeartbeatSchedulePolicy(settings).trigger === "interval" ? " (fixed schedule)" : "";
-  return `Heartbeat is ${status} for this workspace at ${formatHeartbeatInterval(settings.intervalMs)}${scheduleSuffix}.`;
+  return result.action === "unset"
+    ? HEARTBEAT_REMOVED_SUMMARY
+    : summarizeHeartbeatSettings(result.settings);
 }
 
 // Build the shared success payload for every heartbeat action so the get/set/unset branches
@@ -42,7 +31,7 @@ function summarize(
 function buildSuccessResult(
   action: HeartbeatToolArgs["action"],
   settings: WorkspaceHeartbeatSettings | null
-): HeartbeatToolResult {
+): Extract<HeartbeatToolResult, { success: true }> {
   return {
     success: true,
     action,

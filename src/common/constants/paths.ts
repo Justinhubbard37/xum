@@ -11,6 +11,8 @@ const MUX_DIR_NAME = ".mux";
  */
 export const CHAT_FILE_NAME = "chat.jsonl";
 
+export const TIMELINE_FILE_NAME = "timeline.jsonl";
+
 /**
  * Session-dir file holding sealed pre-boundary chat history. HistoryService
  * rotates everything before the latest durable context boundary out of

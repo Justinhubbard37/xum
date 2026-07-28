@@ -24,6 +24,7 @@ import { createSetGoalTool } from "@/node/services/tools/set_goal";
 import { createGetGoalTool } from "@/node/services/tools/get_goal";
 import { createCompleteGoalTool } from "@/node/services/tools/complete_goal";
 import { createNotifyTool } from "@/node/services/tools/notify";
+import { createTimelineEventTool } from "@/node/services/tools/timeline_event";
 import { createToolSearchTool } from "@/node/services/tools/toolSearch";
 import { createAnalyticsQueryTool } from "@/node/services/tools/analyticsQuery";
 import { createDesktopTools } from "@/node/services/tools/desktopTools";
@@ -71,6 +72,7 @@ import type { MemoryIndexEntry, MemoryService } from "@/node/services/memoryServ
 import type { MemoryScopeAccess } from "@/common/constants/memory";
 import { createMemoryTool } from "@/node/services/tools/memory";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
+import type { TimelineService } from "@/node/services/timelineService";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { FileState } from "@/node/services/agentSession";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
@@ -177,6 +179,7 @@ export interface ToolConfiguration {
   agentSkillsRoots?: ToolAgentSkillsRoots;
   /** Memory service for the memory tool (present only when the memory experiment is enabled). */
   memoryService?: MemoryService;
+  timelineService?: TimelineService;
   /** Per-scope memory write policy for the current agent (defaults to read-only). */
   memoryAccess?: MemoryScopeAccess;
   /** Callback to record file state for external edit detection (plan files) */
@@ -267,6 +270,7 @@ export interface ToolConfiguration {
     execSubagentHardRestart?: boolean;
     dynamicWorkflows?: boolean;
     memory?: boolean;
+    timeline?: boolean;
     workspaceHeartbeats?: boolean;
     toolSearch?: boolean;
     /** claude-skills-compat: discover skills from .claude/skills and ~/.claude/skills (read-only). */
@@ -598,6 +602,9 @@ export async function getToolsForModel(
     skills_catalog_read: createSkillsCatalogReadTool(config),
     ...(config.advisorRuntime ? { advisor: createAdvisorTool(config) } : {}),
     ...(config.toolSearchRuntime ? { tool_catalog_search: createToolSearchTool(config) } : {}),
+    ...(config.timelineService && config.experiments?.timeline
+      ? { timeline_event: createTimelineEventTool(config) }
+      : {}),
     ask_user_question: createAskUserQuestionTool(config),
     propose_plan: createProposePlanTool(config),
     // propose_name and propose_status are intentionally NOT registered here —
@@ -740,6 +747,7 @@ export async function getToolsForModel(
       ),
       enableAdvisor: Boolean(config.advisorRuntime),
       enableMemory: Boolean(config.memoryService && config.experiments?.memory),
+      enableTimelineEvent: Boolean(config.timelineService && config.experiments?.timeline),
       enableToolSearch: Boolean(config.toolSearchRuntime),
       // The Review pane belongs to the user-facing parent workspace. config
       // .enableAgentReport is the canonical "is sub-agent" signal (set true iff

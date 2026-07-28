@@ -112,6 +112,11 @@ import {
 } from "@/browser/utils/messages/transcriptRenderProjection";
 import { isBlockedPreStreamTaskStatus } from "@/browser/utils/ui/workspaceFiltering";
 import { recordSyntheticReactRenderSample } from "@/browser/utils/perf/reactProfileCollector";
+import {
+  CUSTOM_EVENTS,
+  type CustomEventType,
+  type CustomEventPayloads,
+} from "@/common/constants/events";
 
 // Perf e2e runs load the production bundle where React's onRender profiler callbacks may not
 // fire. This marker records synthetic commit timings for selected subtrees so automated perf
@@ -221,6 +226,46 @@ function findTranscriptMessageElement(
   return Array.from(scrollContainer.querySelectorAll<HTMLElement>("[data-message-id]")).find(
     (element) => element.getAttribute("data-message-id") === historyId
   );
+}
+
+const TIMELINE_REVEAL_HIGHLIGHT_CLASS = "timeline-reveal-highlight";
+
+function findTranscriptRevealElement(
+  scrollContainer: HTMLElement,
+  anchor: CustomEventPayloads[typeof CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR]
+): HTMLElement | undefined {
+  if (anchor.toolCallId) {
+    const toolElement = Array.from(
+      scrollContainer.querySelectorAll<HTMLElement>("[data-tool-call-id]")
+    ).find((element) => element.dataset.toolCallId === anchor.toolCallId);
+    if (toolElement) {
+      return toolElement;
+    }
+  }
+
+  return anchor.messageId
+    ? findTranscriptMessageElement(scrollContainer, anchor.messageId)
+    : undefined;
+}
+
+function findTimelineRevealMessageIndex(
+  messages: readonly DisplayedMessage[],
+  anchor: CustomEventPayloads[typeof CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR]
+): number {
+  if (anchor.toolCallId) {
+    const toolIndex = messages.findIndex(
+      (message) => message.type === "tool" && message.toolCallId === anchor.toolCallId
+    );
+    if (toolIndex >= 0) {
+      return toolIndex;
+    }
+  }
+
+  return anchor.messageId
+    ? messages.findIndex(
+        (message) => "historyId" in message && message.historyId === anchor.messageId
+      )
+    : -1;
 }
 
 export const ChatPane: React.FC<ChatPaneProps> = (props) => {
@@ -562,6 +607,105 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     handleScrollContainerKeyDown,
   } = useAutoScroll();
 
+  const [pendingTimelineReveal, setPendingTimelineReveal] = useState<
+    CustomEventPayloads[typeof CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR] | null
+  >(null);
+  const highlightedTimelineElementRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    const handleTimelineReveal = (event: Event) => {
+      const customEvent = event as CustomEventType<typeof CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR>;
+      if (customEvent.detail.workspaceId !== workspaceId) {
+        return;
+      }
+      disableAutoScroll();
+      setPendingTimelineReveal(customEvent.detail);
+    };
+
+    window.addEventListener(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, handleTimelineReveal);
+    return () => {
+      window.removeEventListener(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, handleTimelineReveal);
+    };
+  }, [disableAutoScroll, workspaceId]);
+
+  // Store history loads can finish before the deferred transcript renders.
+  // Keep the reveal pending while its collapsed bundles expand.
+  useLayoutEffect(() => {
+    if (!pendingTimelineReveal) {
+      return;
+    }
+    if (pendingTimelineReveal.workspaceId !== workspaceId) {
+      setPendingTimelineReveal(null);
+      return;
+    }
+
+    const targetIndex = findTimelineRevealMessageIndex(deferredMessages, pendingTimelineReveal);
+    if (targetIndex < 0) {
+      return;
+    }
+
+    const bashOutputGroup = bashOutputGroupInfos[targetIndex];
+    const bashGroupKey = bashOutputGroup
+      ? deferredMessages[bashOutputGroup.firstIndex]?.id
+      : undefined;
+    if (bashGroupKey && !expandedBashGroups.has(bashGroupKey)) {
+      setExpandedBashGroups((current) => new Set(current).add(bashGroupKey));
+      return;
+    }
+
+    const workBundle = workBundleInfos?.[targetIndex];
+    if (workBundle && workBundleExpansionOverrides.get(workBundle.key) !== true) {
+      setWorkBundleExpansionOverrides((current) => new Map(current).set(workBundle.key, true));
+      return;
+    }
+
+    const operationalBundle = operationalBundleInfos?.[targetIndex];
+    if (
+      operationalBundle &&
+      operationalBundleExpansionOverrides.get(operationalBundle.key) !== true
+    ) {
+      setOperationalBundleExpansionOverrides((current) =>
+        new Map(current).set(operationalBundle.key, true)
+      );
+      return;
+    }
+
+    const scrollContainer = contentRef.current;
+    const targetElement = scrollContainer
+      ? findTranscriptRevealElement(scrollContainer, pendingTimelineReveal)
+      : undefined;
+    if (!targetElement) {
+      return;
+    }
+
+    // The highlight marks where the reveal landed and stays until the next reveal replaces it or the
+    // pane unmounts. Dismissing it on a timer would coordinate DOM state outside React and can
+    // overrun whenever a backgrounded tab throttles timers.
+    highlightedTimelineElementRef.current?.classList.remove(TIMELINE_REVEAL_HIGHLIGHT_CLASS);
+    highlightedTimelineElementRef.current = targetElement;
+    targetElement.classList.add(TIMELINE_REVEAL_HIGHLIGHT_CLASS);
+    targetElement.scrollIntoView({ behavior: "smooth", block: "center" });
+    setPendingTimelineReveal(null);
+  }, [
+    bashOutputGroupInfos,
+    contentRef,
+    deferredMessages,
+    expandedBashGroups,
+    operationalBundleExpansionOverrides,
+    operationalBundleInfos,
+    pendingTimelineReveal,
+    workBundleExpansionOverrides,
+    workBundleInfos,
+    workspaceId,
+  ]);
+
+  useEffect(() => {
+    return () => {
+      highlightedTimelineElementRef.current?.classList.remove(TIMELINE_REVEAL_HIGHLIGHT_CLASS);
+      highlightedTimelineElementRef.current = null;
+    };
+  }, [workspaceId]);
+
   // The composer dock lives inside the scrollport (sticky to its bottom), so
   // mousedown/keydown events from the composer bubble to the transcript
   // handlers. They must not open a scroll-intent window or clear the
@@ -787,6 +931,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     setExpandedBashGroups(new Set());
     setWorkBundleExpansionOverrides(new Map());
     setOperationalBundleExpansionOverrides(new Map());
+    setPendingTimelineReveal(null);
   }, [workspaceId]);
 
   const handleChatInputReady = useCallback((api: ChatInputAPI) => {

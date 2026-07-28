@@ -138,7 +138,7 @@ import {
   AskUserQuestionToolArgsSchema,
   AskUserQuestionToolResultSchema,
 } from "@/common/utils/tools/toolDefinitions";
-import type { UIMode } from "@/common/types/mode";
+import { UIModeSchema, type UIMode } from "@/common/types/mode";
 import {
   createMuxMessage,
   pickPreservedSendOptions,
@@ -195,8 +195,10 @@ import {
   HEARTBEAT_MAX_INTERVAL_MS,
   HEARTBEAT_MIN_INTERVAL_MS,
   HEARTBEAT_QUEUE_DEDUPE_KEY,
+  HEARTBEAT_REMOVED_SUMMARY,
   HEARTBEAT_RESET_BOUNDARY_MESSAGE,
   formatHeartbeatInterval,
+  summarizeHeartbeatSettings,
   isHeartbeatTrigger,
   isHeartbeatWhenBusy,
   isValidHeartbeatScheduleUpdatedAt,
@@ -234,6 +236,7 @@ import type {
   GoalContinuationRuntimeState,
   WorkspaceGoalService,
 } from "@/node/services/workspaceGoalService";
+import { NOOP_TIMELINE_RECORDER, type TimelineRecorder } from "@/node/services/timelineRecorder";
 import type {
   BackgroundProcessManager,
   MonitorArmedPayload,
@@ -1811,6 +1814,8 @@ export class WorkspaceService extends EventEmitter {
   // from older streams from clobbering a newer streaming=true snapshot after async awaits.
   private readonly streamingGenerations = new Map<string, number>();
 
+  private timelineRecorder: TimelineRecorder = NOOP_TIMELINE_RECORDER;
+
   // Serialize todo snapshot refreshes so back-to-back todo_write/propose_plan updates cannot
   // finish out of order and briefly restore stale progress in workspace activity metadata.
   private readonly todoStatusUpdateQueue = new Map<string, Promise<void>>();
@@ -2262,6 +2267,10 @@ export class WorkspaceService extends EventEmitter {
   private workspaceGoalService?: WorkspaceGoalService;
   /** Narrow DevTools cleanup surface; wired by coreServices when a DevToolsService exists. */
   private devToolsService?: { removeWorkspaceData(workspaceId: string): Promise<void> };
+
+  setTimelineRecorder(recorder: TimelineRecorder): void {
+    this.timelineRecorder = recorder;
+  }
 
   /**
    * Set the MCP server manager for tool access.
@@ -4326,6 +4335,8 @@ export class WorkspaceService extends EventEmitter {
       return Ok(undefined);
     }
     this.removingWorkspaces.add(workspaceId);
+    let timelineClosed = false;
+    let removedFromConfig = false;
 
     // If this workspace is mid-init, cancel the fire-and-forget init work (postCreateSetup,
     // sync/checkout, .mux/init hook, etc.) so removal doesn't leave orphaned background work.
@@ -4793,6 +4804,21 @@ export class WorkspaceService extends EventEmitter {
       // Intentionally deferred until we're committed to removal: if runtime deletion fails with
       // force=false we return early and keep init state intact so init-end can refresh metadata.
       this.initStateManager.clearInMemoryState(workspaceId);
+
+      // Dispose the session before deleting its directory: disposal aborts the active stream, and
+      // the resulting stream-abort event would otherwise be recorded on the timeline after the
+      // delete, recreating the session directory for a workspace the user removed.
+      this.disposeSession(workspaceId);
+      try {
+        await this.timelineRecorder.closeWorkspace(workspaceId);
+        timelineClosed = true;
+      } catch (error: unknown) {
+        log.warn("Failed to close the timeline before workspace removal", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      }
+
       // Remove session data
       try {
         const sessionDir = this.config.getSessionDir(workspaceId);
@@ -4838,15 +4864,13 @@ export class WorkspaceService extends EventEmitter {
         await this.mcpServerManager.stopServers(workspaceId);
       }
 
-      // Dispose session
-      this.disposeSession(workspaceId);
-
       // Close any terminal sessions for this workspace
       this.terminalService?.closeWorkspaceSessions(workspaceId);
       await this.closeDesktopSessionBestEffort(workspaceId, "remove");
 
       // Remove from config
       await this.config.removeWorkspace(workspaceId);
+      removedFromConfig = true;
       this.autoTitlingWorkspaces.delete(workspaceId);
 
       this.emit("metadata", {
@@ -4857,6 +4881,11 @@ export class WorkspaceService extends EventEmitter {
 
       return Ok(undefined);
     } catch (error) {
+      // An abort before the workspace left the config leaves it usable, so undo the timeline close:
+      // otherwise every later event for it would be dropped for the rest of the process.
+      if (timelineClosed && !removedFromConfig) {
+        this.timelineRecorder.reopenWorkspace(workspaceId);
+      }
       const message = getErrorMessage(error);
       return Err(`Failed to remove workspace: ${message}`);
     } finally {
@@ -5120,6 +5149,12 @@ export class WorkspaceService extends EventEmitter {
       const interactionTimestamp = Date.now();
       await this.updateRecencyTimestamp(normalizedWorkspaceId, interactionTimestamp);
       await this.emitCurrentWorkspaceMetadata(normalizedWorkspaceId);
+      this.timelineRecorder.record(normalizedWorkspaceId, {
+        kind: "heartbeat.configured",
+        source: { system: "heartbeat" },
+        status: "completed",
+        data: { digest: HEARTBEAT_REMOVED_SUMMARY },
+      });
 
       return Ok(undefined);
     } catch (error) {
@@ -5282,6 +5317,13 @@ export class WorkspaceService extends EventEmitter {
       // instead of rebuilding from an older completed turn.
       await this.updateRecencyTimestamp(normalizedWorkspaceId, interactionTimestamp);
       await this.emitCurrentWorkspaceMetadata(normalizedWorkspaceId);
+      // Recorded here rather than in the heartbeat tool so sidebar edits are on the record too.
+      this.timelineRecorder.record(normalizedWorkspaceId, {
+        kind: "heartbeat.configured",
+        source: { system: "heartbeat" },
+        status: "completed",
+        data: { digest: summarizeHeartbeatSettings(mergeResult.data.settings) },
+      });
 
       return Ok(mergeResult.data.settings);
     } catch (error) {
@@ -7500,6 +7542,20 @@ export class WorkspaceService extends EventEmitter {
         return Err(persistResult.error);
       }
 
+      if (persistResult.data) {
+        const parsedMode = UIModeSchema.safeParse(agentId);
+        this.timelineRecorder.record(workspaceId, {
+          kind: "settings.changed",
+          source: { system: "settings" },
+          status: "completed",
+          data: {
+            agentId,
+            model: normalized.data.model,
+            mode: parsedMode.success ? parsedMode.data : undefined,
+          },
+        });
+      }
+
       return Ok(undefined);
     } catch (error) {
       const message = getErrorMessage(error);
@@ -9405,6 +9461,11 @@ export class WorkspaceService extends EventEmitter {
         if (!clearResult.success) {
           return Err(`Failed to clear history: ${clearResult.error}`);
         }
+        this.timelineRecorder.record(workspaceId, {
+          kind: "history.cleared",
+          source: { system: "chat" },
+          status: "completed",
+        });
         deletedSequences = clearResult.data;
       }
 
