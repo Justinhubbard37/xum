@@ -3,6 +3,9 @@ import { z } from "zod";
 export const TIMELINE_EVENT_KINDS = [
   "turn.user",
   "turn.synthetic",
+  "turn.monitor_wake",
+  "turn.background_wake",
+  "turn.delegated",
   "turn.completed",
   "turn.interrupted",
   "turn.failed",
@@ -13,9 +16,12 @@ export const TIMELINE_EVENT_KINDS = [
   "context.reset",
   "history.cleared",
   "task.created",
+  "task.progress",
   "task.reported",
+  "task.failed",
   "task.interrupted",
   "workflow.attached",
+  "workflow.result",
   "heartbeat.configured",
   "heartbeat.dispatched",
   "heartbeat.skipped",
@@ -79,6 +85,12 @@ export function truncateTimelineDigest(value: string): string {
   return normalized.length <= TIMELINE_TEXT_MAX_LENGTH
     ? normalized
     : `${normalized.slice(0, TIMELINE_TEXT_MAX_LENGTH - 3)}...`;
+}
+
+// A completed sub-agent report is recorded by TaskService and is also injected into parent history,
+// which the mapper turns into a row too. Both sides key on the task so one report yields one row.
+export function subagentReportSourceKey(taskId: string): string {
+  return `task-report:${taskId}`;
 }
 
 // Free-text payload fields, as opposed to identifiers and enums that are bounded by their producer.

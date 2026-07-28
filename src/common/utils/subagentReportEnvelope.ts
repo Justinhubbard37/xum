@@ -9,6 +9,8 @@ export interface SubagentReportEnvelope {
   structuredOutput?: unknown;
 }
 
+export const SUBAGENT_FAILURE_ENVELOPE_TAG = "<mux_subagent_failure>";
+
 const ROOT_OPEN = "<mux_subagent_report>";
 const ROOT_CLOSE = "</mux_subagent_report>";
 const STRUCTURED_OUTPUT_START = "\n<structured_output_json>\n";
