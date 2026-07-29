@@ -20,10 +20,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
-import { Blocks, Cog, GitBranch, Loader2, Wand2 } from "lucide-react";
+import { GitBranch, Loader2, Wand2 } from "lucide-react";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { formatProjectHierarchyLabel } from "@/common/utils/subProjects";
-import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { RuntimeConfigInput } from "@/browser/components/RuntimeConfigInput/RuntimeConfigInput";
 import { cn } from "@/common/lib/utils";
@@ -54,7 +53,9 @@ import {
  * Fixed width ensures Select (with chevron) and text inputs render identically.
  */
 const INLINE_CONTROL_CLASSES =
-  "h-7 w-[140px] rounded border border-border-medium bg-separator px-2 text-xs text-foreground focus:border-accent focus:outline-none disabled:cursor-not-allowed disabled:opacity-50";
+  "h-7 w-[140px] rounded border border-border-light bg-transparent px-2 text-xs text-foreground focus:border-accent focus:outline-none disabled:cursor-not-allowed disabled:opacity-50";
+
+const SENTENCE_CLAUSE_CLASSES = "flex w-full min-w-0 items-center gap-2 md:w-auto";
 
 /** Credential sharing checkbox - used by Docker and Devcontainer runtimes */
 function CredentialSharingCheckbox(props: {
@@ -522,7 +523,6 @@ export function RuntimeButtonGroup(props: RuntimeButtonGroupProps) {
  */
 export function CreationControls(props: CreationControlsProps) {
   const { userProjects } = useProjectContext();
-  const settings = useSettings();
   const { beginWorkspaceCreation } = useWorkspaceContext();
   const { nameState, runtimeAvailabilityState } = props;
 
@@ -847,42 +847,15 @@ export function CreationControls(props: CreationControlsProps) {
         </div>
       </div>
 
-      {/* Runtime and source branch controls */}
       <div className="flex flex-col gap-1.5" data-component="RuntimeTypeGroup">
-        <div className="flex flex-wrap items-end gap-x-3 gap-y-2">
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-2 text-sm">
+          <span className="text-muted-foreground shrink-0">This workspace will use</span>
           {/* Workspace Type + Source Branch share a row on mobile */}
-          <div className="flex w-full items-end gap-3 md:contents md:w-auto">
-            <div className="flex min-w-0 flex-1 flex-col gap-1.5 md:flex-initial">
-              <div className="flex items-center gap-1.5">
-                <label className="text-muted-foreground flex items-center gap-1 text-xs font-medium">
-                  <Blocks className="h-3.5 w-3.5" />
-                  Workspace Type
-                </label>
-                {/* Keep this compact while preserving quick access to project runtime defaults. */}
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        settings.open("runtimes", { runtimesProjectPath: props.projectPath })
-                      }
-                      className={cn(
-                        "text-muted-foreground hover:text-foreground inline-flex h-3.5 w-3.5 items-center justify-center rounded-sm transition-colors",
-                        runtimeChoice !== props.defaultRuntimeMode &&
-                          "text-warning hover:text-warning"
-                      )}
-                      aria-label="Configure runtimes"
-                    >
-                      <Cog className="h-3 w-3" />
-                    </button>
-                  </TooltipTrigger>
-                  <TooltipContent align="center">
-                    {runtimeChoice !== props.defaultRuntimeMode
-                      ? "Set project runtime defaults"
-                      : "Configure runtimes"}
-                  </TooltipContent>
-                </Tooltip>
-              </div>
+          <div className="flex w-full items-center gap-2 md:contents md:w-auto">
+            <div className="flex min-w-0 flex-1 items-center gap-1.5 md:flex-initial">
+              <label className="sr-only" htmlFor="workspace-type-group">
+                Workspace Type
+              </label>
               <RuntimeButtonGroup
                 value={runtimeChoice}
                 onChange={(mode) => {
@@ -958,15 +931,17 @@ export function CreationControls(props: CreationControlsProps) {
               />
             </div>
 
+            <span className="text-muted-foreground shrink-0">from</span>
+
             <div
-              className="flex min-w-0 flex-1 flex-col gap-1.5 md:flex-initial"
+              className="flex min-w-0 flex-1 items-center gap-1.5 md:flex-initial"
               data-component="BranchSelector"
               data-tutorial="trunk-branch"
             >
-              <label className="text-muted-foreground flex items-center gap-1 text-xs font-medium">
-                <GitBranch className="h-3.5 w-3.5" />
+              <label className="sr-only" htmlFor="source-branch-select">
                 Source Branch
               </label>
+              <GitBranch className="text-muted-foreground h-3.5 w-3.5 shrink-0" />
               {props.branchesLoaded ? (
                 <RadixSelect
                   value={props.trunkBranch}
@@ -994,44 +969,50 @@ export function CreationControls(props: CreationControlsProps) {
           </div>
           {/* end mobile row wrapper */}
 
-          {/* SSH Host Input - shown in the same row when SSH (non-Coder) is selected */}
           {selectedRuntime.mode === "ssh" &&
             !isCoderSelected &&
             (props.allowSshHost ?? true) &&
             !props.coderProps?.enabled &&
             // Also hide when Coder is still checking but has saved config (will enable after check)
             !(props.coderProps?.coderInfo === null && props.coderProps?.coderConfig) && (
-              <RuntimeConfigInput
-                id="ssh-host"
-                fieldSpec={RUNTIME_OPTION_FIELDS.ssh}
-                value={selectedRuntime.host}
-                onChange={(value) => onSelectedRuntimeChange({ mode: "ssh", host: value })}
-                disabled={props.disabled}
-                hasError={props.runtimeFieldError === "ssh"}
-                inputClassName={INLINE_CONTROL_CLASSES}
-                stacked
-              />
+              <div className={SENTENCE_CLAUSE_CLASSES}>
+                <span className="text-muted-foreground shrink-0">on host</span>
+                <RuntimeConfigInput
+                  id="ssh-host"
+                  fieldSpec={RUNTIME_OPTION_FIELDS.ssh}
+                  value={selectedRuntime.host}
+                  onChange={(value) => onSelectedRuntimeChange({ mode: "ssh", host: value })}
+                  disabled={props.disabled}
+                  hasError={props.runtimeFieldError === "ssh"}
+                  className="min-w-0 flex-1 md:flex-initial"
+                  labelClassName="sr-only"
+                  inputClassName={cn(INLINE_CONTROL_CLASSES, "w-full md:w-[160px]")}
+                />
+              </div>
             )}
 
-          {/* Docker Image Input - shown in the same row when Docker is selected */}
           {selectedRuntime.mode === "docker" && (
-            <RuntimeConfigInput
-              fieldSpec={RUNTIME_OPTION_FIELDS.docker}
-              value={selectedRuntime.image}
-              onChange={(value) =>
-                onSelectedRuntimeChange({
-                  mode: "docker",
-                  image: value,
-                  shareCredentials: selectedRuntime.shareCredentials,
-                })
-              }
-              disabled={props.disabled}
-              hasError={props.runtimeFieldError === "docker"}
-              id="docker-image"
-              ariaLabel="Docker image"
-              inputClassName={INLINE_CONTROL_CLASSES}
-              stacked
-            />
+            <div className={SENTENCE_CLAUSE_CLASSES}>
+              <span className="text-muted-foreground shrink-0">with image</span>
+              <RuntimeConfigInput
+                fieldSpec={RUNTIME_OPTION_FIELDS.docker}
+                value={selectedRuntime.image}
+                onChange={(value) =>
+                  onSelectedRuntimeChange({
+                    mode: "docker",
+                    image: value,
+                    shareCredentials: selectedRuntime.shareCredentials,
+                  })
+                }
+                disabled={props.disabled}
+                hasError={props.runtimeFieldError === "docker"}
+                id="docker-image"
+                ariaLabel="Docker image"
+                className="min-w-0 flex-1 md:flex-initial"
+                labelClassName="sr-only"
+                inputClassName={cn(INLINE_CONTROL_CLASSES, "w-full md:w-[160px]")}
+              />
+            </div>
           )}
         </div>
 

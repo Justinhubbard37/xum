@@ -503,6 +503,12 @@ export const KEYBINDS = {
   // "N" for Notifications
   TOGGLE_NOTIFICATIONS: { key: "N", ctrl: true, shift: true },
 
+  TOGGLE_DRIFT_MODE: { key: "G", ctrl: true, shift: true },
+
+  SHOW_WORKSPACE_DETAILS: { key: "D", ctrl: true, shift: true },
+
+  SHOW_LAST_PROMPT: { key: "L", ctrl: true, shift: true },
+
   /** Confirm action in confirmation dialogs */
   CONFIRM_DIALOG_YES: { key: "y", allowShift: true },
 

@@ -477,6 +477,7 @@ export class StreamingMessageAggregator {
   } = {};
   private recencyTimestamp: number | null = null;
   private lastResponseCompletedAt: number | null = null;
+  private historyEpoch = 0;
 
   /** Oldest historySequence from the server's last replay window.
    *  Used for reconnect cursors instead of the absolute minimum (which
@@ -1099,6 +1100,7 @@ export class StreamingMessageAggregator {
     const mode = opts?.mode ?? "replace";
 
     if (mode === "replace") {
+      this.historyEpoch++;
       // Clear existing state to prevent stale messages from persisting.
       this.messages.clear();
       this.displayedMessageCache.clear();
@@ -1243,6 +1245,10 @@ export class StreamingMessageAggregator {
 
   setEstablishedOldestHistorySequence(sequence: number | null): void {
     this.establishedOldestHistorySequence = sequence;
+  }
+
+  getHistoryEpoch(): number {
+    return this.historyEpoch;
   }
 
   getAllMessages(): MuxMessage[] {
@@ -1951,6 +1957,8 @@ export class StreamingMessageAggregator {
       }
     }
 
+    // Deleted rows may fall outside the replay window, so invalidate even with no local match.
+    this.historyEpoch++;
     this.invalidateCache();
   }
 

@@ -11,6 +11,7 @@ import { formatTokens, type TokenMeterData } from "@/common/utils/tokens/tokenMe
 import { cn } from "@/common/lib/utils";
 import { Toggle1MContext } from "../Toggle1MContext/Toggle1MContext";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../Tooltip/Tooltip";
+import { COMPOSER_COMPACT_HIDE_CLASS, COMPOSER_CONTROL_HEIGHT_CLASS } from "@/constants/layout";
 
 /** Compact threshold tick mark for the button view */
 const CompactThresholdIndicator: React.FC<{ threshold: number }> = ({ threshold }) => {
@@ -235,30 +236,38 @@ export const ContextUsageIndicatorButton: React.FC<ContextUsageIndicatorButtonPr
             <button
               aria-label={ariaLabel}
               aria-haspopup="dialog"
-              className="hover:bg-sidebar-hover flex cursor-pointer items-center rounded py-0.5"
+              className={cn(
+                "border-border-light hover:bg-hover focus-visible:ring-accent flex cursor-pointer items-center gap-1.5 rounded-md border px-1.5 focus-visible:ring-1",
+                COMPOSER_CONTROL_HEIGHT_CLASS
+              )}
               type="button"
             >
               {/* Idle compaction indicator */}
               {isIdleCompactionEnabled && (
                 <span
                   title={`Auto-compact after ${idleHours}h idle`}
-                  className="mr-1.5 [@container(max-width:420px)]:hidden"
+                  className={COMPOSER_COMPACT_HIDE_CLASS}
                 >
                   <Hourglass className="text-muted h-3 w-3" />
                 </span>
               )}
 
-              {/* Full meter when there's room; fall back to a compact percentage label on narrow layouts. */}
+              <span className={cn("text-muted text-[11px]", COMPOSER_COMPACT_HIDE_CLASS)}>
+                Context
+              </span>
+
+              {/* Narrow composers keep the percentage only: a 56px meter reads as an empty bar at
+                low usage while starving the model and agent labels next to it. */}
               {data.totalTokens > 0 ? (
                 <div
                   data-context-usage-meter
-                  className="relative h-3 w-14 [@container(max-width:420px)]:hidden"
+                  className={cn("relative h-3 w-14", COMPOSER_COMPACT_HIDE_CLASS)}
                 >
                   <TokenMeter
                     segments={data.segments}
                     orientation="horizontal"
                     className="h-3"
-                    trackClassName="bg-dark"
+                    trackClassName="bg-surface-quaternary"
                   />
                   {isAutoCompactionEnabled && (
                     <CompactThresholdIndicator threshold={autoCompaction.threshold} />
@@ -268,13 +277,16 @@ export const ContextUsageIndicatorButton: React.FC<ContextUsageIndicatorButtonPr
                 /* Empty meter placeholder - allows access to settings with no usage */
                 <div
                   data-context-usage-meter
-                  className="bg-dark relative h-3 w-14 rounded-full [@container(max-width:420px)]:hidden"
+                  className={cn(
+                    "bg-surface-quaternary relative h-3 w-14 rounded-full",
+                    COMPOSER_COMPACT_HIDE_CLASS
+                  )}
                 />
               )}
 
               <span
                 data-context-usage-percent
-                className="text-muted hidden text-[10px] font-medium tabular-nums [@container(max-width:420px)]:block"
+                className="text-muted counter-nums text-[10px] font-medium"
               >
                 {compactLabel}
               </span>

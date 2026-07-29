@@ -65,9 +65,9 @@
     --color-ask-mode-light: hsl(246 100% 85%);
     --color-ask-mode-alpha: hsla(246 100% 68% / 0.1);
 
-    --color-exec-mode: hsl(268.56 94.04% 55.19%);
-    --color-exec-mode-hover: hsl(268.56 94.04% 67%);
-    --color-exec-mode-light: hsl(268.56 94.04% 78%);
+    --color-exec-mode: hsl(187.7 75% 79.6%);
+    --color-exec-mode-hover: hsl(187.7 75% 88%);
+    --color-exec-mode-light: hsl(187.7 75% 93%);
 
     /* Edit mode: amber/gold for editing warnings and barriers */
     --color-edit-mode: hsl(38 80% 45%);
@@ -80,13 +80,17 @@
     --color-editing-mode-alpha: hsla(38 70% 50% / 0.08);
     --color-pending: hsl(30 100% 70%);
 
+    --color-composer-send: #888895;
+    --color-composer-send-foreground: var(--color-surface-primary);
+
     --color-debug-mode: hsl(214 100% 64%);
     --color-debug-light: hsl(214 100% 76%);
     --color-debug-text: hsl(214 100% 80%);
 
-    --color-thinking-mode: hsl(271 76% 53%);
-    --color-thinking-mode-light: hsl(271 76% 65%);
-    --color-thinking-border: hsl(271 76% 53%);
+    /* Lighter than plan-mode's blue on purpose: both are blue, so reasoning blocks separate from the
+      Plan badge and inline code by lightness rather than hue. */
+    --color-thinking-mode: hsl(213 90% 68%);
+    --color-thinking-border: hsl(213 90% 68%);
 
     /* Runtime icon colors (matches Tailwind blue-500/purple-500) */
     --color-runtime-ssh: #3b82f6;
@@ -256,7 +260,7 @@
     --color-bg-light: hsl(0 0% 30%); /* #4c4c4c - light bg */
     --color-bg-subtle: hsl(240 3% 22%); /* #37373d - subtle bg */
 
-    --color-sidebar: #171717; /* neutral-900 - sidebar background */
+    --color-sidebar: var(--color-surface-primary);
     --color-separator: #262626; /* neutral-800 - dividers/separators */
     --color-separator-light: hsl(0 0% 27%); /* #464647 - lighter separator */
     --color-modal-bg: hsl(0 0% 18%); /* #2d2d30 - modal backgrounds */
@@ -368,19 +372,23 @@
   --color-ask-mode-light: hsl(246 100% 85%);
   --color-ask-mode-alpha: hsla(246 100% 68% / 0.08);
 
-  --color-exec-mode: hsl(268.56 94.04% 55.19%);
-  --color-exec-mode-hover: hsl(268.56 94.04% 67%);
-  --color-exec-mode-light: hsl(268.56 94.04% 78%);
+  /* Same hue as the dark-theme teal, darkened: that pale value fails contrast on white. */
+  --color-exec-mode: hsl(187.7 75% 30%);
+  --color-exec-mode-hover: hsl(187.7 75% 38%);
+  --color-exec-mode-light: hsl(187.7 75% 48%);
 
   --color-pending: hsl(30 100% 64%);
+
+  --color-composer-send: hsla(240, 4%, 42%, 1);
+  --color-composer-send-foreground: var(--color-surface-primary);
 
   --color-debug-mode: hsl(214 100% 56%);
   --color-debug-light: hsl(214 100% 68%);
   --color-debug-text: hsl(214 100% 32%);
 
-  --color-thinking-mode: hsl(271 70% 46%);
-  --color-thinking-mode-light: hsl(271 70% 62%);
-  --color-thinking-border: hsl(271 70% 46%);
+  /* Deeper than the dark theme's blue so reasoning text stays legible on white. */
+  --color-thinking-mode: hsl(213 88% 45%);
+  --color-thinking-border: hsl(213 88% 45%);
 
   /* Runtime icon colors (matches Tailwind blue-500/purple-500) */
   --color-runtime-ssh: #3b82f6;
@@ -611,12 +619,14 @@
   --color-plan-mode-light: color-mix(in srgb, var(--color-plan-mode), white 42%);
   --color-plan-mode-alpha: hsl(from var(--color-plan-mode) h s l / 0.08);
 
-  --color-ask-mode: color-mix(in srgb, var(--color-exec-mode) 62%, var(--color-plan-mode)); /* Blend between plan and exec */
+  /* Literal purple rather than var(--color-exec-mode): keeps Ask distinct from plan blue. */
+  --color-ask-mode: color-mix(in srgb, #5e409d 62%, var(--color-plan-mode)); /* Flexoki purple-600 */
   --color-ask-mode-hover: color-mix(in srgb, var(--color-ask-mode), white 18%);
   --color-ask-mode-light: color-mix(in srgb, var(--color-ask-mode), white 42%);
   --color-ask-mode-alpha: hsl(from var(--color-ask-mode) h s l / 0.08);
 
-  --color-exec-mode: #5e409d; /* Flexoki purple-600 */
+  /* Not the canonical cyan-600 for light themes: --color-task-mode already uses that step. */
+  --color-exec-mode: #164f4a; /* Flexoki cyan-800 */
   --color-exec-mode-hover: color-mix(in srgb, var(--color-exec-mode), white 18%);
   --color-exec-mode-light: color-mix(in srgb, var(--color-exec-mode), white 42%);
 
@@ -630,12 +640,15 @@
 
   --color-pending: #bc5215; /* Flexoki orange-600 */
 
+  --color-composer-send: #6f6e69; /* Flexoki base-600 */
+  --color-composer-send-foreground: var(--color-surface-primary);
+
   --color-debug-mode: var(--color-plan-mode);
   --color-debug-light: color-mix(in srgb, var(--color-debug-mode), white 42%);
   --color-debug-text: color-mix(in srgb, var(--color-debug-mode), black 30%);
 
-  --color-thinking-mode: #a02f6f; /* Flexoki magenta-600 */
-  --color-thinking-mode-light: color-mix(in srgb, var(--color-thinking-mode), white 42%);
+  /* Not blue-600: --color-plan-mode already uses that step in this theme. */
+  --color-thinking-mode: #4385be; /* Flexoki blue-400 */
   --color-thinking-border: var(--color-thinking-mode);
 
   /* Runtime badges (ensure readable on light background) */
@@ -842,12 +855,14 @@
   --color-plan-mode-light: color-mix(in srgb, var(--color-plan-mode), white 22%);
   --color-plan-mode-alpha: hsl(from var(--color-plan-mode) h s l / 0.12);
 
-  --color-ask-mode: color-mix(in srgb, var(--color-exec-mode) 62%, var(--color-plan-mode)); /* Blend between plan and exec */
+  /* Literal purple rather than var(--color-exec-mode): keeps Ask distinct from plan blue. */
+  --color-ask-mode: color-mix(in srgb, #8b7ec8 62%, var(--color-plan-mode)); /* Flexoki purple-400 */
   --color-ask-mode-hover: color-mix(in srgb, var(--color-ask-mode), white 10%);
   --color-ask-mode-light: color-mix(in srgb, var(--color-ask-mode), white 22%);
   --color-ask-mode-alpha: hsl(from var(--color-ask-mode) h s l / 0.12);
 
-  --color-exec-mode: #8b7ec8; /* Flexoki purple-400 */
+  /* Not the canonical cyan-400 for dark themes: --color-task-mode already uses that step. */
+  --color-exec-mode: #a2dece; /* Flexoki cyan-150 */
   --color-exec-mode-hover: color-mix(in srgb, var(--color-exec-mode), white 10%);
   --color-exec-mode-light: color-mix(in srgb, var(--color-exec-mode), white 22%);
 
@@ -861,12 +876,15 @@
 
   --color-pending: #da702c; /* Flexoki orange-400 */
 
+  --color-composer-send: #878580; /* Flexoki base-500 */
+  --color-composer-send-foreground: var(--color-surface-primary);
+
   --color-debug-mode: var(--color-plan-mode);
   --color-debug-light: color-mix(in srgb, var(--color-debug-mode), white 22%);
   --color-debug-text: color-mix(in srgb, var(--color-debug-mode), white 30%);
 
-  --color-thinking-mode: #ce5d97; /* Flexoki magenta-400 */
-  --color-thinking-mode-light: color-mix(in srgb, var(--color-thinking-mode), white 22%);
+  /* Not blue-400: --color-plan-mode already uses that step in this theme. */
+  --color-thinking-mode: #92bfdb; /* Flexoki blue-200 */
   --color-thinking-border: var(--color-thinking-mode);
 
   /* Flexoki neutrals */
@@ -1136,6 +1154,7 @@ body,
   button,
   a,
   [role="button"] {
+    /* Keep in sync with MOBILE_TOUCH_TARGET_PX, which tests use to reproduce this rule. */
     min-height: 44px;
     min-width: 44px;
   }

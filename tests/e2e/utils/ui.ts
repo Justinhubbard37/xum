@@ -1,5 +1,6 @@
 import path from "path";
 import { expect, type Locator, type Page } from "@playwright/test";
+import { THINKING_LEVELS, type ThinkingLevel } from "@/common/types/thinking";
 import type { DemoProjectConfig } from "./demoProject";
 
 type ChatMode = "Plan" | "Exec";
@@ -90,15 +91,6 @@ function sanitizeMode(mode: ChatMode): ChatMode {
   }
 }
 
-// Thinking level paddle controls (replaced old slider UI)
-function thinkingDecreasePaddle(page: Page): Locator {
-  return page.getByRole("button", { name: "Decrease thinking level" });
-}
-
-function thinkingIncreasePaddle(page: Page): Locator {
-  return page.getByRole("button", { name: "Increase thinking level" });
-}
-
 function thinkingLevelLabel(page: Page): Locator {
   return page.getByLabel(/Thinking level:/);
 }
@@ -138,7 +130,7 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
       // workspace we need to confirm the navigation actually landed on the demo workspace
       // (not just any transcript).
       const expectedProjectName = path.basename(context.projectPath);
-      await expect(page.getByTestId("workspace-menu-bar")).toContainText(expectedProjectName, {
+      await expect(page.getByTestId("workspace-footer-bar")).toContainText(expectedProjectName, {
         timeout: 20_000,
       });
 
@@ -183,139 +175,83 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
       if (!Number.isInteger(targetLevel)) {
         throw new Error("Thinking level must be an integer");
       }
-      if (targetLevel < 0 || targetLevel > 4) {
-        throw new Error(`Thinking level ${targetLevel} is outside expected range 0-4`);
+      if (targetLevel < 0 || targetLevel >= THINKING_LEVELS.length) {
+        throw new Error(
+          `Thinking level ${targetLevel} is outside expected range 0-${THINKING_LEVELS.length - 1}`
+        );
       }
 
-      const levelLabels = ["OFF", "LOW", "MED", "HIGH", "XHIGH"];
       const label = thinkingLevelLabel(page);
-      const decreasePaddle = thinkingDecreasePaddle(page);
-      const increasePaddle = thinkingIncreasePaddle(page);
 
-      // Wait for thinking controls to be visible
       await expect(label).toBeVisible();
 
-      const readCurrentLabel = async (): Promise<string> => {
-        const text = await label.textContent();
-        const normalized = text?.trim().toUpperCase() ?? "";
-
-        // Note: XHIGH contains HIGH as a substring, so we must avoid includes()-based matching here.
-        return levelLabels.find((candidate) => normalized === candidate) ?? levelLabels[0];
+      // Accessible names carry canonical levels; visible labels can collide across model mappings.
+      const readCurrentLevel = async (): Promise<ThinkingLevel> => {
+        const ariaLabel = (await label.getAttribute("aria-label")) ?? "";
+        const match = /Thinking level:\s*([a-z]+)/i.exec(ariaLabel);
+        const level = THINKING_LEVELS.find((candidate) => candidate === match?.[1]?.toLowerCase());
+        if (!level) {
+          throw new Error(`Could not read thinking level from aria-label: ${ariaLabel}`);
+        }
+        return level;
       };
 
-      const clickUntilLabelChanges = async (
-        control: Locator,
-        previousLabel: string
-      ): Promise<string> => {
-        if (await control.isDisabled()) {
-          return previousLabel;
-        }
-
+      // The label cycles through the model's allowed levels and wraps.
+      const cycleOnce = async (previousLevel: ThinkingLevel): Promise<ThinkingLevel> => {
         for (let attempt = 0; attempt < 3; attempt++) {
-          await control.dispatchEvent("click");
+          await label.dispatchEvent("click");
           try {
             await expect
               .poll(
                 async () => {
-                  const currentLabel = await readCurrentLabel();
-                  return currentLabel === previousLabel ? null : currentLabel;
+                  const currentLevel = await readCurrentLevel();
+                  return currentLevel === previousLevel ? null : currentLevel;
                 },
                 { timeout: 1_000 }
               )
               .not.toBeNull();
-            return await readCurrentLabel();
+            return await readCurrentLevel();
           } catch {
             // Linux CI can drop clicks during rapid mode transitions; retry the same control.
           }
         }
 
-        return await readCurrentLabel();
+        return await readCurrentLevel();
       };
 
-      const discoverAllowedLabels = async (): Promise<string[]> => {
-        const startLabel = await readCurrentLabel();
-        const seen = new Set<string>([startLabel]);
-        let currentLabel = startLabel;
+      const discoverAllowedLevels = async (): Promise<ThinkingLevel[]> => {
+        const startLevel = await readCurrentLevel();
+        const seen = new Set<ThinkingLevel>([startLevel]);
+        let currentLevel = startLevel;
 
-        while (!(await decreasePaddle.isDisabled())) {
-          const nextLabel = await clickUntilLabelChanges(decreasePaddle, currentLabel);
-          if (nextLabel === currentLabel) {
+        for (let step = 0; step < THINKING_LEVELS.length; step++) {
+          const nextLevel = await cycleOnce(currentLevel);
+          if (nextLevel === currentLevel || nextLevel === startLevel) {
             break;
           }
-          currentLabel = nextLabel;
-          seen.add(currentLabel);
+          currentLevel = nextLevel;
+          seen.add(currentLevel);
         }
 
-        while (!(await increasePaddle.isDisabled())) {
-          const nextLabel = await clickUntilLabelChanges(increasePaddle, currentLabel);
-          if (nextLabel === currentLabel) {
-            break;
-          }
-          currentLabel = nextLabel;
-          seen.add(currentLabel);
-        }
-
-        while (currentLabel !== startLabel) {
-          const needsLowerLevel =
-            levelLabels.indexOf(currentLabel) > levelLabels.indexOf(startLabel);
-          const nextLabel = await clickUntilLabelChanges(
-            needsLowerLevel ? decreasePaddle : increasePaddle,
-            currentLabel
-          );
-          if (nextLabel === currentLabel) {
-            break;
-          }
-          currentLabel = nextLabel;
-        }
-
-        return [...seen].sort(
-          (left, right) => levelLabels.indexOf(left) - levelLabels.indexOf(right)
-        );
+        return THINKING_LEVELS.filter((candidate) => seen.has(candidate));
       };
 
-      const allowedLabels = await discoverAllowedLabels();
-      const clampedTargetLevel = Math.max(0, Math.min(targetLevel, allowedLabels.length - 1));
-      const targetLabel = allowedLabels[clampedTargetLevel] ?? allowedLabels[0] ?? levelLabels[0];
+      const allowedLevels = await discoverAllowedLevels();
+      const targetIndex = Math.min(targetLevel, allowedLevels.length - 1);
+      const target = allowedLevels[targetIndex];
 
-      const getCurrentLevel = async (): Promise<number> => {
-        const currentLabel = await readCurrentLabel();
-        const labelIndex = allowedLabels.findIndex((candidate) => currentLabel === candidate);
-        return labelIndex === -1 ? 0 : labelIndex;
-      };
-
-      // Click paddles until we reach the target level. clickUntilLabelChanges() retries
-      // the interaction and dispatches DOM clicks directly so transient Linux Electron
-      // overlays do not interfere with toolbar hit-testing.
-      for (let i = 0; i < allowedLabels.length * 2; i++) {
-        const currentLevel = await getCurrentLevel();
-        if (currentLevel === clampedTargetLevel) {
+      // Direct DOM clicks avoid transient Linux Electron overlays that interfere with hit-testing.
+      for (let i = 0; i < allowedLevels.length; i++) {
+        const currentLevel = await readCurrentLevel();
+        if (currentLevel === target) {
           break;
         }
-
-        const currentLabel = allowedLabels[currentLevel] ?? (await readCurrentLabel());
-        const nextLabel = await clickUntilLabelChanges(
-          currentLevel < clampedTargetLevel ? increasePaddle : decreasePaddle,
-          currentLabel
-        );
-        if (nextLabel === currentLabel) {
+        if ((await cycleOnce(currentLevel)) === currentLevel) {
           break;
         }
       }
 
-      let finalLevel = await getCurrentLevel();
-      if (finalLevel !== clampedTargetLevel) {
-        for (let i = 0; i < allowedLabels.length; i++) {
-          const currentLabel = await readCurrentLabel();
-          const nextLabel = await clickUntilLabelChanges(label, currentLabel);
-          finalLevel = await getCurrentLevel();
-          if (finalLevel === clampedTargetLevel || nextLabel === currentLabel) {
-            break;
-          }
-        }
-      }
-
-      // Verify we reached the target
-      await expect(label).toContainText(targetLabel);
+      expect(await readCurrentLevel()).toBe(target);
     },
 
     async sendMessage(message: string): Promise<void> {

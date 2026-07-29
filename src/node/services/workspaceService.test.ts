@@ -40,6 +40,7 @@ import type { WorktreeArchiveSnapshot } from "@/common/schemas/project";
 import type { BashToolResult } from "@/common/types/tools";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import { createMuxMessage } from "@/common/types/message";
+import { buildStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import {
   WORKFLOW_RUN_CARD_DISPLAY_METADATA_TYPE,
   WORKFLOW_TRIGGER_DISPLAY_METADATA_TYPE,
@@ -13012,5 +13013,214 @@ describe("getSideQuestionModelCandidates", () => {
     expect(candidates).toContain(configuredModel);
     expect(candidates).toContain(agentModel);
     expect(candidates.filter((candidate) => candidate === liveModel)).toHaveLength(1);
+  });
+});
+
+describe("WorkspaceService.getLastUserPrompt", () => {
+  async function withService(
+    seed: (historyService: HistoryService, workspaceId: string) => Promise<void>
+  ): Promise<string | null> {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "last-user-prompt";
+    try {
+      await seed(historyService, workspaceId);
+      const workspaceService = createWorkspaceServiceForTest({ config, historyService });
+      return await workspaceService.getLastUserPrompt(workspaceId);
+    } finally {
+      await cleanup();
+    }
+  }
+
+  test("returns a typed prompt that predates the latest compaction boundary", async () => {
+    const prompt = await withService(async (historyService, workspaceId) => {
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("u1", "user", "the prompt before compaction", { historySequence: 1 })
+      );
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("summary", "assistant", "Compacted summary", {
+          historySequence: 2,
+          compacted: "user",
+          compactionBoundary: true,
+          compactionEpoch: 1,
+        })
+      );
+    });
+
+    expect(prompt).toBe("the prompt before compaction");
+  });
+
+  test("skips synthetic and empty user turns", async () => {
+    const prompt = await withService(async (historyService, workspaceId) => {
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("u1", "user", "typed by the user", { historySequence: 1 })
+      );
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("u2", "user", "   ", { historySequence: 2 })
+      );
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("u3", "user", "injected turn", { historySequence: 3, synthetic: true })
+      );
+    });
+
+    expect(prompt).toBe("typed by the user");
+  });
+
+  test("returns null when the workspace has no typed prompt", async () => {
+    const prompt = await withService(async (historyService, workspaceId) => {
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("a1", "assistant", "hello", { historySequence: 1 })
+      );
+    });
+
+    expect(prompt).toBeNull();
+  });
+
+  test("prefers the raw slash command over its expanded provider text", async () => {
+    const prompt = await withService(async (historyService, workspaceId) => {
+      const message = createMuxMessage("u1", "user", "Expanded skill body sent to the model", {
+        historySequence: 1,
+      });
+      await historyService.appendToHistory(workspaceId, {
+        ...message,
+        metadata: { ...message.metadata, muxMetadata: { rawCommand: "/compact" } },
+      } as typeof message);
+    });
+
+    expect(prompt).toBe("/compact");
+  });
+
+  test("reconstructs a compaction command's follow-up text", async () => {
+    const prompt = await withService(async (historyService, workspaceId) => {
+      const message = createMuxMessage("u1", "user", "Expanded compaction instructions", {
+        historySequence: 1,
+      });
+      await historyService.appendToHistory(workspaceId, {
+        ...message,
+        metadata: {
+          ...message.metadata,
+          muxMetadata: {
+            type: "compaction-request",
+            rawCommand: "/compact",
+            parsed: { followUpContent: { text: "then rerun the failing test" } },
+          },
+        },
+      } as typeof message);
+    });
+
+    expect(prompt).toBe("/compact\nthen rerun the failing test");
+  });
+
+  test("keeps the bare compaction command when the follow-up is the resume sentinel", async () => {
+    const prompt = await withService(async (historyService, workspaceId) => {
+      const message = createMuxMessage("u1", "user", "Expanded compaction instructions", {
+        historySequence: 1,
+      });
+      await historyService.appendToHistory(workspaceId, {
+        ...message,
+        metadata: {
+          ...message.metadata,
+          muxMetadata: {
+            type: "compaction-request",
+            rawCommand: "/compact",
+            parsed: { followUpContent: { text: "Continue" } },
+          },
+        },
+      } as typeof message);
+    });
+
+    expect(prompt).toBe("/compact");
+  });
+
+  test("keeps scanning past a staged-attachment notice", async () => {
+    const prompt = await withService(async (historyService, workspaceId) => {
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("u1", "user", "summarize the attached data", { historySequence: 1 })
+      );
+      const notice = buildStagedAttachmentNotice([
+        {
+          kind: "staged",
+          id: "csv-1",
+          filename: "data.csv",
+          mediaType: "text/csv",
+          sizeBytes: 34,
+          stagedPath: ".mux/user-attachments/id/data.csv",
+        },
+      ]);
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("u2", "user", notice.trimStart(), { historySequence: 2 })
+      );
+    });
+
+    expect(prompt).toBe("summarize the attached data");
+  });
+
+  test("survives a compaction row whose parsed metadata is missing", async () => {
+    const prompt = await withService(async (historyService, workspaceId) => {
+      const message = createMuxMessage("u1", "user", "Expanded compaction instructions", {
+        historySequence: 1,
+      });
+      await historyService.appendToHistory(workspaceId, {
+        ...message,
+        metadata: {
+          ...message.metadata,
+          muxMetadata: { type: "compaction-request", rawCommand: "/compact" },
+        },
+      } as unknown as typeof message);
+    });
+
+    expect(prompt).toBe("/compact");
+  });
+
+  test("keeps scanning past a user row with primitive muxMetadata", async () => {
+    const prompt = await withService(async (historyService, workspaceId) => {
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("u1", "user", "the older valid prompt", { historySequence: 1 })
+      );
+      const broken = createMuxMessage("u2", "user", "   ", { historySequence: 2 });
+      await historyService.appendToHistory(workspaceId, {
+        ...broken,
+        metadata: { ...broken.metadata, muxMetadata: "corrupted" },
+      } as unknown as typeof broken);
+    });
+
+    expect(prompt).toBe("the older valid prompt");
+  });
+
+  test("keeps scanning past a user row with malformed parts", async () => {
+    const prompt = await withService(async (historyService, workspaceId) => {
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("u1", "user", "the older valid prompt", { historySequence: 1 })
+      );
+      const broken = createMuxMessage("u2", "user", "ignored", { historySequence: 2 });
+      await historyService.appendToHistory(workspaceId, {
+        ...broken,
+        parts: undefined,
+      } as unknown as typeof broken);
+    });
+
+    expect(prompt).toBe("the older valid prompt");
+  });
+
+  test("returns the newest prompt when several share one reverse-read chunk", async () => {
+    const prompt = await withService(async (historyService, workspaceId) => {
+      for (const [index, text] of ["oldest prompt", "middle prompt", "newest prompt"].entries()) {
+        await historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage(`u${index}`, "user", text, { historySequence: index + 1 })
+        );
+      }
+    });
+
+    expect(prompt).toBe("newest prompt");
   });
 });

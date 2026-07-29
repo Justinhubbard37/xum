@@ -1519,6 +1519,11 @@ export const workspace = {
         hasOlder: z.boolean(),
       }),
     },
+    /** Searches full history, including prompts before the replay boundary. */
+    lastUserPrompt: {
+      input: z.object({ workspaceId: z.string() }),
+      output: z.string().nullable(),
+    },
   },
   /**
    * Load an archived subagent transcript (chat.jsonl + optional partial.json) from this workspace's

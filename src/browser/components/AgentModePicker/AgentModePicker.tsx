@@ -18,9 +18,16 @@ import {
 } from "@/browser/utils/ui/keybinds";
 import { sortAgentsStable } from "@/browser/utils/agents";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
+import { COMPOSER_CONTROL_HEIGHT_CLASS, COMPOSER_ICON_ONLY_HIDE_CLASS } from "@/constants/layout";
 
 interface AgentModePickerProps {
   className?: string;
+
+  /**
+   * Overrides when the trigger drops to icon-only, because the width the label needs depends on
+   * which sibling controls share its row.
+   */
+  iconOnlyHideClassName?: string;
 
   /** Called when the picker closes (best-effort). Useful for restoring focus. */
   onComplete?: () => void;
@@ -89,6 +96,7 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
   } = useAgent();
 
   const onComplete = props.onComplete;
+  const iconOnlyHideClassName = props.iconOnlyHideClassName ?? COMPOSER_ICON_ONLY_HIDE_CLASS;
 
   const [isPickerOpen, setIsPickerOpen] = useState(false);
   const [highlightedIndex, setHighlightedIndex] = useState<number>(-1);
@@ -295,9 +303,9 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
   // Resolve display properties for the trigger pill
   const activeDisplayName = activeOption?.name ?? formatAgentIdLabel(normalizedAgentId);
   const activeStyle: React.CSSProperties | undefined = activeOption?.uiColor
-    ? { borderColor: activeOption.uiColor }
+    ? { color: activeOption.uiColor }
     : undefined;
-  const activeClassName = activeOption?.uiColor ? "" : "border-exec-mode";
+  const activeClassName = activeOption?.uiColor ? "" : "text-exec-mode";
   const TriggerIcon = getAgentIcon(normalizedAgentId);
 
   return (
@@ -321,19 +329,27 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
             }}
             style={activeStyle}
             className={cn(
-              "text-foreground hover:bg-hover flex items-center gap-1.5 rounded-sm border-[0.5px] px-1.5 py-0.5 text-[11px] font-medium transition-[background-color] duration-150",
+              "text-foreground border-border-light hover:bg-hover flex items-center gap-1.5 rounded-md border px-1.5 text-[11px] font-medium transition-[background-color] duration-150",
+              COMPOSER_CONTROL_HEIGHT_CLASS,
               activeClassName
             )}
           >
-            <TriggerIcon
-              className="h-3 w-3 shrink-0"
-              style={activeOption?.uiColor ? { color: activeOption.uiColor } : undefined}
-            />
-            <span className="max-w-[clamp(4.5rem,30vw,130px)] truncate">{activeDisplayName}</span>
+            <TriggerIcon className="h-3 w-3 shrink-0" />
+            {/* shrink-0 leaves iconOnlyHideClassName as the only thing that hides this label. Without
+              it a tight row shrinks the label to a letter and an ellipsis instead. */}
+            <span
+              className={cn(
+                "max-w-[clamp(4.5rem,30vw,130px)] shrink-0 truncate",
+                iconOnlyHideClassName
+              )}
+            >
+              {activeDisplayName}
+            </span>
             {!isAgentLocked && (
               <ChevronDown
                 className={cn(
-                  "text-muted h-3 w-3 transition-transform duration-150",
+                  "text-muted h-3 w-3 shrink-0 transition-transform duration-150",
+                  iconOnlyHideClassName,
                   isPickerOpen && "rotate-180"
                 )}
               />
@@ -341,6 +357,9 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
           </Button>
         </TooltipTrigger>
         <TooltipContent align="start" className="max-w-80 whitespace-normal">
+          {/* Name the active agent here because narrow composers render the trigger icon-only. */}
+          <strong>{activeDisplayName}</strong>
+          <br />
           Selects an agent definition (system prompt + tool policy).
           <br />
           <br />
@@ -360,7 +379,8 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
           ref={dropdownRef}
           tabIndex={-1}
           onKeyDown={handleDropdownKeyDown}
-          className="bg-separator border-border-light absolute right-0 bottom-full z-[1020] mb-1 min-w-52 overflow-hidden rounded border shadow-[0_4px_12px_rgba(0,0,0,0.3)] outline-none"
+          // Left alignment prevents the menu from opening beyond the viewport.
+          className="bg-surface-primary border-border-light absolute bottom-full left-0 z-[1020] mb-1 min-w-52 overflow-hidden rounded border shadow-[0_4px_12px_rgba(0,0,0,0.3)] outline-none"
         >
           {/* Agent list — scrollable for long lists */}
           <div className="max-h-64 overflow-y-auto py-1">

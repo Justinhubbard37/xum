@@ -141,11 +141,14 @@ import {
 import { UIModeSchema, type UIMode } from "@/common/types/mode";
 import {
   createMuxMessage,
+  getCompactionFollowUpContent,
   pickPreservedSendOptions,
   type CompactionFollowUpRequest,
   type MuxMessageMetadata,
   type MuxMessage,
 } from "@/common/types/message";
+import { getFollowUpContentText } from "@/browser/utils/compaction/format";
+import { stripStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import {
   isActiveWorkflowRunStatus,
   isNestedWorkflowRun,
@@ -1645,6 +1648,53 @@ function mergeActiveCount(
     delete merged[key];
   }
   return merged;
+}
+
+/**
+ * `/compact` stores its follow-up separately from `rawCommand`; reconstruct it to match the
+ * transcript display.
+ */
+function appendCompactionFollowUp(rawCommand: string, message: MuxMessage): string {
+  const muxMeta: unknown = message.metadata?.muxMetadata;
+  if (rawCommand.includes("\n") || typeof muxMeta !== "object" || muxMeta === null) {
+    return rawCommand;
+  }
+  const followUpText = getFollowUpContentText(
+    getCompactionFollowUpContent(message.metadata?.muxMetadata)
+  );
+  return followUpText === null ? rawCommand : `${rawCommand}\n${followUpText}`;
+}
+
+/**
+ * Prefer `rawCommand` so slash commands match the transcript instead of provider-expanded content.
+ * Treat malformed persisted rows as empty so they cannot hide older valid prompts.
+ */
+function extractUserPromptText(message: MuxMessage): string {
+  const muxMeta: unknown = message.metadata?.muxMetadata;
+  const rawCommand =
+    typeof muxMeta === "object" &&
+    muxMeta !== null &&
+    "rawCommand" in muxMeta &&
+    typeof muxMeta.rawCommand === "string"
+      ? muxMeta.rawCommand.trim()
+      : "";
+  if (rawCommand.length > 0) {
+    return stripStagedAttachmentNotice(appendCompactionFollowUp(rawCommand, message)).trim();
+  }
+
+  if (!Array.isArray(message.parts)) {
+    return "";
+  }
+
+  const partsText = message.parts
+    .map((part) =>
+      part && typeof part === "object" && part.type === "text" && typeof part.text === "string"
+        ? part.text
+        : ""
+    )
+    .join("");
+
+  return stripStagedAttachmentNotice(partsText).trim();
 }
 
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
@@ -9604,6 +9654,43 @@ export class WorkspaceService extends EventEmitter {
       log.error("Failed to get chat history:", error);
       return [];
     }
+  }
+
+  /** Full history is required because compaction removes older prompts from replay. */
+  async getLastUserPrompt(workspaceId: string): Promise<string | null> {
+    assert(
+      typeof workspaceId === "string" && workspaceId.trim().length > 0,
+      "workspaceId is required"
+    );
+
+    let found: string | null = null;
+    const result = await this.historyService.iterateFullHistory(
+      workspaceId,
+      "backward",
+      (chunk) => {
+        // Each backward chunk is newest-first; reversing it can return an older prompt.
+        for (const message of chunk) {
+          if (message.role !== "user" || message.metadata?.synthetic === true) {
+            continue;
+          }
+          const text = extractUserPromptText(message);
+          if (text.length > 0) {
+            found = text;
+            return false;
+          }
+        }
+      }
+    );
+
+    if (!result.success) {
+      log.warn("workspace.history.lastUserPrompt: failed to read history", {
+        workspaceId,
+        error: result.error,
+      });
+      return null;
+    }
+
+    return found;
   }
 
   async getHistoryLoadMore(

@@ -70,6 +70,9 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   NAVIGATE_BACK: "Navigate back",
   NAVIGATE_FORWARD: "Navigate forward",
   TOGGLE_NOTIFICATIONS: "Toggle notifications",
+  TOGGLE_DRIFT_MODE: "Toggle git drift lines/commits",
+  SHOW_WORKSPACE_DETAILS: "Show workspace details",
+  SHOW_LAST_PROMPT: "Show last prompt",
   // Modal-only keybinds; intentionally omitted from KEYBIND_GROUPS.
   CONFIRM_DIALOG_YES: "Confirm dialog action",
   CONFIRM_DIALOG_NO: "Cancel dialog action",
@@ -106,6 +109,8 @@ const KEYBIND_GROUPS: Array<{ label: string; keys: Array<keyof typeof KEYBINDS> 
       "DECREASE_THINKING",
       "INCREASE_THINKING",
       "TOGGLE_NOTIFICATIONS",
+      "TOGGLE_DRIFT_MODE",
+      "SHOW_WORKSPACE_DETAILS",
       "CONFIGURE_MCP",
       "CONFIGURE_HEARTBEAT",
     ],
@@ -125,6 +130,7 @@ const KEYBIND_GROUPS: Array<{ label: string; keys: Array<keyof typeof KEYBINDS> 
       "INTERRUPT_STREAM_VIM",
       "RESUME_STREAM",
       "TOGGLE_VOICE_INPUT",
+      "SHOW_LAST_PROMPT",
     ],
   },
   {

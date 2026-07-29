@@ -11,6 +11,7 @@ import {
   type Mock,
 } from "bun:test";
 import type { CompactionFollowUpRequest, DisplayedMessage } from "@/common/types/message";
+import type { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
 import type { StreamStartEvent, ToolCallStartEvent } from "@/common/types/stream";
@@ -24,6 +25,7 @@ import {
   getStatusStateKey,
 } from "@/common/constants/storage";
 import type { TodoItem } from "@/common/types/tools";
+import { buildStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import { WorkspaceStore } from "./WorkspaceStore";
 import type { ResponseCompleteEvent } from "@/browser/utils/messages/responseCompletionMetadata";
 
@@ -5784,6 +5786,129 @@ describe("WorkspaceStore", () => {
       });
 
       expect(store.getWorkspaceState(workspaceId).canInterrupt).toBe(true);
+    });
+  });
+
+  describe("getWorkspaceLastUserPrompt", () => {
+    const seedUserMessages = (workspaceId: string, rows: Array<{ id: string; text: string }>) => {
+      const rawStore = getInternal<{
+        handleChatMessage: (workspaceId: string, data: WorkspaceChatMessage) => void;
+      }>(store);
+      rawStore.handleChatMessage(workspaceId, caughtUpEvent());
+      rows.forEach((row, index) => {
+        rawStore.handleChatMessage(workspaceId, {
+          type: "message",
+          id: row.id,
+          role: "user",
+          parts: [{ type: "text", text: row.text }],
+          metadata: {
+            historySequence: index + 1,
+            timestamp: (index + 1) * 1_000,
+          },
+        });
+      });
+    };
+
+    it("returns the most recent typed prompt", () => {
+      const workspaceId = "last-prompt-basic";
+      createAndAddWorkspace(store, workspaceId);
+      seedUserMessages(workspaceId, [
+        { id: "u1", text: "first prompt" },
+        { id: "u2", text: "second prompt" },
+      ]);
+
+      expect(store.getWorkspaceLastUserPrompt(workspaceId)).toBe("second prompt");
+    });
+
+    it("keeps scanning past an attachment-only turn with empty text", () => {
+      const workspaceId = "last-prompt-attachment-only";
+      createAndAddWorkspace(store, workspaceId);
+      seedUserMessages(workspaceId, [
+        { id: "u1", text: "describe this screenshot" },
+        { id: "u2", text: "   " },
+      ]);
+
+      expect(store.getWorkspaceLastUserPrompt(workspaceId)).toBe("describe this screenshot");
+    });
+
+    it("keeps scanning past a staged-attachment notice", () => {
+      const workspaceId = "last-prompt-staged-notice";
+      createAndAddWorkspace(store, workspaceId);
+      const notice = buildStagedAttachmentNotice([
+        {
+          kind: "staged",
+          id: "csv-1",
+          filename: "data.csv",
+          mediaType: "text/csv",
+          sizeBytes: 34,
+          stagedPath: ".mux/user-attachments/id/data.csv",
+        },
+      ]);
+      seedUserMessages(workspaceId, [
+        { id: "u1", text: "summarize the attached data" },
+        { id: "u2", text: notice.trimStart() },
+      ]);
+
+      expect(store.getWorkspaceLastUserPrompt(workspaceId)).toBe("summarize the attached data");
+    });
+
+    it("returns null when every user turn is empty", () => {
+      const workspaceId = "last-prompt-all-empty";
+      createAndAddWorkspace(store, workspaceId);
+      seedUserMessages(workspaceId, [{ id: "u1", text: "" }]);
+
+      expect(store.getWorkspaceLastUserPrompt(workspaceId)).toBeNull();
+    });
+
+    it("holds the history epoch steady while messages stream in", () => {
+      const workspaceId = "last-prompt-epoch-stable";
+      createAndAddWorkspace(store, workspaceId);
+      seedUserMessages(workspaceId, [{ id: "u1", text: "first prompt" }]);
+      const epoch = store.getWorkspaceHistoryEpoch(workspaceId);
+
+      getInternal<{
+        handleChatMessage: (workspaceId: string, data: WorkspaceChatMessage) => void;
+      }>(store).handleChatMessage(workspaceId, {
+        type: "message",
+        id: "u2",
+        role: "user",
+        parts: [{ type: "text", text: "second prompt" }],
+        metadata: { historySequence: 2, timestamp: 2_000 },
+      });
+
+      expect(store.getWorkspaceLastUserPrompt(workspaceId)).toBe("second prompt");
+      expect(store.getWorkspaceHistoryEpoch(workspaceId)).toBe(epoch);
+    });
+
+    it("advances the history epoch when rows this window never held are deleted", () => {
+      const workspaceId = "last-prompt-epoch-clear";
+      createAndAddWorkspace(store, workspaceId);
+      seedUserMessages(workspaceId, [{ id: "u1", text: "first prompt" }]);
+      const epoch = store.getWorkspaceHistoryEpoch(workspaceId);
+
+      getInternal<{
+        handleChatMessage: (workspaceId: string, data: WorkspaceChatMessage) => void;
+      }>(store).handleChatMessage(workspaceId, {
+        type: "delete",
+        historySequences: [99],
+      });
+
+      expect(store.getWorkspaceHistoryEpoch(workspaceId)).toBeGreaterThan(epoch);
+      expect(store.getWorkspaceLastUserPrompt(workspaceId)).toBe("first prompt");
+    });
+
+    it("advances the history epoch when a full replay replaces the transcript", () => {
+      const workspaceId = "last-prompt-epoch-replay";
+      createAndAddWorkspace(store, workspaceId);
+      seedUserMessages(workspaceId, [{ id: "u1", text: "first prompt" }]);
+      const epoch = store.getWorkspaceHistoryEpoch(workspaceId);
+
+      getInternal<{ aggregators: Map<string, StreamingMessageAggregator> }>(store)
+        .aggregators.get(workspaceId)!
+        .loadHistoricalMessages([], false, { mode: "replace" });
+
+      expect(store.getWorkspaceHistoryEpoch(workspaceId)).toBeGreaterThan(epoch);
+      expect(store.getWorkspaceLastUserPrompt(workspaceId)).toBeNull();
     });
   });
 });

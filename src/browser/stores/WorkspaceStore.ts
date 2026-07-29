@@ -1,4 +1,5 @@
 import assert from "@/common/utils/assert";
+import { stripStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import type { MuxMessage, DisplayedMessage, QueuedMessage } from "@/common/types/message";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { isGoalPendingPersistence, type GoalSnapshot } from "@/common/types/goal";
@@ -32,7 +33,7 @@ import {
   BASH_TRUNCATE_MAX_TOTAL_BYTES,
 } from "@/common/constants/toolLimits";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { useCallback, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import {
   isCaughtUpMessage,
   isStreamAbort,
@@ -2549,6 +2550,44 @@ export class WorkspaceStore {
     return this.chatTransientState.get(workspaceId)?.caughtUp ?? false;
   }
 
+  getWorkspaceHistoryEpoch(workspaceId: string): number {
+    return this.aggregators.get(workspaceId)?.getHistoryEpoch() ?? 0;
+  }
+
+  getWorkspaceLastUserPrompt(workspaceId: string): string | null {
+    const aggregator = this.aggregators.get(workspaceId);
+    if (!aggregator) {
+      return null;
+    }
+
+    const messages = aggregator.getDisplayedMessages();
+    for (let index = messages.length - 1; index >= 0; index--) {
+      const message = messages[index];
+      if (message.type !== "user" || message.isSynthetic === true) {
+        continue;
+      }
+      // Generated attachment markup is provider context, not part of the user's prompt.
+      const trimmed = stripStagedAttachmentNotice(message.content).trim();
+      if (trimmed.length > 0) {
+        return trimmed;
+      }
+    }
+
+    return null;
+  }
+
+  async fetchLastUserPromptFromHistory(workspaceId: string): Promise<string | null> {
+    const client = this.client;
+    if (!client) {
+      return null;
+    }
+    try {
+      return await client.workspace.history.lastUserPrompt({ workspaceId });
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * Extract usage from session-usage.json (no tokenization or message iteration).
    *
@@ -4826,6 +4865,55 @@ export function useActiveGoalCount(): number {
     () => store.getActiveGoalCount(),
     () => 0
   );
+}
+
+export function useWorkspaceLastUserPrompt(workspaceId: string): string | null {
+  const store = getStoreInstance();
+
+  const displayed = useSyncExternalStore(
+    (listener) => store.subscribeKey(workspaceId, listener),
+    () => store.getWorkspaceLastUserPrompt(workspaceId)
+  );
+  // The fallback scans full history, so streaming deltas must not invalidate it.
+  const historyEpoch = useSyncExternalStore(
+    (listener) => store.subscribeKey(workspaceId, listener),
+    () => store.getWorkspaceHistoryEpoch(workspaceId)
+  );
+  // Wait for catch-up because empty replay state is not yet authoritative.
+  const isCaughtUp = useSyncExternalStore(
+    (listener) => store.subscribeKey(workspaceId, listener),
+    () => store.isWorkspaceTranscriptCaughtUp(workspaceId)
+  );
+
+  // Compaction can hide the latest user prompt behind the replay boundary.
+  const [fallback, setFallback] = useState<{
+    workspaceId: string;
+    historyEpoch: number;
+    prompt: string | null;
+  } | null>(null);
+
+  useEffect(() => {
+    if (displayed !== null || !isCaughtUp) {
+      return;
+    }
+    let cancelled = false;
+    void store.fetchLastUserPromptFromHistory(workspaceId).then((prompt) => {
+      if (!cancelled) {
+        setFallback({ workspaceId, historyEpoch, prompt });
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [store, workspaceId, displayed, historyEpoch, isCaughtUp]);
+
+  // Ignore fallback results from a superseded replay or deletion.
+  const fallbackPrompt =
+    fallback?.workspaceId === workspaceId && fallback.historyEpoch === historyEpoch
+      ? fallback.prompt
+      : null;
+
+  return displayed ?? fallbackPrompt;
 }
 
 /**

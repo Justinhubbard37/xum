@@ -62,6 +62,7 @@ import {
   useWorkspaceStoreRaw,
 } from "@/browser/stores/WorkspaceStore";
 import { WorkspaceMenuBar } from "../WorkspaceMenuBar/WorkspaceMenuBar";
+import { WorkspaceFooterBar } from "./WorkspaceFooterBar";
 import type { DisplayedMessage, QueuedMessage as QueuedMessageData } from "@/common/types/message";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { getRuntimeTypeForTelemetry } from "@/common/telemetry";
@@ -331,6 +332,18 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
           namedWorkspacePath={props.namedWorkspacePath}
           runtimeConfig={props.runtimeConfig}
           onOpenTerminal={props.onOpenTerminal}
+        />
+
+        {/* Reset the footer's scroll and popover state because ChatPane remains mounted across
+            workspace switches. */}
+        <WorkspaceFooterBar
+          key={workspaceId}
+          workspaceId={workspaceId}
+          projectName={props.projectName}
+          projectPath={props.projectPath}
+          workspaceName={props.workspaceName}
+          namedWorkspacePath={props.namedWorkspacePath}
+          runtimeConfig={props.runtimeConfig}
         />
       </div>
     </PerfRenderMarker>
@@ -1817,7 +1830,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
 
 const TranscriptOnlyNoticePane: React.FC = () => {
   return (
-    <div className="bg-surface-primary border-border-light mb-[calc(-1*min(env(safe-area-inset-bottom,0px),40px))] border-t px-4 pb-[max(8px,min(env(safe-area-inset-bottom,0px),40px))]">
+    <div className="bg-surface-primary border-border-light border-t px-4 pb-2">
       <div className="mx-auto max-w-4xl py-4">
         <p role="note" className="text-muted text-sm leading-6">
           {TRANSCRIPT_ONLY_NOTICE}
