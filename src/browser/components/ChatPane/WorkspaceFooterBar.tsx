@@ -280,11 +280,12 @@ export const WorkspaceFooterBar: React.FC<WorkspaceFooterBarProps> = (props) => 
     : null;
 
   return (
-    // As the chat column's last row, this bar owns the mobile bottom inset: padding clears the
-    // home indicator, and the negative margin lets its fill reach the screen edge.
+    // Narrow layouts drop the app root's bottom inset, so this row owns it: a capped clearance for
+    // the home indicator instead of the full inset, whose reserved band is the empty space we are
+    // reclaiming. Wider layouts still take their clearance from the root.
     <footer
       data-testid="workspace-footer-bar"
-      className="bg-sidebar border-border-light mb-[calc(-1*min(env(safe-area-inset-bottom,0px),40px))] shrink-0 border-t pb-[min(env(safe-area-inset-bottom,0px),40px)]"
+      className="bg-sidebar border-border-light shrink-0 border-t [@media(max-width:768px)]:pb-[min(env(safe-area-inset-bottom,0px),8px)]"
     >
       {/* min-h rather than a fixed height: mobile raises these buttons to 44px touch targets, and a
         capped row would clip them along the same axis overflow-x-auto makes scrollable. */}
@@ -296,7 +297,11 @@ export const WorkspaceFooterBar: React.FC<WorkspaceFooterBarProps> = (props) => 
           workspaceName={props.workspaceName}
           tooltipSide="top"
         />
-        <WorkspaceLinks workspaceId={props.workspaceId} />
+        {/* Narrow layouts show it in the header, where it cannot scroll out of view with this row. */}
+        <WorkspaceLinks
+          workspaceId={props.workspaceId}
+          className="[@media(max-width:768px)]:hidden"
+        />
         {hasRepository && (
           <>
             <WorkspaceDriftIndicator
