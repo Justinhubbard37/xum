@@ -78,6 +78,12 @@ interface QueuedMessageInternalOptions {
   onAccepted?: () => Promise<void> | void;
   onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
   onCanceled?: (reason: string) => Promise<void> | void;
+  /** Mutable ownership state; queuing clears it before deferred dispatch. */
+  monitorHistoryLockState?: { held: boolean };
+  /** Mutable dispatch outcome shared with sendQueuedMessages. */
+  cancelState?: { canceledBeforeAcceptance: boolean };
+  /** Cancels a queued entry even after it has been dequeued into PREPARING. */
+  cancelSignal?: AbortSignal;
 }
 
 type QueueClearCallbacks = Pick<
@@ -116,6 +122,9 @@ interface QueueEntry {
   onCanceled?: (reason: string) => Promise<void> | void;
   onAccepted?: () => Promise<void> | void;
   onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
+  monitorHistoryLockState?: { held: boolean };
+  cancelState?: { canceledBeforeAcceptance: boolean };
+  cancelSignal?: AbortSignal;
 }
 
 /**
@@ -252,7 +261,8 @@ export class MessageQueue {
     const incomingHasAcceptedCallbacks =
       internal?.onAccepted != null ||
       internal?.onAcceptedPreStreamFailure != null ||
-      internal?.onCanceled != null;
+      internal?.onCanceled != null ||
+      internal?.cancelSignal != null;
     const incomingIsUserAuthored =
       internal?.synthetic !== true && internal?.agentInitiated !== true;
     // Sealed entries must own their turn end-to-end: workspace-turn metadata and
@@ -331,6 +341,16 @@ export class MessageQueue {
     }
     if (internal?.onAcceptedPreStreamFailure != null) {
       entry.onAcceptedPreStreamFailure = internal.onAcceptedPreStreamFailure;
+    }
+
+    if (internal?.monitorHistoryLockState != null) {
+      entry.monitorHistoryLockState = internal.monitorHistoryLockState;
+    }
+    if (internal?.cancelState != null) {
+      entry.cancelState = internal.cancelState;
+    }
+    if (internal?.cancelSignal != null) {
+      entry.cancelSignal = internal.cancelSignal;
     }
 
     entry.addCount += 1;
@@ -578,12 +598,18 @@ export class MessageQueue {
       allAddsAreAgentInitiated ||
       entry.onAccepted != null ||
       entry.onAcceptedPreStreamFailure != null ||
-      entry.onCanceled != null;
+      entry.onCanceled != null ||
+      entry.cancelSignal != null;
     const internal = hasInternalOptions
       ? {
           ...(allAddsAreSynthetic ? { synthetic: true } : {}),
           ...(allAddsAreAgentInitiated ? { agentInitiated: true } : {}),
           ...(entry.onCanceled != null ? { onCanceled: entry.onCanceled } : {}),
+          ...(entry.monitorHistoryLockState != null
+            ? { monitorHistoryLockState: entry.monitorHistoryLockState }
+            : {}),
+          ...(entry.cancelState != null ? { cancelState: entry.cancelState } : {}),
+          ...(entry.cancelSignal != null ? { cancelSignal: entry.cancelSignal } : {}),
           ...(entry.onAccepted != null ? { onAccepted: entry.onAccepted } : {}),
           ...(entry.onAcceptedPreStreamFailure != null
             ? { onAcceptedPreStreamFailure: entry.onAcceptedPreStreamFailure }

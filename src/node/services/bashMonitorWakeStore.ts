@@ -176,6 +176,8 @@ export function buildBashMonitorWakeMetadata(
   return {
     type: "bash-monitor-wake",
     records: records.map((record) => ({
+      processId: record.processId,
+      wakeUpdatedAt: record.updatedAt,
       kind: record.kind,
       displayName: record.displayName ?? record.processId,
       filter: record.filter,
@@ -438,6 +440,36 @@ export class BashMonitorWakeStore {
     }
     ownerWorkspaceIds.sort();
     return ownerWorkspaceIds;
+  }
+
+  async supersedeAllPending(ownerWorkspaceId: string): Promise<BashMonitorWakeRecord[]> {
+    const pending = await this.listPending(ownerWorkspaceId);
+    const staged: BashMonitorWakeRecord[] = [];
+    try {
+      for (const record of pending) {
+        await this.markSuperseded(ownerWorkspaceId, record.id);
+        staged.push(record);
+      }
+      return pending;
+    } catch (error) {
+      await this.restorePendingSnapshots(ownerWorkspaceId, staged);
+      throw error;
+    }
+  }
+
+  async restorePendingSnapshots(
+    ownerWorkspaceId: string,
+    snapshots: readonly BashMonitorWakeRecord[]
+  ): Promise<void> {
+    for (const snapshot of snapshots) {
+      const key = `${ownerWorkspaceId}:${snapshot.id}`;
+      await this.locks.withLock(key, async () => {
+        const current = await this.get(ownerWorkspaceId, snapshot.id);
+        if (current?.status === "superseded") {
+          await this.write(snapshot);
+        }
+      });
+    }
   }
 
   async markDeliveredSnapshot(

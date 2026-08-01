@@ -327,6 +327,10 @@ interface AgentSessionOptions {
   telemetryService?: TelemetryService;
   backgroundProcessManager: BackgroundProcessManager;
   workspaceGoalService?: WorkspaceGoalService;
+  /** Destructive clear coordinator used by exec hard restart. */
+  clearHistoryForHardRestart?: (options: {
+    monitorHistoryLockHeld: boolean;
+  }) => Promise<Result<number[]>>;
   /** When true, skip terminating background processes on dispose/compaction (for bench/CI) */
   keepBackgroundProcesses?: boolean;
   /** Called when compaction completes (e.g., to clear idle compaction pending state) */
@@ -359,6 +363,9 @@ export class AgentSession {
   private readonly initStateManager: InitStateManager;
   private readonly backgroundProcessManager: BackgroundProcessManager;
   private readonly workspaceGoalService?: WorkspaceGoalService;
+  private readonly clearHistoryForHardRestart?: (options: {
+    monitorHistoryLockHeld: boolean;
+  }) => Promise<Result<number[]>>;
   private readonly keepBackgroundProcesses: boolean;
   private readonly onPostCompactionStateChange?: () => void;
   private readonly emitter = new EventEmitter();
@@ -525,6 +532,7 @@ export class AgentSession {
     agentInitiated?: boolean;
     openaiTruncationModeOverride?: "auto" | "disabled";
     providersConfig: ProvidersConfigMap | null;
+    monitorHistoryLockHeld?: boolean;
     goalKind?: GoalSyntheticMessageKind;
   };
 
@@ -546,6 +554,7 @@ export class AgentSession {
       telemetryService,
       backgroundProcessManager,
       workspaceGoalService,
+      clearHistoryForHardRestart,
       keepBackgroundProcesses,
       onCompactionComplete,
       onIdleCompactionOutcome,
@@ -563,6 +572,7 @@ export class AgentSession {
     this.initStateManager = initStateManager;
     this.backgroundProcessManager = backgroundProcessManager;
     this.workspaceGoalService = workspaceGoalService;
+    this.clearHistoryForHardRestart = clearHistoryForHardRestart;
     this.keepBackgroundProcesses = keepBackgroundProcesses ?? false;
     this.onPostCompactionStateChange = onPostCompactionStateChange;
 
@@ -2340,7 +2350,10 @@ export class AgentSession {
       startStreamInBackground?: boolean;
       onAccepted?: () => Promise<void> | void;
       onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
+      monitorHistoryLockState?: { held: boolean };
       onCanceled?: (reason: string) => Promise<void> | void;
+      cancelState?: { canceledBeforeAcceptance: boolean };
+      cancelSignal?: AbortSignal;
     }
   ): Promise<Result<void, SendMessageError>> {
     this.assertNotDisposed("sendMessage");
@@ -2348,6 +2361,67 @@ export class AgentSession {
     assert(typeof message === "string", "sendMessage requires a string message");
 
     const isManualUserMessage = internal?.synthetic !== true;
+
+    const cancelSignal = internal?.cancelSignal;
+    const persistedCancelableMessageIds: string[] = [];
+    let cancellationHandled = false;
+    let cancellationDisabled = false;
+    const cancelBeforeAcceptance = async (): Promise<boolean> => {
+      if (cancelSignal?.aborted !== true || cancellationDisabled) return false;
+      if (cancellationHandled) return true;
+
+      if (persistedCancelableMessageIds.length > 0) {
+        // History also has non-session writers (for example goal pause boundaries). Delete exactly
+        // this preparing turn's rows in one atomic rewrite so later concurrent rows are preserved.
+        const rollbackResult = await this.historyService.deleteMessages(
+          this.workspaceId,
+          persistedCancelableMessageIds
+        );
+        if (!rollbackResult.success) {
+          // deleteMessages can fail after its atomic rewrite (for example while refreshing
+          // sequence metadata). Verify the durable result before deciding whether cancellation won.
+          const historyResult = await this.historyService.getHistoryFromLatestBoundary(
+            this.workspaceId
+          );
+          const rollbackCommitted =
+            historyResult.success &&
+            persistedCancelableMessageIds.every(
+              (messageId) => !historyResult.data.some((message) => message.id === messageId)
+            );
+          if (!rollbackCommitted) {
+            // Do not report cancellation (which would supersede the durable monitor wake) unless the
+            // not-yet-accepted row is actually gone. Continue accepting this wake instead of leaving
+            // a hidden synthetic row that can leak into a later provider request.
+            cancellationDisabled = true;
+            log.error("Failed to roll back canceled preparing turn; continuing acceptance", {
+              workspaceId: this.workspaceId,
+              error: rollbackResult.error,
+              verificationError: historyResult.success ? undefined : historyResult.error,
+            });
+            return false;
+          }
+          log.warn("Preparing-turn rollback reported failure after its rewrite committed", {
+            workspaceId: this.workspaceId,
+            error: rollbackResult.error,
+          });
+        }
+      }
+
+      const reason =
+        typeof cancelSignal.reason === "string"
+          ? cancelSignal.reason
+          : "Queued message canceled before acceptance.";
+      cancellationHandled = true;
+      await internal?.onCanceled?.(reason);
+      if (internal?.cancelState != null) {
+        internal.cancelState.canceledBeforeAcceptance = true;
+      }
+      return true;
+    };
+
+    if (await cancelBeforeAcceptance()) {
+      return Ok(undefined);
+    }
 
     // Last-line-of-defence pricing gate: every dispatch path (initial sends,
     // sendQueuedMessages, dispatchPendingFollowUp,
@@ -2370,6 +2444,9 @@ export class AgentSession {
         this.workspaceId,
         options?.model
       );
+      if (await cancelBeforeAcceptance()) {
+        return Ok(undefined);
+      }
       if (!pricingGate.success) {
         if (isManualUserMessage) {
           const persisted = await this.preserveRejectedManualSend(
@@ -2667,6 +2744,10 @@ export class AgentSession {
     // File changes after this point are surfaced via <system-file-update> diffs instead.
     const snapshotResult = await this.materializeFileAtMentionsSnapshot(trimmedMessage);
 
+    if (await cancelBeforeAcceptance()) {
+      return Ok(undefined);
+    }
+
     // Check compaction threshold BEFORE persisting the user message.
     // Skill snapshots are materialized AFTER this decision (below): when on-send
     // compaction defers the turn, the follow-up re-enters sendMessage with the same
@@ -2685,6 +2766,9 @@ export class AgentSession {
       // so the compaction monitor can detect context limits even before any live
       // stream events have populated lastUsageState.
       await this.seedUsageStateFromHistory();
+      if (await cancelBeforeAcceptance()) {
+        return Ok(undefined);
+      }
 
       const providersConfigForCompaction = this.getProvidersConfigSafe();
       const compactionResult = this.compactionMonitor.checkBeforeSend({
@@ -2752,6 +2836,10 @@ export class AgentSession {
         if (!appendCompactionResult.success) {
           return Err(createUnknownSendMessageError(appendCompactionResult.error));
         }
+        persistedCancelableMessageIds.push(autoCompactionMessage.id);
+        if (await cancelBeforeAcceptance()) {
+          return Ok(undefined);
+        }
 
         this.emitChatEvent({
           type: "auto-compaction-triggered",
@@ -2785,6 +2873,9 @@ export class AgentSession {
       } catch (error) {
         return Err(createUnknownSendMessageError(getErrorMessage(error)));
       }
+      if (await cancelBeforeAcceptance()) {
+        return Ok(undefined);
+      }
     }
 
     if (shouldPersistTurnSnapshots && snapshotResult?.snapshotMessage) {
@@ -2794,6 +2885,10 @@ export class AgentSession {
       );
       if (!snapshotAppendResult.success) {
         return Err(createUnknownSendMessageError(snapshotAppendResult.error));
+      }
+      persistedCancelableMessageIds.push(snapshotResult.snapshotMessage.id);
+      if (await cancelBeforeAcceptance()) {
+        return Ok(undefined);
       }
     }
 
@@ -2805,6 +2900,10 @@ export class AgentSession {
         );
         if (!skillSnapshotAppendResult.success) {
           return Err(createUnknownSendMessageError(skillSnapshotAppendResult.error));
+        }
+        persistedCancelableMessageIds.push(snapshotMessage.id);
+        if (await cancelBeforeAcceptance()) {
+          return Ok(undefined);
         }
       }
     }
@@ -2819,17 +2918,40 @@ export class AgentSession {
         // the orphan via the truncation logic that removes preceding snapshots.
         return Err(createUnknownSendMessageError(appendResult.error));
       }
+      persistedCancelableMessageIds.push(userMessage.id);
+      if (await cancelBeforeAcceptance()) {
+        return Ok(undefined);
+      }
     }
 
-    await this.workspaceGoalService?.syncGoalModeWithChatTail(this.workspaceId);
+    // Goal synchronization can mutate goal.json based on this durable user row. Once it begins, the
+    // turn has crossed the cancellation point-of-no-return: a concurrent monitor stop must let this
+    // wake finish acceptance rather than delete the row after goal state has already observed it.
+    if (cancelSignal != null) {
+      cancellationDisabled = true;
+    }
+    try {
+      await this.workspaceGoalService?.syncGoalModeWithChatTail(this.workspaceId);
+    } catch (error) {
+      if (cancelSignal != null) {
+        // The durable row crossed the point of no return, so every later goal-sync failure must still
+        // finalize this monitor wake. Startup recovery can resume the row without redelivering it.
+        await internal?.onAccepted?.();
+      }
+      throw error;
+    }
 
     if (manualGoalInterventionPolicy != null) {
       await this.applyManualUserMessageGoalSafety({ policy: manualGoalInterventionPolicy });
     }
 
     // Workspace may be tearing down while we await filesystem IO.
-    // If so, skip event emission + streaming to avoid races with dispose().
+    // If so, skip event emission + streaming to avoid races with dispose(). A cancelable monitor
+    // wake past the point of no return is already durable, so finalize it before leaving.
     if (this.disposed) {
+      if (cancelSignal != null && cancellationDisabled) {
+        await internal?.onAccepted?.();
+      }
       return Ok(undefined);
     }
 
@@ -2927,7 +3049,8 @@ export class AgentSession {
           agentInitiated,
           preparedTurnAbortController.signal,
           goalKind,
-          turnThinkingOverride
+          turnThinkingOverride,
+          internal?.monitorHistoryLockState?.held === true
         );
       } finally {
         // Success should advance via stream events; if startup never emitted any, don't leave the
@@ -3556,7 +3679,8 @@ export class AgentSession {
     // Session-owned per-turn holder for mid-turn thinking changes. Passed
     // explicitly (not read from the field) so a preempted turn can never pick
     // up its replacement's holder. Absent for internal retry paths.
-    activeTurnThinkingOverride?: ActiveTurnThinkingOverride
+    activeTurnThinkingOverride?: ActiveTurnThinkingOverride,
+    monitorHistoryLockHeld = false
   ): Promise<Result<void, SendMessageError>> {
     const isStartupAbortRequested = (): boolean => abortSignal?.aborted === true;
 
@@ -3579,6 +3703,7 @@ export class AgentSession {
       agentInitiated,
       openaiTruncationModeOverride,
       ...(goalKind != null ? { goalKind } : {}),
+      monitorHistoryLockHeld,
       providersConfig,
     };
     this.activeStreamUserMessageId = undefined;
@@ -4296,7 +4421,11 @@ export class AgentSession {
       });
     }
 
-    const clearResult = await this.historyService.clearHistory(this.workspaceId);
+    const clearResult = this.clearHistoryForHardRestart
+      ? await this.clearHistoryForHardRestart({
+          monitorHistoryLockHeld: context.monitorHistoryLockHeld === true,
+        })
+      : await this.historyService.clearHistory(this.workspaceId);
     if (!clearResult.success) {
       log.warn("Failed to clear history for exec subagent hard restart", {
         workspaceId: this.workspaceId,
@@ -5198,6 +5327,9 @@ export class AgentSession {
       onAccepted?: () => Promise<void> | void;
       onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
       onCanceled?: (reason: string) => Promise<void> | void;
+      monitorHistoryLockState?: { held: boolean };
+      cancelState?: { canceledBeforeAcceptance: boolean };
+      cancelSignal?: AbortSignal;
     }
   ): "tool-end" | "turn-end" | null {
     this.assertNotDisposed("queueMessage");
@@ -5488,6 +5620,15 @@ export class AgentSession {
             // No stream started, so no stream-end drain will fire for the
             // remaining entries — try the next one now (each attempt pops an
             // entry, so this terminates).
+            this.sendQueuedMessages();
+            return;
+          }
+          if (internal?.cancelState?.canceledBeforeAcceptance === true) {
+            // Cancellation can arrive after dequeue while sendMessage is validating or writing
+            // history. No stream will start, so release PREPARING and continue with later entries.
+            if (this.turnPhase === TurnPhase.PREPARING) {
+              this.setTurnPhase(TurnPhase.IDLE);
+            }
             this.sendQueuedMessages();
           }
         })

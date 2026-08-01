@@ -33,7 +33,7 @@ import type {
 import type { TaskService } from "./taskService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import { BashMonitorRegistryStore } from "./bashMonitorRegistryStore";
-import { BashMonitorWakeStore } from "./bashMonitorWakeStore";
+import { BashMonitorWakeStore, buildBashMonitorWakeMetadata } from "./bashMonitorWakeStore";
 import type { TerminalService } from "@/node/services/terminalService";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import type { WorktreeArchiveSnapshot } from "@/common/schemas/project";
@@ -364,6 +364,239 @@ describe("WorkspaceService bash monitor wakes", () => {
         }
       ).bashMonitorWakeStore;
       await waitForCondition(async () => (await wakeStore.listPending(workspaceId)).length === 0);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("explicit monitor cancellation supersedes a match racing persistence", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-cancel-race";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      });
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockResolvedValue(Ok(undefined));
+      const wakeStore = (
+        workspaceService as unknown as {
+          bashMonitorWakeStore: BashMonitorWakeStore;
+        }
+      ).bashMonitorWakeStore;
+      const markSupersededSpy = spyOn(wakeStore, "markSuperseded");
+
+      backgroundProcessManager.emit("monitor:match", workspaceId, {
+        processId: "proc-canceled",
+        taskId: "bash:proc-canceled",
+        workspaceId,
+        filter: "FAILED",
+        filterExclude: false,
+        lines: ["FAILED stale"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+        matchedThroughOffset: 12,
+      });
+      backgroundProcessManager.emit("monitor:stopped", workspaceId, {
+        processId: "proc-canceled",
+        reason: "canceled",
+      });
+
+      await waitForCondition(() => markSupersededSpy.mock.calls.length > 0);
+      await waitForCondition(async () => (await wakeStore.listPending(workspaceId)).length === 0);
+      expect(sendSpy).not.toHaveBeenCalled();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("canceled retirement finishes before a reused process ID can persist a new wake", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-cancel-generation";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      });
+      let deferDrains = true;
+      spyOn(workspaceService, "hasPendingQueuedOrPreparingTurn").mockImplementation(
+        () => deferDrains
+      );
+      spyOn(workspaceService, "waitForIdleAndNoQueuedMessages").mockImplementation(
+        () => new Promise(() => undefined)
+      );
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockImplementation(
+        async (...args: Parameters<WorkspaceService["sendMessage"]>) => {
+          await args[3]?.onAccepted?.();
+          return Ok(undefined);
+        }
+      );
+      const wakeStore = (
+        workspaceService as unknown as {
+          bashMonitorWakeStore: BashMonitorWakeStore;
+        }
+      ).bashMonitorWakeStore;
+
+      backgroundProcessManager.emit("monitor:match", workspaceId, {
+        processId: "reused-proc",
+        taskId: "bash:reused-proc",
+        workspaceId,
+        filter: "DONE",
+        filterExclude: false,
+        lines: ["OLD done"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+        matchedThroughOffset: 8,
+      });
+      await waitForCondition(async () => (await wakeStore.listPending(workspaceId)).length === 1);
+
+      const supersedeStarted = createDeferred<void>();
+      const releaseSupersede = createDeferred<void>();
+      const originalMarkSuperseded = wakeStore.markSuperseded.bind(wakeStore);
+      spyOn(wakeStore, "markSuperseded").mockImplementation(async (...args) => {
+        supersedeStarted.resolve();
+        await releaseSupersede.promise;
+        return originalMarkSuperseded(...args);
+      });
+
+      backgroundProcessManager.emit("monitor:stopped", workspaceId, {
+        processId: "reused-proc",
+        reason: "canceled",
+      });
+      await supersedeStarted.promise;
+
+      backgroundProcessManager.emit("monitor:armed", workspaceId, {
+        processId: "reused-proc",
+        taskId: "bash:reused-proc",
+        workspaceId,
+        displayName: "Reused Proc",
+        filter: "DONE",
+        filterExclude: false,
+        script: "echo NEW done",
+        createdAt: new Date().toISOString(),
+      });
+      deferDrains = false;
+      backgroundProcessManager.emit("monitor:match", workspaceId, {
+        processId: "reused-proc",
+        taskId: "bash:reused-proc",
+        workspaceId,
+        filter: "DONE",
+        filterExclude: false,
+        lines: ["NEW done"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+        matchedThroughOffset: 8,
+      });
+
+      await drainPendingDispatches();
+      expect(sendSpy).not.toHaveBeenCalled();
+
+      releaseSupersede.resolve();
+      await waitForCondition(() => sendSpy.mock.calls.length === 1);
+      expect(sendSpy.mock.calls[0][1]).toContain("NEW done");
+      expect(sendSpy.mock.calls[0][1]).not.toContain("OLD done");
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("explicit monitor cancellation retracts an already queued synthetic wake", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-cancel-queued";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => true) }),
+      });
+      spyOn(workspaceService, "isBusyForMessage").mockReturnValue(true);
+      spyOn(workspaceService, "hasPendingQueuedOrPreparingTurn").mockReturnValue(false);
+      type SendInternal = NonNullable<Parameters<WorkspaceService["sendMessage"]>[3]>;
+      let onCanceled: SendInternal["onCanceled"] | undefined;
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockImplementation(
+        (...args: Parameters<WorkspaceService["sendMessage"]>) => {
+          onCanceled = args[3]?.onCanceled;
+          return Promise.resolve(Ok(undefined));
+        }
+      );
+      const removeQueuedSpy = spyOn(
+        workspaceService,
+        "removeQueuedMessagesByDedupeKeyPrefix"
+      ).mockImplementation((_ownerWorkspaceId, _prefix, options) => {
+        void onCanceled?.(options?.cancelReason ?? "canceled");
+        return Ok(1);
+      });
+
+      backgroundProcessManager.emit("monitor:match", workspaceId, {
+        processId: "proc-queued",
+        taskId: "bash:proc-queued",
+        workspaceId,
+        filter: "FAILED",
+        filterExclude: false,
+        lines: ["FAILED queued"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+        matchedThroughOffset: 13,
+      });
+      await waitForCondition(() => sendSpy.mock.calls.length === 1);
+      expect(sendSpy.mock.calls[0][3]).toMatchObject({
+        removableQueueDedupeKey: true,
+      });
+
+      backgroundProcessManager.emit("monitor:stopped", workspaceId, {
+        processId: "proc-queued",
+        reason: "canceled",
+      });
+
+      await waitForCondition(() => removeQueuedSpy.mock.calls.length === 1);
+      const wakeStore = (
+        workspaceService as unknown as {
+          bashMonitorWakeStore: BashMonitorWakeStore;
+        }
+      ).bashMonitorWakeStore;
+      await waitForCondition(async () => (await wakeStore.listPending(workspaceId)).length === 0);
+      expect(removeQueuedSpy.mock.calls[0][1]).toStartWith("bash-monitor-wake:");
+      expect(sendSpy).toHaveBeenCalledTimes(1);
     } finally {
       await cleanup();
     }
@@ -1522,6 +1755,157 @@ describe("WorkspaceService bash monitor wakes", () => {
         }
       ).bashMonitorWakeStore;
       await waitForCondition(async () => (await wakeStore.listPending(workspaceId)).length === 0);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("retries the delivered transition after a transient wake-store failure", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-delivery-retry";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+        getForegroundToolCallIds: mock(() => []),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => true) }),
+      });
+      spyOn(workspaceService, "isBusyForMessage").mockReturnValue(true);
+      spyOn(workspaceService, "hasPendingQueuedOrPreparingTurn").mockReturnValue(false);
+      const wakeStore = (
+        workspaceService as unknown as {
+          bashMonitorWakeStore: BashMonitorWakeStore;
+        }
+      ).bashMonitorWakeStore;
+      const originalMarkDelivered = wakeStore.markDeliveredSnapshot.bind(wakeStore);
+      let deliveryAttempts = 0;
+      spyOn(wakeStore, "markDeliveredSnapshot").mockImplementation(async (...args) => {
+        deliveryAttempts += 1;
+        if (deliveryAttempts === 1) {
+          throw new Error("injected wake-store failure");
+        }
+        return originalMarkDelivered(...args);
+      });
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockImplementation(
+        async (...args: Parameters<WorkspaceService["sendMessage"]>) => {
+          await args[3]?.onAccepted?.();
+          return Ok(undefined);
+        }
+      );
+
+      backgroundProcessManager.emit("monitor:match", workspaceId, {
+        processId: "proc-retry",
+        taskId: "bash:proc-retry",
+        workspaceId,
+        filter: "FAILED",
+        filterExclude: false,
+        lines: ["FAILED retry delivery"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+      });
+
+      await waitForCondition(() => sendSpy.mock.calls.length === 1);
+      await waitForCondition(() => deliveryAttempts === 2);
+      await waitForCondition(async () => (await wakeStore.listPending(workspaceId)).length === 0);
+      expect(deliveryAttempts).toBe(2);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("accepted history suppresses redelivery while wake-store reconciliation keeps failing", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-accepted-recovery";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const seedStore = new BashMonitorWakeStore(config);
+      const record = await seedStore.enqueueOrMergePending({
+        processId: "proc-accepted",
+        taskId: "bash:proc-accepted",
+        workspaceId,
+        filter: "DONE",
+        filterExclude: false,
+        lines: ["DONE accepted"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+        matchedThroughOffset: 13,
+      });
+      const malformedWake = createMuxMessage("malformed-wake", "user", "Malformed wake", {
+        synthetic: true,
+      });
+      if (malformedWake.metadata) {
+        (malformedWake.metadata as Record<string, unknown>).muxMetadata = {
+          type: "bash-monitor-wake",
+          records: null,
+        };
+      }
+      const emptyIdentityWake = createMuxMessage(
+        "empty-identity-wake",
+        "user",
+        "Empty identity wake",
+        { synthetic: true }
+      );
+      if (emptyIdentityWake.metadata) {
+        (emptyIdentityWake.metadata as Record<string, unknown>).muxMetadata = {
+          type: "bash-monitor-wake",
+          records: [{ processId: "", wakeUpdatedAt: "" }],
+        };
+      }
+      await historyService.appendToHistory(workspaceId, emptyIdentityWake);
+      await historyService.appendToHistory(workspaceId, malformedWake);
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("accepted-wake", "user", "Accepted monitor wake", {
+          synthetic: true,
+          muxMetadata: buildBashMonitorWakeMetadata([record]),
+        })
+      );
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      });
+      const wakeStore = (
+        workspaceService as unknown as {
+          bashMonitorWakeStore: BashMonitorWakeStore;
+        }
+      ).bashMonitorWakeStore;
+      const markDeliveredSpy = spyOn(wakeStore, "markDeliveredSnapshot").mockRejectedValue(
+        new Error("injected persistent wake-store failure")
+      );
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockResolvedValue(Ok(undefined));
+
+      await waitForCondition(() => markDeliveredSpy.mock.calls.length > 0);
+      await drainPendingDispatches();
+      expect(sendSpy).not.toHaveBeenCalled();
+      expect(await wakeStore.listPending(workspaceId)).toHaveLength(1);
     } finally {
       await cleanup();
     }
@@ -3258,6 +3642,31 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     }
   });
 
+  test("destructive clear waits for startup monitor recovery discovery", async () => {
+    const { historyService, workspaceService, cleanup } = await createServices();
+    const workspaceId = "clear-waits-for-monitor-recovery";
+    const recovery = createDeferred<void>();
+    const internal = workspaceService as unknown as {
+      bashMonitorRecoveryPromise: Promise<void>;
+    };
+    internal.bashMonitorRecoveryPromise = recovery.promise;
+    const truncateSpy = spyOn(historyService, "truncateHistory").mockResolvedValue(Ok([]));
+
+    try {
+      const clearPromise = workspaceService.truncateHistory(workspaceId, 1.0);
+      await drainPendingDispatches();
+      expect(truncateSpy).not.toHaveBeenCalled();
+
+      recovery.resolve();
+      expect(await clearPromise).toEqual(Ok(undefined));
+      expect(truncateSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      recovery.resolve();
+      truncateSpy.mockRestore();
+      await cleanup();
+    }
+  });
+
   test("full chat clear preserves the goal and requires user acknowledgment", async () => {
     const { config, historyService, workspaceService, goalService, cleanup } =
       await createServices();
@@ -3293,6 +3702,250 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         objective: created.objective,
         requireUserAcknowledgmentSinceMs: 1_234_567,
       });
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("full chat clear retires pending monitor wakes before deleting acceptance proof", async () => {
+    const { config, historyService, workspaceService, cleanup } = await createServices();
+    const workspaceId = "clear-pending-monitor-wake";
+    try {
+      await config.addWorkspace("/tmp/clear-monitor-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "clear-monitor-project",
+        projectPath: "/tmp/clear-monitor-project",
+        runtimeConfig: { type: "local" },
+      });
+      const wakeStore = new BashMonitorWakeStore(config);
+      const record = await wakeStore.enqueueOrMergePending({
+        processId: "clear-proc",
+        taskId: "bash:clear-proc",
+        workspaceId,
+        filter: "DONE",
+        filterExclude: false,
+        lines: ["DONE before clear"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+        matchedThroughOffset: 17,
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("accepted-before-clear", "user", "Accepted wake", {
+          synthetic: true,
+          muxMetadata: buildBashMonitorWakeMetadata([record]),
+        })
+      );
+
+      const result = await workspaceService.truncateHistory(workspaceId, 1.5);
+
+      expect(result.success).toBe(true);
+      expect(await wakeStore.listPending(workspaceId)).toEqual([]);
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history).toEqual(Ok([]));
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("partial truncation that deletes every row retires accepted monitor wakes", async () => {
+    const { config, historyService, workspaceService, cleanup } = await createServices();
+    const workspaceId = "partial-truncation-deletes-all-monitor-wake";
+    try {
+      await config.addWorkspace("/tmp/partial-delete-all-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "partial-delete-all-project",
+        projectPath: "/tmp/partial-delete-all-project",
+        runtimeConfig: { type: "local" },
+      });
+      const wakeStore = new BashMonitorWakeStore(config);
+      const record = await wakeStore.enqueueOrMergePending({
+        processId: "partial-delete-proc",
+        taskId: "bash:partial-delete-proc",
+        workspaceId,
+        filter: "DONE",
+        filterExclude: false,
+        lines: ["DONE before partial deletion"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+        matchedThroughOffset: 29,
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("partial-delete-accepted", "user", "Accepted wake", {
+          synthetic: true,
+          muxMetadata: buildBashMonitorWakeMetadata([record]),
+        })
+      );
+
+      const result = await workspaceService.truncateHistory(workspaceId, 0.75);
+
+      expect(result.success).toBe(true);
+      expect(await wakeStore.listPending(workspaceId)).toEqual([]);
+      expect(await historyService.getHistoryFromLatestBoundary(workspaceId)).toEqual(Ok([]));
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("history scan failure blocks destructive clear without retiring wakes", async () => {
+    const { config, historyService, workspaceService, cleanup } = await createServices();
+    const workspaceId = "clear-history-scan-failure";
+    try {
+      await config.addWorkspace("/tmp/clear-history-scan-failure-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "clear-history-scan-failure-project",
+        projectPath: "/tmp/clear-history-scan-failure-project",
+        runtimeConfig: { type: "local" },
+      });
+      const wakeStore = new BashMonitorWakeStore(config);
+      await wakeStore.enqueueOrMergePending({
+        processId: "scan-failure-proc",
+        taskId: "bash:scan-failure-proc",
+        workspaceId,
+        filter: "FAILED",
+        filterExclude: false,
+        lines: ["FAILED before scan"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+        matchedThroughOffset: 19,
+      });
+      const iterateSpy = spyOn(historyService, "iterateFullHistory").mockResolvedValue(
+        Err("injected history scan failure")
+      );
+
+      const result = await workspaceService.truncateHistory(workspaceId, 1.0);
+
+      expect(result).toEqual(
+        Err("Cannot clear history while monitor wake acceptance cannot be verified.")
+      );
+      expect(await wakeStore.listPending(workspaceId)).toHaveLength(1);
+      iterateSpy.mockRestore();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("failed full clear restores pending monitor wakes", async () => {
+    const { config, historyService, workspaceService, cleanup } = await createServices();
+    const workspaceId = "failed-clear-restores-monitor-wake";
+    try {
+      await config.addWorkspace("/tmp/failed-clear-monitor-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "failed-clear-monitor-project",
+        projectPath: "/tmp/failed-clear-monitor-project",
+        runtimeConfig: { type: "local" },
+      });
+      const wakeStore = new BashMonitorWakeStore(config);
+      await wakeStore.enqueueOrMergePending({
+        processId: "failed-clear-proc",
+        taskId: "bash:failed-clear-proc",
+        workspaceId,
+        filter: "FAILED",
+        filterExclude: false,
+        lines: ["FAILED before clear"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+        matchedThroughOffset: 20,
+      });
+      const truncateSpy = spyOn(historyService, "truncateHistory").mockResolvedValue(
+        Err("injected clear failure")
+      );
+
+      const result = await workspaceService.truncateHistory(workspaceId, 1.0);
+
+      expect(result).toEqual(Err("injected clear failure"));
+      expect(await wakeStore.listPending(workspaceId)).toHaveLength(1);
+      truncateSpy.mockRestore();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("partially committed clear keeps an accepted wake retired", async () => {
+    const { config, historyService, workspaceService, cleanup } = await createServices();
+    const workspaceId = "partial-clear-keeps-accepted-retired";
+    try {
+      await config.addWorkspace("/tmp/partial-clear-monitor-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "partial-clear-monitor-project",
+        projectPath: "/tmp/partial-clear-monitor-project",
+        runtimeConfig: { type: "local" },
+      });
+      const wakeStore = new BashMonitorWakeStore(config);
+      const record = await wakeStore.enqueueOrMergePending({
+        processId: "partial-clear-proc",
+        taskId: "bash:partial-clear-proc",
+        workspaceId,
+        filter: "DONE",
+        filterExclude: false,
+        lines: ["DONE before partial clear"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+        matchedThroughOffset: 25,
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("partial-clear-accepted", "user", "Accepted wake", {
+          synthetic: true,
+          muxMetadata: buildBashMonitorWakeMetadata([record]),
+        })
+      );
+      const originalTruncate = historyService.truncateHistory.bind(historyService);
+      const truncateSpy = spyOn(historyService, "truncateHistory").mockImplementation(
+        async (...args) => {
+          const result = await originalTruncate(...args);
+          expect(result.success).toBe(true);
+          return Err("injected post-clear failure");
+        }
+      );
+
+      const result = await workspaceService.truncateHistory(workspaceId, 1.0);
+
+      expect(result).toEqual(Err("injected post-clear failure"));
+      expect(await wakeStore.listPending(workspaceId)).toEqual([]);
+      truncateSpy.mockRestore();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("destructive history replacement retires pending monitor wakes", async () => {
+    const { config, workspaceService, cleanup } = await createServices();
+    const workspaceId = "replace-pending-monitor-wake";
+    try {
+      await config.addWorkspace("/tmp/replace-monitor-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "replace-monitor-project",
+        projectPath: "/tmp/replace-monitor-project",
+        runtimeConfig: { type: "local" },
+      });
+      const wakeStore = new BashMonitorWakeStore(config);
+      await wakeStore.enqueueOrMergePending({
+        processId: "replace-proc",
+        taskId: "bash:replace-proc",
+        workspaceId,
+        filter: "DONE",
+        filterExclude: false,
+        lines: ["DONE before replace"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+        matchedThroughOffset: 19,
+      });
+
+      const result = await workspaceService.replaceHistory(
+        workspaceId,
+        createMuxMessage("replacement-summary", "assistant", "Replacement summary", {})
+      );
+
+      expect(result.success).toBe(true);
+      expect(await wakeStore.listPending(workspaceId)).toEqual([]);
     } finally {
       await cleanup();
     }
