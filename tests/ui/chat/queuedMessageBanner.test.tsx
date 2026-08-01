@@ -66,7 +66,8 @@ describe("QueuedMessage banner", () => {
   test("renders queued preview text and step-dispatch label", () => {
     const view = render(<QueuedMessage message={createQueuedMessage()} />);
 
-    expect(view.getByText("Queued - Sending after step")).toBeTruthy();
+    expect(view.getByText("Queued")).toBeTruthy();
+    expect(view.getByText("Sends after this step")).toBeTruthy();
     expandQueuedMessage(view);
     expect(view.getByText("Review this change before sending")).toBeTruthy();
   });
@@ -76,7 +77,7 @@ describe("QueuedMessage banner", () => {
       <QueuedMessage message={createQueuedMessage({ queueDispatchMode: "turn-end" })} />
     );
 
-    expect(view.getByText("Queued - Sending after turn")).toBeTruthy();
+    expect(view.getByText("Sends after this turn")).toBeTruthy();
   });
 
   test("renders an inner queued bubble inside the banner", () => {
@@ -130,6 +131,31 @@ describe("QueuedMessage banner", () => {
 
     await waitFor(() => {
       expect(onSendImmediately).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  test("shows send-now failures inline and allows retry", async () => {
+    let attempt = 0;
+    const onSendImmediately = mock(async () => {
+      attempt += 1;
+      if (attempt === 1) {
+        throw new Error("Connection lost while interrupting");
+      }
+    });
+
+    const view = render(
+      <QueuedMessage message={createQueuedMessage()} onSendImmediately={onSendImmediately} />
+    );
+
+    fireEvent.click(view.getByText("Send now"));
+    await waitFor(() => {
+      expect(view.getByRole("alert").textContent).toContain("Connection lost while interrupting");
+    });
+
+    fireEvent.click(view.getByText("Send now"));
+    await waitFor(() => {
+      expect(onSendImmediately).toHaveBeenCalledTimes(2);
+      expect(view.queryByRole("alert")).toBeNull();
     });
   });
 
