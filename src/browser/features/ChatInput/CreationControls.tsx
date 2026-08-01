@@ -21,10 +21,10 @@ import {
   SelectValue,
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import { GitBranch, Loader2, Wand2 } from "lucide-react";
-import { useProjectContext } from "@/browser/contexts/ProjectContext";
+import type { ProjectConfig } from "@/common/types/project";
 import { formatProjectHierarchyLabel } from "@/common/utils/subProjects";
-import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { RuntimeConfigInput } from "@/browser/components/RuntimeConfigInput/RuntimeConfigInput";
+import { usePerfRenderMarker } from "@/browser/utils/perf/PerfRenderMarker";
 import { cn } from "@/common/lib/utils";
 import { formatNameGenerationError } from "@/common/utils/errors/formatNameGenerationError";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
@@ -127,6 +127,9 @@ interface CreationControlsProps {
    * {@link projectPath} when omitted.
    */
   selectedProjectPath?: string;
+  /** Stable project data passed by ChatInput so typing does not subscribe this form to broad contexts. */
+  userProjects: Map<string, ProjectConfig>;
+  onSelectedProjectPathChange: (path: string) => void;
   /** Project name to display as header */
   projectName: string;
   /** Workspace name/title generation state and actions */
@@ -521,9 +524,8 @@ export function RuntimeButtonGroup(props: RuntimeButtonGroupProps) {
  * Prominent controls shown above the input during workspace creation.
  * Displays project name as header, workspace name with magic wand, and runtime/branch selectors.
  */
-export function CreationControls(props: CreationControlsProps) {
-  const { userProjects } = useProjectContext();
-  const { beginWorkspaceCreation } = useWorkspaceContext();
+function CreationControlsContent(props: CreationControlsProps) {
+  usePerfRenderMarker("chat-input.creation-controls");
   const { nameState, runtimeAvailabilityState } = props;
 
   // Extract mode from discriminated union for convenience
@@ -739,12 +741,9 @@ export function CreationControls(props: CreationControlsProps) {
           // selecting "gbot/bbot" would show "gbot" because props.projectPath
           // is normalized to the owning parent for runtime/config scoping.
           const selected = props.selectedProjectPath ?? props.projectPath;
-          const selectedLabel = formatProjectHierarchyLabel(selected, userProjects);
-          return userProjects.size > 1 ? (
-            <RadixSelect
-              value={selected}
-              onValueChange={(path: string) => beginWorkspaceCreation(path)}
-            >
+          const selectedLabel = formatProjectHierarchyLabel(selected, props.userProjects);
+          return props.userProjects.size > 1 ? (
+            <RadixSelect value={selected} onValueChange={props.onSelectedProjectPathChange}>
               <Tooltip>
                 <TooltipTrigger asChild>
                   <SelectTrigger
@@ -765,9 +764,9 @@ export function CreationControls(props: CreationControlsProps) {
                 <TooltipContent align="start">{selected}</TooltipContent>
               </Tooltip>
               <SelectContent>
-                {Array.from(userProjects.keys()).map((path) => (
+                {Array.from(props.userProjects.keys()).map((path) => (
                   <SelectItem key={path} value={path}>
-                    {formatProjectHierarchyLabel(path, userProjects)}
+                    {formatProjectHierarchyLabel(path, props.userProjects)}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -1141,5 +1140,101 @@ export function CreationControls(props: CreationControlsProps) {
         )}
       </div>
     </div>
+  );
+}
+
+// ChatInput is not currently compiler-eligible because of its async control flow,
+// so keep this small wrapper compiler-friendly and pass every dependency explicitly.
+// React Compiler then retains the expensive control tree while draft text changes.
+export function CreationControls(props: CreationControlsProps) {
+  const coderEnabled = props.coderProps?.enabled;
+  const coderOnEnabledChange = props.coderProps?.onEnabledChange;
+  const coderInfo = props.coderProps?.coderInfo;
+  const coderConfig = props.coderProps?.coderConfig;
+  const coderOnConfigChange = props.coderProps?.onCoderConfigChange;
+  const coderTemplates = props.coderProps?.templates;
+  const coderTemplatesError = props.coderProps?.templatesError;
+  const coderPresets = props.coderProps?.presets;
+  const coderPresetsError = props.coderProps?.presetsError;
+  const coderExistingWorkspaces = props.coderProps?.existingWorkspaces;
+  const coderWorkspacesError = props.coderProps?.workspacesError;
+  const coderLoadingTemplates = props.coderProps?.loadingTemplates;
+  const coderLoadingPresets = props.coderProps?.loadingPresets;
+  const coderLoadingWorkspaces = props.coderProps?.loadingWorkspaces;
+  const hasCoderProps = props.coderProps != null;
+  const coderProps = !hasCoderProps
+    ? undefined
+    : {
+        enabled: coderEnabled ?? false,
+        onEnabledChange: coderOnEnabledChange!,
+        coderInfo: coderInfo ?? null,
+        coderConfig: coderConfig ?? null,
+        onCoderConfigChange: coderOnConfigChange!,
+        templates: coderTemplates ?? [],
+        templatesError: coderTemplatesError ?? null,
+        presets: coderPresets ?? [],
+        presetsError: coderPresetsError ?? null,
+        existingWorkspaces: coderExistingWorkspaces ?? [],
+        workspacesError: coderWorkspacesError ?? null,
+        loadingTemplates: coderLoadingTemplates ?? false,
+        loadingPresets: coderLoadingPresets ?? false,
+        loadingWorkspaces: coderLoadingWorkspaces ?? false,
+      };
+  const runtimeLocal = props.runtimeEnablement?.local;
+  const runtimeWorktree = props.runtimeEnablement?.worktree;
+  const runtimeSsh = props.runtimeEnablement?.ssh;
+  const runtimeCoder = props.runtimeEnablement?.coder;
+  const runtimeDocker = props.runtimeEnablement?.docker;
+  const runtimeDevcontainer = props.runtimeEnablement?.devcontainer;
+  const hasRuntimeEnablement = props.runtimeEnablement != null;
+  const runtimeEnablement = !hasRuntimeEnablement
+    ? undefined
+    : {
+        local: runtimeLocal ?? true,
+        worktree: runtimeWorktree ?? true,
+        ssh: runtimeSsh ?? true,
+        coder: runtimeCoder ?? true,
+        docker: runtimeDocker ?? true,
+        devcontainer: runtimeDevcontainer ?? true,
+      };
+  const nameState = {
+    name: props.nameState.name,
+    title: props.nameState.title,
+    isGenerating: props.nameState.isGenerating,
+    autoGenerate: props.nameState.autoGenerate,
+    error: props.nameState.error,
+    setAutoGenerate: props.nameState.setAutoGenerate,
+    setName: props.nameState.setName,
+  };
+
+  return (
+    <CreationControlsContent
+      branches={props.branches}
+      branchesLoaded={props.branchesLoaded}
+      trunkBranch={props.trunkBranch}
+      onTrunkBranchChange={props.onTrunkBranchChange}
+      selectedRuntime={props.selectedRuntime}
+      coderConfigFallback={props.coderConfigFallback}
+      sshHostFallback={props.sshHostFallback}
+      defaultRuntimeMode={props.defaultRuntimeMode}
+      onSelectedRuntimeChange={props.onSelectedRuntimeChange}
+      onSetDefaultRuntime={props.onSetDefaultRuntime}
+      disabled={props.disabled}
+      projectPath={props.projectPath}
+      selectedProjectPath={props.selectedProjectPath}
+      userProjects={props.userProjects}
+      onSelectedProjectPathChange={props.onSelectedProjectPathChange}
+      projectName={props.projectName}
+      nameState={nameState}
+      runtimeAvailabilityState={props.runtimeAvailabilityState}
+      runtimeEnablement={runtimeEnablement}
+      runtimeFieldError={props.runtimeFieldError}
+      allowedRuntimeModes={props.allowedRuntimeModes}
+      allowSshHost={props.allowSshHost}
+      allowSshCoder={props.allowSshCoder}
+      runtimePolicyError={props.runtimePolicyError}
+      coderInfo={props.coderInfo}
+      coderProps={coderProps}
+    />
   );
 }

@@ -158,7 +158,11 @@ import {
   type OpenAIReasoningMode,
   type ThinkingLevel,
 } from "@/common/types/thinking";
-import { DEFAULT_RUNTIME_ENABLEMENT, normalizeRuntimeEnablement } from "@/common/types/runtime";
+import {
+  DEFAULT_RUNTIME_ENABLEMENT,
+  normalizeRuntimeEnablement,
+  type CoderWorkspaceConfig,
+} from "@/common/types/runtime";
 import { resolveThinkingInput } from "@/common/utils/thinking/policy";
 import {
   type MuxMessageMetadata,
@@ -724,7 +728,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const preEditDraftRef = useRef<DraftState>({ text: "", attachments: [] });
   const preEditReviewsRef = useRef<ReviewNoteDataForDisplay[] | null>(null);
   const { open } = useSettings();
-  const { selectedWorkspace } = useWorkspaceContext();
+  const { selectedWorkspace, beginWorkspaceCreation } = useWorkspaceContext();
   const { agentId, currentAgent } = useAgent();
 
   // Use current agent's uiColor, or neutral border until agents load
@@ -1025,21 +1029,23 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   // Coder workspace state - config is owned by selectedRuntime.coder, this hook manages async data
   const currentRuntime = creationState.selectedRuntime;
+  const coderRuntimeHost = currentRuntime.mode === "ssh" ? currentRuntime.host : null;
+  const setCreationSelectedRuntime = creationState.setSelectedRuntime;
+  // Plain function: React Compiler stabilizes this handler from its primitive host
+  // and compiler-stable runtime setter dependencies.
+  const handleCoderConfigChange = (config: CoderWorkspaceConfig | null) => {
+    if (coderRuntimeHost == null) return;
+    // Existing Coder workspaces name the SSH host; new ones derive it later.
+    const computedHost = config?.workspaceName ? `${config.workspaceName}.coder` : coderRuntimeHost;
+    setCreationSelectedRuntime({
+      mode: "ssh",
+      host: computedHost,
+      coder: config ?? undefined,
+    });
+  };
   const coderState = useCoderWorkspace({
     coderConfig: currentRuntime.mode === "ssh" ? (currentRuntime.coder ?? null) : null,
-    onCoderConfigChange: (config) => {
-      if (currentRuntime.mode !== "ssh") return;
-      // Compute host from workspace name for "existing" mode.
-      // For "new" mode, workspaceName is omitted/undefined and backend derives it later.
-      const computedHost = config?.workspaceName
-        ? `${config.workspaceName}.coder`
-        : currentRuntime.host;
-      creationState.setSelectedRuntime({
-        mode: "ssh",
-        host: computedHost,
-        coder: config ?? undefined,
-      });
-    },
+    onCoderConfigChange: handleCoderConfigChange,
     coderInfoRefreshPolicy: variant === "creation" ? "mount-and-focus" : "mount-only",
   });
 
@@ -1087,6 +1093,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           // the draft (pendingSubProjectPath / creationSubProjectPath); both
           // routes (deep link to a sub-project, or sidebar "+") collapse here.
           selectedProjectPath: creationSubProjectPath ?? props.projectPath,
+          userProjects,
+          onSelectedProjectPathChange: beginWorkspaceCreation,
           projectName: props.projectName,
           nameState: creationState.nameState,
           runtimeAvailabilityState: creationState.runtimeAvailabilityState,
