@@ -117,6 +117,22 @@ describe("ReasoningMessage", () => {
     expect(getReasoningContentContainer(view.container)?.getAttribute("aria-hidden")).toBe("true");
   });
 
+  test("shows only one ellipsis for collapsed streaming reasoning", () => {
+    const streamingMessage = createReasoningMessage("Summary\nBody line", {
+      isStreaming: true,
+      isLastPartOfMessage: true,
+    });
+    const view = render(<ReasoningMessage message={streamingMessage} />);
+
+    // The accessible activity label omits its own dots while the separate
+    // collapsed-content marker supplies the one visible ellipsis.
+    expect(view.container.querySelector(".shimmer-text-base")?.textContent).toBe("Thinking");
+    expect(view.getByTestId("reasoning-ellipsis").textContent).toBe("...");
+    expect(view.container.querySelector(".shimmer-text-sweep")?.getAttribute("aria-hidden")).toBe(
+      "true"
+    );
+  });
+
   test("does not auto-collapse on stream completion (keeps the mounted expand state)", () => {
     // The streaming→settled transition must not mutate the block: the deleted
     // auto-collapse effect was the source of the mid-turn height tear. With the
