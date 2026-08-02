@@ -45,6 +45,75 @@ export const VoiceInputNoApiKey: AppStory = {
   },
 };
 
+export const ComposerTooltip: AppStory = {
+  tags: ["tooltip-visual"],
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  render: () => (
+    <AppWithMocks
+      setup={() =>
+        setupSimpleChatStory({
+          workspaceId: "ws-composer-tooltip",
+          messages: [],
+        })
+      }
+    />
+  ),
+  parameters: {
+    ...appMeta.parameters,
+    pixel: {
+      // Keep the shared tooltip honest in the dense composer and near the phone viewport edge.
+      matrix: { themes: ["dark", "light"], viewports: ["phone", "laptop"] },
+    },
+    docs: {
+      description: {
+        story:
+          "Hovers the chat input attachment control so the shared tooltip surface is captured in its most space-constrained production context.",
+      },
+    },
+  },
+  play: async ({ canvasElement }) => {
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    await waitForChatInputAutofocusDone(storyRoot);
+    blurActiveElement();
+
+    const attachButton = within(storyRoot).getByLabelText("Attach file");
+    await userEvent.hover(attachButton);
+
+    await waitFor(
+      () => {
+        const tooltip = document.querySelector<HTMLElement>(
+          "[data-radix-popper-content-wrapper] [data-side]"
+        );
+        if (!tooltip?.textContent?.includes("Attach any file")) {
+          throw new Error("Chat input attachment tooltip not visible");
+        }
+        if (
+          tooltip.scrollWidth > tooltip.clientWidth ||
+          tooltip.scrollHeight > tooltip.clientHeight
+        ) {
+          throw new Error(
+            `Tooltip overflows (${tooltip.scrollWidth}×${tooltip.scrollHeight}px > ${tooltip.clientWidth}×${tooltip.clientHeight}px)`
+          );
+        }
+
+        const bounds = tooltip.getBoundingClientRect();
+        const viewportPadding = 8;
+        if (
+          bounds.left < viewportPadding ||
+          bounds.right > window.innerWidth - viewportPadding ||
+          bounds.top < viewportPadding ||
+          bounds.bottom > window.innerHeight - viewportPadding
+        ) {
+          throw new Error("Tooltip is outside the viewport-safe area");
+        }
+      },
+      { interval: 50, timeout: 5000 }
+    );
+  },
+};
+
 export const QueuedFollowUp: AppStory = {
   globals: {
     viewport: { value: "mobile1", isRotated: false },
