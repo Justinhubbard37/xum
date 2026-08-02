@@ -266,6 +266,12 @@
     --color-separator: #262626; /* neutral-800 - dividers/separators */
     --color-separator-light: hsl(0 0% 27%); /* #464647 - lighter separator */
     --color-modal-bg: hsl(0 0% 18%); /* #2d2d30 - modal backgrounds */
+    /* Tooltips need clearer separation from dense surfaces such as the composer while inheriting each
+      theme's palette rather than introducing a fixed dark popover. */
+    --color-tooltip-bg: color-mix(in srgb, var(--color-modal-bg) 88%, var(--color-background) 12%);
+    --color-tooltip-border: color-mix(in srgb, var(--color-foreground) 16%, transparent);
+    --color-tooltip-foreground: color-mix(in srgb, var(--color-foreground) 92%, var(--color-content-primary) 8%);
+    --shadow-tooltip: 0 12px 30px hsl(0 0% 0% / 0.28), 0 3px 10px hsl(0 0% 0% / 0.2), inset 0 1px 0 hsl(0 0% 100% / 0.04);
     --color-inline-code-dark-bg: hsl(0 0% 18%); /* #2d2d30 - always dark, for inline code that should stay dark in all themes */
 
     --color-accent: hsl(207 100% 40%); /* #007acc - VS Code blue */
