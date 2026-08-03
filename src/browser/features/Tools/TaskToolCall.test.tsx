@@ -167,8 +167,74 @@ describe("TaskAwaitToolCall", () => {
     const timer = view.getByTestId("elapsed-time");
     expect(timer.dataset.active).toBe("true");
     expect(timer.dataset.startedAt).toBe(String(startedAt));
-    expect(timer.dataset.prefix).toBe("elapsed ");
+    expect(timer.dataset.prefix).toBe("");
+    expect(view.getByText("Waiting for 1 task")).toBeDefined();
     expect(timer.dataset.separator).toBe("");
+  });
+
+  test("summarizes completed polls without generic tool chrome", () => {
+    const view = renderTaskAwaitToolCall({
+      status: "completed",
+      result: { results: [{ status: "running", taskId: "task-1" }] },
+    });
+
+    expect(view.getByText("Still waiting for 1 task")).toBeDefined();
+    expect(view.queryByText("task_await")).toBeNull();
+  });
+
+  test("renders interrupted waits as terminal instead of still waiting", () => {
+    const view = renderTaskAwaitToolCall({
+      status: "completed",
+      result: { results: [{ status: "interrupted", taskId: "task-1" }] },
+    });
+
+    expect(view.getByText("1 task interrupted")).toBeDefined();
+    expect(view.queryByText(/still waiting/i)).toBeNull();
+  });
+
+  test("treats interrupted error rows as cancelled waits, not failed tasks", () => {
+    const view = renderTaskAwaitToolCall({
+      status: "completed",
+      result: {
+        results: [{ status: "error", taskId: "task-1", error: "Interrupted" }],
+      },
+    });
+
+    expect(view.getByText("1 task interrupted")).toBeDefined();
+    expect(view.queryByText("1 task failed")).toBeNull();
+  });
+
+  test("renders call-level interruption as terminal", () => {
+    const view = renderTaskAwaitToolCall({ status: "interrupted", result: undefined });
+
+    expect(view.getByText("Task wait interrupted")).toBeDefined();
+    expect(view.queryByText("Checked task status")).toBeNull();
+  });
+
+  test("keeps active task counts visible beside interruptions", () => {
+    const view = renderTaskAwaitToolCall({
+      status: "completed",
+      result: {
+        results: [
+          { status: "interrupted", taskId: "task-1" },
+          { status: "running", taskId: "task-2" },
+          { status: "queued", taskId: "task-3" },
+        ],
+      },
+    });
+
+    expect(view.getByText("1 task interrupted")).toBeDefined();
+    expect(view.getByText(/2 tasks still active/)).toBeDefined();
+  });
+
+  test("surfaces call-level task_await failures", () => {
+    const view = renderTaskAwaitToolCall({
+      status: "failed",
+      result: { success: false, error: "Task service unavailable" },
+    });
+
+    expect(view.getByText("Task wait failed")).toBeDefined();
+    expect(view.getByText("Task service unavailable")).toBeDefined();
   });
 
   test("uses valid legacy agentType for task_await rows when agentId is invalid", () => {
@@ -194,7 +260,7 @@ describe("TaskAwaitToolCall", () => {
 
     const view = renderTaskAwaitToolCall();
 
-    fireEvent.click(view.getByText("task_await"));
+    fireEvent.click(view.getByLabelText("Waiting for 1 task. Show task wait details"));
 
     expect(view.getByText("explore")).toBeDefined();
     expect(view.queryByText("???")).toBeNull();

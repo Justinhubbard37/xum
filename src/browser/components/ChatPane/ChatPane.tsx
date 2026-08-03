@@ -116,6 +116,7 @@ import {
 } from "./sideQuestionScrollHold";
 import {
   computeOperationalBundleInfos,
+  computeTaskAwaitPollGroupInfos,
   computeWorkBundleInfos,
 } from "@/browser/utils/messages/transcriptRenderProjection";
 import { isBlockedPreStreamTaskStatus } from "@/browser/utils/ui/workspaceFiltering";
@@ -532,6 +533,8 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     () => computeBashOutputGroupInfos(deferredMessages),
     [deferredMessages]
   );
+
+  const taskAwaitPollGroupInfos = computeTaskAwaitPollGroupInfos(deferredMessages);
 
   const workBundleInfos = useMemo(
     () => (transcriptDensity === "hyper" ? computeWorkBundleInfos(deferredMessages) : undefined),
@@ -1574,6 +1577,42 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                     )}
                     {deferredMessages.map((msg, index) => {
                       const workBundle = workBundleInfos?.[index];
+                      const operationalBundle = workBundle
+                        ? undefined
+                        : operationalBundleInfos?.[index];
+                      const taskAwaitPollGroup = taskAwaitPollGroupInfos[index];
+                      if (taskAwaitPollGroup && !workBundle && !operationalBundle) {
+                        const override = operationalBundleExpansionOverrides.get(
+                          taskAwaitPollGroup.key
+                        );
+                        // A failure/interruption discovered after the user collapsed routine polls must
+                        // still surface immediately; terminal attention wins over a stale false override.
+                        const expanded = taskAwaitPollGroup.defaultExpanded || override === true;
+                        const renderHeader = taskAwaitPollGroup.position === "head";
+                        if (!renderHeader && !expanded) {
+                          return null;
+                        }
+
+                        return (
+                          <React.Fragment key={`${workspaceId}:${msg.id}:task-await-polls`}>
+                            {renderHeader && (
+                              <OperationalBundleMessage
+                                item={taskAwaitPollGroup}
+                                expanded={expanded}
+                                onToggle={() =>
+                                  setOperationalBundleExpanded(taskAwaitPollGroup.key, !expanded)
+                                }
+                              />
+                            )}
+                            {expanded &&
+                              renderMessageAtIndex(msg, index, {
+                                key: `${workspaceId}:${msg.id}:task-await-poll`,
+                                className: "ml-4",
+                              })}
+                          </React.Fragment>
+                        );
+                      }
+
                       const workBundleOverride = workBundle
                         ? workBundleExpansionOverrides.get(workBundle.key)
                         : undefined;
@@ -1599,9 +1638,6 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       const renderWorkBundle = workBundle?.position === "head";
                       const renderMessageBeforeWorkBundle = renderWorkBundle && msg.type === "user";
                       const renderMessageAfterWorkBundle = !renderWorkBundle;
-                      const operationalBundle = workBundle
-                        ? undefined
-                        : operationalBundleInfos?.[index];
                       const operationalBundleOverride = operationalBundle
                         ? operationalBundleExpansionOverrides.get(operationalBundle.key)
                         : undefined;

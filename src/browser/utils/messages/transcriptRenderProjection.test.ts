@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { DisplayedMessage } from "@/common/types/message";
 import {
   computeOperationalBundleInfos,
+  computeTaskAwaitPollGroupInfos,
   computeWorkBundleInfos,
   summarizeOperationalBundle,
 } from "./transcriptRenderProjection";
@@ -502,6 +503,116 @@ describe("work bundle coalescing", () => {
   });
 });
 
+describe("task_await poll grouping", () => {
+  test("leaves standalone waits visible and collapses consecutive polls", () => {
+    const first = tool({ id: "await-1", toolName: "task_await", status: "completed" });
+    const second = tool({ id: "await-2", toolName: "task_await", status: "executing" });
+
+    expect(computeTaskAwaitPollGroupInfos([first])[0]).toBeUndefined();
+
+    const infos = computeTaskAwaitPollGroupInfos([first, second]);
+    expect(infos[0]).toMatchObject({
+      position: "head",
+      state: "active",
+      defaultExpanded: false,
+      summary: {
+        title: "Checked task status 2 times",
+        activeTitle: "Waiting for tasks · 2 checks",
+        details: "",
+      },
+    });
+    expect(infos[1]).toMatchObject({ position: "member", defaultExpanded: false });
+  });
+
+  test("expands poll groups with terminal failures", () => {
+    const infos = computeTaskAwaitPollGroupInfos([
+      tool({
+        id: "await-running",
+        toolName: "task_await",
+        result: { results: [{ status: "running", taskId: "task-1" }] },
+      }),
+      tool({
+        id: "await-failed",
+        toolName: "task_await",
+        result: { results: [{ status: "error", taskId: "task-1", error: "failed" }] },
+      }),
+    ]);
+
+    expect(infos[0]).toMatchObject({
+      defaultExpanded: true,
+      summary: {
+        title: "Task wait needs attention",
+        activeTitle: "Task wait needs attention",
+        details: "2 checks",
+        tone: "danger",
+      },
+    });
+  });
+
+  test("expands groups with call-level task_await failures", () => {
+    const infos = computeTaskAwaitPollGroupInfos([
+      tool({
+        id: "await-running",
+        toolName: "task_await",
+        result: { results: [{ status: "running", taskId: "task-1" }] },
+      }),
+      tool({
+        id: "await-call-failed",
+        toolName: "task_await",
+        status: "failed",
+        result: { success: false, error: "service unavailable" },
+      }),
+    ]);
+
+    expect(infos[0]).toMatchObject({
+      defaultExpanded: true,
+      summary: { title: "Task wait needs attention", tone: "danger" },
+    });
+  });
+
+  test("expands groups with call-level interruptions", () => {
+    const infos = computeTaskAwaitPollGroupInfos([
+      tool({ id: "await-running", toolName: "task_await" }),
+      tool({
+        id: "await-interrupted",
+        toolName: "task_await",
+        status: "interrupted",
+      }),
+    ]);
+
+    expect(infos[0]).toMatchObject({
+      defaultExpanded: true,
+      summary: { title: "Task wait interrupted", tone: "interrupted" },
+    });
+  });
+
+  test("classifies interrupted error rows as cancelled waits", () => {
+    const infos = computeTaskAwaitPollGroupInfos([
+      tool({ id: "await-running", toolName: "task_await" }),
+      tool({
+        id: "await-aborted",
+        toolName: "task_await",
+        result: { results: [{ status: "error", taskId: "task-1", error: "Interrupted" }] },
+      }),
+    ]);
+
+    expect(infos[0]).toMatchObject({
+      defaultExpanded: true,
+      summary: { title: "Task wait interrupted", tone: "interrupted" },
+    });
+  });
+
+  test("conversation rows break poll groups", () => {
+    const infos = computeTaskAwaitPollGroupInfos([
+      tool({ id: "await-1", toolName: "task_await" }),
+      assistant("a1"),
+      tool({ id: "await-2", toolName: "task_await" }),
+    ]);
+
+    expect(infos.every((info) => info === undefined)).toBe(true);
+  });
+});
+
 describe("operational bundle coalescing", () => {
   test("groups consecutive reasoning and tool calls without mutating messages", () => {
     const first = reasoning({ id: "think-1" });
@@ -689,6 +800,36 @@ describe("operational bundle coalescing", () => {
     });
   });
 
+  test("keeps task_await operational bundles quiet unless they need attention", () => {
+    const active = computeOperationalBundleInfos(
+      [
+        tool({
+          id: "await-active",
+          toolName: "task_await",
+          status: "executing",
+          result: { results: [{ status: "running", taskId: "task-1" }] },
+        }),
+      ],
+      { isTurnActive: true }
+    );
+    expect(active[0]).toMatchObject({ defaultExpanded: false });
+
+    const failed = computeOperationalBundleInfos(
+      [
+        tool({
+          id: "await-failed",
+          toolName: "task_await",
+          result: { results: [{ status: "not_found", taskId: "task-1" }] },
+        }),
+      ],
+      { isTurnActive: false }
+    );
+    expect(failed[0]).toMatchObject({
+      defaultExpanded: true,
+      summary: { title: "Task wait needs attention", tone: "danger" },
+    });
+  });
+
   test("bundle key stays stable while an active bundle grows", () => {
     const one = computeOperationalBundleInfos([tool({ id: "read-1", status: "executing" })], {
       isTurnActive: true,
@@ -705,6 +846,20 @@ describe("operational bundle coalescing", () => {
 });
 
 describe("operational bundle summary", () => {
+  test("uses task-specific copy for repeated task_await polls", () => {
+    const summary = summarizeOperationalBundle([
+      tool({ id: "await-1", toolName: "task_await" }),
+      tool({ id: "await-2", toolName: "task_await" }),
+      tool({ id: "await-3", toolName: "task_await" }),
+    ]);
+
+    expect(summary).toEqual({
+      title: "Checked task status 3 times",
+      activeTitle: "Waiting for tasks · 3 checks",
+      details: "",
+    });
+  });
+
   test("summarizes mixed tools and reasoning", () => {
     const summary = summarizeOperationalBundle([
       reasoning({ id: "think-1" }),

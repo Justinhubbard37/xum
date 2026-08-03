@@ -1,5 +1,5 @@
 import React, { useRef, useState } from "react";
-import { Info } from "lucide-react";
+import { CircleAlert, CircleCheck, Clock3, Info, LoaderCircle } from "lucide-react";
 import {
   ToolContainer,
   ToolHeader,
@@ -9,6 +9,7 @@ import {
   ToolDetails,
   LoadingDots,
   ErrorBox,
+  ToolIcon,
 } from "./Shared/ToolPrimitives";
 import {
   useToolExpansion,
@@ -41,6 +42,7 @@ import type {
   TaskListToolSuccessResult,
   TaskTerminateToolArgs,
   TaskTerminateToolSuccessResult,
+  ToolErrorResult,
 } from "@/common/types/tools";
 import type { TaskReportLinking } from "@/browser/utils/messages/taskReportLinking";
 import { formatGitPatchArtifactSummary } from "./taskPatchSummary";
@@ -292,6 +294,7 @@ interface TaskRowProps {
   startedAtMs?: number;
   openWorkspaceId?: string;
   className?: string;
+  variant?: "default" | "await";
 }
 
 function isTaskRowElapsedActive(status: string): boolean {
@@ -324,28 +327,68 @@ const TaskRowElapsed: React.FC<{ startedAtMs: number | undefined; status: string
   return null;
 };
 
-const TaskRow: React.FC<TaskRowProps> = (props) => (
-  <div
-    className={cn("bg-code-bg flex flex-wrap items-center gap-2 rounded-sm p-2", props.className)}
-  >
-    <TaskId id={props.taskId} openWorkspaceId={props.openWorkspaceId} />
-    <TaskStatusBadge status={props.status} />
-    {props.agentType && (
-      <AgentTypeBadge
-        type={props.agentType}
-        taskId={props.taskId}
-        openWorkspaceId={props.openWorkspaceId}
-      />
-    )}
-    {props.title && (
-      <span className="text-foreground max-w-[200px] truncate text-[11px]">{props.title}</span>
-    )}
-    {typeof props.depth === "number" && props.depth > 0 && (
-      <span className="text-muted text-[10px]">depth: {props.depth}</span>
-    )}
-    <TaskRowElapsed startedAtMs={props.startedAtMs} status={props.status} />
-  </div>
-);
+const TaskRow: React.FC<TaskRowProps> = (props) => {
+  if (props.variant === "await") {
+    return (
+      <div
+        className={cn(
+          "border-border-light/60 bg-surface-primary/40 grid grid-cols-[minmax(0,1fr)_auto] items-start gap-2 rounded-md border px-2.5 py-2",
+          props.className
+        )}
+      >
+        <div className="min-w-0">
+          {props.title ? (
+            <div className="text-foreground truncate text-[11px] font-medium">{props.title}</div>
+          ) : (
+            <TaskId
+              id={props.taskId}
+              openWorkspaceId={props.openWorkspaceId}
+              className="text-secondary opacity-100"
+            />
+          )}
+          <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5">
+            {props.title && <TaskId id={props.taskId} openWorkspaceId={props.openWorkspaceId} />}
+            {props.agentType && (
+              <AgentTypeBadge
+                type={props.agentType}
+                taskId={props.taskId}
+                openWorkspaceId={props.openWorkspaceId}
+              />
+            )}
+            {typeof props.depth === "number" && props.depth > 0 && (
+              <span className="text-muted text-[10px]">depth {props.depth}</span>
+            )}
+            <TaskRowElapsed startedAtMs={props.startedAtMs} status={props.status} />
+          </div>
+        </div>
+        <TaskStatusBadge status={props.status} />
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className={cn("bg-code-bg flex flex-wrap items-center gap-2 rounded-sm p-2", props.className)}
+    >
+      <TaskId id={props.taskId} openWorkspaceId={props.openWorkspaceId} />
+      <TaskStatusBadge status={props.status} />
+      {props.agentType && (
+        <AgentTypeBadge
+          type={props.agentType}
+          taskId={props.taskId}
+          openWorkspaceId={props.openWorkspaceId}
+        />
+      )}
+      {props.title && (
+        <span className="text-foreground max-w-[200px] truncate text-[11px]">{props.title}</span>
+      )}
+      {typeof props.depth === "number" && props.depth > 0 && (
+        <span className="text-muted text-[10px]">depth: {props.depth}</span>
+      )}
+      <TaskRowElapsed startedAtMs={props.startedAtMs} status={props.status} />
+    </div>
+  );
+};
 
 const MAX_TASK_DEPTH_TRAVERSAL = 50;
 
@@ -1108,9 +1151,18 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
 // TASK AWAIT TOOL CALL
 // ═══════════════════════════════════════════════════════════════════════════════
 
+function isInterruptedTaskAwaitResult(
+  result: TaskAwaitToolSuccessResult["results"][number]
+): boolean {
+  return (
+    result.status === "interrupted" ||
+    (result.status === "error" && result.error.trim().toLowerCase() === "interrupted")
+  );
+}
+
 interface TaskAwaitToolCallProps {
   args: TaskAwaitToolArgs;
-  result?: TaskAwaitToolSuccessResult;
+  result?: TaskAwaitToolSuccessResult | ToolErrorResult;
   status?: ToolStatus;
   startedAt?: number;
   taskReportLinking?: TaskReportLinking;
@@ -1125,7 +1177,8 @@ export const TaskAwaitToolCall: React.FC<TaskAwaitToolCallProps> = ({
 }) => {
   const taskIds = args.task_ids;
   const timeoutSecs = args.timeout_secs;
-  const results = result?.results ?? [];
+  const callError = isToolErrorResult(result) ? result.error : undefined;
+  const results = result && "results" in result ? result.results : [];
 
   const suppressReportInAwaitTaskIds = taskReportLinking?.suppressReportInAwaitTaskIds;
 
@@ -1136,8 +1189,11 @@ export const TaskAwaitToolCall: React.FC<TaskAwaitToolCallProps> = ({
   const completedCount = results.filter((r) => r.status === "completed").length;
   const totalCount = results.length;
   const failedCount = results.filter(
-    (r) => r.status === "error" || r.status === "invalid_scope" || r.status === "not_found"
+    (r) =>
+      !isInterruptedTaskAwaitResult(r) &&
+      (r.status === "error" || r.status === "invalid_scope" || r.status === "not_found")
   ).length;
+  const interruptedCount = results.filter(isInterruptedTaskAwaitResult).length;
 
   const workspaceContext = useOptionalWorkspaceContext();
   const workspaceMetadata = workspaceContext?.workspaceMetadata;
@@ -1193,59 +1249,144 @@ export const TaskAwaitToolCall: React.FC<TaskAwaitToolCallProps> = ({
     }
   }
 
-  // Keep task_await collapsed by default (following the sticky tools preference), but
-  // auto-expand when failures are present so they aren't hidden behind a "completed"
-  // badge. failedCount is usually 0 at mount and only rises once awaited results land,
-  // so pass it as a live forceExpanded signal (latched) rather than a one-time seed.
+  const pendingCount = totalCount - completedCount - failedCount - interruptedCount;
+  const targetCount = totalCount > 0 ? totalCount : taskIds?.length;
+  const formatTasks = (count: number) => `${count} ${count === 1 ? "task" : "tasks"}`;
+
+  let summaryTitle: string;
+  let summaryDetail: string | undefined;
+  let summaryTone: "active" | "danger" | "interrupted" | "success" | "waiting";
+  if (callError != null || status === "failed") {
+    summaryTitle = "Task wait failed";
+    summaryDetail = callError;
+    summaryTone = "danger";
+  } else if (failedCount > 0) {
+    summaryTitle = `${formatTasks(failedCount)} failed`;
+    summaryDetail = completedCount > 0 ? `${completedCount} completed` : undefined;
+    summaryTone = "danger";
+  } else if (status === "interrupted" && interruptedCount === 0) {
+    summaryTitle = "Task wait interrupted";
+    summaryTone = "interrupted";
+  } else if (interruptedCount > 0) {
+    summaryTitle = `${formatTasks(interruptedCount)} interrupted`;
+    summaryDetail = [
+      pendingCount > 0 ? `${formatTasks(pendingCount)} still active` : undefined,
+      completedCount > 0 ? `${completedCount} completed` : undefined,
+    ]
+      .filter((detail): detail is string => detail != null)
+      .join(" · ");
+    summaryDetail = summaryDetail.length > 0 ? summaryDetail : undefined;
+    summaryTone = "interrupted";
+  } else if (status === "executing") {
+    summaryTitle = targetCount
+      ? `Waiting for ${formatTasks(targetCount)}`
+      : "Waiting for background work";
+    summaryTone = "active";
+  } else if (pendingCount > 0) {
+    summaryTitle = `Still waiting for ${formatTasks(pendingCount)}`;
+    summaryDetail = completedCount > 0 ? `${completedCount} completed` : undefined;
+    summaryTone = "waiting";
+  } else if (completedCount > 0) {
+    summaryTitle = `${formatTasks(completedCount)} completed`;
+    summaryTone = "success";
+  } else {
+    summaryTitle = "Checked task status";
+    summaryTone = "waiting";
+  }
+
+  // task_await commonly appears several times during one turn. Give each poll a compact,
+  // semantic timeline row instead of repeating the full generic tool chrome, while keeping
+  // failures expanded so the actionable details are never hidden.
   const { expanded, toggleExpanded } = useStickyExpand("tools", false, {
-    forceExpanded: failedCount > 0,
+    forceExpanded: callError != null || status === "failed" || failedCount > 0,
   });
 
-  const effectiveStatus: ToolStatus = status === "completed" && failedCount > 0 ? "failed" : status;
+  const SummaryIcon =
+    summaryTone === "active"
+      ? LoaderCircle
+      : summaryTone === "danger"
+        ? CircleAlert
+        : summaryTone === "success"
+          ? CircleCheck
+          : summaryTone === "interrupted"
+            ? CircleAlert
+            : Clock3;
 
   return (
-    <ToolContainer expanded={expanded}>
-      <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
-        <TaskIcon toolName="task_await" />
-        <ToolName>task_await</ToolName>
+    <ToolContainer
+      expanded={expanded}
+      data-component="TaskAwaitToolCall"
+      className={cn("my-1 bg-transparent px-2 py-1.5", expanded && "bg-surface-secondary/40")}
+    >
+      <ToolHeader
+        onClick={toggleExpanded}
+        className="group min-h-5 gap-2"
+        aria-label={`${summaryTitle}. Show task wait details`}
+      >
+        <ToolIcon
+          toolName="task_await"
+          className={cn(
+            "[&_svg]:size-3.5",
+            summaryTone === "active" && "text-task-mode",
+            summaryTone === "danger" && "text-danger",
+            summaryTone === "success" && "text-success",
+            summaryTone === "interrupted" && "text-interrupted",
+            summaryTone === "waiting" && "text-muted"
+          )}
+        />
+        <SummaryIcon
+          aria-hidden="true"
+          className={cn(
+            "size-3 shrink-0",
+            summaryTone === "active" && "text-task-mode animate-spin",
+            summaryTone === "danger" && "text-danger",
+            summaryTone === "success" && "text-success",
+            summaryTone === "interrupted" && "text-interrupted",
+            summaryTone === "waiting" && "text-muted"
+          )}
+        />
+        <span className="counter-nums min-w-0 flex-1 truncate text-[12px] leading-5">
+          <span
+            className={cn(
+              summaryTone === "active" ? "text-foreground" : "text-secondary",
+              summaryTone === "danger" && "text-danger",
+              summaryTone === "interrupted" && "text-interrupted"
+            )}
+          >
+            {summaryTitle}
+          </span>
+          {summaryDetail && <span className="text-muted"> · {summaryDetail}</span>}
+        </span>
         {status === "executing" && (
-          <span className="text-pending counter-nums ml-2 text-[10px] whitespace-nowrap [@container(max-width:500px)]:hidden">
-            <ElapsedTimeDisplay
-              startedAt={startedAt}
-              isActive={true}
-              separator=""
-              prefix="elapsed "
-            />
+          <span className="text-muted counter-nums text-[10px] whitespace-nowrap [@container(max-width:350px)]:hidden">
+            <ElapsedTimeDisplay startedAt={startedAt} isActive={true} separator="" prefix="" />
           </span>
         )}
-        {totalCount > 0 && (
-          <span className="text-muted text-[10px]">
-            {completedCount}/{totalCount} completed
-          </span>
-        )}
-        {failedCount > 0 && <span className="text-danger text-[10px]">{failedCount} failed</span>}
-        <StatusIndicator status={effectiveStatus}>
-          {getStatusDisplay(effectiveStatus)}
-        </StatusIndicator>
+        <ExpandIcon expanded={expanded} className="text-muted group-hover:text-secondary shrink-0">
+          ▶
+        </ExpandIcon>
       </ToolHeader>
 
       {expanded && (
-        <ToolDetails>
-          <div className="task-surface mt-1 rounded-md p-3">
-            {/* Config info */}
+        <ToolDetails className="mt-1.5 border-t-0 pt-0">
+          <div
+            data-component="TaskAwaitDetails"
+            className="border-task-mode/20 bg-task-mode/5 overflow-hidden rounded-lg border"
+          >
             {showConfigInfo && (
-              <div className="task-divider text-muted mb-2 flex flex-wrap gap-2 border-b pb-2 text-[10px]">
-                {taskIds != null && <span>Waiting for: {taskIds.length} task(s)</span>}
-                {timeoutSecs != null && <span>Timeout: {timeoutSecs}s</span>}
-                {args.filter != null && <span>Filter: {args.filter}</span>}
-                {args.filter_exclude === true && <span>Exclude: true</span>}
+              <div className="border-task-mode/10 bg-surface-secondary/40 text-muted flex flex-wrap items-center gap-x-2 gap-y-1 border-b px-3 py-2 text-[10px]">
+                {taskIds != null && <span>{formatTasks(taskIds.length)}</span>}
+                {timeoutSecs != null && <span>· {timeoutSecs}s timeout</span>}
+                {args.filter != null && <span className="truncate">· filter {args.filter}</span>}
+                {args.filter_exclude === true && <span>· excluding matches</span>}
               </div>
             )}
 
+            {callError && <ErrorBox className="m-2">{callError}</ErrorBox>}
+
             {/* Results */}
             {results.length > 0 ? (
-              <div className="space-y-3">
+              <div className="space-y-1.5 p-2">
                 {results.map((r, idx) => {
                   const taskId = typeof r.taskId === "string" ? r.taskId : null;
 
@@ -1271,17 +1412,20 @@ export const TaskAwaitToolCall: React.FC<TaskAwaitToolCallProps> = ({
                 })}
               </div>
             ) : status === "executing" ? (
-              <div className="space-y-2">
-                {awaitedRows.map((row) => (
-                  <TaskRow key={row.taskId} {...row} />
-                ))}
-                <div className="text-muted text-[11px] italic">
-                  Waiting for tasks to complete
+              <>
+                <div className="space-y-1.5 p-2">
+                  {awaitedRows.map((row) => (
+                    <TaskRow key={row.taskId} {...row} variant="await" />
+                  ))}
+                </div>
+                <div className="border-task-mode/10 text-muted flex items-center gap-1.5 border-t px-3 py-2 text-[10px]">
+                  <LoaderCircle className="text-task-mode size-3 animate-spin" />
+                  Listening for task updates
                   <LoadingDots />
                 </div>
-              </div>
+              </>
             ) : (
-              <div className="text-muted text-[11px] italic">No tasks specified</div>
+              <div className="text-muted px-3 py-2 text-[11px] italic">No tasks specified</div>
             )}
           </div>
         </ToolDetails>
@@ -1319,33 +1463,47 @@ const TaskAwaitResult: React.FC<{
   const showDetails = !suppressReport;
 
   return (
-    <div className="bg-code-bg rounded-sm p-2">
-      <div className={cn("flex flex-wrap items-center gap-2", showDetails && "mb-1")}>
-        <TaskId id={result.taskId} openWorkspaceId={openWorkspaceId} />
+    <div className="border-border-light/60 bg-surface-primary/40 rounded-md border px-2.5 py-2">
+      <div className={cn("grid grid-cols-[minmax(0,1fr)_auto] gap-2", showDetails && "mb-1")}>
+        <div className="min-w-0">
+          {title ? (
+            <div className="text-foreground truncate text-[11px] font-medium">{title}</div>
+          ) : (
+            <TaskId
+              id={result.taskId}
+              openWorkspaceId={openWorkspaceId}
+              className="text-secondary opacity-100"
+            />
+          )}
+          <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5">
+            {title && <TaskId id={result.taskId} openWorkspaceId={openWorkspaceId} />}
+            {exitCode !== undefined && (
+              <span className="text-muted text-[10px]">exit {exitCode}</span>
+            )}
+            {elapsedMs !== undefined && (
+              <span className="text-muted counter-nums text-[10px]">
+                took {formatDuration(elapsedMs)}
+              </span>
+            )}
+            {note && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label="View notice"
+                    className="text-muted hover:text-secondary rounded p-0.5 transition-colors"
+                  >
+                    <Info size={12} />
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  <div className="max-w-xs break-words whitespace-pre-wrap">{note}</div>
+                </TooltipContent>
+              </Tooltip>
+            )}
+          </div>
+        </div>
         <TaskStatusBadge status={result.status} />
-        {title && <span className="text-foreground text-[11px] font-medium">{title}</span>}
-        {exitCode !== undefined && <span className="text-muted text-[10px]">exit {exitCode}</span>}
-        {elapsedMs !== undefined && (
-          <span className="text-muted counter-nums text-[10px]">
-            took {formatDuration(elapsedMs)}
-          </span>
-        )}
-        {note && (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                aria-label="View notice"
-                className="text-muted hover:text-secondary translate-y-[-1px] rounded p-0.5 transition-colors"
-              >
-                <Info size={12} />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent>
-              <div className="max-w-xs break-words whitespace-pre-wrap">{note}</div>
-            </TooltipContent>
-          </Tooltip>
-        )}
       </div>
 
       {showDetails && patchSummary && <div className="text-muted text-[10px]">{patchSummary}</div>}
