@@ -660,6 +660,78 @@ function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectC
   return next;
 }
 /**
+ * The built-in Chat with Mux workspace (removed in #3123) lived in a hidden
+ * `<muxHome>/system/Mux` project. The removal shipped no config migration, so
+ * upgraded installs kept the entry: invisible in the UI (system projects are
+ * filtered out) but still swept by config-driven background jobs like
+ * AgentStatusService, which sent its stale transcript to the LLM on every
+ * launch. Drop the leftovers on load. Older builds recreate the entry on
+ * downgrade; this cleanup re-runs on the next upgrade. The workspace's session
+ * data is preserved for downgrades: cleanupOrphanSessionDirs exempts the
+ * mux-chat id from orphan reaping.
+ */
+function removeLegacyMuxChatEntries(projects: Map<string, ProjectConfig>): boolean {
+  // Match by path shape (basename "Mux" under "system") rather than the
+  // current root dir so stale entries from other roots (e.g. a ~/.mux entry
+  // seen by a ~/.mux-dev build) are cleaned too.
+  const isSystemMuxPath = (candidate: string): boolean =>
+    path.basename(candidate) === "Mux" && path.basename(path.dirname(candidate)) === "system";
+
+  let modified = false;
+  for (const [projectPath, projectConfig] of projects) {
+    const projectIsSystemMux = isSystemMuxPath(projectPath);
+
+    const remaining = projectConfig.workspaces.filter((workspace) => {
+      if (workspace.id !== "mux-chat") {
+        return true;
+      }
+      // The subproject merge below may have already relocated the entry into
+      // an ancestor project (e.g. ~/.mux registered as a project) on an
+      // earlier load, stamping subProjectPath with the original system/Mux
+      // path. Match the entry in either location.
+      // typeof guard: config JSON is unvalidated at runtime, and a corrupted
+      // non-string subProjectPath would make path.basename throw, collapsing
+      // the whole config load to empty defaults.
+      const legacyProjectPath = projectIsSystemMux
+        ? projectPath
+        : typeof workspace.subProjectPath === "string" && isSystemMuxPath(workspace.subProjectPath)
+          ? workspace.subProjectPath
+          : null;
+      if (legacyProjectPath === null) {
+        return true;
+      }
+      // Keep unrelated workspaces whose generated id happens to be "mux-chat";
+      // only entries carrying the built-in workspace's markers are legacy.
+      const looksLikeLegacyMuxChat =
+        workspace.agentId === "mux" ||
+        workspace.path === legacyProjectPath ||
+        workspace.name === "chat-with-mux" ||
+        workspace.title === "Chat with Mux";
+      return !looksLikeLegacyMuxChat;
+    });
+
+    const removedEntries = remaining.length !== projectConfig.workspaces.length;
+    if (removedEntries) {
+      projectConfig.workspaces = remaining;
+      modified = true;
+    }
+
+    // Delete the system Mux project once empty. The already-empty +
+    // projectKind check covers the shell left behind when the subproject
+    // merge relocated its only workspace into a parent project.
+    if (
+      projectIsSystemMux &&
+      remaining.length === 0 &&
+      (removedEntries || projectConfig.projectKind === "system")
+    ) {
+      projects.delete(projectPath);
+      modified = true;
+    }
+  }
+  return modified;
+}
+
+/**
  * Config - Centralized configuration management
  *
  * Encapsulates all config paths and operations, making them dependency-injectable
@@ -888,6 +960,12 @@ export class Config {
             ];
           });
         const projectsMap = deriveProjectHierarchy(new Map<string, ProjectConfig>(normalizedPairs));
+
+        // Run before the subproject merge below so a hierarchy edge case
+        // cannot relocate a legacy workspace into a parent project first.
+        if (removeLegacyMuxChatEntries(projectsMap)) {
+          configModified = true;
+        }
 
         for (const [projectPath, projectConfig] of projectsMap) {
           const parentProjectPath = projectConfig.parentProjectPath;
