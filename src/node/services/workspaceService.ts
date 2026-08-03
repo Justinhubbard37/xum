@@ -245,6 +245,7 @@ import type {
   MonitorArmedPayload,
   MonitorMatchPayload,
   MonitorStoppedPayload,
+  OutputShownPayload,
 } from "@/node/services/backgroundProcessManager";
 import { BashMonitorRegistryStore } from "@/node/services/bashMonitorRegistryStore";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
@@ -632,11 +633,14 @@ const IDLE_ONLY_BUSY_SKIP_MESSAGE = "Workspace is busy; idle-only send was skipp
 const BASH_MONITOR_WAKE_QUEUE_KEY_PREFIX = "bash-monitor-wake:";
 const BASH_MONITOR_CANCELED_QUEUE_REASON =
   "Background bash monitor was explicitly canceled before its wake dispatched.";
+const BASH_MONITOR_SHOWN_QUEUE_REASON =
+  "Background bash monitor output was already shown before its wake dispatched.";
 
 interface QueuedBashMonitorWakeCancellation {
   abortController: AbortController;
   dispatchState: { canceledBeforeAcceptance: boolean };
-  canceledProcessKeys: Set<string>;
+  invalidatedProcessKeys: Set<string>;
+  matchedOutputByProcess: Map<string, { matchedThroughOffset: number; originNotAfterMs: number }>;
 }
 
 async function waitForAgentSessionIdle(session: AgentSession, signal?: AbortSignal): Promise<void> {
@@ -1736,6 +1740,31 @@ export class WorkspaceService extends EventEmitter {
     Map<string, QueuedBashMonitorWakeCancellation>
   >();
   private nextBashMonitorWakeQueueKey = 0;
+  private readonly bashOutputShownListener = (
+    workspaceId: string,
+    payload: OutputShownPayload
+  ): void => {
+    const processKey = this.bashMonitorProcessKey(workspaceId, payload.processId);
+    for (const [queueKey, cancellation] of this.queuedBashMonitorWakeKeysByProcess.get(
+      processKey
+    ) ?? []) {
+      // Process IDs are reusable across restarts. Match the existing delivery gate's createdAt
+      // generation bound so output from a newer process cannot supersede an older pending wake.
+      const matchedOutput = cancellation.matchedOutputByProcess.get(processKey);
+      if (
+        matchedOutput == null ||
+        payload.processStartTime > matchedOutput.originNotAfterMs ||
+        payload.shownThroughOffset < matchedOutput.matchedThroughOffset
+      ) {
+        continue;
+      }
+      cancellation.invalidatedProcessKeys.add(processKey);
+      cancellation.abortController.abort(BASH_MONITOR_SHOWN_QUEUE_REASON);
+      this.removeQueuedMessagesByDedupeKeyPrefix(workspaceId, queueKey, {
+        cancelReason: BASH_MONITOR_SHOWN_QUEUE_REASON,
+      });
+    }
+  };
   private readonly bashMonitorMatchListener = (
     _workspaceId: string,
     payload: MonitorMatchPayload
@@ -1794,7 +1823,7 @@ export class WorkspaceService extends EventEmitter {
       // between the monitor stopping and the persisted/queued cleanup below.
       this.canceledBashMonitorKeys.add(processKey);
       for (const [queueKey, cancellation] of trackedWakeCancellations ?? []) {
-        cancellation.canceledProcessKeys.add(processKey);
+        cancellation.invalidatedProcessKeys.add(processKey);
         cancellation.abortController.abort(BASH_MONITOR_CANCELED_QUEUE_REASON);
         this.removeQueuedMessagesByDedupeKeyPrefix(workspaceId, queueKey, {
           cancelReason: BASH_MONITOR_CANCELED_QUEUE_REASON,
@@ -1953,6 +1982,7 @@ export class WorkspaceService extends EventEmitter {
     this.bashMonitorWakeStore = new BashMonitorWakeStore(config);
     this.bashMonitorRegistryStore = new BashMonitorRegistryStore(config);
     if (typeof this.backgroundProcessManager.on === "function") {
+      this.backgroundProcessManager.on("output:shown", this.bashOutputShownListener);
       this.backgroundProcessManager.on("monitor:match", this.bashMonitorMatchListener);
       this.backgroundProcessManager.on("monitor:armed", this.bashMonitorArmedListener);
       this.backgroundProcessManager.on("monitor:stopped", this.bashMonitorStoppedListener);
@@ -2092,10 +2122,24 @@ export class WorkspaceService extends EventEmitter {
     const cancellation: QueuedBashMonitorWakeCancellation = {
       abortController: new AbortController(),
       dispatchState: { canceledBeforeAcceptance: false },
-      canceledProcessKeys: new Set<string>(),
+      invalidatedProcessKeys: new Set<string>(),
+      matchedOutputByProcess: new Map(),
     };
     for (const record of records) {
       const processKey = this.bashMonitorProcessKey(ownerWorkspaceId, record.processId);
+      if (record.kind === "match" && record.matchedThroughOffset != null) {
+        const previous = cancellation.matchedOutputByProcess.get(processKey);
+        cancellation.matchedOutputByProcess.set(processKey, {
+          matchedThroughOffset: Math.max(
+            previous?.matchedThroughOffset ?? 0,
+            record.matchedThroughOffset
+          ),
+          originNotAfterMs: Math.min(
+            previous?.originNotAfterMs ?? Number.POSITIVE_INFINITY,
+            Date.parse(record.createdAt)
+          ),
+        });
+      }
       const queueKeys =
         this.queuedBashMonitorWakeKeysByProcess.get(processKey) ??
         new Map<string, QueuedBashMonitorWakeCancellation>();
@@ -2349,71 +2393,107 @@ export class WorkspaceService extends EventEmitter {
         this.bashMonitorWakeStore.markSupersededSnapshot(ownerWorkspaceId, record)
       );
 
-    // Delivery gate: re-check each match against the shown frontier immediately before sending it.
-    // If task_await is already reading that same process, defer only that record until the read
-    // settles; unrelated process wakes in this owner batch remain deliverable. Partial manager stubs
-    // without the non-blocking query retain the previous settled-frontier behavior.
-    const canQueryDeliveryState =
-      typeof this.backgroundProcessManager.getMonitorWakeDeliveryState === "function";
-    const canQueryShownFrontier =
-      typeof this.backgroundProcessManager.getSettledShownThroughOffset === "function";
-    const deliverable: BashMonitorWakeRecord[] = [];
-    const supersededByShown: BashMonitorWakeRecord[] = [];
-    for (const record of pending) {
-      let shownThroughOffset: number | undefined;
-      if (record.kind === "match" && record.matchedThroughOffset != null) {
-        if (canQueryDeliveryState) {
-          const state = await this.backgroundProcessManager.getMonitorWakeDeliveryState(
-            record.processId,
-            Date.parse(record.createdAt)
-          );
-          if (state?.status === "blocked") {
-            this.scheduleBashMonitorWakeDrainAfterRead(ownerWorkspaceId, state.readSettled);
-            continue;
-          }
-          shownThroughOffset = state?.shownThroughOffset;
-        } else if (canQueryShownFrontier) {
-          shownThroughOffset = await this.backgroundProcessManager.getSettledShownThroughOffset(
-            record.processId,
-            Date.parse(record.createdAt)
-          );
-        }
-        if (shownThroughOffset != null && shownThroughOffset >= record.matchedThroughOffset) {
-          supersededByShown.push(record);
-          continue;
-        }
-      }
-      deliverable.push(record);
-    }
-    if (supersededByShown.length > 0) {
-      await markSupersededSnapshots(supersededByShown);
-    }
-    // Cancellation can land while the shown-frontier checks above await I/O. Drop those records
-    // before constructing the prompt, while allowing unrelated process wakes in the batch through.
-    for (let index = deliverable.length - 1; index >= 0; index--) {
-      const record = deliverable[index];
-      if (
-        this.canceledBashMonitorKeys.has(
-          this.bashMonitorProcessKey(ownerWorkspaceId, record.processId)
-        )
-      ) {
-        deliverable.splice(index, 1);
-        await this.bashMonitorWakeStore.markSuperseded(ownerWorkspaceId, record.id);
-      }
-    }
-    if (deliverable.length === 0) return;
-
+    // Register every pending match before the first frontier query. If an earlier process becomes
+    // shown while a later query awaits, the existing cancellation object retains that fact.
     const { queueKey, cancellation } = this.registerQueuedBashMonitorWake(
       ownerWorkspaceId,
-      deliverable
+      pending
     );
     let queueKeyRegistered = true;
     const unregisterQueueKey = (): void => {
       if (!queueKeyRegistered) return;
       queueKeyRegistered = false;
-      this.unregisterQueuedBashMonitorWake(ownerWorkspaceId, deliverable, queueKey);
+      this.unregisterQueuedBashMonitorWake(ownerWorkspaceId, pending, queueKey);
     };
-    const prompt = buildBashMonitorWakePrompt(deliverable);
+
+    const deliverable: BashMonitorWakeRecord[] = [];
+    let prompt: string;
+    try {
+      // Delivery gate: re-check each match against the shown frontier immediately before sending it.
+      // If task_await is already reading that same process, defer only that record until the read
+      // settles; unrelated process wakes in this owner batch remain deliverable. Partial manager stubs
+      // without the non-blocking query retain the previous settled-frontier behavior.
+      const canQueryDeliveryState =
+        typeof this.backgroundProcessManager.getMonitorWakeDeliveryState === "function";
+      const canQueryShownFrontier =
+        typeof this.backgroundProcessManager.getSettledShownThroughOffset === "function";
+      const supersededByShown: BashMonitorWakeRecord[] = [];
+      for (const record of pending) {
+        let shownThroughOffset: number | undefined;
+        if (record.kind === "match" && record.matchedThroughOffset != null) {
+          if (canQueryDeliveryState) {
+            const state = await this.backgroundProcessManager.getMonitorWakeDeliveryState(
+              record.processId,
+              Date.parse(record.createdAt)
+            );
+            if (state?.status === "blocked") {
+              this.scheduleBashMonitorWakeDrainAfterRead(ownerWorkspaceId, state.readSettled);
+              continue;
+            }
+            shownThroughOffset = state?.shownThroughOffset;
+          } else if (canQueryShownFrontier) {
+            shownThroughOffset = await this.backgroundProcessManager.getSettledShownThroughOffset(
+              record.processId,
+              Date.parse(record.createdAt)
+            );
+          }
+          if (shownThroughOffset != null && shownThroughOffset >= record.matchedThroughOffset) {
+            supersededByShown.push(record);
+            continue;
+          }
+        }
+        deliverable.push(record);
+      }
+      const supersededBeforeSend = new Map(
+        supersededByShown.map((record) => [record.id, record] as const)
+      );
+      if (supersededBeforeSend.size > 0) {
+        await markSupersededSnapshots([...supersededBeforeSend.values()]);
+      }
+      if (cancellation.abortController.signal.aborted) {
+        // Stop accepting new invalidations, then include every event retained while the gate awaited.
+        unregisterQueueKey();
+        const newlyInvalidated = pending.filter(
+          (record) =>
+            !supersededBeforeSend.has(record.id) &&
+            cancellation.invalidatedProcessKeys.has(
+              this.bashMonitorProcessKey(ownerWorkspaceId, record.processId)
+            )
+        );
+        for (const record of newlyInvalidated) {
+          supersededBeforeSend.set(record.id, record);
+        }
+        if (newlyInvalidated.length > 0) {
+          await markSupersededSnapshots(newlyInvalidated);
+        }
+        if (supersededBeforeSend.size < pending.length) {
+          this.scheduleBashMonitorWakeDrain(ownerWorkspaceId);
+        }
+        return;
+      }
+      // Cancellation can land while the shown-frontier checks above await I/O. Drop those records
+      // before constructing the prompt, while allowing unrelated process wakes in the batch through.
+      for (let index = deliverable.length - 1; index >= 0; index--) {
+        const record = deliverable[index];
+        if (
+          this.canceledBashMonitorKeys.has(
+            this.bashMonitorProcessKey(ownerWorkspaceId, record.processId)
+          )
+        ) {
+          deliverable.splice(index, 1);
+          await this.bashMonitorWakeStore.markSuperseded(ownerWorkspaceId, record.id);
+        }
+      }
+      if (deliverable.length === 0) {
+        unregisterQueueKey();
+        return;
+      }
+
+      prompt = buildBashMonitorWakePrompt(deliverable);
+    } catch (error) {
+      unregisterQueueKey();
+      throw error;
+    }
     const retryAfterIdleIfBusy = (reason: string): void => {
       if (
         this.isBusyForMessage(ownerWorkspaceId) ||
@@ -2502,14 +2582,16 @@ export class WorkspaceService extends EventEmitter {
           cancellationCallbackHandled = true;
           unregisterQueueKey();
           if (delivered) return;
-          const canceledRecords =
-            reason === BASH_MONITOR_CANCELED_QUEUE_REASON
-              ? deliverable.filter((record) =>
-                  cancellation.canceledProcessKeys.has(
-                    this.bashMonitorProcessKey(ownerWorkspaceId, record.processId)
-                  )
+          const wakeInvalidated =
+            reason === BASH_MONITOR_CANCELED_QUEUE_REASON ||
+            reason === BASH_MONITOR_SHOWN_QUEUE_REASON;
+          const canceledRecords = wakeInvalidated
+            ? deliverable.filter((record) =>
+                cancellation.invalidatedProcessKeys.has(
+                  this.bashMonitorProcessKey(ownerWorkspaceId, record.processId)
                 )
-              : deliverable;
+              )
+            : deliverable;
           const cancelingKeys = canceledRecords.map((record) =>
             this.bashMonitorWakeKey(ownerWorkspaceId, record.id)
           );
@@ -2542,9 +2624,11 @@ export class WorkspaceService extends EventEmitter {
     if (!accepted && cancellation.abortController.signal.aborted) {
       // Cancellation may have raced the async preparation inside sendMessage and attempted queue
       // removal before the entry existed. Retry after sendMessage returns from the enqueue path.
-      this.removeQueuedMessagesByDedupeKeyPrefix(ownerWorkspaceId, queueKey, {
-        cancelReason: BASH_MONITOR_CANCELED_QUEUE_REASON,
-      });
+      const cancelReason =
+        typeof cancellation.abortController.signal.reason === "string"
+          ? cancellation.abortController.signal.reason
+          : BASH_MONITOR_CANCELED_QUEUE_REASON;
+      this.removeQueuedMessagesByDedupeKeyPrefix(ownerWorkspaceId, queueKey, { cancelReason });
     }
 
     if (!sendResult.success) {

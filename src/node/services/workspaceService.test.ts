@@ -602,6 +602,258 @@ describe("WorkspaceService bash monitor wakes", () => {
     }
   });
 
+  test("retracts a queued monitor wake once a later unfiltered read shows its match", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-shown-after-queue";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const seedWakeStore = new BashMonitorWakeStore(config);
+      const shownRecord = await seedWakeStore.enqueueOrMergePending({
+        processId: "proc-shown",
+        taskId: "bash:proc-shown",
+        workspaceId,
+        filter: "FAILED",
+        filterExclude: false,
+        lines: ["FAILED shown"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+        matchedThroughOffset: 100,
+      });
+      await seedWakeStore.enqueueOrMergePending({
+        processId: "proc-unshown",
+        taskId: "bash:proc-unshown",
+        workspaceId,
+        filter: "FAILED",
+        filterExclude: false,
+        lines: ["FAILED unshown"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+        matchedThroughOffset: 200,
+      });
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+        getForegroundToolCallIds: mock(() => []),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => true) }),
+      });
+      let queueHasPendingMonitorWake = false;
+      spyOn(workspaceService, "isBusyForMessage").mockReturnValue(true);
+      spyOn(workspaceService, "hasPendingQueuedOrPreparingTurn").mockImplementation(
+        () => queueHasPendingMonitorWake
+      );
+      spyOn(workspaceService, "waitForIdleAndNoQueuedMessages").mockImplementation(
+        () => new Promise(() => undefined)
+      );
+      type SendInternal = NonNullable<Parameters<WorkspaceService["sendMessage"]>[3]>;
+      let onCanceled: SendInternal["onCanceled"] | undefined;
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockImplementation(
+        (...args: Parameters<WorkspaceService["sendMessage"]>) => {
+          onCanceled = args[3]?.onCanceled;
+          queueHasPendingMonitorWake = true;
+          return Promise.resolve(Ok(undefined));
+        }
+      );
+      const removeQueuedSpy = spyOn(
+        workspaceService,
+        "removeQueuedMessagesByDedupeKeyPrefix"
+      ).mockImplementation((_ownerWorkspaceId, _prefix, options) => {
+        queueHasPendingMonitorWake = false;
+        void onCanceled?.(options?.cancelReason ?? "canceled");
+        return Ok(1);
+      });
+
+      await waitForCondition(() => sendSpy.mock.calls.length === 1);
+      expect(sendSpy.mock.calls[0][1]).toContain("FAILED shown");
+      expect(sendSpy.mock.calls[0][1]).toContain("FAILED unshown");
+
+      (backgroundProcessManager as EventEmitter).emit("output:shown", workspaceId, {
+        processId: "proc-shown",
+        processStartTime: Date.parse(shownRecord.createdAt) + 1,
+        shownThroughOffset: 100,
+      });
+      expect(removeQueuedSpy).not.toHaveBeenCalled();
+
+      (backgroundProcessManager as EventEmitter).emit("output:shown", workspaceId, {
+        processId: "proc-shown",
+        processStartTime: Date.parse(shownRecord.createdAt),
+        shownThroughOffset: 99,
+      });
+      expect(removeQueuedSpy).not.toHaveBeenCalled();
+
+      (backgroundProcessManager as EventEmitter).emit("output:shown", workspaceId, {
+        processId: "proc-shown",
+        processStartTime: Date.parse(shownRecord.createdAt),
+        shownThroughOffset: 100,
+      });
+
+      await waitForCondition(() => removeQueuedSpy.mock.calls.length === 1);
+      await waitForCondition(() => sendSpy.mock.calls.length === 2);
+      expect(sendSpy.mock.calls[1][1]).not.toContain("FAILED shown");
+      expect(sendSpy.mock.calls[1][1]).toContain("FAILED unshown");
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("retains an earlier shown event while a later frontier query is pending", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    const releaseSecondCheck = createDeferred<void>();
+    try {
+      const workspaceId = "bash-monitor-shown-during-gate";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const wakeStore = new BashMonitorWakeStore(config);
+      const shownRecord = await wakeStore.enqueueOrMergePending({
+        processId: "a-shown",
+        taskId: "bash:a-shown",
+        workspaceId,
+        filter: "FAILED",
+        filterExclude: false,
+        lines: ["FAILED shown"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+        matchedThroughOffset: 100,
+      });
+      await wakeStore.enqueueOrMergePending({
+        processId: "b-unshown",
+        taskId: "bash:b-unshown",
+        workspaceId,
+        filter: "FAILED",
+        filterExclude: false,
+        lines: ["FAILED unshown"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+        matchedThroughOffset: 200,
+      });
+
+      const secondCheckStarted = createDeferred<void>();
+      let firstOutputShown = false;
+      const getDeliveryState = mock(async (processId: string) => {
+        if (processId === "a-shown") {
+          return { status: "settled" as const, shownThroughOffset: firstOutputShown ? 100 : 0 };
+        }
+        secondCheckStarted.resolve();
+        await releaseSecondCheck.promise;
+        return { status: "settled" as const, shownThroughOffset: 0 };
+      });
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+        getForegroundToolCallIds: mock(() => []),
+        getMonitorWakeDeliveryState: getDeliveryState,
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => true) }),
+      });
+      spyOn(workspaceService, "isBusyForMessage").mockReturnValue(true);
+      spyOn(workspaceService, "hasPendingQueuedOrPreparingTurn").mockReturnValue(false);
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockImplementation(
+        async (...args: Parameters<WorkspaceService["sendMessage"]>) => {
+          await args[3]?.onAccepted?.();
+          return Ok(undefined);
+        }
+      );
+
+      await secondCheckStarted.promise;
+      firstOutputShown = true;
+      backgroundProcessManager.emit("output:shown", workspaceId, {
+        processId: "a-shown",
+        processStartTime: Date.parse(shownRecord.createdAt),
+        shownThroughOffset: 100,
+      });
+      releaseSecondCheck.resolve();
+
+      await waitForCondition(() => sendSpy.mock.calls.length === 1);
+      expect(sendSpy.mock.calls[0][1]).not.toContain("FAILED shown");
+      expect(sendSpy.mock.calls[0][1]).toContain("FAILED unshown");
+      expect(getDeliveryState.mock.calls.slice(0, 2).map(([processId]) => processId)).toEqual([
+        "a-shown",
+        "b-unshown",
+      ]);
+    } finally {
+      releaseSecondCheck.resolve();
+      await cleanup();
+    }
+  });
+
+  test("unregisters pending wakes when a delivery-state query fails", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-delivery-gate-failure";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const wakeStore = new BashMonitorWakeStore(config);
+      await wakeStore.enqueueOrMergePending({
+        processId: "proc-failed-gate",
+        taskId: "bash:proc-failed-gate",
+        workspaceId,
+        filter: "FAILED",
+        filterExclude: false,
+        lines: ["FAILED gate"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+        matchedThroughOffset: 100,
+      });
+
+      const getDeliveryState = mock(() => Promise.reject(new Error("delivery gate failed")));
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+        getForegroundToolCallIds: mock(() => []),
+        getMonitorWakeDeliveryState: getDeliveryState,
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => true) }),
+      });
+      spyOn(workspaceService, "isBusyForMessage").mockReturnValue(true);
+      spyOn(workspaceService, "hasPendingQueuedOrPreparingTurn").mockReturnValue(false);
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockResolvedValue(Ok(undefined));
+
+      await waitForCondition(() => getDeliveryState.mock.calls.length === 1);
+      await drainPendingDispatches();
+      backgroundProcessManager.emit("monitor:stopped", workspaceId, {
+        processId: "proc-failed-gate",
+        reason: "canceled",
+      });
+
+      await waitForCondition(async () => (await wakeStore.listPending(workspaceId)).length === 0);
+      expect(sendSpy).not.toHaveBeenCalled();
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("converts stale armed-monitor registry records into monitor-lost wakes at startup", async () => {
     const { config, cleanup } = await createTestHistoryService();
     try {
