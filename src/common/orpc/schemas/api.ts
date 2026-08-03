@@ -135,25 +135,16 @@ import { TaskSettingsSchema } from "../../config/schemas/taskSettings";
 import { ThinkingLevelSchema } from "../../types/thinking";
 
 // Experiments
-export const ExperimentValueSchema = z.object({
-  value: z.union([z.string(), z.boolean(), z.null()]),
-  source: z.enum(["posthog", "cache", "override", "disabled"]),
-});
-
 export const experiments = {
-  getAll: {
+  getOverrides: {
     input: z.void(),
-    output: z.record(z.string(), ExperimentValueSchema),
+    output: z.partialRecord(z.enum(EXPERIMENT_IDS), z.boolean()),
   },
   setOverride: {
     input: z.object({
       experimentId: z.enum(EXPERIMENT_IDS),
       enabled: z.boolean().nullish(),
     }),
-    output: z.void(),
-  },
-  reload: {
-    input: z.void(),
     output: z.void(),
   },
 };
