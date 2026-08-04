@@ -145,3 +145,7 @@ export function parseSubagentReportEnvelope(content: string): SubagentReportEnve
   if (!root) return null;
   return parseJsonEnvelope(root[1]) ?? parseLegacyEnvelope(root[1]);
 }
+
+export function isCompletedSubagentReportEnvelope(content: string): boolean {
+  return parseSubagentReportEnvelope(content)?.status === "completed";
+}

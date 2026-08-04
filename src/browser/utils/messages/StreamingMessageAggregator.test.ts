@@ -1,7 +1,9 @@
 import { describe, test, expect } from "bun:test";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { createMuxMessage, type DisplayedMessage } from "@/common/types/message";
+import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { buildWorkflowRunCardMessage } from "@/common/utils/workflowRunMessages";
+import { getInterruptionContext } from "@/common/utils/messages/retryEligibility";
 import { shouldNotifyOnResponseComplete } from "./responseCompletionMetadata";
 import { MAX_HISTORY_HIDDEN_SEGMENTS } from "./transcriptTruncationPlan";
 import { StreamingMessageAggregator } from "./StreamingMessageAggregator";
@@ -504,6 +506,86 @@ describe("StreamingMessageAggregator", () => {
       expect(userMessages[0]?.isSynthetic).toBe(true);
       expect(userMessages[1]?.content).toBe("hello");
       expect(userMessages[1]?.isSynthetic).toBeUndefined();
+    });
+
+    test("does not start a parent response for a visible completed subagent report", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.loadHistoricalMessages(
+        [
+          createMuxMessage("assistant-1", "assistant", "I incorporated the progress update.", {
+            timestamp: 1,
+            historySequence: 1,
+          }),
+        ],
+        false
+      );
+
+      aggregator.handleMessage({
+        ...createMuxMessage(
+          "report-1",
+          "user",
+          formatSubagentReportEnvelope({
+            taskId: "task-1",
+            agentType: "explore",
+            status: "completed",
+            title: "Investigation complete",
+            reportMarkdown: "The child finished successfully.",
+          }),
+          {
+            timestamp: 2,
+            historySequence: 2,
+            synthetic: true,
+            uiVisible: true,
+          }
+        ),
+        type: "message",
+      });
+
+      expect(aggregator.getPendingStreamStartTime()).toBeNull();
+      const displayedMessages = aggregator.getDisplayedMessages();
+      expect(displayedMessages.at(-1)).toMatchObject({
+        type: "user",
+        id: "report-1",
+        isSynthetic: true,
+        isUiVisible: true,
+      });
+      expect(getInterruptionContext(displayedMessages).hasInterruptedStream).toBe(false);
+    });
+
+    test("keeps hidden completed subagent reports in the retry lifecycle", () => {
+      withDebugLlmRequestEnabled(() => {
+        const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+        aggregator.loadHistoricalMessages(
+          [
+            createMuxMessage(
+              "report-1",
+              "user",
+              formatSubagentReportEnvelope({
+                taskId: "task-1",
+                agentType: "explore",
+                status: "completed",
+                title: "Investigation complete",
+                reportMarkdown: "The child finished successfully.",
+              }),
+              {
+                timestamp: 1,
+                historySequence: 1,
+                synthetic: true,
+              }
+            ),
+          ],
+          false
+        );
+
+        const displayedMessages = aggregator.getDisplayedMessages();
+        expect(displayedMessages.at(-1)).toMatchObject({
+          type: "user",
+          id: "report-1",
+          isSynthetic: true,
+          isUiVisible: undefined,
+        });
+        expect(getInterruptionContext(displayedMessages).hasInterruptedStream).toBe(true);
+      });
     });
 
     test("renders persisted workflow slash invocation before workflow card", () => {
