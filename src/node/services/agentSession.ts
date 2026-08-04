@@ -3038,6 +3038,17 @@ export class AgentSession {
       return Err(createUnknownSendMessageError(getErrorMessage(error)));
     }
 
+    let acceptedPreStreamFailureNotified = false;
+    const notifyAcceptedPreStreamFailure = async (error: SendMessageError): Promise<void> => {
+      if (acceptedPreStreamFailureNotified) {
+        return;
+      }
+      await internal?.onAcceptedPreStreamFailure?.(error);
+      // Only suppress duplicate notifications after cleanup succeeds. A transient callback failure
+      // must remain retryable from the surrounding catch path so durable reservations do not stick.
+      acceptedPreStreamFailureNotified = true;
+    };
+
     const preparedTurnAbortController = new AbortController();
     this.activePreparedTurnAbortController = preparedTurnAbortController;
     this.setTurnPhase(TurnPhase.PREPARING);
@@ -3045,6 +3056,9 @@ export class AgentSession {
     const startPreparedStream = async (): Promise<Result<void, SendMessageError>> => {
       try {
         if (preparedTurnAbortController.signal.aborted) {
+          await notifyAcceptedPreStreamFailure(
+            createUnknownSendMessageError("Accepted stream startup was canceled before it began.")
+          );
           return Ok(undefined);
         }
         // If this is a compaction request, terminate background processes first.
@@ -3063,11 +3077,14 @@ export class AgentSession {
         // This provides crash safety - the follow-up survives app restarts.
 
         if (this.disposed || preparedTurnAbortController.signal.aborted) {
+          await notifyAcceptedPreStreamFailure(
+            createUnknownSendMessageError("Accepted stream startup was canceled before streaming.")
+          );
           return Ok(undefined);
         }
 
         // Turn-phase transitions for success are driven by stream events.
-        return await this.streamWithHistory(
+        const streamResult = await this.streamWithHistory(
           modelForStream,
           optionsForStream,
           undefined,
@@ -3078,6 +3095,14 @@ export class AgentSession {
           turnThinkingOverride,
           internal?.monitorHistoryLockState?.held === true
         );
+        if (streamResult.success && preparedTurnAbortController.signal.aborted) {
+          await notifyAcceptedPreStreamFailure(
+            createUnknownSendMessageError(
+              "Accepted stream startup was canceled during preparation."
+            )
+          );
+        }
+        return streamResult;
       } finally {
         // Success should advance via stream events; if startup never emitted any, don't leave the
         // session stuck in PREPARING. Guard by controller identity so an aborted startup cannot
@@ -3096,19 +3121,36 @@ export class AgentSession {
       // goal continuations should unblock once the user message exists: for
       // Resume, that makes chat history the durable source of truth for the
       // running goal before runtime warmup or streaming can race/fail.
+      const drainQueuedMessagesAfterFailedStartup = (): void => {
+        if (this.turnPhase === TurnPhase.IDLE && !this.messageQueue.isEmpty()) {
+          this.sendQueuedMessages();
+        }
+      };
       startPreparedStream()
         .then(async (result) => {
           if (!result.success) {
-            await internal?.onAcceptedPreStreamFailure?.(result.error);
+            await notifyAcceptedPreStreamFailure(result.error);
           }
+          drainQueuedMessagesAfterFailedStartup();
         })
-        .catch((error: unknown) => {
+        .catch(async (error: unknown) => {
           log.error("Accepted background stream failed before startup completed", {
             workspaceId: this.workspaceId,
             editMessageId,
             goalKind,
             error: getErrorMessage(error),
           });
+          try {
+            await notifyAcceptedPreStreamFailure(
+              createUnknownSendMessageError(getErrorMessage(error))
+            );
+          } catch (callbackError: unknown) {
+            log.error("Accepted background stream failure callback failed", {
+              workspaceId: this.workspaceId,
+              error: getErrorMessage(callbackError),
+            });
+          }
+          drainQueuedMessagesAfterFailedStartup();
         });
       return Ok(undefined);
     }

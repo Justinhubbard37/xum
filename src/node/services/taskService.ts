@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import * as fsPromises from "fs/promises";
 
@@ -418,7 +419,7 @@ type AgentReportFinalizationResult =
   | { finalized: true }
   | {
       finalized: false;
-      reason: "invalid_structured_output" | "terminal_interrupted";
+      reason: "invalid_structured_output" | "pending_guidance" | "terminal_interrupted";
       message: string;
     };
 
@@ -611,6 +612,19 @@ interface MaterializedTaskLaunch {
   inheritedProjects: WorkspaceMetadata["projects"];
   sourceRuntimeConfigUpdate?: RuntimeConfig;
 }
+
+export type TaskMessageQueueDispatchMode = "tool-end" | "turn-end";
+
+export interface SendAgentTaskMessageResult {
+  delivery: "accepted" | "queued";
+  queueDispatchMode?: TaskMessageQueueDispatchMode;
+}
+
+export type SendAgentTaskMessageError =
+  | { code: "not_found" }
+  | { code: "invalid_scope" }
+  | { code: "not_active"; taskStatus: AgentTaskStatus | "unknown"; message?: string }
+  | { code: "send_failed"; message: string };
 
 export interface TerminateAgentTaskResult {
   /** Task IDs terminated (includes descendants). */
@@ -2174,6 +2188,57 @@ export class TaskService {
           taskIndex
         )
       ) {
+        continue;
+      }
+
+      const pendingGuidance = task.taskPendingGuidance ?? [];
+      if (pendingGuidance.length > 0) {
+        // Pending corrections outrank generic restart recovery and must replay even when this task
+        // still has active descendants. Otherwise the descendant gate below can strand the durable
+        // reservation forever after the in-memory queue is lost on restart.
+        const pendingGuidanceIds = new Set(pendingGuidance.map((guidance) => guidance.id));
+        const model = task.taskModelString ?? defaultModel;
+        const agentId = resolveTaskAgentIdForResume(task);
+        const clearAcceptedPendingGuidance = async (): Promise<void> => {
+          await this.editWorkspaceEntry(
+            task.id!,
+            (workspace) => {
+              const remaining = (workspace.taskPendingGuidance ?? []).filter(
+                (guidance) => !pendingGuidanceIds.has(guidance.id)
+              );
+              workspace.taskPendingGuidance = remaining.length > 0 ? remaining : undefined;
+            },
+            { allowMissing: true }
+          );
+        };
+        const sendResult = await this.workspaceService.sendMessage(
+          task.id,
+          "Mux restarted before these parent guidance updates could run. Apply them in order and continue:\n\n" +
+            pendingGuidance
+              .map((guidance, index) => `${index + 1}. ${guidance.message}`)
+              .join("\n\n"),
+          {
+            model,
+            agentId,
+            thinkingLevel: task.taskThinkingLevel,
+            reasoningMode: coerceOpenAIReasoningMode(task.aiSettings?.reasoningMode),
+            experiments: task.taskExperiments,
+          },
+          {
+            synthetic: true,
+            agentInitiated: true,
+            onAccepted: clearAcceptedPendingGuidance,
+          }
+        );
+        if (!sendResult.success) {
+          failedRunningCount += 1;
+          log.error("Failed to replay pending task guidance on startup", {
+            taskId: task.id,
+            error: sendResult.error,
+          });
+          continue;
+        }
+        resumedRunningCount += 1;
         continue;
       }
 
@@ -4036,6 +4101,189 @@ export class TaskService {
       status: "running",
       modelString: taskModelString,
       thinkingLevel: effectiveThinkingLevel,
+    });
+  }
+
+  async sendMessageToDescendantAgentTask(
+    ancestorWorkspaceId: string,
+    taskId: string,
+    message: string,
+    queueDispatchMode: TaskMessageQueueDispatchMode
+  ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
+    assert(
+      ancestorWorkspaceId.length > 0,
+      "sendMessageToDescendantAgentTask: ancestorWorkspaceId must be non-empty"
+    );
+    assert(taskId.length > 0, "sendMessageToDescendantAgentTask: taskId must be non-empty");
+    const trimmedMessage = message.trim();
+    assert(
+      trimmedMessage.length > 0,
+      "sendMessageToDescendantAgentTask: message must be non-empty"
+    );
+
+    const queuedUpdateResult = await (async (): Promise<
+      Result<SendAgentTaskMessageResult | null, SendAgentTaskMessageError>
+    > => {
+      // The scheduler snapshots taskPrompt and flips queued -> starting under this mutex. Use the
+      // same lock so a correction is either included in that snapshot or observes starting and is
+      // rejected; it can never be persisted after the scheduler already captured a stale prompt.
+      await using _lock = await this.mutex.acquire();
+      const cfg = this.config.loadConfigOrDefault();
+      const entry = findWorkspaceEntry(cfg, taskId);
+      if (!entry) {
+        return Err({ code: "not_found" as const });
+      }
+      const taskIndex = this.buildAgentTaskIndex(cfg);
+      if (
+        !this.isDescendantAgentTaskUsingParentById(
+          taskIndex.parentById,
+          ancestorWorkspaceId,
+          taskId
+        )
+      ) {
+        return Err({ code: "invalid_scope" as const });
+      }
+      if (isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)) {
+        return Err({
+          code: "not_active" as const,
+          taskStatus: entry.workspace.taskStatus ?? "unknown",
+          message: "Task workspace is archived and cannot accept updated guidance.",
+        });
+      }
+      if (entry.workspace.taskStatus !== "queued") {
+        return Ok(null);
+      }
+
+      const initialPrompt = coerceNonEmptyString(entry.workspace.taskPrompt);
+      if (!initialPrompt) {
+        return Err({
+          code: "send_failed" as const,
+          message: "Queued task has no durable prompt to update.",
+        });
+      }
+      await this.editWorkspaceEntry(taskId, (workspace) => {
+        workspace.taskPrompt = `${initialPrompt}\n\nUpdated guidance from parent:\n\n${trimmedMessage}`;
+      });
+      return Ok({ delivery: "queued" as const });
+    })();
+    if (!queuedUpdateResult.success) {
+      return queuedUpdateResult;
+    }
+    if (queuedUpdateResult.data != null) {
+      return Ok(queuedUpdateResult.data);
+    }
+
+    return this.workspaceEventLocks.withLock(taskId, async () => {
+      const cfg = this.config.loadConfigOrDefault();
+      const entry = findWorkspaceEntry(cfg, taskId);
+      if (!entry) {
+        return Err({ code: "not_found" as const });
+      }
+      const taskIndex = this.buildAgentTaskIndex(cfg);
+      if (
+        !this.isDescendantAgentTaskUsingParentById(
+          taskIndex.parentById,
+          ancestorWorkspaceId,
+          taskId
+        )
+      ) {
+        return Err({ code: "invalid_scope" as const });
+      }
+
+      if (isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)) {
+        return Err({
+          code: "not_active" as const,
+          taskStatus: entry.workspace.taskStatus ?? "unknown",
+          message: "Task workspace is archived and cannot accept updated guidance.",
+        });
+      }
+
+      // Missing status is a legacy running task: old persisted children predate taskStatus.
+      const previousStatus = entry.workspace.taskStatus ?? "running";
+      if (previousStatus !== "running" && previousStatus !== "awaiting_report") {
+        return Err({ code: "not_active" as const, taskStatus: previousStatus ?? "unknown" });
+      }
+
+      const guidanceId = randomUUID();
+      await this.editWorkspaceEntry(
+        taskId,
+        (workspace) => {
+          workspace.taskPendingGuidance = [
+            ...(workspace.taskPendingGuidance ?? []),
+            { id: guidanceId, message: trimmedMessage, queueDispatchMode },
+          ];
+          if (workspace.taskStatus == null || previousStatus === "awaiting_report") {
+            // Persist the legacy implicit-running state so startup recovery can replay this durable
+            // guidance if Mux exits before the replacement turn accepts it.
+            workspace.taskStatus = "running";
+          }
+        },
+        { allowMissing: true }
+      );
+
+      const clearGuidanceReservation = async (restoreAfterFailure: boolean): Promise<void> => {
+        await this.editWorkspaceEntry(
+          taskId,
+          (workspace) => {
+            const remainingGuidance = (workspace.taskPendingGuidance ?? []).filter(
+              (guidance) => guidance.id !== guidanceId
+            );
+            workspace.taskPendingGuidance =
+              remainingGuidance.length > 0 ? remainingGuidance : undefined;
+            if (
+              restoreAfterFailure &&
+              remainingGuidance.length === 0 &&
+              workspace.taskStatus === "running"
+            ) {
+              workspace.taskStatus = this.aiService.isStreaming(taskId)
+                ? previousStatus
+                : "awaiting_report";
+            }
+          },
+          { allowMissing: true }
+        );
+      };
+
+      let accepted = false;
+      const sendResult = await this.workspaceService.sendMessage(
+        taskId,
+        // Keep the correction explicit in the child transcript so it cannot be confused with the
+        // original brief, while synthetic metadata avoids treating parent orchestration as a direct
+        // human intervention in child-only features such as goals and interactive questions.
+        `Updated guidance from parent:\n\n${trimmedMessage}`,
+        {
+          model: entry.workspace.taskModelString ?? defaultModel,
+          agentId: resolveTaskAgentIdForResume(entry.workspace),
+          thinkingLevel: entry.workspace.taskThinkingLevel,
+          reasoningMode: coerceOpenAIReasoningMode(entry.workspace.aiSettings?.reasoningMode),
+          experiments: entry.workspace.taskExperiments,
+          queueDispatchMode,
+        },
+        {
+          synthetic: true,
+          agentInitiated: true,
+          startStreamInBackground: true,
+          onAcceptedPreStreamFailure: async () => {
+            // If the replacement turn cannot start, remove the settlement reservation and restore
+            // an idle child to completion recovery instead of leaving it permanently running.
+            await clearGuidanceReservation(true);
+          },
+          onAccepted: async () => {
+            await clearGuidanceReservation(false);
+            accepted = true;
+          },
+        }
+      );
+
+      if (!sendResult.success) {
+        await clearGuidanceReservation(true);
+        return Err({
+          code: "send_failed" as const,
+          message: formatSendMessageError(sendResult.error).message,
+        });
+      }
+
+      return Ok(accepted ? { delivery: "accepted" } : { delivery: "queued", queueDispatchMode });
     });
   }
 
@@ -9457,6 +9705,13 @@ export class TaskService {
       return;
     }
 
+    // Parent corrections queued for the next task turn supersede any report emitted by the old
+    // turn. Keep the task active until AgentSession accepts the reserved guidance and clears this
+    // durable flag; otherwise turn-end dispatch could deliver a stale report before the correction.
+    if ((entry.workspace.taskPendingGuidance?.length ?? 0) > 0) {
+      return;
+    }
+
     if (reportArgs) {
       const finalization = await this.finalizeAgentTaskReport(workspaceId, entry, reportArgs);
       if (finalization.finalized) {
@@ -10602,6 +10857,14 @@ export class TaskService {
     const cfgBeforeReport = this.config.loadConfigOrDefault();
     const latestEntryBeforeReport =
       findWorkspaceEntry(cfgBeforeReport, childWorkspaceId) ?? childEntry;
+    if ((latestEntryBeforeReport?.workspace.taskPendingGuidance?.length ?? 0) > 0) {
+      return {
+        finalized: false,
+        reason: "pending_guidance",
+        message: "A parent guidance update is pending; ignore this stale report.",
+      };
+    }
+
     const statusBefore = latestEntryBeforeReport?.workspace.taskStatus;
     if (statusBefore === "reported") {
       return { finalized: true };

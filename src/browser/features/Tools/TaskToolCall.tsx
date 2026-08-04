@@ -40,6 +40,8 @@ import type {
   TaskAwaitToolSuccessResult,
   TaskListToolArgs,
   TaskListToolSuccessResult,
+  TaskSendMessageToolArgs,
+  TaskSendMessageToolSuccessResult,
   TaskTerminateToolArgs,
   TaskTerminateToolSuccessResult,
   ToolErrorResult,
@@ -101,6 +103,7 @@ const TaskStatusBadge: React.FC<{
 }> = ({ status, className }) => {
   const getStatusStyle = () => {
     switch (status) {
+      case "accepted":
       case "completed":
       case "reported":
         return "bg-success/20 text-success";
@@ -1681,6 +1684,51 @@ const TaskListItem: React.FC<{
     openWorkspaceId={task.workspaceId}
   />
 );
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TASK SEND MESSAGE TOOL CALL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+interface TaskSendMessageToolCallProps {
+  args: TaskSendMessageToolArgs;
+  result?: TaskSendMessageToolSuccessResult;
+  status?: ToolStatus;
+}
+
+export const TaskSendMessageToolCall: React.FC<TaskSendMessageToolCallProps> = (props) => {
+  const { expanded, toggleExpanded } = useToolExpansion(false);
+  const status = props.status ?? "pending";
+  const summary = props.result?.status ?? "sending";
+
+  return (
+    <ToolContainer expanded={expanded}>
+      <ToolHeader onClick={toggleExpanded}>
+        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+        <TaskIcon toolName="task_send_message" />
+        <ToolName>task_send_message</ToolName>
+        <span className="text-muted text-[10px]">{summary}</span>
+        <StatusIndicator status={status}>{getStatusDisplay(status)}</StatusIndicator>
+      </ToolHeader>
+
+      {expanded && (
+        <ToolDetails>
+          <div className="task-surface mt-1 space-y-2 rounded-md p-3">
+            <div className="flex items-center gap-2">
+              <TaskId id={props.args.task_id} />
+              {props.result && <TaskStatusBadge status={props.result.status} />}
+            </div>
+            <div className="text-foreground bg-code-bg max-h-[140px] overflow-y-auto rounded-sm p-2 text-[11px] break-words whitespace-pre-wrap">
+              {props.args.message}
+            </div>
+            {props.result && "error" in props.result && props.result.error && (
+              <div className="text-danger text-[11px]">{props.result.error}</div>
+            )}
+          </div>
+        </ToolDetails>
+      )}
+    </ToolContainer>
+  );
+};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TASK TERMINATE TOOL CALL
