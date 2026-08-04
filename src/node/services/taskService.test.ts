@@ -631,7 +631,15 @@ describe("TaskService", () => {
 
     const result = await createAgentTask(taskService, parentId, "Inspect the scratch files");
 
-    expect(result).toEqual(Ok({ taskId: childId, kind: "agent", status: "running" }));
+    expect(result).toEqual(
+      Ok({
+        taskId: childId,
+        kind: "agent",
+        status: "running",
+        modelString: "anthropic:claude-opus-4-6",
+        thinkingLevel: "high",
+      })
+    );
     const scratchProject = config.loadConfigOrDefault().projects.get(SCRATCH_PROJECT_CONFIG_KEY);
     const child = scratchProject?.workspaces.find((workspace) => workspace.id === childId);
     expect(child?.kind).toBe("scratch");
@@ -10028,6 +10036,68 @@ describe("TaskService", () => {
     expect(serializedParentHistory).toContain("claims");
   });
 
+  test("waitForAgentReport surfaces the child's report-time AI settings", async () => {
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-report-settings";
+    const childTaskId = "task-report-settings";
+
+    // The persisted settings at report time differ from any launch-time snapshot a
+    // caller may hold (e.g. after a plan-to-exec handoff rewrote them).
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId, {
+          aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
+        }),
+        {
+          path: path.join(projectPath, "child-task"),
+          id: childTaskId,
+          name: "agent_exec_child",
+          parentWorkspaceId,
+          agentType: "exec",
+          taskStatus: "running",
+          taskModelString: "anthropic:claude-opus-5",
+          taskThinkingLevel: "high",
+        },
+      ],
+      testTaskSettings()
+    );
+
+    const { aiService } = createAIServiceMocks(config);
+    const { workspaceService } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+
+    await handleTaskServiceStreamEndForTest(taskService, {
+      type: "stream-end",
+      workspaceId: childTaskId,
+      messageId: "assistant-child-report-settings",
+      metadata: { model: "anthropic:claude-opus-5", finishReason: "stop" },
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "agent-report-settings-call",
+          toolName: "agent_report",
+          input: { reportMarkdown: "Done", title: "Result" },
+          state: "output-available",
+          output: {
+            success: true,
+            report: { reportMarkdown: "Done", title: "Result" },
+          },
+        },
+        { type: "text", text: "Done" },
+      ],
+    });
+
+    const report = await taskService.waitForAgentReport(childTaskId, {
+      requestingWorkspaceId: parentWorkspaceId,
+    });
+    expect(report.model).toBe("anthropic:claude-opus-5");
+    expect(report.thinkingLevel).toBe("high");
+  });
+
   test("workflow-owned child reports do not trigger generic parent handoff", async () => {
     const config = await createTestConfig(rootDir);
 
@@ -15859,7 +15929,11 @@ describe("TaskService", () => {
     });
 
     const report = await waiter;
-    expect(report).toEqual({ reportMarkdown: "Interrupted child report", title: "Result" });
+    expect(report).toEqual({
+      reportMarkdown: "Interrupted child report",
+      title: "Result",
+      model: "openai:gpt-4o-mini",
+    });
 
     const postCfg = config.loadConfigOrDefault();
     const ws = Array.from(postCfg.projects.values())
@@ -15873,7 +15947,11 @@ describe("TaskService", () => {
       timeoutMs: 10_000,
       requestingWorkspaceId: parentId,
     });
-    expect(persisted).toEqual({ reportMarkdown: "Interrupted child report", title: "Result" });
+    expect(persisted).toEqual({
+      reportMarkdown: "Interrupted child report",
+      title: "Result",
+      model: "openai:gpt-4o-mini",
+    });
   });
 
   test("handleStreamEnd rejects waiters when interrupted task stream ends without report", async () => {
@@ -18027,6 +18105,126 @@ describe("TaskService", () => {
     ).toHaveLength(1);
   });
 
+  test("deferred fallback honors partial task outputs carrying unknown future fields", async () => {
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const parentId = "parent-best-of-future-fields-fallback";
+    const childOneId = "child-best-of-future-fields-fallback-1";
+    const childTwoId = "child-best-of-future-fields-fallback-2";
+    const childThreeId = "child-best-of-future-fields-fallback-3";
+    const bestOf = {
+      groupId: "best-of-future-fields-fallback-group",
+      index: 0,
+      total: 3,
+    } as const;
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentId),
+        {
+          path: path.join(projectPath, "child-1"),
+          id: childOneId,
+          name: "agent_explore_child_1",
+          parentWorkspaceId: parentId,
+          agentType: "explore",
+          taskStatus: "reported",
+          bestOf,
+        },
+        projectWorkspace(projectPath, "child-2", childTwoId, {
+          name: "agent_explore_child_2",
+          parentWorkspaceId: parentId,
+          agentType: "explore",
+          taskStatus: "interrupted",
+          bestOf: { ...bestOf, index: 1 },
+        }),
+        projectWorkspace(projectPath, "child-3", childThreeId, {
+          name: "agent_explore_child_3",
+          parentWorkspaceId: parentId,
+          agentType: "explore",
+          taskStatus: "interrupted",
+          bestOf: { ...bestOf, index: 2 },
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { aiService } = createAIServiceMocks(config);
+    const { workspaceService } = createWorkspaceServiceMocks();
+    const { historyService, partialService, taskService } = createTaskServiceHarness(config, {
+      aiService,
+      workspaceService,
+    });
+
+    // An output written by a newer release: extra fields fail the strict result schema, but
+    // the referenced-task bookkeeping must still see these IDs or recovery would append a
+    // duplicate fallback report after a downgrade.
+    const parentPartial = createMuxMessage(
+      "assistant-parent-best-of-future-fields-fallback",
+      "assistant",
+      "Waiting on best-of subagents…",
+      { timestamp: Date.now() },
+      [
+        {
+          type: "dynamic-tool",
+          toolCallId: "task-best-of-future-fields-fallback-call",
+          toolName: "task",
+          input: {
+            subagent_type: "explore",
+            prompt: "compare options",
+            title: "Best of 3",
+            n: 3,
+          },
+          state: "output-available",
+          output: {
+            status: "running",
+            taskIds: [childOneId, childTwoId, childThreeId],
+            tasks: [
+              { taskId: childOneId, status: "completed", futureRowField: "x" },
+              { taskId: childTwoId, status: "running" },
+              { taskId: childThreeId, status: "running" },
+            ],
+            note: "use task_await to monitor progress",
+            futureTopLevelField: "y",
+          },
+        },
+      ]
+    );
+    expect((await partialService.writePartial(parentId, parentPartial)).success).toBe(true);
+
+    await upsertSubagentReportArtifact({
+      workspaceId: parentId,
+      workspaceSessionDir: config.getSessionDir(parentId),
+      childTaskId: childOneId,
+      parentWorkspaceId: parentId,
+      ancestorWorkspaceIds: [parentId],
+      reportMarkdown: "Report from child one",
+      title: "Option one",
+      nowMs: Date.now(),
+    });
+
+    const internal = taskService as unknown as {
+      deliverDeferredBestOfSiblingReports: (params: {
+        parentWorkspaceId: string;
+        groupId: string;
+        total: number;
+      }) => Promise<void>;
+    };
+
+    await internal.deliverDeferredBestOfSiblingReports({
+      parentWorkspaceId: parentId,
+      groupId: bestOf.groupId,
+      total: bestOf.total,
+    });
+
+    const parentHistory = await collectFullHistory(historyService, parentId);
+    const serializedParentHistory = JSON.stringify(parentHistory);
+    expect(serializedParentHistory).not.toContain("<mux_subagent_report>");
+    expect(serializedParentHistory).not.toContain("Report from child one");
+  });
+
   test("incremental best-of updates do not suppress deferred terminal reports", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
@@ -18822,6 +19020,7 @@ describe("TaskService", () => {
         reportMarkdown: "# Proposed workflow plan\n\nDo the tiny safe change.\n",
         title: "Proposed plan",
         planFilePath: planPath,
+        model: "openai:gpt-4o-mini",
       });
       expect(debugSpy).toHaveBeenCalledWith(
         "Workflow plan completion using canonical plan file path",
@@ -18909,6 +19108,7 @@ describe("TaskService", () => {
         reportMarkdown: "# Interrupted workflow plan\n\nStill complete.\n",
         title: "Proposed plan",
         planFilePath: planPath,
+        model: "openai:gpt-4o-mini",
       });
       expect(replaceHistory).not.toHaveBeenCalled();
       expect(sendMessage).not.toHaveBeenCalled();

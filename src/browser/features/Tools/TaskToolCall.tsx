@@ -62,6 +62,8 @@ import {
 import { resolvePersistedAgentId } from "@/common/utils/agentIds";
 import { formatDuration } from "@/common/utils/formatDuration";
 import { ElapsedTimeDisplay } from "./Shared/ElapsedTimeDisplay";
+import { ModelDisplay } from "../Messages/ModelDisplay";
+import { getThinkingOptionLabel, type ThinkingLevel } from "@/common/types/thinking";
 
 /**
  * Clean SVG icon for task tools - represents spawning/branching work
@@ -492,7 +494,42 @@ interface TaskToolDisplayEntry {
   openWorkspaceId?: string;
   groupKind?: TaskGroupKind;
   label?: string;
+  modelString?: string;
+  thinkingLevel?: ThinkingLevel;
 }
+
+interface TaskAiSettingsInfo {
+  modelString?: string;
+  thinkingLevel?: ThinkingLevel;
+}
+
+const TaskAiSettingsDisplay: React.FC<TaskAiSettingsInfo & { className?: string }> = (props) => {
+  if (!props.modelString && props.thinkingLevel == null) {
+    return null;
+  }
+  return (
+    // min-w-0 at both flex levels + break-words let long custom model IDs wrap inside
+    // narrow cards instead of forcing right-edge overflow.
+    <span
+      className={cn(
+        "text-muted inline-flex min-w-0 max-w-full flex-wrap items-center gap-1.5 break-words",
+        props.className
+      )}
+      data-task-ai-settings
+    >
+      {props.modelString && (
+        <span className="min-w-0">
+          <ModelDisplay modelString={props.modelString} />
+        </span>
+      )}
+      {props.thinkingLevel != null && (
+        <span className="rounded bg-[var(--color-bg-tertiary)] px-1 py-0.5 font-mono leading-none">
+          thinking: {getThinkingOptionLabel(props.thinkingLevel, props.modelString)}
+        </span>
+      )}
+    </span>
+  );
+};
 
 interface TaskToolOwnReport {
   reportMarkdown: string;
@@ -697,12 +734,14 @@ function collectTaskToolResultDisplayData(result: TaskToolSuccessResult | null):
   ownReportsByTaskId: Map<string, TaskToolOwnReport>;
   taskGroupsByTaskId: Map<string, { groupKind?: TaskGroupKind; label?: string }>;
   workspaceIdByTaskId: Map<string, string>;
+  aiSettingsByTaskId: Map<string, TaskAiSettingsInfo>;
 } {
   const taskIds = new Set<string>();
   const statusByTaskId = new Map<string, string>();
   const ownReportsByTaskId = new Map<string, TaskToolOwnReport>();
   const taskGroupsByTaskId = new Map<string, { groupKind?: TaskGroupKind; label?: string }>();
   const workspaceIdByTaskId = new Map<string, string>();
+  const aiSettingsByTaskId = new Map<string, TaskAiSettingsInfo>();
   if (!result) {
     return {
       taskIds: [],
@@ -710,6 +749,7 @@ function collectTaskToolResultDisplayData(result: TaskToolSuccessResult | null):
       ownReportsByTaskId,
       taskGroupsByTaskId,
       workspaceIdByTaskId,
+      aiSettingsByTaskId,
     };
   }
 
@@ -742,10 +782,23 @@ function collectTaskToolResultDisplayData(result: TaskToolSuccessResult | null):
     }
   };
 
+  const rememberAiSettings = (taskId: string, settings: TaskAiSettingsInfo): void => {
+    const modelString = trimToNonEmptyString(settings.modelString) ?? undefined;
+    if (!modelString && settings.thinkingLevel == null) {
+      return;
+    }
+    const existing = aiSettingsByTaskId.get(taskId);
+    aiSettingsByTaskId.set(taskId, {
+      modelString: existing?.modelString ?? modelString,
+      thinkingLevel: existing?.thinkingLevel ?? settings.thinkingLevel,
+    });
+  };
+
   const taskStatuses = "tasks" in result && Array.isArray(result.tasks) ? result.tasks : undefined;
   const singleTaskId = rememberTaskId(result.taskId);
   if (singleTaskId) {
     rememberWorkspace(singleTaskId, result.workspaceId);
+    rememberAiSettings(singleTaskId, result);
   }
   if (singleTaskId && result.status === "completed" && typeof result.reportMarkdown === "string") {
     ownReportsByTaskId.set(singleTaskId, {
@@ -767,6 +820,7 @@ function collectTaskToolResultDisplayData(result: TaskToolSuccessResult | null):
         statusByTaskId.set(taskId, task.status);
         rememberWorkspace(taskId, task.workspaceId);
         rememberTaskGroup(taskId, { groupKind: task.groupKind, label: task.label });
+        rememberAiSettings(taskId, task);
       }
     }
   }
@@ -783,6 +837,7 @@ function collectTaskToolResultDisplayData(result: TaskToolSuccessResult | null):
         });
         rememberWorkspace(taskId, report.workspaceId);
         rememberTaskGroup(taskId, { groupKind: report.groupKind, label: report.label });
+        rememberAiSettings(taskId, report);
       }
     }
   }
@@ -800,6 +855,7 @@ function collectTaskToolResultDisplayData(result: TaskToolSuccessResult | null):
     ownReportsByTaskId,
     taskGroupsByTaskId,
     workspaceIdByTaskId,
+    aiSettingsByTaskId,
   };
 }
 
@@ -851,6 +907,11 @@ const TaskToolCandidateCard: React.FC<{
         {entry.title && (
           <span className="text-foreground text-[11px] font-medium">{entry.title}</span>
         )}
+        <TaskAiSettingsDisplay
+          modelString={entry.modelString}
+          thinkingLevel={entry.thinkingLevel}
+          className="text-[10px]"
+        />
         {canViewTranscript && (
           <button
             type="button"
@@ -896,6 +957,7 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
     ownReportsByTaskId,
     taskGroupsByTaskId,
     workspaceIdByTaskId,
+    aiSettingsByTaskId,
   } = collectTaskToolResultDisplayData(successResult);
 
   const requestedTaskGroupCount = getTaskGroupCount(args);
@@ -956,6 +1018,8 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
         ? "completed"
         : (getTaskToolWorkspaceStatus(metadata?.taskStatus) ?? statusByTaskId.get(taskId));
 
+    const resultAiSettings = aiSettingsByTaskId.get(taskId);
+
     return {
       taskId,
       status:
@@ -973,6 +1037,16 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
         resultTaskGroup?.label ??
         normalizeTaskGroupLabel(metadata?.bestOf?.label) ??
         getTaskGroupLabelAtIndex(args, index),
+      // Prefer live metadata while the workspace exists: a plan child's auto-handoff to
+      // exec rewrites its settings after launch, so a spawn snapshot can go stale. After
+      // cleanup, a linked task_await report carries report-time settings; the spawn
+      // result is the last resort.
+      modelString:
+        metadata?.taskModelString ?? linkedReport?.modelString ?? resultAiSettings?.modelString,
+      thinkingLevel:
+        metadata?.taskThinkingLevel ??
+        linkedReport?.thinkingLevel ??
+        resultAiSettings?.thinkingLevel,
     };
   });
 
@@ -1072,6 +1146,13 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
               )}
               {!isTaskGroup && singleEntry?.status && (
                 <TaskStatusBadge status={singleEntry.status} />
+              )}
+              {!isTaskGroup && singleEntry && (
+                <TaskAiSettingsDisplay
+                  modelString={singleEntry.modelString}
+                  thinkingLevel={singleEntry.thinkingLevel}
+                  className="text-[10px]"
+                />
               )}
               {!isTaskGroup && singleEntry?.status === "completed" && (
                 <button

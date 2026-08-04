@@ -292,6 +292,8 @@ function formatSubagentReportUserMessage(params: {
   title: string;
   reportMarkdown: string;
   status: "in_progress" | "completed";
+  model?: string;
+  thinkingLevel?: ThinkingLevel;
   structuredOutput?: unknown;
 }): string {
   assert(params.childWorkspaceId.length > 0, "subagent report message requires child id");
@@ -305,6 +307,8 @@ function formatSubagentReportUserMessage(params: {
     status: params.status,
     title: params.title,
     reportMarkdown: params.reportMarkdown,
+    ...(params.model != null ? { model: params.model } : {}),
+    ...(params.thinkingLevel != null ? { thinkingLevel: params.thinkingLevel } : {}),
     ...(params.structuredOutput !== undefined ? { structuredOutput: params.structuredOutput } : {}),
   });
 }
@@ -560,6 +564,9 @@ export interface TaskCreateResult {
   taskId: string;
   kind: TaskKind;
   status: "queued" | "starting" | "running";
+  /** Resolved (post-precedence) AI settings the child was created with. */
+  modelString?: string;
+  thinkingLevel?: ThinkingLevel;
 }
 
 type TaskLaunchStart = { kind: "sendMessage"; prompt: string } | { kind: "resumeStream" };
@@ -770,6 +777,8 @@ interface PendingTaskWaiter extends BackgroundableForegroundWaiter {
     title?: string;
     structuredOutput?: unknown;
     planFilePath?: string;
+    model?: string;
+    thinkingLevel?: ThinkingLevel;
   }) => void;
 }
 
@@ -783,6 +792,9 @@ interface CompletedAgentReportCacheEntry {
   planFilePath?: string;
   structuredOutput?: unknown;
   title?: string;
+  // Final settings the child reported with (post plan-to-exec handoff), not the launch snapshot.
+  model?: string;
+  thinkingLevel?: ThinkingLevel;
   // Ancestor workspace IDs captured when the report was cached.
   // Used to keep descendant-scope checks working even if the task workspace is cleaned up.
   ancestorWorkspaceIds: string[];
@@ -901,6 +913,41 @@ function collectWorkflowRunIdsFromToolOutput(output: unknown): string[] {
     }
   }
   return runIds;
+}
+
+/**
+ * Tolerant extraction of the task IDs a persisted task tool output references. Recovery
+ * bookkeeping must survive outputs written by newer releases (extra fields would fail the
+ * strict result schema) so that a mid-stream downgrade cannot duplicate fallback reports.
+ */
+function collectReferencedTaskIdsFromTaskToolOutput(output: unknown, into: Set<string>): void {
+  if (output == null || typeof output !== "object") {
+    return;
+  }
+  const addTaskId = (value: unknown): void => {
+    if (typeof value === "string" && value.length > 0) {
+      into.add(value);
+    }
+  };
+
+  const record = output as Record<string, unknown>;
+  addTaskId(record.taskId);
+  if (Array.isArray(record.taskIds)) {
+    for (const taskId of record.taskIds) {
+      addTaskId(taskId);
+    }
+  }
+  for (const key of ["tasks", "reports"] as const) {
+    const rows = record[key];
+    if (!Array.isArray(rows)) {
+      continue;
+    }
+    for (const row of rows) {
+      if (row != null && typeof row === "object") {
+        addTaskId((row as Record<string, unknown>).taskId);
+      }
+    }
+  }
 }
 
 function collectWorkflowRunIdsFromTaskAwaitInput(input: unknown): string[] {
@@ -2598,7 +2645,13 @@ export class TaskService {
           ? { preferredTrunkBranch: parentBranchName }
           : {}),
       });
-      results.push({ taskId, kind: "agent", status });
+      results.push({
+        taskId,
+        kind: "agent",
+        status,
+        modelString: taskModelString,
+        thinkingLevel: effectiveThinkingLevel,
+      });
     }
 
     for (const [index, result] of results.entries()) {
@@ -3764,7 +3817,13 @@ export class TaskService {
       // Schedule queue processing (best-effort).
       void this.maybeStartQueuedTasks();
       taskQueueDebug("TaskService.create queued scheduled maybeStartQueuedTasks", { taskId });
-      return Ok({ taskId, kind: "agent", status: "queued" });
+      return Ok({
+        taskId,
+        kind: "agent",
+        status: "queued",
+        modelString: taskModelString,
+        thinkingLevel: effectiveThinkingLevel,
+      });
     }
 
     const initLogger = this.startWorkspaceInit(taskId, parentMeta.projectPath);
@@ -3971,7 +4030,13 @@ export class TaskService {
       return Err(message);
     }
 
-    return Ok({ taskId, kind: "agent", status: "running" });
+    return Ok({
+      taskId,
+      kind: "agent",
+      status: "running",
+      modelString: taskModelString,
+      thinkingLevel: effectiveThinkingLevel,
+    });
   }
 
   async terminateDescendantAgentTask(
@@ -5746,6 +5811,12 @@ export class TaskService {
         title,
         reportMarkdown: report.reportMarkdown,
         status: "in_progress",
+        ...(childEntry.workspace.taskModelString != null
+          ? { model: childEntry.workspace.taskModelString }
+          : {}),
+        ...(childEntry.workspace.taskThinkingLevel != null
+          ? { thinkingLevel: childEntry.workspace.taskThinkingLevel }
+          : {}),
         ...(report.structuredOutput !== undefined
           ? { structuredOutput: report.structuredOutput }
           : {}),
@@ -5989,6 +6060,8 @@ export class TaskService {
     title?: string;
     structuredOutput?: unknown;
     planFilePath?: string;
+    model?: string;
+    thinkingLevel?: ThinkingLevel;
   }> {
     assert(taskId.length > 0, "waitForAgentReport: taskId must be non-empty");
 
@@ -6001,6 +6074,8 @@ export class TaskService {
         title: cached.title,
         planFilePath: cached.planFilePath,
         structuredOutput: cached.structuredOutput,
+        model: cached.model,
+        thinkingLevel: cached.thinkingLevel,
       };
     }
 
@@ -6018,6 +6093,8 @@ export class TaskService {
       planFilePath?: string;
       structuredOutput?: unknown;
       title?: string;
+      model?: string;
+      thinkingLevel?: ThinkingLevel;
     } | null> => {
       if (!requestingWorkspaceId) {
         return null;
@@ -6035,6 +6112,8 @@ export class TaskService {
         title: artifact.title,
         planFilePath: artifact.planFilePath,
         structuredOutput: artifact.structuredOutput,
+        model: artifact.model,
+        thinkingLevel: artifact.thinkingLevel,
         workflowOwnedAncestorWorkspaceIds: artifact.workflowOwnedAncestorWorkspaceIds,
         ancestorWorkspaceIds: artifact.ancestorWorkspaceIds,
       });
@@ -6062,6 +6141,8 @@ export class TaskService {
         title: artifact.title,
         planFilePath: artifact.planFilePath,
         structuredOutput: artifact.structuredOutput,
+        model: artifact.model,
+        thinkingLevel: artifact.thinkingLevel,
       };
     };
 
@@ -10714,7 +10795,11 @@ export class TaskService {
     );
 
     // Resolve foreground waiters.
-    const hadForegroundWaiters = this.resolveWaiters(childWorkspaceId, reportArgs);
+    const hadForegroundWaiters = this.resolveWaiters(childWorkspaceId, {
+      ...reportArgs,
+      model: latestChildEntry?.workspace.taskModelString,
+      thinkingLevel: latestChildEntry?.workspace.taskThinkingLevel,
+    });
 
     // Free slot and start queued tasks.
     await this.maybeStartQueuedTasks();
@@ -10788,6 +10873,8 @@ export class TaskService {
       title?: string;
       structuredOutput?: unknown;
       planFilePath?: string;
+      model?: string;
+      thinkingLevel?: ThinkingLevel;
     }
   ): boolean {
     this.markTaskForegroundRelevant(taskId);
@@ -10809,6 +10896,8 @@ export class TaskService {
       title: report.title,
       planFilePath: report.planFilePath,
       structuredOutput: report.structuredOutput,
+      model: report.model,
+      thinkingLevel: report.thinkingLevel,
       ancestorWorkspaceIds,
       workflowOwnedAncestorWorkspaceIds,
     });
@@ -11114,6 +11203,8 @@ export class TaskService {
       agentType?: string;
       groupKind?: TaskGroupKind;
       label?: string;
+      modelString?: string;
+      thinkingLevel?: ThinkingLevel;
     }> = [];
 
     for (const sibling of siblings) {
@@ -11132,6 +11223,8 @@ export class TaskService {
         agentType: sibling.agentType,
         groupKind: sibling.kind,
         label: sibling.label,
+        modelString: artifact.model,
+        thinkingLevel: artifact.thinkingLevel,
       });
     }
 
@@ -11187,30 +11280,7 @@ export class TaskService {
         continue;
       }
 
-      const parsedOutput = TaskToolResultSchema.safeParse(part.output);
-      if (!parsedOutput.success) {
-        continue;
-      }
-
-      const output = parsedOutput.data;
-      if (typeof output.taskId === "string") {
-        referencedTaskIds.add(output.taskId);
-      }
-      if (Array.isArray(output.taskIds)) {
-        for (const taskId of output.taskIds) {
-          referencedTaskIds.add(taskId);
-        }
-      }
-      if ("tasks" in output && Array.isArray(output.tasks)) {
-        for (const task of output.tasks) {
-          referencedTaskIds.add(task.taskId);
-        }
-      }
-      if ("reports" in output && Array.isArray(output.reports)) {
-        for (const report of output.reports) {
-          referencedTaskIds.add(report.taskId);
-        }
-      }
+      collectReferencedTaskIdsFromTaskToolOutput(part.output, referencedTaskIds);
     }
 
     return {
@@ -11315,6 +11385,8 @@ export class TaskService {
     options?: { uiVisible?: boolean }
   ): Promise<readonly string[]> {
     const agentType = coerceNonEmptyString(childEntry?.workspace.agentType) ?? "agent";
+    const childModelString = childEntry?.workspace.taskModelString;
+    const childThinkingLevel = childEntry?.workspace.taskThinkingLevel;
 
     const output = {
       status: "completed" as const,
@@ -11324,6 +11396,8 @@ export class TaskService {
       planFilePath: report.planFilePath,
       structuredOutput: report.structuredOutput,
       agentType,
+      modelString: childModelString,
+      thinkingLevel: childThinkingLevel,
     };
     const parsedOutput = TaskToolResultSchema.safeParse(output);
     if (!parsedOutput.success) {
@@ -11396,6 +11470,8 @@ export class TaskService {
       title: titlePrefix,
       reportMarkdown: report.reportMarkdown,
       status: "completed",
+      ...(childModelString != null ? { model: childModelString } : {}),
+      ...(childThinkingLevel != null ? { thinkingLevel: childThinkingLevel } : {}),
       ...(report.structuredOutput !== undefined
         ? { structuredOutput: report.structuredOutput }
         : {}),

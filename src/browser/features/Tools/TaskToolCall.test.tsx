@@ -137,6 +137,132 @@ describe("TaskToolCall", () => {
     expect(setSelectedWorkspace).toHaveBeenCalledTimes(1);
     expect(setSelectedWorkspace.mock.calls[0][0]).toEqual(workspace);
   });
+
+  test("prefers live workspace settings over the result snapshot", () => {
+    // A plan child's auto-handoff to exec rewrites live metadata after launch; the
+    // result snapshot keeps the stale plan-phase settings.
+    const workspace = createWorkspaceMetadata({
+      id: "task-child-1",
+      taskModelString: "anthropic:claude-opus-5",
+      taskThinkingLevel: "high",
+    });
+    workspaceContextMock = {
+      workspaceMetadata: new Map([[workspace.id, workspace]]),
+    };
+
+    const agentTaskArgs = {
+      subagent_type: "plan",
+      prompt: "Plan then implement.",
+      title: "Plan task",
+      run_in_background: true,
+    };
+    const AgentTaskToolCall = getToolComponent("task", agentTaskArgs);
+    const view = render(
+      <TooltipProvider>
+        <AgentTaskToolCall
+          args={agentTaskArgs}
+          result={{
+            status: "running",
+            taskId: "task-child-1",
+            modelString: "openai:gpt-5.2",
+            thinkingLevel: "low",
+            note: "Task started in background.",
+          }}
+          status="completed"
+        />
+      </TooltipProvider>
+    );
+
+    fireEvent.click(view.getByText("task"));
+
+    const settings = view.container.querySelector("[data-task-ai-settings]");
+    expect(settings?.textContent).toContain("Opus 5");
+    expect(settings?.textContent).toContain("thinking: high");
+    expect(settings?.textContent).not.toContain("thinking: low");
+  });
+
+  test("prefers linked report settings over the spawn snapshot after cleanup", () => {
+    // Workspace already cleaned up; the task_await-linked report carries the exec
+    // settings while the spawn result kept the stale plan-phase ones.
+    workspaceContextMock = { workspaceMetadata: new Map() };
+
+    const agentTaskArgs = {
+      subagent_type: "plan",
+      prompt: "Plan then implement.",
+      title: "Plan task",
+      run_in_background: true,
+    };
+    const AgentTaskToolCall = getToolComponent("task", agentTaskArgs);
+    const view = render(
+      <TooltipProvider>
+        <AgentTaskToolCall
+          args={agentTaskArgs}
+          result={{
+            status: "running",
+            taskId: "task-child-3",
+            modelString: "openai:gpt-5.2",
+            thinkingLevel: "low",
+            note: "Task started in background.",
+          }}
+          taskReportLinking={{
+            reportByTaskId: new Map([
+              [
+                "task-child-3",
+                {
+                  taskId: "task-child-3",
+                  reportMarkdown: "done",
+                  modelString: "anthropic:claude-opus-5",
+                  thinkingLevel: "high",
+                },
+              ],
+            ]),
+            suppressReportInAwaitTaskIds: new Set(["task-child-3"]),
+            spawnTitleByTaskId: new Map(),
+          }}
+          status="completed"
+        />
+      </TooltipProvider>
+    );
+
+    fireEvent.click(view.getByText("task"));
+
+    const settings = view.container.querySelector("[data-task-ai-settings]");
+    expect(settings?.textContent).toContain("Opus 5");
+    expect(settings?.textContent).toContain("thinking: high");
+    expect(settings?.textContent).not.toContain("thinking: low");
+  });
+
+  test("falls back to result-carried settings after workspace cleanup", () => {
+    workspaceContextMock = { workspaceMetadata: new Map() };
+
+    const agentTaskArgs = {
+      subagent_type: "explore",
+      prompt: "Look around.",
+      title: "Explore task",
+      run_in_background: true,
+    };
+    const AgentTaskToolCall = getToolComponent("task", agentTaskArgs);
+    const view = render(
+      <TooltipProvider>
+        <AgentTaskToolCall
+          args={agentTaskArgs}
+          result={{
+            status: "running",
+            taskId: "task-child-2",
+            modelString: "openai:gpt-5.2",
+            thinkingLevel: "low",
+            note: "Task started in background.",
+          }}
+          status="completed"
+        />
+      </TooltipProvider>
+    );
+
+    fireEvent.click(view.getByText("task"));
+
+    const settings = view.container.querySelector("[data-task-ai-settings]");
+    expect(settings?.textContent).toContain("thinking: low");
+  });
 });
 
 describe("TaskAwaitToolCall", () => {
