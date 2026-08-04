@@ -5411,7 +5411,7 @@ export class AgentSession {
     this.emitQueuedMessageChanged();
     // Signal to bash_output that it should return early to process queued messages
     // only for tool-end dispatches.
-    const effectiveDispatchMode = this.messageQueue.getQueueDispatchMode();
+    const effectiveDispatchMode = this.messageQueue.getNextQueueDispatchMode();
     this.backgroundProcessManager.setMessageQueued(
       this.workspaceId,
       effectiveDispatchMode === "tool-end"
@@ -5428,6 +5428,23 @@ export class AgentSession {
     for (const callbacks of callbackSets) {
       this.notifyQueuedMessageCleared(callbacks, cancelReason);
     }
+  }
+
+  setQueuedMessageDispatchMode(mode: "tool-end" | "turn-end"): boolean {
+    this.assertNotDisposed("setQueuedMessageDispatchMode");
+    const didUpdate = this.messageQueue.setVisibleQueueDispatchMode(mode);
+    if (!didUpdate) {
+      return false;
+    }
+
+    this.emitQueuedMessageChanged();
+    // Only the FIFO head can dispatch next; later hidden entries must not pull an earlier
+    // user-authored turn-end entry forward to a step boundary.
+    this.backgroundProcessManager.setMessageQueued(
+      this.workspaceId,
+      !this.messageQueue.isEmpty() && this.messageQueue.getNextQueueDispatchMode() === "tool-end"
+    );
+    return true;
   }
 
   private notifyQueuedMessageCleared(
@@ -5462,7 +5479,7 @@ export class AgentSession {
     this.emitQueuedMessageChanged();
     this.backgroundProcessManager.setMessageQueued(
       this.workspaceId,
-      !this.messageQueue.isEmpty() && this.messageQueue.getQueueDispatchMode() === "tool-end"
+      !this.messageQueue.isEmpty() && this.messageQueue.getNextQueueDispatchMode() === "tool-end"
     );
     for (const callbacks of removal.callbacks) {
       this.notifyQueuedMessageCleared(callbacks, cancelReason);
@@ -5490,7 +5507,7 @@ export class AgentSession {
     this.emitQueuedMessageChanged();
     this.backgroundProcessManager.setMessageQueued(
       this.workspaceId,
-      !this.messageQueue.isEmpty() && this.messageQueue.getQueueDispatchMode() === "tool-end"
+      !this.messageQueue.isEmpty() && this.messageQueue.getNextQueueDispatchMode() === "tool-end"
     );
     this.notifyQueuedMessageCleared(callbacks, cancelReason);
     return true;
@@ -5499,7 +5516,7 @@ export class AgentSession {
   hasQueuedMessages(dispatchMode?: "tool-end" | "turn-end"): boolean {
     return (
       !this.messageQueue.isEmpty() &&
-      (dispatchMode == null || this.messageQueue.getQueueDispatchMode() === dispatchMode)
+      (dispatchMode == null || this.messageQueue.getNextQueueDispatchMode() === dispatchMode)
     );
   }
 
@@ -5668,7 +5685,7 @@ export class AgentSession {
       if (!this.messageQueue.isEmpty()) {
         this.backgroundProcessManager.setMessageQueued(
           this.workspaceId,
-          this.messageQueue.getQueueDispatchMode() === "tool-end"
+          this.messageQueue.getNextQueueDispatchMode() === "tool-end"
         );
       }
 

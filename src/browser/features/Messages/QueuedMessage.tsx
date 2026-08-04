@@ -1,14 +1,22 @@
 import React, { useState } from "react";
 import type { QueuedMessage as QueuedMessageType } from "@/common/types/message";
-import { AlertCircle, Clock3, Loader2, Pencil, Send } from "lucide-react";
-import { ChatInputDecoration } from "@/browser/components/ChatPane/ChatInputDecoration";
+import { AlertCircle, Check, ChevronDown, Clock3, Loader2, Pencil, Send } from "lucide-react";
+import { ChatDockSurface } from "@/browser/components/ChatPane/chatDockColumn";
+import { SEND_DISPATCH_MODES } from "@/browser/features/ChatInput/sendDispatchModes";
+import type { QueueDispatchMode } from "@/browser/features/ChatInput/types";
 import { UserMessageContent } from "@/browser/features/Messages/UserMessageContent";
-import { getErrorMessage } from "@/common/utils/errors";
+import { stopKeyboardPropagation } from "@/browser/utils/events";
+import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
+import { cn } from "@/common/lib/utils";
 
 interface QueuedMessageProps {
   message: QueuedMessageType;
   className?: string;
   onEdit?: () => void;
+  onChangeDispatchMode?: (mode: QueueDispatchMode) => Promise<void>;
+  onActionError?: (error: unknown) => void;
+  actionError?: string | null;
+  onActionStart?: () => void;
   onSendImmediately?: () => Promise<void>;
 }
 
@@ -30,113 +38,175 @@ function deriveQueuedPreview(message: QueuedMessageType): QueuedPreview {
 }
 
 export const QueuedMessage: React.FC<QueuedMessageProps> = (props) => {
-  const [isExpanded, setIsExpanded] = useState(true);
-  const [isSending, setIsSending] = useState(false);
-  const [sendError, setSendError] = useState<string | null>(null);
+  const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const [pendingAction, setPendingAction] = useState<"mode" | "send-now" | null>(null);
   const preview = deriveQueuedPreview(props.message);
+  const queueDispatchMode = props.message.queueDispatchMode ?? "tool-end";
   const queueStatusLabel =
-    props.message.queueDispatchMode === "turn-end"
-      ? "Sends after this turn"
-      : "Sends after this step";
+    queueDispatchMode === "turn-end" ? "Sends after this turn" : "Sends after this step";
+  const isActionPending = pendingAction != null;
 
-  const handleToggle = () => {
-    setIsExpanded((prev) => !prev);
-  };
-
-  const handleSendImmediately = () => {
-    if (isSending || !props.onSendImmediately) return;
-    setIsSending(true);
-    setSendError(null);
-    props.onSendImmediately().then(
-      () => setIsSending(false),
+  const handleDispatchModeChange = (mode: QueueDispatchMode) => {
+    setIsMenuOpen(false);
+    if (isActionPending || !props.onChangeDispatchMode) return;
+    props.onActionStart?.();
+    setPendingAction("mode");
+    props.onChangeDispatchMode(mode).then(
+      () => setPendingAction(null),
       (error: unknown) => {
-        // Keep failures visible at the action that caused them while leaving the queued draft intact
-        // for a retry; consuming this rejection without feedback makes IPC failures look like no-ops.
-        setSendError(getErrorMessage(error));
-        setIsSending(false);
+        props.onActionError?.(error);
+        setPendingAction(null);
       }
     );
   };
 
-  const hasActions = props.onEdit != null || props.onSendImmediately != null;
-
-  // Give queued follow-ups one cohesive pending surface so they read as the user's next message,
-  // not as another generic system banner stacked above the composer.
-  return (
-    <ChatInputDecoration
-      expanded={isExpanded}
-      onToggle={handleToggle}
-      className={props.className}
-      contentClassName="py-1.5"
-      dataComponent="QueuedMessageBanner"
-      summary={
-        <>
-          <span className="bg-pending/10 text-pending flex size-5 shrink-0 items-center justify-center rounded-full">
-            <Clock3 className="size-3" />
-          </span>
-          <span className="flex min-w-0 flex-1 items-baseline gap-1.5">
-            <span className="text-foreground font-medium">Queued</span>
-            <span className="text-muted truncate">{queueStatusLabel}</span>
-          </span>
-        </>
+  const handleSendImmediately = () => {
+    setIsMenuOpen(false);
+    if (isActionPending || !props.onSendImmediately) return;
+    props.onActionStart?.();
+    setPendingAction("send-now");
+    props.onSendImmediately().then(
+      () => setPendingAction(null),
+      (error: unknown) => {
+        // Keep failures visible at the action that caused them while leaving the queued draft intact
+        // for a retry; consuming this rejection without feedback makes IPC failures look like no-ops.
+        props.onActionError?.(error);
+        setPendingAction(null);
       }
-      renderExpanded={() => (
-        <div
-          className="border-pending/20 bg-pending/5 overflow-hidden rounded-lg border"
-          data-component="QueuedMessageCard"
-        >
-          {/* Keep queued drafts bounded so long content never pushes the composer off-screen. */}
-          <div className="max-h-[40vh] overflow-y-auto px-3 py-2.5">
-            <UserMessageContent
-              content={preview.sanitizedText || preview.fallbackLabel}
-              reviews={props.message.reviews}
-              fileParts={props.message.fileParts}
-              variant="queued"
-            />
+    );
+  };
+
+  // Mirror the sent user-message shape so dispatching the queued draft removes temporary status
+  // chrome instead of making the content jump from a full-width banner into a right-aligned bubble.
+  return (
+    <ChatDockSurface>
+      <div
+        className={cn("bg-surface-primary py-1.5", props.className)}
+        data-component="QueuedMessageBanner"
+      >
+        <div className="ml-auto w-fit max-w-full" data-component="QueuedMessageGroup">
+          <div
+            className="border-pending/20 overflow-hidden rounded-lg border bg-[color-mix(in_srgb,var(--color-user-surface)_85%,var(--color-surface-primary)_15%)] shadow-sm"
+            data-component="QueuedMessageCard"
+          >
+            {/* Keep queued drafts bounded so long content never pushes the composer off-screen. */}
+            <div className="max-h-[40vh] overflow-y-auto px-3 py-2">
+              <UserMessageContent
+                content={preview.sanitizedText || preview.fallbackLabel}
+                reviews={props.message.reviews}
+                fileParts={props.message.fileParts}
+                variant="sent"
+              />
+            </div>
+
+            {props.actionError && (
+              <div
+                role="alert"
+                className="border-toast-error-border/50 bg-toast-error-bg/50 text-toast-error-text flex items-start gap-1.5 border-t px-3 py-2 text-xs"
+              >
+                <AlertCircle className="mt-0.5 size-3 shrink-0" />
+                <span className="min-w-0 break-words">{props.actionError}</span>
+              </div>
+            )}
           </div>
 
-          {sendError && (
+          <div
+            className="mt-1.5 flex max-w-full flex-wrap items-center justify-end gap-1 text-[11px]"
+            data-component="QueuedMessageActions"
+          >
+            {props.onEdit && (
+              <button
+                type="button"
+                onClick={props.onEdit}
+                className="text-muted hover:bg-hover hover:text-foreground flex h-6 items-center gap-1 rounded-md px-1.5 font-medium transition-colors"
+              >
+                <Pencil className="size-3" />
+                Edit
+              </button>
+            )}
+
             <div
-              role="alert"
-              className="border-toast-error-border/50 bg-toast-error-bg/50 text-toast-error-text flex items-start gap-1.5 border-t px-3 py-2 text-xs"
+              className="relative"
+              onBlur={(event) => {
+                if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+                  setIsMenuOpen(false);
+                }
+              }}
+              onKeyDown={(event) => {
+                if (event.key !== "Escape" || !isMenuOpen) return;
+                event.preventDefault();
+                stopKeyboardPropagation(event);
+                setIsMenuOpen(false);
+              }}
             >
-              <AlertCircle className="mt-0.5 size-3 shrink-0" />
-              <span className="min-w-0 break-words">{sendError}</span>
-            </div>
-          )}
+              <button
+                type="button"
+                onClick={() => setIsMenuOpen((open) => !open)}
+                aria-haspopup="menu"
+                aria-expanded={isMenuOpen}
+                className="text-secondary bg-muted/10 hover:bg-hover hover:text-foreground flex h-6 max-w-full items-center gap-1.5 rounded-md px-2 font-medium transition-colors"
+                data-component="QueuedMessageStatus"
+              >
+                {pendingAction === "mode" ? (
+                  <Loader2 className="size-3 shrink-0 animate-spin" />
+                ) : (
+                  <Clock3 className="text-pending size-3 shrink-0" />
+                )}
+                <span className="text-foreground shrink-0">Queued</span>
+                <span className="truncate">{queueStatusLabel}</span>
+                <ChevronDown className="size-3 shrink-0" />
+              </button>
 
-          {hasActions && (
-            <div className="border-pending/10 bg-surface-secondary/60 flex flex-wrap items-center justify-end gap-1.5 border-t px-2 py-1.5">
-              {props.onEdit && (
-                <button
-                  type="button"
-                  onClick={props.onEdit}
-                  className="text-muted hover:bg-hover hover:text-foreground flex h-7 items-center gap-1.5 rounded-md px-2.5 text-[11px] font-medium transition-colors"
+              {isMenuOpen && (
+                <div
+                  role="menu"
+                  className="bg-separator border-border-light absolute right-0 bottom-full z-[1020] mb-1 min-w-[12rem] rounded-md border p-1.5 shadow-md"
+                  data-component="QueuedMessageDispatchMenu"
                 >
-                  <Pencil className="size-3" />
-                  Edit
-                </button>
-              )}
-
-              {props.onSendImmediately && (
-                <button
-                  type="button"
-                  onClick={handleSendImmediately}
-                  disabled={isSending}
-                  className="bg-pending/10 text-pending hover:bg-pending/20 flex h-7 items-center gap-1.5 rounded-md px-2.5 text-[11px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  {isSending ? (
-                    <Loader2 className="size-3 animate-spin" />
-                  ) : (
-                    <Send className="size-3" />
-                  )}
-                  {isSending ? "Sending…" : "Send now"}
-                </button>
+                  {SEND_DISPATCH_MODES.map((entry) => (
+                    <button
+                      key={entry.mode}
+                      type="button"
+                      role="menuitem"
+                      aria-label={entry.label}
+                      disabled={isActionPending || !props.onChangeDispatchMode}
+                      className="hover:bg-hover focus-visible:bg-hover text-foreground flex w-full items-center justify-between gap-2 rounded-sm px-2.5 py-1 text-left text-xs whitespace-nowrap disabled:cursor-not-allowed disabled:opacity-50"
+                      onClick={() => handleDispatchModeChange(entry.mode)}
+                    >
+                      <span>{entry.label}</span>
+                      <span className="flex items-center gap-1.5">
+                        <kbd className="bg-background-secondary text-muted border-border-medium rounded border px-1.5 py-px font-mono text-[10px] whitespace-nowrap [@media(max-width:768px)]:hidden">
+                          {formatKeybind(entry.keybind)}
+                        </kbd>
+                        {queueDispatchMode === entry.mode && <Check className="size-3" />}
+                      </span>
+                    </button>
+                  ))}
+                  <div className="border-border-light my-1 border-t" />
+                  <button
+                    type="button"
+                    role="menuitem"
+                    aria-label="Send now"
+                    disabled={isActionPending || !props.onSendImmediately}
+                    className="hover:bg-hover focus-visible:bg-hover text-foreground flex w-full items-center gap-2 rounded-sm px-2.5 py-1 text-left text-xs whitespace-nowrap disabled:cursor-not-allowed disabled:opacity-50"
+                    onClick={handleSendImmediately}
+                  >
+                    {pendingAction === "send-now" ? (
+                      <Loader2 className="size-3 animate-spin" />
+                    ) : (
+                      <Send className="size-3" />
+                    )}
+                    <span className="flex-1 whitespace-nowrap">Send now</span>
+                    <kbd className="bg-background-secondary text-muted border-border-medium rounded border px-1.5 py-px font-mono text-[10px] whitespace-nowrap [@media(max-width:768px)]:hidden">
+                      {formatKeybind(KEYBINDS.SEND_QUEUED_MESSAGE_NOW)}
+                    </kbd>
+                  </button>
+                </div>
               )}
             </div>
-          )}
+          </div>
         </div>
-      )}
-    />
+      </div>
+    </ChatDockSurface>
   );
 };

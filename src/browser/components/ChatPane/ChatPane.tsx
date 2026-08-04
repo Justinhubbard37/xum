@@ -406,6 +406,17 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     });
   }, [api, workspaceId, autoCompactionThreshold]);
 
+  const [queuedActionErrorState, setQueuedActionErrorState] = useState<{
+    workspaceId: string;
+    messageId: string;
+    error: string;
+  } | null>(null);
+  const queuedActionError =
+    queuedActionErrorState?.workspaceId === workspaceId &&
+    queuedActionErrorState.messageId === workspaceState?.queuedMessage?.id
+      ? queuedActionErrorState.error
+      : null;
+
   const [editingState, setEditingState] = useState(() => ({
     workspaceId,
     message: undefined as EditingMessageState | undefined,
@@ -1008,6 +1019,17 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     }
   }, [workspaceState?.queuedMessage?.id]);
 
+  const clearQueuedActionError = () => setQueuedActionErrorState(null);
+  const handleQueuedActionError = (error: unknown) => {
+    const queuedMessageId = workspaceState?.queuedMessage?.id;
+    if (!queuedMessageId) return;
+    setQueuedActionErrorState({
+      workspaceId,
+      messageId: queuedMessageId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  };
+
   // Handler for sending queued message immediately (interrupt + send)
   const handleSendQueuedImmediately = useCallback(async () => {
     const queuedMessage = workspaceState?.queuedMessage;
@@ -1020,6 +1042,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       return;
     }
 
+    clearQueuedActionError();
     sendQueuedImmediatelyInFlightRef.current = queuedMessage.id;
     // Release the duplicate-send guard only if it still points at this attempt; a
     // newer queued message (or a clear) may have already reset it in the meantime.
@@ -1037,12 +1060,30 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       });
       if (!interruptResult.success) {
         clearInFlightGuardIfCurrent();
+        throw new Error(interruptResult.error);
       }
     } catch (error) {
       clearInFlightGuardIfCurrent();
       throw error;
     }
   }, [api, workspaceId, workspaceState?.queuedMessage, workspaceState?.canInterrupt, storeRaw]);
+
+  const handleQueuedDispatchModeChange = async (queueDispatchMode: QueueDispatchMode) => {
+    clearQueuedActionError();
+    if (!api) {
+      throw new Error("Workspace API is unavailable.");
+    }
+    const result = await api.workspace.setQueuedMessageDispatchMode({
+      workspaceId,
+      queueDispatchMode,
+    });
+    if (!result.success) {
+      throw new Error(result.error);
+    }
+    if (!result.data) {
+      throw new Error("The queued message is no longer available.");
+    }
+  };
 
   const handleCancelCompactionFromBarrier = useCallback(() => {
     if (!api || !aggregator) {
@@ -1848,6 +1889,10 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       onSendQueuedImmediately={
                         workspaceState?.canInterrupt ? handleSendQueuedImmediately : undefined
                       }
+                      onQueuedDispatchModeChange={handleQueuedDispatchModeChange}
+                      onQueuedActionError={handleQueuedActionError}
+                      queuedActionError={queuedActionError}
+                      onClearQueuedActionError={clearQueuedActionError}
                       reviews={reviews}
                       onCheckReviews={handleCheckReviews}
                     />
@@ -1917,6 +1962,10 @@ interface ChatInputPaneProps {
   queuedMessage: QueuedMessageData | null;
   onEditQueuedMessage: () => void;
   onSendQueuedImmediately: (() => Promise<void>) | undefined;
+  onQueuedDispatchModeChange: (mode: QueueDispatchMode) => Promise<void>;
+  queuedActionError: string | null;
+  onQueuedActionError: (error: unknown) => void;
+  onClearQueuedActionError: () => void;
   reviews: ReviewsState;
   onCheckReviews: (ids: string[]) => void;
 }
@@ -1932,6 +1981,24 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
     decorationEntries.push(createChatInputDecorationStackItem(entry));
   };
 
+  // Keep the user's pending follow-up closest to the transcript, above every workspace decoration,
+  // so it reads as the next message rather than as another banner competing near the composer.
+  if (props.queuedMessage) {
+    addDecorationEntry({
+      key: "queued-message",
+      node: (
+        <QueuedMessage
+          message={props.queuedMessage}
+          onEdit={() => void props.onEditQueuedMessage()}
+          onChangeDispatchMode={props.onQueuedDispatchModeChange}
+          onActionError={props.onQueuedActionError}
+          actionError={props.queuedActionError}
+          onActionStart={props.onClearQueuedActionError}
+          onSendImmediately={props.onSendQueuedImmediately}
+        />
+      ),
+    });
+  }
   if (props.shouldShowCompactionWarning) {
     addDecorationEntry({
       key: "compaction-warning",
@@ -1998,18 +2065,6 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
       node: <ReviewsBanner workspaceId={props.workspaceId} />,
     });
   }
-  if (props.queuedMessage) {
-    addDecorationEntry({
-      key: "queued-message",
-      node: (
-        <QueuedMessage
-          message={props.queuedMessage}
-          onEdit={() => void props.onEditQueuedMessage()}
-          onSendImmediately={props.onSendQueuedImmediately}
-        />
-      ),
-    });
-  }
   if (props.isPreStreamAgentTask) {
     addDecorationEntry({
       key: "pre-stream-agent-task",
@@ -2062,6 +2117,8 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
         onEditLastUserMessage={props.onEditLastUserMessage}
         canInterrupt={props.canInterrupt}
         queuedMessage={props.queuedMessage}
+        onQueuedDispatchModeChange={props.onQueuedDispatchModeChange}
+        onQueuedActionError={props.onQueuedActionError}
         onSendQueuedImmediately={props.onSendQueuedImmediately}
         onReady={props.onChatInputReady}
         attachedReviews={reviews.attachedReviews}

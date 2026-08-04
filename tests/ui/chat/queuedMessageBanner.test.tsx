@@ -1,6 +1,7 @@
 import "../dom";
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { useState, type ComponentProps } from "react";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 import { QueuedMessage } from "@/browser/features/Messages/QueuedMessage";
@@ -15,13 +16,23 @@ function createQueuedMessage(overrides?: Partial<QueuedMessageData>): QueuedMess
   };
 }
 
-function expandQueuedMessage(view: ReturnType<typeof render>) {
-  if (view.container.querySelector('[data-component="QueuedMessageCard"]')) {
-    return;
-  }
+function QueuedMessageWithErrorFeedback(props: ComponentProps<typeof QueuedMessage>) {
+  const [actionError, setActionError] = useState<string | null>(null);
+  return (
+    <QueuedMessage
+      {...props}
+      actionError={actionError}
+      onActionStart={() => setActionError(null)}
+      onActionError={(error) =>
+        setActionError(error instanceof Error ? error.message : String(error))
+      }
+    />
+  );
+}
 
-  const header = view.getByRole("button", { name: /queued/i });
-  fireEvent.click(header);
+function openDispatchMenu(view: ReturnType<typeof render>) {
+  fireEvent.click(view.getByRole("button", { name: /queued/i }));
+  return view.getByRole("menu");
 }
 
 describe("QueuedMessage banner", () => {
@@ -37,30 +48,21 @@ describe("QueuedMessage banner", () => {
     cleanupDom = null;
   });
 
-  test("starts expanded — body content is visible", () => {
+  test("always shows the queued user bubble and opens a dispatch menu without hiding it", () => {
     const view = render(
       <QueuedMessage
         message={createQueuedMessage()}
         onEdit={mock(() => {})}
+        onChangeDispatchMode={mock(async () => {})}
         onSendImmediately={mock(async () => {})}
       />
     );
 
-    expect(view.getByRole("button", { name: /queued/i })).toBeTruthy();
     expect(view.getByText("Review this change before sending")).toBeTruthy();
     expect(view.getByText("Edit")).toBeTruthy();
-  });
-
-  test("collapses and re-expands on header click", () => {
-    const view = render(<QueuedMessage message={createQueuedMessage()} onEdit={mock(() => {})} />);
-
-    const header = view.getByRole("button", { name: /queued/i });
-    fireEvent.click(header);
-    expect(view.queryByText("Review this change before sending")).toBeNull();
-    expect(view.queryByText("Edit")).toBeNull();
-
-    fireEvent.click(header);
+    openDispatchMenu(view);
     expect(view.getByText("Review this change before sending")).toBeTruthy();
+    expect(view.getAllByRole("menuitem")).toHaveLength(3);
   });
 
   test("renders queued preview text and step-dispatch label", () => {
@@ -68,7 +70,6 @@ describe("QueuedMessage banner", () => {
 
     expect(view.getByText("Queued")).toBeTruthy();
     expect(view.getByText("Sends after this step")).toBeTruthy();
-    expandQueuedMessage(view);
     expect(view.getByText("Review this change before sending")).toBeTruthy();
   });
 
@@ -83,7 +84,6 @@ describe("QueuedMessage banner", () => {
   test("renders an inner queued bubble inside the banner", () => {
     const view = render(<QueuedMessage message={createQueuedMessage()} />);
 
-    expandQueuedMessage(view);
     const banner = view.container.querySelector('[data-component="QueuedMessageBanner"]');
     const bubble = view.container.querySelector('[data-component="QueuedMessageCard"]');
 
@@ -91,43 +91,73 @@ describe("QueuedMessage banner", () => {
     expect(bubble).toBeTruthy();
   });
 
-  test("shows Edit and Send now buttons when handlers are provided", () => {
-    const onEdit = mock(() => {});
-    const onSendImmediately = mock(async () => {});
-
+  test("keeps only Edit and the queued dropdown as top-level actions", () => {
     const view = render(
       <QueuedMessage
         message={createQueuedMessage()}
-        onEdit={onEdit}
-        onSendImmediately={onSendImmediately}
+        onEdit={mock(() => {})}
+        onChangeDispatchMode={mock(async () => {})}
+        onSendImmediately={mock(async () => {})}
       />
     );
 
-    expandQueuedMessage(view);
-    expect(view.getByText("Edit")).toBeTruthy();
-    expect(view.getByText("Send now")).toBeTruthy();
+    expect(view.getByRole("button", { name: "Edit" })).toBeTruthy();
+    expect(view.getByRole("button", { name: /queued/i })).toBeTruthy();
+    expect(view.queryByText("Send now")).toBeNull();
+    openDispatchMenu(view);
+    expect(view.getByRole("menuitem", { name: "Send after step" })).toBeTruthy();
+    expect(view.getByRole("menuitem", { name: "Send after turn" })).toBeTruthy();
+    expect(view.getByRole("menuitem", { name: "Send now" })).toBeTruthy();
   });
 
   test("clicking Edit calls onEdit", () => {
     const onEdit = mock(() => {});
-
     const view = render(<QueuedMessage message={createQueuedMessage()} onEdit={onEdit} />);
 
-    expandQueuedMessage(view);
-    fireEvent.click(view.getByText("Edit"));
+    fireEvent.click(view.getByRole("button", { name: "Edit" }));
 
     expect(onEdit).toHaveBeenCalledTimes(1);
   });
 
+  test("selecting a deferred mode calls onChangeDispatchMode", async () => {
+    const onChangeDispatchMode = mock(async (_mode: "tool-end" | "turn-end") => {});
+    const view = render(
+      <QueuedMessage message={createQueuedMessage()} onChangeDispatchMode={onChangeDispatchMode} />
+    );
+
+    openDispatchMenu(view);
+    fireEvent.click(view.getByRole("menuitem", { name: "Send after turn" }));
+
+    await waitFor(() => {
+      expect(onChangeDispatchMode).toHaveBeenCalledWith("turn-end");
+    });
+  });
+
+  test("reapplies the checked mode so the backend can reprioritize visible entries", async () => {
+    const onChangeDispatchMode = mock(async (_mode: "tool-end" | "turn-end") => {});
+    const view = render(
+      <QueuedMessage
+        message={createQueuedMessage({ queueDispatchMode: "tool-end" })}
+        onChangeDispatchMode={onChangeDispatchMode}
+      />
+    );
+
+    openDispatchMenu(view);
+    fireEvent.click(view.getByRole("menuitem", { name: "Send after step" }));
+
+    await waitFor(() => {
+      expect(onChangeDispatchMode).toHaveBeenCalledWith("tool-end");
+    });
+  });
+
   test("clicking Send now calls onSendImmediately", async () => {
     const onSendImmediately = mock(async () => {});
-
     const view = render(
       <QueuedMessage message={createQueuedMessage()} onSendImmediately={onSendImmediately} />
     );
 
-    expandQueuedMessage(view);
-    fireEvent.click(view.getByText("Send now"));
+    openDispatchMenu(view);
+    fireEvent.click(view.getByRole("menuitem", { name: "Send now" }));
 
     await waitFor(() => {
       expect(onSendImmediately).toHaveBeenCalledTimes(1);
@@ -142,28 +172,32 @@ describe("QueuedMessage banner", () => {
         throw new Error("Connection lost while interrupting");
       }
     });
-
     const view = render(
-      <QueuedMessage message={createQueuedMessage()} onSendImmediately={onSendImmediately} />
+      <QueuedMessageWithErrorFeedback
+        message={createQueuedMessage()}
+        onSendImmediately={onSendImmediately}
+      />
     );
 
-    fireEvent.click(view.getByText("Send now"));
+    openDispatchMenu(view);
+    fireEvent.click(view.getByRole("menuitem", { name: "Send now" }));
     await waitFor(() => {
       expect(view.getByRole("alert").textContent).toContain("Connection lost while interrupting");
     });
 
-    fireEvent.click(view.getByText("Send now"));
+    openDispatchMenu(view);
+    fireEvent.click(view.getByRole("menuitem", { name: "Send now" }));
     await waitFor(() => {
       expect(onSendImmediately).toHaveBeenCalledTimes(2);
       expect(view.queryByRole("alert")).toBeNull();
     });
   });
 
-  test("does not render Send now button when onSendImmediately is absent", () => {
+  test("keeps Send now visible but disabled when immediate dispatch is unavailable", () => {
     const view = render(<QueuedMessage message={createQueuedMessage()} onEdit={mock(() => {})} />);
 
-    expandQueuedMessage(view);
-    expect(view.queryByText("Send now")).toBeNull();
+    openDispatchMenu(view);
+    expect(view.getByRole("menuitem", { name: "Send now" }).hasAttribute("disabled")).toBe(true);
   });
 
   test("renders file attachment links when non-image fileParts are present", () => {
@@ -181,7 +215,6 @@ describe("QueuedMessage banner", () => {
       />
     );
 
-    expandQueuedMessage(view);
     expect(view.getByRole("link", { name: "example.ts" })).toBeTruthy();
   });
 
@@ -201,7 +234,6 @@ describe("QueuedMessage banner", () => {
       />
     );
 
-    expandQueuedMessage(view);
     expect(view.getByText(/src\/example\.ts/)).toBeTruthy();
     expect(view.getByText("Double-check this logic.")).toBeTruthy();
   });
@@ -224,7 +256,6 @@ describe("QueuedMessage banner", () => {
       />
     );
 
-    expandQueuedMessage(view);
     expect(view.queryByText(/Re src\/example\.ts/)).toBeNull();
     expect(view.queryByText(/<review>/)).toBeNull();
     expect(view.getByText("Please also check the tests")).toBeTruthy();
@@ -247,7 +278,6 @@ describe("QueuedMessage banner", () => {
       />
     );
 
-    expandQueuedMessage(view);
     expect(view.getByText("Do this please")).toBeTruthy();
   });
 
@@ -277,7 +307,6 @@ describe("QueuedMessage banner", () => {
       />
     );
 
-    expandQueuedMessage(view);
     expect(view.getByText("Please review the bundle output")).toBeTruthy();
     expect(view.getByText(/src\/App\.tsx/)).toBeTruthy();
     expect(view.getByText("Please validate edge cases")).toBeTruthy();
@@ -302,7 +331,6 @@ describe("QueuedMessage banner", () => {
       />
     );
 
-    expandQueuedMessage(view);
     const images = view.container.querySelectorAll("img");
     expect(images.length).toBe(2);
     expect(view.getByAltText("Attachment 1")).toBeTruthy();
@@ -326,7 +354,6 @@ describe("QueuedMessage banner", () => {
       />
     );
 
-    expandQueuedMessage(view);
     const images = view.container.querySelectorAll("img");
     expect(images.length).toBe(5);
     expect(view.getByAltText("Attachment 5")).toBeTruthy();
@@ -350,7 +377,6 @@ describe("QueuedMessage banner", () => {
       />
     );
 
-    expandQueuedMessage(view);
     const images = view.container.querySelectorAll("img");
     expect(images.length).toBe(1);
     expect(view.getByAltText("Attachment 1")).toBeTruthy();
@@ -371,7 +397,6 @@ describe("QueuedMessage banner", () => {
       />
     );
 
-    expandQueuedMessage(view);
     const images = view.container.querySelectorAll("img");
     expect(images.length).toBe(2);
     expect(view.getByText("Queued message ready")).toBeTruthy();

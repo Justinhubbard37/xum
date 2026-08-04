@@ -174,6 +174,11 @@ export class MessageQueue {
     return entries.some((entry) => entry.dispatchMode === "tool-end") ? "tool-end" : "turn-end";
   }
 
+  /** Dispatch boundary for the FIFO head entry — the only entry the next drain can send. */
+  getNextQueueDispatchMode(): QueueDispatchMode {
+    return this.entries[0]?.dispatchMode ?? "tool-end";
+  }
+
   /**
    * Effective dispatch mode across pending entries: any entry queued for tool-end
    * makes the whole queue dispatch at tool-end (sticky, matching pre-entry behavior),
@@ -188,7 +193,32 @@ export class MessageQueue {
    * messages should not change the queue badge shown beside the user's own follow-up.
    */
   getVisibleQueueDispatchMode(): QueueDispatchMode {
-    return this.getDispatchMode(this.getVisibleEntries());
+    return this.getVisibleEntries().length > 0 ? this.getNextQueueDispatchMode() : "tool-end";
+  }
+
+  /**
+   * Update the dispatch boundary for every user-visible queued entry represented by the
+   * aggregate queued-message card. Hidden synthetic/background entries keep their own mode.
+   */
+  setVisibleQueueDispatchMode(mode: QueueDispatchMode): boolean {
+    const visibleEntries: QueueEntry[] = [];
+    const hiddenEntries: QueueEntry[] = [];
+    for (const entry of this.entries) {
+      if (entry.userAuthored) {
+        entry.dispatchMode = mode;
+        visibleEntries.push(entry);
+      } else {
+        hiddenEntries.push(entry);
+      }
+    }
+    if (visibleEntries.length === 0) {
+      return false;
+    }
+
+    // The user explicitly chose when the aggregate visible card should dispatch. Keep those
+    // entries together at the FIFO head so a hidden predecessor cannot contradict that choice.
+    this.entries = [...visibleEntries, ...hiddenEntries];
+    return true;
   }
 
   /**

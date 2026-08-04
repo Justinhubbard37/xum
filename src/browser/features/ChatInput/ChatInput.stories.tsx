@@ -184,12 +184,63 @@ export const QueuedFollowUp: AppStory = {
     blurActiveElement();
 
     await waitFor(() => {
+      const group = storyRoot.querySelector<HTMLElement>('[data-component="QueuedMessageGroup"]');
+      const dock = group?.closest<HTMLElement>('[data-component="ChatDockSurface"]');
       const card = storyRoot.querySelector<HTMLElement>('[data-component="QueuedMessageCard"]');
-      if (!card) throw new Error("Queued follow-up card not rendered");
-      if (card.scrollWidth > card.clientWidth) {
-        throw new Error(
-          `Queued follow-up overflows horizontally (${card.scrollWidth}px > ${card.clientWidth}px)`
-        );
+      const actions = storyRoot.querySelector<HTMLElement>(
+        '[data-component="QueuedMessageActions"]'
+      );
+      const status = storyRoot.querySelector<HTMLElement>('[data-component="QueuedMessageStatus"]');
+      if (!dock || !group || !card || !actions || !status) {
+        throw new Error("Queued follow-up user-message layout not rendered");
+      }
+      for (const element of [group, card, actions, status]) {
+        if (element.scrollWidth > element.clientWidth) {
+          throw new Error(
+            `Queued follow-up element overflows horizontally (${element.scrollWidth}px > ${element.clientWidth}px)`
+          );
+        }
+      }
+
+      const dockBounds = dock.getBoundingClientRect();
+      const groupBounds = group.getBoundingClientRect();
+      const cardBounds = card.getBoundingClientRect();
+      const actionsBounds = actions.getBoundingClientRect();
+      const statusBounds = status.getBoundingClientRect();
+      if (Math.abs(dockBounds.right - groupBounds.right) > 1) {
+        throw new Error("Queued follow-up group is not right-aligned with the transcript column");
+      }
+      if (Math.abs(groupBounds.right - cardBounds.right) > 1) {
+        throw new Error("Queued follow-up bubble is not right-aligned within its group");
+      }
+      if (Math.abs(groupBounds.right - actionsBounds.right) > 1) {
+        throw new Error("Queued follow-up actions are not right-aligned within their metadata row");
+      }
+      if (statusBounds.right > groupBounds.right + 1) {
+        throw new Error("Queued follow-up status overflows its right-aligned metadata row");
+      }
+    });
+
+    const status = storyRoot.querySelector<HTMLButtonElement>(
+      '[data-component="QueuedMessageStatus"]'
+    );
+    if (!status) throw new Error("Queued dispatch dropdown not rendered");
+    await userEvent.click(status);
+    await waitFor(() => {
+      const menu = storyRoot.querySelector<HTMLElement>(
+        '[data-component="QueuedMessageDispatchMenu"]'
+      );
+      if (!menu) throw new Error("Queued dispatch menu did not open");
+      if (menu.querySelectorAll('[role="menuitem"]').length !== 3) {
+        throw new Error("Queued dispatch menu must show exactly three actions");
+      }
+      if (menu.scrollWidth > menu.clientWidth) {
+        throw new Error("Queued dispatch menu overflows horizontally");
+      }
+      for (const item of menu.querySelectorAll<HTMLElement>('[role="menuitem"]')) {
+        if (item.scrollHeight > item.clientHeight) {
+          throw new Error("Queued dispatch menu item wraps vertically");
+        }
       }
     });
   },

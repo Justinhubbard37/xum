@@ -230,7 +230,7 @@ describe("Send dispatch modes (mock AI router)", () => {
     }
   }, 60_000);
 
-  test("pressing Enter on an empty composer sends the queued message now", async () => {
+  test("queued send keybinds update the boundary and can send immediately", async () => {
     const app = await createAppHarness({ branchPrefix: "queued-enter-send-now" });
 
     try {
@@ -266,7 +266,37 @@ describe("Send dispatch modes (mock AI router)", () => {
         const textContent = app.view.container.textContent ?? "";
         expect(textContent).toContain("Queued");
         expect(textContent).toContain("Sends after this turn");
-        expect(textContent).toContain("Send now");
+        expect(
+          app.view.container.querySelector('[data-component="QueuedMessageDispatchMenu"]')
+        ).toBeNull();
+      });
+
+      const queuedDispatchButton = app.view.container.querySelector<HTMLButtonElement>(
+        '[data-component="QueuedMessageStatus"]'
+      );
+      if (!queuedDispatchButton) {
+        throw new Error("Queued dispatch dropdown not found");
+      }
+      fireEvent.click(queuedDispatchButton);
+      const queuedDispatchMenu = await waitFor(() => {
+        const menu = app.view.container.querySelector<HTMLElement>(
+          '[data-component="QueuedMessageDispatchMenu"]'
+        );
+        expect(menu?.textContent).toContain("Send after step");
+        expect(menu?.textContent).toContain("Send after turn");
+        expect(menu?.textContent).toContain("Send now");
+        if (!menu) throw new Error("Queued dispatch menu not rendered");
+        return menu;
+      });
+      const sendAfterStepRow = Array.from(queuedDispatchMenu.querySelectorAll("button")).find(
+        (button) => button.textContent?.includes("Send after step")
+      );
+      if (!sendAfterStepRow) throw new Error("Queued Send after step action not found");
+      fireEvent.click(sendAfterStepRow);
+      await waitFor(() => {
+        expect(app.view.container.textContent).toContain("Sends after this step");
+        expect(app.view.container.textContent).not.toContain("Sends after this turn");
+        expect(app.view.container.textContent).toContain(queuedText);
       });
 
       const textarea = await getComposerDockTextarea(app.view.container);
@@ -275,18 +305,41 @@ describe("Send dispatch modes (mock AI router)", () => {
       });
 
       textarea.focus();
-      expect(fireEvent.keyDown(textarea, { key: "Enter", code: "Enter", charCode: 13 })).toBe(
-        false
-      );
-      // A fast second Enter press should be ignored while the send-now interrupt is in flight.
-      expect(fireEvent.keyDown(textarea, { key: "Enter", code: "Enter", charCode: 13 })).toBe(
-        false
-      );
+      fireEvent.keyDown(textarea, {
+        key: "Enter",
+        code: "Enter",
+        charCode: 13,
+        ctrlKey: true,
+      });
+      await waitFor(() => {
+        expect(app.view.container.textContent).toContain("Sends after this turn");
+      });
+
+      fireEvent.keyDown(textarea, { key: "Enter", code: "Enter", charCode: 13 });
+      await waitFor(() => {
+        expect(app.view.container.textContent).toContain("Sends after this step");
+      });
+
+      fireEvent.keyDown(textarea, {
+        key: "Enter",
+        code: "Enter",
+        charCode: 13,
+        ctrlKey: true,
+        shiftKey: true,
+      });
+      // A fast repeated send-now shortcut should be ignored while the interrupt is in flight.
+      fireEvent.keyDown(textarea, {
+        key: "Enter",
+        code: "Enter",
+        charCode: 13,
+        ctrlKey: true,
+        shiftKey: true,
+        repeat: true,
+      });
 
       await waitFor(
         () => {
-          const textContent = app.view.container.textContent ?? "";
-          expect(textContent).not.toContain("Sends after this turn");
+          expect(app.view.container.textContent).not.toContain("Sends after this step");
         },
         { timeout: 30_000 }
       );

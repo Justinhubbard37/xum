@@ -22,8 +22,10 @@ import {
   buildWorkflowRunCardMessage,
 } from "@/common/utils/workflowRunMessages";
 import {
+  createCompletedTaskTool,
   createFileEditTool,
   createFileReadTool,
+  createGenericTool,
   createTaskAwaitTool,
   createWebSearchTool,
 } from "@/browser/stories/mocks/tools";
@@ -118,6 +120,24 @@ export const TaskAwaitTranscript: AppStory = {
             `Task await summary overflows horizontally (${summary.scrollWidth}px > ${summary.clientWidth}px)`
           );
         }
+
+        const groupedSummary = canvasElement.querySelector<HTMLElement>(
+          '[data-component="OperationalBundleSummary"]'
+        );
+        const standaloneSummary = summary.querySelector<HTMLElement>(
+          '[data-component="TaskAwaitSummary"]'
+        );
+        if (!groupedSummary || !standaloneSummary) {
+          throw new Error("Task wait summary typography targets not rendered");
+        }
+        const groupedFontSize = Number.parseFloat(getComputedStyle(groupedSummary).fontSize);
+        const standaloneFontSize = Number.parseFloat(getComputedStyle(standaloneSummary).fontSize);
+        if (groupedFontSize !== standaloneFontSize) {
+          throw new Error("Grouped and standalone task waits use inconsistent text sizes");
+        }
+        if (standaloneFontSize > 11) {
+          throw new Error("Task wait summary is larger than compact tool chrome");
+        }
         return summary;
       },
       { timeout: 15_000 }
@@ -137,6 +157,126 @@ export const TaskAwaitTranscript: AppStory = {
       if (details.scrollWidth > details.clientWidth) {
         throw new Error(
           `Task await details overflow horizontally (${details.scrollWidth}px > ${details.clientWidth}px)`
+        );
+      }
+    });
+  },
+};
+
+export const TaskReportTranscript: AppStory = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    pixel: {
+      matrix: { themes: ["dark", "light"], viewports: ["phone", "laptop"] },
+    },
+  },
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        collapseLeftSidebar();
+        return setupSimpleChatStory({
+          workspaceId: "ws-task-report-transcript",
+          messages: [
+            createUserMessage("msg-task-report-1", "Investigate the transcript typography bug.", {
+              historySequence: 1,
+              timestamp: STABLE_TIMESTAMP - 60_000,
+            }),
+            createAssistantMessage("msg-task-report-2", "The investigation is complete.", {
+              historySequence: 2,
+              timestamp: STABLE_TIMESTAMP,
+              toolCalls: [
+                createCompletedTaskTool("task-report-complete", {
+                  subagent_type: "explore",
+                  prompt: "Find why task report text renders larger than nearby tool chrome.",
+                  title: "Investigate task report typography",
+                  taskId: "task-report-1",
+                  reportTitle: "Typography investigation",
+                  reportMarkdown: `# Typography investigation
+
+The report inherited transcript-sized markdown styles instead of compact task chrome.
+
+## Fix
+
+- Keep body text aligned with compact \`tool chrome\`.
+- Preserve modest heading hierarchy without transcript-scale headings.`,
+                }),
+                createGenericTool(
+                  "agent-report-update",
+                  "agent_report",
+                  {
+                    title: "Agent update",
+                    reportMarkdown: `## Agent update
+
+The same compact report typography applies to incremental agent findings.
+
+- Body and inline \`code\` remain aligned with tool chrome.
+- Headings retain a modest hierarchy.`,
+                  },
+                  { success: true }
+                ),
+              ],
+            }),
+          ],
+        });
+      }}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    const taskCard = await waitFor(() => {
+      const card = canvasElement.querySelector<HTMLElement>('[data-component="TaskToolCall"]');
+      if (!card) throw new Error("Task report card not rendered");
+      return card;
+    });
+    const taskHeader = taskCard.querySelector<HTMLElement>('[data-scroll-intent="ignore"]');
+    if (!taskHeader) throw new Error("Task report header not rendered");
+    await userEvent.click(taskHeader);
+
+    const agentReportCard = await waitFor(() => {
+      const card = canvasElement.querySelector<HTMLElement>(
+        '[data-component="AgentReportToolCall"]'
+      );
+      if (!card) throw new Error("Agent report card not rendered");
+      return card;
+    });
+
+    await waitFor(() => {
+      const report = taskCard.querySelector<HTMLElement>(".compact-report-markdown");
+      const heading = report?.querySelector<HTMLElement>("h1");
+      if (!report || !heading) throw new Error("Expanded task report markdown not rendered");
+      if (Number.parseFloat(getComputedStyle(report).fontSize) > 12) {
+        throw new Error("Task report body text is larger than compact tool chrome");
+      }
+      if (Number.parseFloat(getComputedStyle(heading).fontSize) > 14) {
+        throw new Error("Task report heading is too large for compact tool chrome");
+      }
+      if (taskCard.scrollWidth > taskCard.clientWidth) {
+        throw new Error(
+          `Task report card overflows horizontally (${taskCard.scrollWidth}px > ${taskCard.clientWidth}px)`
+        );
+      }
+    });
+
+    await waitFor(() => {
+      const report = agentReportCard.querySelector<HTMLElement>(".compact-report-markdown");
+      const heading = report?.querySelector<HTMLElement>("h2");
+      const code = report?.querySelector<HTMLElement>("code");
+      if (!report || !heading || !code) {
+        throw new Error("Expanded agent report markdown not rendered");
+      }
+      if (Number.parseFloat(getComputedStyle(report).fontSize) > 11) {
+        throw new Error("Agent report body text is larger than compact tool chrome");
+      }
+      if (Number.parseFloat(getComputedStyle(heading).fontSize) > 13) {
+        throw new Error("Agent report heading is too large for compact tool chrome");
+      }
+      if (Number.parseFloat(getComputedStyle(code).fontSize) > 11) {
+        throw new Error("Agent report inline code is larger than compact tool chrome");
+      }
+      if (agentReportCard.scrollWidth > agentReportCard.clientWidth) {
+        throw new Error(
+          `Agent report card overflows horizontally (${agentReportCard.scrollWidth}px > ${agentReportCard.clientWidth}px)`
         );
       }
     });
@@ -521,7 +661,7 @@ const BASH_MONITOR_WAKE_LOST_PROMPT = [
 ].join("\n");
 
 /**
- * Bash monitor wakes render as quiet inline events instead of user bubbles.
+ * Bash monitor wakes render as quiet right-aligned events instead of user bubbles.
  * The play expands the first (match) event so the snapshot covers both the
  * on-demand raw prompt and the collapsed monitor-lost event below it.
  */
@@ -598,6 +738,20 @@ export const BashMonitorWakeMessages: AppStory = {
       },
       { timeout: 15_000 }
     );
+
+    const monitorWakeRows = canvasElement.querySelectorAll<HTMLElement>("[data-bash-monitor-wake]");
+    if (monitorWakeRows.length !== 2) {
+      throw new Error(`Expected 2 monitor wake rows, found ${monitorWakeRows.length}`);
+    }
+    for (const row of monitorWakeRows) {
+      const rowBounds = row.getBoundingClientRect();
+      const toggle = row.querySelector<HTMLElement>("button");
+      if (!toggle) throw new Error("Monitor wake toggle not rendered");
+      const toggleBounds = toggle.getBoundingClientRect();
+      if (Math.abs(rowBounds.right - toggleBounds.right) > 1) {
+        throw new Error("Monitor wake summary is not right-aligned");
+      }
+    }
 
     // Expand the first (match) card; the monitor-lost card stays collapsed.
     await userEvent.click(toggles[0]);

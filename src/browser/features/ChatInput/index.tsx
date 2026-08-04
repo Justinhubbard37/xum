@@ -3132,10 +3132,35 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       return; // Let CommandSuggestions handle it
     }
 
-    // Handle send message (Shift+Enter for newline is default behavior)
+    const hasOnlyQueuedMessage =
+      variant === "workspace" &&
+      !editingMessageForUi &&
+      props.queuedMessage != null &&
+      input.trim() === "" &&
+      attachments.length === 0 &&
+      reviewPanelItems.length === 0;
+
+    // Existing send keybinds edit the queued boundary when the composer itself is empty.
+    if (hasOnlyQueuedMessage && matchesKeybind(e, KEYBINDS.SEND_QUEUED_MESSAGE_NOW)) {
+      if (!props.onSendQueuedImmediately || e.repeat) return;
+      e.preventDefault();
+      stopKeyboardPropagation(e);
+      props.onSendQueuedImmediately().catch((error: unknown) => {
+        props.onQueuedActionError?.(error);
+      });
+      return;
+    }
+
     if (matchesKeybind(e, KEYBINDS.SEND_MESSAGE_AFTER_TURN)) {
       e.preventDefault();
-      void handleSend({ queueDispatchMode: "turn-end" });
+      if (hasOnlyQueuedMessage && props.onQueuedDispatchModeChange) {
+        stopKeyboardPropagation(e);
+        props.onQueuedDispatchModeChange("turn-end").catch((error: unknown) => {
+          props.onQueuedActionError?.(error);
+        });
+      } else {
+        void handleSend({ queueDispatchMode: "turn-end" });
+      }
       return;
     }
 
@@ -3144,21 +3169,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       if (isMobileTouch) {
         return;
       }
-      if (
-        variant === "workspace" &&
-        !e.repeat &&
-        !editingMessageForUi &&
-        props.queuedMessage != null &&
-        props.onSendQueuedImmediately &&
-        input.trim() === "" &&
-        attachments.length === 0 &&
-        reviewPanelItems.length === 0
-      ) {
-        // User request: with an already-queued follow-up and an empty composer, Enter
-        // should activate the visible "Send now" action instead of requiring a mouse click.
+      if (hasOnlyQueuedMessage && props.onQueuedDispatchModeChange && !e.repeat) {
         e.preventDefault();
-        e.stopPropagation();
-        void props.onSendQueuedImmediately();
+        stopKeyboardPropagation(e);
+        props.onQueuedDispatchModeChange("tool-end").catch((error: unknown) => {
+          props.onQueuedActionError?.(error);
+        });
         return;
       }
       e.preventDefault();
