@@ -48,6 +48,7 @@ import type {
 } from "@/common/types/tools";
 import type { TaskReportLinking } from "@/browser/utils/messages/taskReportLinking";
 import { formatGitPatchArtifactSummary } from "./taskPatchSummary";
+import { sanitizeDisplayableModelIntent } from "./bashCollapsedSummary";
 import {
   formatTaskGroupCreationLabel,
   formatTaskGroupHeader,
@@ -461,6 +462,10 @@ function toTaskStatusFromBackgroundProcessStatus(
 
 function isWorkspaceTurnTaskHandleId(taskId: string): boolean {
   return /^wst_[a-z0-9][a-z0-9_-]*$/.test(taskId);
+}
+
+function isWorkflowRunTaskHandleId(taskId: string): boolean {
+  return taskId.startsWith("wfr_");
 }
 
 function fromBashTaskId(taskId: string): string | null {
@@ -1337,6 +1342,33 @@ export const TaskAwaitToolCall: React.FC<TaskAwaitToolCallProps> = ({
   const targetCount = totalCount > 0 ? totalCount : taskIds?.length;
   const formatTasks = (count: number) => `${count} ${count === 1 ? "task" : "tasks"}`;
 
+  // "1 task completed" alone says nothing about what finished; for single-task awaits,
+  // surface the task's kind plus its spawn intent/title in the collapsed row.
+  const firstResult = results[0];
+  let singleTaskDetail: string | undefined;
+  if (results.length === 1 && firstResult.status === "completed") {
+    const completedTaskId = firstResult.taskId;
+    const bashSpawn = taskReportLinking?.bashSpawnByTaskId.get(completedTaskId);
+    const kind = fromBashTaskId(completedTaskId)
+      ? "bash"
+      : isWorkflowRunTaskHandleId(completedTaskId)
+        ? "workflow"
+        : isWorkspaceTurnTaskHandleId(completedTaskId) ||
+            firstResult.handleKind === "workspace_turn"
+          ? "workspace"
+          : taskReportLinking?.spawnAgentTypeByTaskId.get(completedTaskId);
+    // Spawn-side intent first (bash model_intent, task spawn title); the result's own
+    // title (report heading, bash display_name) is only a fallback.
+    const description =
+      (bashSpawn
+        ? sanitizeDisplayableModelIntent(bashSpawn.modelIntent, bashSpawn.script)
+        : undefined) ??
+      trimToNonEmptyString(taskReportLinking?.spawnTitleByTaskId.get(completedTaskId)) ??
+      trimToNonEmptyString(firstResult.title);
+    const detail = [kind, description].filter((part): part is string => part != null).join(" · ");
+    singleTaskDetail = detail.length > 0 ? detail : undefined;
+  }
+
   let summaryTitle: string;
   let summaryDetail: string | undefined;
   let summaryTone: "active" | "danger" | "interrupted" | "success" | "waiting";
@@ -1372,6 +1404,7 @@ export const TaskAwaitToolCall: React.FC<TaskAwaitToolCallProps> = ({
     summaryTone = "waiting";
   } else if (completedCount > 0) {
     summaryTitle = `${formatTasks(completedCount)} completed`;
+    summaryDetail = singleTaskDetail;
     summaryTone = "success";
   } else {
     summaryTitle = "Checked task status";
