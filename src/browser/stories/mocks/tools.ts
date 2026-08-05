@@ -480,6 +480,9 @@ export function createTaskTool(
     run_in_background?: boolean;
     taskId: string;
     status: "queued" | "running";
+    interruption?:
+      | { reason: "progress_report_received"; sourceTaskId: string }
+      | { reason: "message_queued" };
   }
 ): MuxPart {
   return {
@@ -496,6 +499,10 @@ export function createTaskTool(
     output: {
       status: opts.status,
       taskId: opts.taskId,
+      interruption: opts.interruption,
+      ...(opts.interruption
+        ? { note: "Foreground wait paused because a queued message needs attention." }
+        : {}),
     },
   };
 }

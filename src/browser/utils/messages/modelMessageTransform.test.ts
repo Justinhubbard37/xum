@@ -264,16 +264,34 @@ describe("modelMessageTransform", () => {
 
     it("does not coalesce a task_await result that was interrupted by a child report", () => {
       const input = { task_ids: ["task1"], timeout_secs: 10 };
-      const assistantMsg: AssistantModelMessage = {
+      const noProgressCall: AssistantModelMessage = {
         role: "assistant",
         content: [{ type: "tool-call", toolCallId: "call1", toolName: "task_await", input }],
       };
-      const toolMsg: ToolModelMessage = {
+      const noProgressResult: ToolModelMessage = {
         role: "tool",
         content: [
           {
             type: "tool-result",
             toolCallId: "call1",
+            toolName: "task_await",
+            output: {
+              type: "json",
+              value: { results: [{ status: "running", taskId: "task1" }] },
+            },
+          },
+        ],
+      };
+      const interruptedCall: AssistantModelMessage = {
+        role: "assistant",
+        content: [{ type: "tool-call", toolCallId: "call2", toolName: "task_await", input }],
+      };
+      const interruptedResult: ToolModelMessage = {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call2",
             toolName: "task_await",
             output: {
               type: "json",
@@ -288,11 +306,11 @@ describe("modelMessageTransform", () => {
           },
         ],
       };
+      const messages = [noProgressCall, noProgressResult, interruptedCall, interruptedResult];
 
-      expect(transformModelMessages([assistantMsg, toolMsg], "anthropic")).toEqual([
-        assistantMsg,
-        toolMsg,
-      ]);
+      // Removing the interruption guard would classify both pairs as no-progress and collapse the
+      // first pair. Keep both so the child report remains a visible interaction boundary.
+      expect(transformModelMessages(messages, "anthropic")).toEqual(messages);
     });
 
     it("does not coalesce task_await polls when a later poll returns progress", () => {

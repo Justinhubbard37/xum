@@ -7,7 +7,7 @@ import {
   createSubagentReportMessage,
   createUserMessage,
 } from "../mocks/messages";
-import { createTaskAwaitTool, createTaskSendMessageTool } from "../mocks/tools";
+import { createTaskSendMessageTool, createTaskTool } from "../mocks/tools";
 import { STABLE_TIMESTAMP } from "../mocks/workspaces";
 
 const REPORT_MESSAGES = [
@@ -27,9 +27,13 @@ const REPORT_MESSAGES = [
     historySequence: 3,
     timestamp: STABLE_TIMESTAMP - 140_000,
     toolCalls: [
-      createTaskAwaitTool("wait-for-report", {
-        task_ids: ["18c2511cea"],
-        results: [{ taskId: "18c2511cea", status: "running" }],
+      createTaskTool("wait-for-report", {
+        subagent_type: "explore",
+        prompt: "Review the message rendering path and report important findings.",
+        title: "Trace report presentation",
+        run_in_background: false,
+        taskId: "18c2511cea",
+        status: "running",
         interruption: {
           reason: "progress_report_received",
           sourceTaskId: "18c2511cea",

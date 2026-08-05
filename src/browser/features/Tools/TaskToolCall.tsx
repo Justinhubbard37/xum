@@ -1070,6 +1070,15 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
   const hasAnyReport = displayEntries.some((entry) => hasNonEmptyText(entry.reportMarkdown));
   const aggregateTaskStatus = getAggregateTaskStatus(displayEntries, successResult?.status);
 
+  const interruption =
+    successResult?.status !== "completed" ? successResult?.interruption : undefined;
+  const headerLabel =
+    interruption?.reason === "progress_report_received"
+      ? "Wait paused for subagent update"
+      : interruption?.reason === "message_queued"
+        ? "Wait paused for queued message"
+        : "task";
+
   const effectiveStatus: ToolStatus =
     aggregateTaskStatus === "completed"
       ? "completed"
@@ -1112,14 +1121,14 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
       <ToolHeader onClick={toggleExpanded}>
         <ExpandIcon expanded={expanded}>▶</ExpandIcon>
         <TaskIcon toolName="task" />
-        <ToolName>task</ToolName>
+        <ToolName>{headerLabel}</ToolName>
         {kindBadge}
         {isTaskGroup && (
           <span className="text-muted text-[10px]">
             {formatTaskGroupSummary(taskGroupKind, totalTaskGroupCount).toLowerCase()}
           </span>
         )}
-        {isBackground && (
+        {isBackground && interruption == null && (
           <span className="text-backgrounded text-[10px] font-medium">background</span>
         )}
         <StatusIndicator status={effectiveStatus}>

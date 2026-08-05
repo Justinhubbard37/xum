@@ -157,6 +157,36 @@ describe("TaskToolCall", () => {
     expect(setSelectedWorkspace.mock.calls[0][0]).toEqual(workspace);
   });
 
+  test("surfaces progress interruptions from foreground task spawns", () => {
+    const agentTaskArgs = {
+      subagent_type: "explore",
+      prompt: "Trace the report path.",
+      title: "Trace reports",
+      run_in_background: false,
+    };
+    const AgentTaskToolCall = getToolComponent("task", agentTaskArgs);
+    const view = render(
+      <TooltipProvider>
+        <AgentTaskToolCall
+          args={agentTaskArgs}
+          result={{
+            status: "running",
+            taskId: "task-child-progress",
+            interruption: {
+              reason: "progress_report_received",
+              sourceTaskId: "task-child-progress",
+            },
+            note: "Foreground wait paused because a queued message needs attention.",
+          }}
+          status="completed"
+        />
+      </TooltipProvider>
+    );
+
+    expect(view.getByText("Wait paused for subagent update")).toBeDefined();
+    expect(view.queryByText("background")).toBeNull();
+  });
+
   test("prefers live workspace settings over the result snapshot", () => {
     // A plan child's auto-handoff to exec rewrites live metadata after launch; the
     // result snapshot keeps the stale plan-phase settings.
