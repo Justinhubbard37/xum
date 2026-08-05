@@ -687,6 +687,26 @@ describe("TaskSendMessageToolCall", () => {
     fireEvent.click(view.getByText("Sent guidance to"));
     expect(view.getByText("Use the corrected API shape.")).toBeDefined();
   });
+
+  test("does not claim rejected guidance was sent", () => {
+    const view = render(
+      <TooltipProvider>
+        <TaskSendMessageToolCall
+          args={taskSendMessageArgs}
+          status="completed"
+          result={{
+            status: "not_active",
+            taskId: "child-task",
+            taskStatus: "reported",
+            error: "Task already completed.",
+          }}
+        />
+      </TooltipProvider>
+    );
+
+    expect(view.getByText("Could not send guidance to")).toBeDefined();
+    expect(view.queryByText("Sent guidance to")).toBeNull();
+  });
 });
 
 const taskTerminateArgs = { task_ids: ["wfr_x"] };

@@ -529,6 +529,30 @@ export function summarizeOperationalBundle(
     };
   }
 
+  if (
+    messages.length === 1 &&
+    messages[0].type === "tool" &&
+    messages[0].toolName === "task_send_message"
+  ) {
+    const message = messages[0];
+    const result = unwrapJsonResult(message.result);
+    const delivered =
+      isPlainObject(result) && (result.status === "accepted" || result.status === "queued");
+    const failed =
+      message.status === "failed" ||
+      (isPlainObject(result) && typeof result.status === "string" && !delivered);
+    return {
+      title: delivered
+        ? "Sent 1 guidance message"
+        : failed
+          ? "Could not send guidance"
+          : "Sending guidance",
+      ...(failed ? {} : { activeTitle: "Sending guidance" }),
+      details: "1 guidance message",
+      ...(failed ? { tone: "danger" as const } : {}),
+    };
+  }
+
   const allSearchMisses = messages.every(isEmptyCompletedWebSearch);
   if (allSearchMisses) {
     return {

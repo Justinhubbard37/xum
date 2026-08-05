@@ -2764,6 +2764,68 @@ describe("TaskService", () => {
     }
   });
 
+  test("plain text remains ambiguous when a non-candidate sibling also awaits a response", async () => {
+    const config = await createTestConfig(rootDir);
+    const { historyService, taskService } = createTaskServiceHarness(config);
+    const internal = taskService as unknown as {
+      findProgressRespondedTaskIds: (
+        ownerWorkspaceId: string,
+        candidateTaskIds: ReadonlySet<string>
+      ) => Promise<Set<string>>;
+    };
+
+    const parentId = "parent-ambiguous-progress-response";
+    const completedChild = "progress-completed-child";
+    const activeSibling = "progress-active-sibling";
+    for (const childId of [completedChild, activeSibling]) {
+      await historyService.appendToHistory(
+        parentId,
+        createMuxMessage(
+          `${childId}-progress`,
+          "user",
+          formatSubagentReportEnvelope({
+            taskId: childId,
+            agentType: "explore",
+            status: "in_progress",
+            title: "Progress",
+            reportMarkdown: `Progress from ${childId}.`,
+          }),
+          { timestamp: Date.now(), synthetic: true }
+        )
+      );
+    }
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage(
+        "ambiguous-progress-response",
+        "assistant",
+        "Thanks, keep following that lead.",
+        { timestamp: Date.now() }
+      )
+    );
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage(
+        `${completedChild}-completed`,
+        "user",
+        formatSubagentReportEnvelope({
+          taskId: completedChild,
+          agentType: "explore",
+          status: "completed",
+          title: "Final report",
+          reportMarkdown: "Completed child report.",
+        }),
+        { timestamp: Date.now(), synthetic: true, uiVisible: true }
+      )
+    );
+
+    const responded = await internal.findProgressRespondedTaskIds(
+      parentId,
+      new Set([completedChild])
+    );
+    expect([...responded]).toEqual([]);
+  });
+
   test("mixed text and guidance only respond to the targeted sibling", async () => {
     const config = await createTestConfig(rootDir);
     const { historyService, taskService } = createTaskServiceHarness(config);

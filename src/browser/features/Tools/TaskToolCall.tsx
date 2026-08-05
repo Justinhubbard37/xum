@@ -1756,13 +1756,20 @@ export const TaskSendMessageToolCall: React.FC<TaskSendMessageToolCallProps> = (
   const { expanded, toggleExpanded } = useToolExpansion(false);
   const status = props.status ?? "pending";
   const summary = props.result?.status ?? "sending";
+  const guidanceDelivered =
+    props.result?.status === "accepted" || props.result?.status === "queued";
+  const headerLabel = guidanceDelivered
+    ? "Sent guidance to"
+    : props.result != null || status === "failed"
+      ? "Could not send guidance to"
+      : "Sending guidance to";
 
   return (
     <ToolContainer expanded={expanded}>
       <ToolHeader onClick={toggleExpanded}>
         <ExpandIcon expanded={expanded}>▶</ExpandIcon>
         <TaskIcon toolName="task_send_message" />
-        <ToolName>Sent guidance to</ToolName>
+        <ToolName>{headerLabel}</ToolName>
         <TaskId id={props.args.task_id} className="min-w-0 truncate" />
         <span className="text-muted text-[10px]">{summary}</span>
         <StatusIndicator status={status}>{getStatusDisplay(status)}</StatusIndicator>

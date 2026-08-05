@@ -830,10 +830,44 @@ describe("operational bundle summary", () => {
 
   test("uses guidance-specific copy for parent-to-child messages", () => {
     expect(
-      summarizeOperationalBundle([tool({ id: "guidance-1", toolName: "task_send_message" })])
+      summarizeOperationalBundle([
+        tool({
+          id: "guidance-1",
+          toolName: "task_send_message",
+          result: { status: "accepted", taskId: "child-task" },
+        }),
+      ])
     ).toMatchObject({
       title: "Sent 1 guidance message",
       details: "1 guidance message",
+    });
+  });
+
+  test("uses neutral copy while guidance is still sending", () => {
+    expect(
+      summarizeOperationalBundle([
+        tool({ id: "guidance-active", toolName: "task_send_message", status: "executing" }),
+      ])
+    ).toMatchObject({
+      title: "Sending guidance",
+      activeTitle: "Sending guidance",
+      details: "1 guidance message",
+    });
+  });
+
+  test("does not describe rejected guidance as sent", () => {
+    expect(
+      summarizeOperationalBundle([
+        tool({
+          id: "guidance-failed",
+          toolName: "task_send_message",
+          result: { status: "not_active", taskId: "child-task" },
+        }),
+      ])
+    ).toEqual({
+      title: "Could not send guidance",
+      details: "1 guidance message",
+      tone: "danger",
     });
   });
 

@@ -1633,6 +1633,70 @@ describe("task_await tool", () => {
     });
   });
 
+  it("releases a multi-task wait immediately when one child reports progress", async () => {
+    using tempDir = new TestTempDir("test-task-await-tool-progress-interruption");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    const interruption = {
+      reason: "progress_report_received",
+      sourceTaskId: "t1",
+    } as const;
+    let interruptFirstWait: ((error: Error) => void) | undefined;
+    let secondWaitSignal: AbortSignal | undefined;
+    let markSecondWaitStarted: (() => void) | undefined;
+    const secondWaitStarted = new Promise<void>((resolve) => {
+      markSecondWaitStarted = resolve;
+    });
+
+    const waitForAgentReport = mock((taskId: string, options?: { abortSignal?: AbortSignal }) => {
+      if (taskId === "t1") {
+        return new Promise<never>((_resolve, reject) => {
+          interruptFirstWait = reject;
+        });
+      }
+      secondWaitSignal = options?.abortSignal;
+      markSecondWaitStarted?.();
+      return new Promise<never>((_resolve, reject) => {
+        options?.abortSignal?.addEventListener("abort", () => reject(new Error("Interrupted")), {
+          once: true,
+        });
+      });
+    });
+    const taskService = {
+      listActiveDescendantAgentTaskIds: mock(() => []),
+      isDescendantAgentTask: mock(() => Promise.resolve(true)),
+      waitForAgentReport,
+      getAgentTaskStatus: mock(() => "running" as const),
+    } as unknown as TaskService;
+    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const outerController = new AbortController();
+    const resultPromise = Promise.resolve(
+      tool.execute!(
+        { task_ids: ["t1", "t2"] },
+        { ...mockToolCallOptions, abortSignal: outerController.signal }
+      )
+    );
+
+    await secondWaitStarted;
+    interruptFirstWait?.(new ForegroundWaitBackgroundedError(interruption));
+    for (let i = 0; i < 10 && secondWaitSignal?.aborted !== true; i += 1) {
+      await Promise.resolve();
+    }
+    const releasedByProgressReport = secondWaitSignal?.aborted === true;
+    if (!releasedByProgressReport) {
+      outerController.abort();
+      await resultPromise.catch(() => undefined);
+    }
+    expect(releasedByProgressReport).toBe(true);
+
+    expect(await resultPromise).toEqual({
+      results: [
+        { status: "running", taskId: "t1" },
+        { status: "running", taskId: "t2" },
+      ],
+      interruption,
+    });
+  });
+
   it("maps wait errors to running/not_found/error statuses", async () => {
     using tempDir = new TestTempDir("test-task-await-tool-errors");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });

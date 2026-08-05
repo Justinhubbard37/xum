@@ -5427,9 +5427,10 @@ export class TaskService {
         ) {
           visibleCompletedReports.add(report.taskId);
         }
-        if (report?.status === "in_progress" && candidateTaskIds.has(report.taskId)) {
-          // A newer update requires a newer assistant response before terminal handoff can be
-          // suppressed. This avoids hiding a final result behind an unprocessed progress update.
+        if (report?.status === "in_progress") {
+          // Attribution must consider every outstanding sibling update, not only tasks whose
+          // terminal notifications happen to be in this drain. Otherwise the same plain-text turn
+          // could be misattributed independently to several children as they finish.
           awaitingResponse.add(report.taskId);
           responded.delete(report.taskId);
         }

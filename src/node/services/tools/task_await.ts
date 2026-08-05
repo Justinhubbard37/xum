@@ -943,7 +943,13 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
         let gateResolved = false;
         const checkGate = () => {
           if (gateResolved) return;
-          if (completedCount >= wantCount || resultsByTaskId.size >= uniqueTaskIds.length) {
+          // A queued progress report needs a parent turn now. Release the whole multi-task wait;
+          // the cleanup below aborts unrelated polls without terminating their underlying work.
+          if (
+            foregroundWaitInterruption != null ||
+            completedCount >= wantCount ||
+            resultsByTaskId.size >= uniqueTaskIds.length
+          ) {
             gateResolved = true;
             resolveGate();
           }
