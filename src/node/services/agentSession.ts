@@ -11,6 +11,7 @@ import type { HistoryService } from "@/node/services/historyService";
 import type { InitStateManager } from "@/node/services/initStateManager";
 
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
+import type { ForegroundWaitInterruption } from "@/common/types/foregroundWaitInterruption";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
@@ -5485,6 +5486,7 @@ export class AgentSession {
       dedupeKey?: string;
       /** Isolate this keyed message so it can be selectively superseded later. */
       removableDedupeKey?: boolean;
+      foregroundWaitInterruption?: ForegroundWaitInterruption;
       onAccepted?: () => Promise<void> | void;
       onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
       onCanceled?: (reason: string) => Promise<void> | void;
@@ -5629,6 +5631,14 @@ export class AgentSession {
     }
     const dispatching = this.dispatchingQueuedEntryMuxMetadata as MuxMessageMetadata | undefined;
     return dispatching?.type === "bash-monitor-wake";
+  }
+
+  getQueuedForegroundWaitInterruption(
+    dispatchMode?: "tool-end" | "turn-end"
+  ): ForegroundWaitInterruption | undefined {
+    return this.hasQueuedMessages(dispatchMode)
+      ? this.messageQueue.getNextForegroundWaitInterruption()
+      : undefined;
   }
 
   /** Whether a message queued with this dedupe key is still pending (see MessageQueue.addOnce). */

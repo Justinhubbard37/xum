@@ -15,6 +15,10 @@ import {
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
+import {
+  GENERIC_FOREGROUND_WAIT_INTERRUPTION,
+  type ForegroundWaitInterruption,
+} from "@/common/types/foregroundWaitInterruption";
 import type { Config } from "@/node/config";
 import type { ProjectsConfig, Workspace } from "@/common/types/project";
 import type { Result } from "@/common/types/result";
@@ -8493,6 +8497,8 @@ export class WorkspaceService extends EventEmitter {
       queueDedupeKey?: string;
       /** Keep this dedupe-keyed queue entry isolated so it can be selectively superseded. */
       removableQueueDedupeKey?: boolean;
+      /** Why this queued message should pause a foreground task wait. */
+      foregroundWaitInterruption?: ForegroundWaitInterruption;
       /**
        * For queued sends: quietly drop the message (success) when other messages are already
        * queued at enqueue time. Scheduled heartbeats use this so a user send racing the awaits
@@ -8705,6 +8711,8 @@ export class WorkspaceService extends EventEmitter {
           agentInitiated: internal?.agentInitiated,
           dedupeKey: internal?.queueDedupeKey,
           removableDedupeKey: internal?.removableQueueDedupeKey,
+          foregroundWaitInterruption:
+            internal?.foregroundWaitInterruption ?? GENERIC_FOREGROUND_WAIT_INTERRUPTION,
           monitorHistoryLockState: internal?.monitorHistoryLockState,
           cancelState: internal?.cancelState,
           cancelSignal: internal?.cancelSignal,
@@ -8727,7 +8735,11 @@ export class WorkspaceService extends EventEmitter {
         }
 
         if (effectiveQueueDispatchMode === "tool-end") {
-          this.taskService?.backgroundForegroundWaitsForWorkspace?.(workspaceId);
+          this.taskService?.backgroundForegroundWaitsForWorkspace?.(
+            workspaceId,
+            session.getQueuedForegroundWaitInterruption?.("tool-end") ??
+              GENERIC_FOREGROUND_WAIT_INTERRUPTION
+          );
         }
 
         return Ok(undefined);
@@ -9428,6 +9440,13 @@ export class WorkspaceService extends EventEmitter {
 
   hasQueuedMessages(workspaceId: string, dispatchMode?: "tool-end" | "turn-end"): boolean {
     return this.sessions.get(workspaceId.trim())?.hasQueuedMessages(dispatchMode) ?? false;
+  }
+
+  getQueuedForegroundWaitInterruption(
+    workspaceId: string,
+    dispatchMode?: "tool-end" | "turn-end"
+  ): ForegroundWaitInterruption | undefined {
+    return this.sessions.get(workspaceId.trim())?.getQueuedForegroundWaitInterruption(dispatchMode);
   }
 
   async waitForPendingStreamErrorRecoveryDecision(workspaceId: string): Promise<void> {

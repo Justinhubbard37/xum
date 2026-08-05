@@ -774,6 +774,30 @@ describe("operational bundle coalescing", () => {
     });
   });
 
+  test("keeps progress-interrupted waits visible in operational summaries", () => {
+    const infos = computeOperationalBundleInfos(
+      [
+        tool({
+          id: "await-progress",
+          toolName: "task_await",
+          result: {
+            results: [{ status: "running", taskId: "task-1" }],
+            interruption: {
+              reason: "progress_report_received",
+              sourceTaskId: "task-1",
+            },
+          },
+        }),
+      ],
+      { isTurnActive: false }
+    );
+
+    expect(infos[0]).toMatchObject({
+      defaultExpanded: true,
+      summary: { title: "Wait paused for subagent update", tone: "interrupted" },
+    });
+  });
+
   test("bundle key stays stable while an active bundle grows", () => {
     const one = computeOperationalBundleInfos([tool({ id: "read-1", status: "executing" })], {
       isTurnActive: true,
@@ -801,6 +825,15 @@ describe("operational bundle summary", () => {
       title: "Checked task status 3 times",
       activeTitle: "Waiting for tasks · 3 checks",
       details: "",
+    });
+  });
+
+  test("uses guidance-specific copy for parent-to-child messages", () => {
+    expect(
+      summarizeOperationalBundle([tool({ id: "guidance-1", toolName: "task_send_message" })])
+    ).toMatchObject({
+      title: "Sent 1 guidance message",
+      details: "1 guidance message",
     });
   });
 

@@ -5237,6 +5237,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
     hasQueuedMessages: ReturnType<typeof mock>;
     dropQueuedMessageWithOnlyDedupeKey: ReturnType<typeof mock>;
     queueMessage: ReturnType<typeof mock>;
+    getQueuedForegroundWaitInterruption: ReturnType<typeof mock>;
     sendMessage: ReturnType<typeof mock>;
     resumeStream: ReturnType<typeof mock>;
   };
@@ -5309,6 +5310,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
       hasQueuedMessages: mock(() => false),
       dropQueuedMessageWithOnlyDedupeKey: mock(() => false),
       queueMessage: mock(() => "tool-end" as const),
+      getQueuedForegroundWaitInterruption: mock(() => ({ reason: "message_queued" as const })),
       sendMessage: mock(() => Promise.resolve(Ok(undefined))),
       resumeStream: mock(() => Promise.resolve(Ok({ started: true }))),
     };
@@ -5746,8 +5748,43 @@ describe("WorkspaceService sendMessage status clearing", () => {
     });
 
     expect(result.success).toBe(true);
-    expect(backgroundForegroundWaitsForWorkspace).toHaveBeenCalledWith("test-workspace");
+    expect(backgroundForegroundWaitsForWorkspace).toHaveBeenCalledWith("test-workspace", {
+      reason: "message_queued",
+    });
     expect(fakeSession.queueMessage).toHaveBeenCalled();
+  });
+
+  test("preserves a child report as the reason for pausing foreground waits", async () => {
+    fakeSession.isBusy.mockReturnValue(true);
+    const interruption = {
+      reason: "progress_report_received",
+      sourceTaskId: "child-task",
+    } as const;
+    fakeSession.getQueuedForegroundWaitInterruption.mockReturnValue(interruption);
+
+    const backgroundForegroundWaitsForWorkspace = mock(() => 0);
+    workspaceService.setTaskService({
+      getAgentTaskStatus: mock(() => "running" as const),
+      backgroundForegroundWaitsForWorkspace,
+    } as unknown as TaskService);
+
+    const result = await workspaceService.sendMessage(
+      "test-workspace",
+      "child update",
+      { model: "openai:gpt-4o-mini", agentId: "exec" },
+      { foregroundWaitInterruption: interruption }
+    );
+
+    expect(result.success).toBe(true);
+    expect(fakeSession.queueMessage).toHaveBeenCalledWith(
+      "child update",
+      expect.any(Object),
+      expect.objectContaining({ foregroundWaitInterruption: interruption })
+    );
+    expect(backgroundForegroundWaitsForWorkspace).toHaveBeenCalledWith(
+      "test-workspace",
+      interruption
+    );
   });
 
   test("does not background foreground task waits when queuing a turn-end message", async () => {
@@ -5808,7 +5845,9 @@ describe("WorkspaceService sendMessage status clearing", () => {
     });
 
     expect(result.success).toBe(true);
-    expect(backgroundForegroundWaitsForWorkspace).toHaveBeenCalledWith("test-workspace");
+    expect(backgroundForegroundWaitsForWorkspace).toHaveBeenCalledWith("test-workspace", {
+      reason: "message_queued",
+    });
     expect(fakeSession.queueMessage).toHaveBeenCalled();
   });
 

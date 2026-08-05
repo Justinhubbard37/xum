@@ -60,6 +60,7 @@ import { zodToJsonSchema } from "zod-to-json-schema";
 import { extractToolFilePath } from "@/common/utils/tools/toolInputFilePath";
 import { TASK_VARIANT_PLACEHOLDER, TASK_GROUP_KIND_VALUES } from "@/common/utils/tools/taskGroups";
 import { WorkspaceTurnFinalMessageRefSchema } from "@/common/types/workspaceTurn";
+import { ForegroundWaitInterruptionSchema } from "@/common/types/foregroundWaitInterruption";
 
 import {
   HEARTBEAT_CONTEXT_MODE_VALUES,
@@ -328,19 +329,20 @@ export function buildTaskToolDescription(runtimeMode: RuntimeMode | undefined): 
     "\n\nWhen the user explicitly asks for best-of-n work, the parent should begin with light preliminary analysis to extract shared context, constraints, or evaluation criteria that would otherwise be duplicated across children. " +
     "Keep that pre-work lightweight: frame the task and provide useful starting points, but do not pre-solve the problem or over-constrain how the children reason about it. Then delegate the substantive analysis to the spawned sub-agents. " +
     "Do not also do a full parallel analysis in the parent. Call task_await when you are ready to act on child output; do not await reflexively just because tasks are running. " +
-    "task_await returns as soon as the first awaited task completes by default (min_completed), so you can start dependent work on each result as it lands instead of blocking on the whole batch; for best-of-N synthesis that must compare every candidate, pass min_completed equal to the batch size (or use a foreground grouped spawn, below). " +
+    "An in-progress child report is an interaction, not a terminal result: normally acknowledge or steer it with task_send_message before waiting again, unless it is a routine periodic report you explicitly requested. " +
+    "task_await returns as soon as the first awaited task completes by default (min_completed), so you can start dependent work on each terminal result as it lands instead of blocking on the whole batch; for best-of-N synthesis that must compare every candidate, pass min_completed equal to the batch size (or use a foreground grouped spawn, below). " +
     "\n\nWhen delegating, include a compact task brief (Task / Background / Scope / Starting points / Acceptance / Deliverables / Constraints). " +
     "For now, persisted sub-agent goals are not supported; pass sub-agent objectives, success criteria, and deliverables directly in the prompt. " +
     "Sub-agents observe the same system instructions as the parent (project/global AGENTS.md and custom instructions), so do not restate that shared context in the prompt; spend the prompt on task-specific information the sub-agent cannot infer from those instructions. " +
     "Caveat: instruction files are read from the child's checkout, so uncommitted AGENTS.md edits in the parent follow the same runtime visibility rules above — commit them first or pass the relevant guidance in the prompt. " +
     "Avoid telling the sub-agent to read your plan file; child workspaces do not automatically have access to it. " +
     "\n\nIf run_in_background is false, waits for the sub-agent to finish and returns the completed report. When grouped sibling tasks are requested via n or variants, the completed result includes one report per spawned task. " +
-    "If the foreground wait times out, returns queued/starting/running task metadata with a note (the task continues running); use task_await to monitor progress. " +
+    "If the foreground wait times out, returns queued/starting/running task metadata with a note while the task continues in background; wait again only when its output is needed. " +
     "If run_in_background is true, returns immediately with queued/starting/running task metadata and the task runs non-blocking: you may end your turn without awaiting it, and Mux wakes this workspace when the task reaches a terminal state so you can integrate its result. Use task_await only when the current request depends on the output before you can answer, or to inspect progress. " +
     "Prefer run_in_background: false when spawning a single task — it is equivalent to spawning background + immediately awaiting, but saves a round-trip. " +
-    "Use run_in_background: true when launching multiple tasks in parallel so you can act on each as it completes via task_await (which returns on the first completion by default); a foreground grouped spawn (run_in_background: false) instead blocks until every sibling finishes and returns all reports at once. " +
+    "Use run_in_background: true when launching multiple tasks in parallel so you can act on each terminal result via task_await (which returns on the first completion by default); an in-progress report should normally receive task_send_message guidance first. A foreground grouped spawn (run_in_background: false) instead blocks until every sibling finishes and returns all reports at once. " +
     "Do not call task_await in the same parallel tool-call batch; wait for the returned task metadata first. " +
-    "If later user guidance corrects or refines an active sub-agent's work, use task_send_message to update the existing child instead of terminating and recreating it. " +
+    "Use task_send_message to respond to an in-progress child report or when later user guidance corrects or refines active work, instead of terminating and recreating the child. " +
     isolationGuidance +
     "Use the bash tool to run shell commands."
   );
@@ -578,10 +580,8 @@ export const TaskToolQueuedResultSchema = z
     reports: z.array(TaskToolCompletedReportSchema).min(1).optional(),
     modelString: z.string().optional(),
     thinkingLevel: TaskThinkingLevelSchema.optional(),
-    note: z
-      .string()
-      .min(1)
-      .describe("Additional guidance for the caller (e.g., use task_await to monitor progress)."),
+    interruption: ForegroundWaitInterruptionSchema.optional(),
+    note: z.string().min(1).describe("Additional guidance for the caller."),
   })
   .strict()
   .superRefine((value, ctx) => {
@@ -901,6 +901,7 @@ export const TaskAwaitToolResultSchema = z
         TaskAwaitToolErrorResultSchema,
       ])
     ),
+    interruption: ForegroundWaitInterruptionSchema.optional(),
   })
   .strict();
 
@@ -2162,6 +2163,7 @@ export const TOOL_DEFINITIONS = {
       "\n\nWHEN TO USE: only call task_await when the current user request depends on a task's output, or when synthesis/integration of a previously-spawned task is the next logical step. " +
       "Do not call task_await solely because active tasks exist; for unrelated user messages, respond directly and let tasks continue in the background. " +
       "If a synthetic/system follow-up explicitly says active background tasks or workflow runs block your turn, treat that as a dependency and await the listed IDs. " +
+      "When an in-progress sub-agent report is already in context, do not reflexively wait again: normally acknowledge or steer that child with task_send_message first. Silence is appropriate only for a routine periodic report you explicitly requested that needs no decision or course correction. " +
       "When a terminal wake-up says a sub-agent report or failure is already injected into context, integrate it directly — do NOT call task_await for it. When a wake-up asks you to retrieve a workspace turn's terminal output, call task_await with the listed IDs and timeout_secs: 0 (a one-shot retrieval, not a wait). " +
       "\n\nIMPORTANT: Do not call task_await in the same parallel tool-call batch as task, bash, or workflow_run — " +
       "the taskId/runId is not available until the spawning tool returns. " +
@@ -2173,7 +2175,7 @@ export const TOOL_DEFINITIONS = {
       "For bash tasks, you may optionally pass filter/filter_exclude to include/exclude output lines by regex. " +
       "WARNING: when using filter, non-matching lines are permanently discarded. " +
       "Use this tool to WAIT; do not poll task_list in a loop to wait for task completion (that is misuse and wastes tool calls). " +
-      "\n\nBy default (min_completed=1) this returns as soon as the FIRST awaited task completes, so you can begin dependent work on that result while the rest keep running — then call task_await again for the remainder. " +
+      "\n\nBy default (min_completed=1) this returns as soon as the FIRST awaited task completes, so you can begin dependent work on that terminal result while the rest keep running — then call task_await again for the remainder when its output is needed. " +
       "This is ideal for independent lanes (variants) or any case where per-result work exists. " +
       "Set min_completed higher (up to the number of awaited tasks) when you genuinely need more before proceeding — e.g. best-of-N synthesis that must compare every candidate should pass min_completed equal to the batch size. " +
       "The result always includes every task complete at the moment it returns, plus current status for the rest; not-yet-completed tasks keep running and stay re-awaitable on a later call. " +
@@ -2185,9 +2187,9 @@ export const TOOL_DEFINITIONS = {
   },
   task_send_message: {
     description:
-      "Send updated guidance to a running descendant sub-agent without terminating or recreating it. " +
-      "If the child is busy, the message is queued for the requested boundary; tool-end is the default so corrections can take effect after the child's next tool call. Queued tasks have the guidance appended to their durable launch prompt. " +
-      "Use this when a new user message corrects or refines work that an active sub-agent is already performing. " +
+      "Send guidance to a running descendant sub-agent without terminating or recreating it. " +
+      "Use this after an in-progress child report to acknowledge it and say whether to continue, narrow, redirect, correct, or answer a question. Unless the report is a routine periodic update you explicitly requested, prefer sending useful guidance before waiting again. " +
+      "Also use it when a new user message corrects or refines active work. If the child is busy, the message is queued for the requested boundary; tool-end is the default so guidance can take effect after the child's next tool call. Queued tasks have the guidance appended to their durable launch prompt. " +
       "This tool only accepts sub-agent task IDs in the current workspace's descendant tree; it does not target bash tasks, workflow runs, or workspace-turn handles.",
     schema: TaskSendMessageToolArgsSchema,
   },
@@ -2247,7 +2249,7 @@ export const TOOL_DEFINITIONS = {
   agent_report: {
     description:
       "Send an incremental update from a sub-agent to its parent workspace and wake the parent. " +
-      "Call this whenever the parent should see important progress or a finding before the task is complete; it may be called multiple times. " +
+      "Use it for a question, blocker, unexpected finding, or other progress the parent should act on before completion; avoid routine narration unless the parent explicitly requested periodic reports. It may be called multiple times. " +
       "Do not use it for the final result—the final assistant message completes the sub-agent task.",
     schema: AgentReportToolArgsSchema,
   },

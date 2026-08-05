@@ -1272,6 +1272,7 @@ export const TaskAwaitToolCall: React.FC<TaskAwaitToolCallProps> = ({
   const timeoutSecs = args.timeout_secs;
   const callError = isToolErrorResult(result) ? result.error : undefined;
   const results = result && "results" in result ? result.results : [];
+  const interruption = result && "interruption" in result ? result.interruption : undefined;
 
   const suppressReportInAwaitTaskIds = taskReportLinking?.suppressReportInAwaitTaskIds;
 
@@ -1401,6 +1402,14 @@ export const TaskAwaitToolCall: React.FC<TaskAwaitToolCallProps> = ({
       ? `Waiting for ${formatTasks(targetCount)}`
       : "Waiting for background work";
     summaryTone = "active";
+  } else if (interruption?.reason === "progress_report_received") {
+    summaryTitle = "Wait paused for subagent update";
+    summaryDetail = pendingCount > 0 ? `${formatTasks(pendingCount)} still active` : undefined;
+    summaryTone = "waiting";
+  } else if (interruption?.reason === "message_queued") {
+    summaryTitle = "Wait paused for queued message";
+    summaryDetail = pendingCount > 0 ? `${formatTasks(pendingCount)} still active` : undefined;
+    summaryTone = "waiting";
   } else if (pendingCount > 0) {
     summaryTitle = `Still waiting for ${formatTasks(pendingCount)}`;
     summaryDetail = completedCount > 0 ? `${completedCount} completed` : undefined;
@@ -1753,7 +1762,8 @@ export const TaskSendMessageToolCall: React.FC<TaskSendMessageToolCallProps> = (
       <ToolHeader onClick={toggleExpanded}>
         <ExpandIcon expanded={expanded}>▶</ExpandIcon>
         <TaskIcon toolName="task_send_message" />
-        <ToolName>task_send_message</ToolName>
+        <ToolName>Sent guidance to</ToolName>
+        <TaskId id={props.args.task_id} className="min-w-0 truncate" />
         <span className="text-muted text-[10px]">{summary}</span>
         <StatusIndicator status={status}>{getStatusDisplay(status)}</StatusIndicator>
       </ToolHeader>

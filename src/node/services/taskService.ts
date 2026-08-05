@@ -63,6 +63,10 @@ import {
   type TaskSettings,
 } from "@/common/types/tasks";
 import {
+  GENERIC_FOREGROUND_WAIT_INTERRUPTION,
+  type ForegroundWaitInterruption,
+} from "@/common/types/foregroundWaitInterruption";
+import {
   resolveBackgroundWorkAttentionPolicy,
   type BackgroundWorkAttentionPolicy,
 } from "@/common/types/backgroundWorkAttention";
@@ -116,6 +120,8 @@ import {
 import {
   AgentReportInlineToolArgsSchema,
   AgentReportSubmittedReportSchema,
+  TaskSendMessageToolArgsSchema,
+  TaskSendMessageToolResultSchema,
   TaskToolResultSchema,
   TaskToolArgsSchema,
   type TaskWorkspaceLifecycleToolTargetResultSchema,
@@ -313,6 +319,35 @@ function formatSubagentReportUserMessage(params: {
     ...(params.thinkingLevel != null ? { thinkingLevel: params.thinkingLevel } : {}),
     ...(params.structuredOutput !== undefined ? { structuredOutput: params.structuredOutput } : {}),
   });
+}
+
+function hasSubstantiveAssistantText(message: MuxMessage): boolean {
+  return message.parts.some((part) => part.type === "text" && part.text.trim().length > 0);
+}
+
+function getSuccessfulGuidanceTaskIds(message: MuxMessage): Set<string> {
+  const taskIds = new Set<string>();
+  for (const part of message.parts) {
+    if (
+      !isDynamicToolPart(part) ||
+      part.toolName !== "task_send_message" ||
+      part.state !== "output-available"
+    ) {
+      continue;
+    }
+
+    const input = TaskSendMessageToolArgsSchema.safeParse(part.input);
+    const output = TaskSendMessageToolResultSchema.safeParse(part.output);
+    if (
+      input.success &&
+      output.success &&
+      (output.data.status === "accepted" || output.data.status === "queued") &&
+      output.data.taskId === input.data.task_id
+    ) {
+      taskIds.add(input.data.task_id);
+    }
+  }
+  return taskIds;
 }
 
 // Failure twin of formatSubagentReportUserMessage: terminal child failures are
@@ -1184,7 +1219,9 @@ async function readTaskBaseCommitShaByProjectPath(params: {
 }
 
 export class ForegroundWaitBackgroundedError extends Error {
-  constructor() {
+  constructor(
+    readonly interruption: ForegroundWaitInterruption = GENERIC_FOREGROUND_WAIT_INTERRUPTION
+  ) {
     super("Foreground wait sent to background due to queued message");
     this.name = "ForegroundWaitBackgroundedError";
   }
@@ -4940,7 +4977,10 @@ export class TaskService {
    * when a new message is queued. Returns the number of waiters signaled.
    * Safe to call repeatedly — already-cleaned-up waiters are skipped.
    */
-  backgroundForegroundWaitsForWorkspace(workspaceId: string): number {
+  backgroundForegroundWaitsForWorkspace(
+    workspaceId: string,
+    interruption: ForegroundWaitInterruption = GENERIC_FOREGROUND_WAIT_INTERRUPTION
+  ): number {
     const set = this.backgroundableForegroundWaitersByWorkspaceId.get(workspaceId);
     if (!set || set.size === 0) return 0;
 
@@ -4954,7 +4994,7 @@ export class TaskService {
         // await. The in-memory mark above covers the immediate next stream-end while this
         // persistence settles. Tracked so handleStreamEnd can await it before reading config.
         this.scheduleNotifyOnTerminalPersist(waiter.taskId, waiter.requestingWorkspaceId);
-        waiter.reject(new ForegroundWaitBackgroundedError());
+        waiter.reject(new ForegroundWaitBackgroundedError(interruption));
         count++;
       } catch {
         // waiter already resolved/rejected — ignore
@@ -5397,10 +5437,22 @@ export class TaskService {
       }
 
       if (message.role === "assistant" && message.metadata?.partial !== true) {
-        for (const taskId of awaitingResponse) {
-          responded.add(taskId);
+        if (hasSubstantiveAssistantText(message)) {
+          // User-visible reasoning or synthesis can legitimately consume several sibling updates.
+          for (const taskId of awaitingResponse) {
+            responded.add(taskId);
+          }
+          awaitingResponse.clear();
+          continue;
         }
-        awaitingResponse.clear();
+
+        // A wait-only or unrelated tool turn is not a response to the child. Only successful,
+        // same-child guidance discharges that child's latest update; sibling guidance remains scoped.
+        for (const taskId of getSuccessfulGuidanceTaskIds(message)) {
+          if (awaitingResponse.delete(taskId)) {
+            responded.add(taskId);
+          }
+        }
       }
     }
     return new Set([...responded].filter((taskId) => visibleCompletedReports.has(taskId)));
@@ -5651,7 +5703,13 @@ export class TaskService {
       requestingWorkspaceId &&
       this.workspaceService.hasQueuedMessages(requestingWorkspaceId, "tool-end")
     ) {
-      this.backgroundForegroundWaitsForWorkspace(requestingWorkspaceId);
+      this.backgroundForegroundWaitsForWorkspace(
+        requestingWorkspaceId,
+        this.workspaceService.getQueuedForegroundWaitInterruption?.(
+          requestingWorkspaceId,
+          "tool-end"
+        ) ?? GENERIC_FOREGROUND_WAIT_INTERRUPTION
+      );
     }
   }
 
@@ -6095,6 +6153,10 @@ export class TaskService {
           startStreamInBackground: true,
           queueDedupeKey: `agent-report:${childWorkspaceId}:${toolCallId}`,
           removableQueueDedupeKey: true,
+          foregroundWaitInterruption: {
+            reason: "progress_report_received",
+            sourceTaskId: childWorkspaceId,
+          },
         }
       );
       if (!sendResult.success) {

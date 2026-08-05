@@ -16,6 +16,7 @@ import {
   type RuntimeMode,
 } from "@/common/types/runtime";
 import type { TaskCreatedEvent } from "@/common/types/stream";
+import type { ForegroundWaitInterruption } from "@/common/types/foregroundWaitInterruption";
 import { log } from "@/node/services/log";
 import { ForegroundWaitBackgroundedError } from "@/node/services/taskService";
 
@@ -178,7 +179,7 @@ interface CompletedTaskInfo {
 
 type ForegroundWaitOutcome =
   | { kind: "completed"; report: CompletedTaskInfo }
-  | { kind: "backgrounded" }
+  | { kind: "backgrounded"; interruption: ForegroundWaitInterruption }
   | { kind: "timed_out" }
   | { kind: "interrupted" }
   | { kind: "task_interrupted" }
@@ -240,8 +241,8 @@ function serializeCompletedReports(reports: readonly CompletedTaskInfo[]) {
 
 function buildBackgroundStartNote(taskCount: number): string {
   return taskCount === 1
-    ? "Task started in background. Use task_await to monitor progress."
-    : "Tasks started in background. Use task_await to monitor progress.";
+    ? "Task started in background. Leave it running until its output is needed."
+    : "Tasks started in background. Leave them running until their output is needed.";
 }
 
 function buildForegroundContinuationNote(
@@ -250,13 +251,13 @@ function buildForegroundContinuationNote(
 ): string {
   if (reason === "backgrounded") {
     return taskCount === 1
-      ? "Task sent to background because a new message was queued. Use task_await to monitor progress."
-      : "Tasks were sent to background because a new message was queued. Use task_await to monitor progress.";
+      ? "Foreground wait paused because a queued message needs attention."
+      : "Foreground waits paused because a queued message needs attention.";
   }
 
   return taskCount === 1
-    ? "Task exceeded foreground wait limit and continues running in background. Use task_await to monitor progress."
-    : "Tasks exceeded the foreground wait limit and continue running in background. Use task_await to monitor progress.";
+    ? "Task exceeded the foreground wait limit and continues in background; Mux will wake this workspace when it finishes."
+    : "Tasks exceeded the foreground wait limit and continue in background; Mux will wake this workspace as they finish.";
 }
 
 function buildInterruptedTaskNote(taskCount: number): string {
@@ -269,6 +270,7 @@ function buildPendingTaskResult(params: {
   tasks: readonly PendingTaskInfo[];
   note: string;
   reports?: readonly CompletedTaskInfo[];
+  interruption?: ForegroundWaitInterruption;
   forceGrouped?: boolean;
 }): z.infer<typeof TaskToolResultSchema> {
   const status = toAggregatePendingStatus(params.tasks.map((task) => task.status));
@@ -284,6 +286,7 @@ function buildPendingTaskResult(params: {
       taskId: task.taskId,
       modelString: task.modelString,
       thinkingLevel: task.thinkingLevel,
+      ...(params.interruption ? { interruption: params.interruption } : {}),
       note: params.note,
     };
   }
@@ -299,6 +302,7 @@ function buildPendingTaskResult(params: {
       modelString: task.modelString,
       thinkingLevel: task.thinkingLevel,
     })),
+    ...(params.interruption ? { interruption: params.interruption } : {}),
     note: params.note,
     ...(serializedReports ? { reports: serializedReports } : {}),
   };
@@ -500,6 +504,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
               TaskToolResultSchema,
               {
                 ...pendingResult,
+                interruption: error.interruption,
                 note: buildForegroundContinuationNote(1, "backgrounded"),
               },
               "task"
@@ -666,7 +671,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
               return { kind: "interrupted" };
             }
             if (error instanceof ForegroundWaitBackgroundedError) {
-              return { kind: "backgrounded" };
+              return { kind: "backgrounded", interruption: error.interruption };
             }
             const errorMessage = getErrorMessage(error);
             if (errorMessage === "Timed out waiting for agent_report") {
@@ -703,7 +708,11 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
         );
       }
 
-      const wasBackgrounded = waitOutcomes.some((outcome) => outcome.kind === "backgrounded");
+      const backgroundedOutcome = waitOutcomes.find(
+        (outcome): outcome is Extract<ForegroundWaitOutcome, { kind: "backgrounded" }> =>
+          outcome.kind === "backgrounded"
+      );
+      const wasBackgrounded = backgroundedOutcome != null;
       const didTimeOut = waitOutcomes.some((outcome) => outcome.kind === "timed_out");
       const hadInterruptedTask = waitOutcomes.some(
         (outcome) => outcome.kind === "task_interrupted"
@@ -729,6 +738,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
               completedReports,
             }),
             reports: completedReports,
+            ...(backgroundedOutcome ? { interruption: backgroundedOutcome.interruption } : {}),
             note: hadInterruptedTask
               ? buildInterruptedTaskNote(createdTasks.length)
               : buildForegroundContinuationNote(

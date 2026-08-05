@@ -10,6 +10,17 @@ describe("MessageQueue", () => {
     queue = new MessageQueue();
   });
 
+  it("preserves the semantic reason that paused a foreground wait", () => {
+    const interruption = {
+      reason: "progress_report_received",
+      sourceTaskId: "child-task",
+    } as const;
+
+    queue.add("Child update", undefined, { foregroundWaitInterruption: interruption });
+
+    expect(queue.getNextForegroundWaitInterruption()).toEqual(interruption);
+  });
+
   describe("getDisplayText", () => {
     it("should return joined messages for normal messages", () => {
       queue.add("First message");

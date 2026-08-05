@@ -651,6 +651,9 @@ export function createTaskAwaitTool(
       error?: string;
       note?: string;
     }>;
+    interruption?:
+      | { reason: "progress_report_received"; sourceTaskId: string }
+      | { reason: "message_queued" };
   }
 ): MuxPart {
   return {
@@ -692,6 +695,25 @@ export function createTaskAwaitTool(
           taskId: r.taskId,
         };
       }),
+      interruption: opts.interruption,
+    },
+  };
+}
+
+/** Create parent guidance sent to a running sub-agent. */
+export function createTaskSendMessageTool(
+  toolCallId: string,
+  opts: { task_id: string; message: string; status?: "accepted" | "queued" }
+): MuxPart {
+  return {
+    type: "dynamic-tool",
+    toolCallId,
+    toolName: "task_send_message",
+    state: "output-available",
+    input: { task_id: opts.task_id, message: opts.message },
+    output: {
+      status: opts.status ?? "accepted",
+      taskId: opts.task_id,
     },
   };
 }

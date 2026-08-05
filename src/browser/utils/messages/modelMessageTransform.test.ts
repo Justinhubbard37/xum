@@ -262,6 +262,39 @@ describe("modelMessageTransform", () => {
       expect(result).toEqual([assistantMsg3, toolMsg3]);
     });
 
+    it("does not coalesce a task_await result that was interrupted by a child report", () => {
+      const input = { task_ids: ["task1"], timeout_secs: 10 };
+      const assistantMsg: AssistantModelMessage = {
+        role: "assistant",
+        content: [{ type: "tool-call", toolCallId: "call1", toolName: "task_await", input }],
+      };
+      const toolMsg: ToolModelMessage = {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call1",
+            toolName: "task_await",
+            output: {
+              type: "json",
+              value: {
+                results: [{ status: "running", taskId: "task1" }],
+                interruption: {
+                  reason: "progress_report_received",
+                  sourceTaskId: "task1",
+                },
+              },
+            },
+          },
+        ],
+      };
+
+      expect(transformModelMessages([assistantMsg, toolMsg], "anthropic")).toEqual([
+        assistantMsg,
+        toolMsg,
+      ]);
+    });
+
     it("does not coalesce task_await polls when a later poll returns progress", () => {
       const input = { task_ids: ["task1"], timeout_secs: 10 };
 

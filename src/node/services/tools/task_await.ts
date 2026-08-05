@@ -9,6 +9,7 @@ import {
   TOOL_DEFINITIONS,
 } from "@/common/utils/tools/toolDefinitions";
 import { canRetryWorkflowFromCheckpoint } from "@/common/utils/workflowRetryEligibility";
+import type { ForegroundWaitInterruption } from "@/common/types/foregroundWaitInterruption";
 import {
   isActiveWorkflowRunStatus,
   isNestedWorkflowRun,
@@ -248,6 +249,8 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
     execute: async (args, { abortSignal }): Promise<unknown> => {
       const workspaceId = requireWorkspaceId(config, "task_await");
       const taskService = requireTaskService(config, "task_await");
+
+      let foregroundWaitInterruption: ForegroundWaitInterruption | undefined;
 
       const timeoutMs = coerceTimeoutMs(args.timeout_secs);
       // Preserve the documented 600s default when the model sends null
@@ -629,6 +632,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
           } catch (error: unknown) {
             const message = getErrorMessage(error);
             if (error instanceof ForegroundWaitBackgroundedError) {
+              foregroundWaitInterruption ??= error.interruption;
               const latest = await taskService.getWorkspaceTurnSnapshot(workspaceId, taskId);
               const status =
                 latest != null && isWorkspaceTurnActiveStatus(latest.status)
@@ -639,7 +643,6 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
                 taskId,
                 handleKind: "workspace_turn" as const,
                 ...(latest?.workspaceId != null ? { workspaceId: latest.workspaceId } : {}),
-                note: "Workspace turn sent to background because a new message was queued. Use task_await to monitor progress.",
               };
             }
             if (abortSignal?.aborted) {
@@ -831,6 +834,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
           };
         } catch (error: unknown) {
           if (error instanceof ForegroundWaitBackgroundedError) {
+            foregroundWaitInterruption ??= error.interruption;
             const currentStatus = taskService.getAgentTaskStatus(taskId);
             const normalizedStatus = isAgentTaskActiveStatus(currentStatus)
               ? currentStatus
@@ -839,7 +843,6 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
               status: normalizedStatus,
               taskId,
               ...getAgentTaskElapsedField(taskId),
-              note: "Task sent to background because a new message was queued. Use task_await to monitor progress.",
             };
           }
 
@@ -965,7 +968,14 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
 
       const results = uniqueTaskIds.map((taskId) => resultsByTaskId.get(taskId)!);
 
-      return parseToolResult(TaskAwaitToolResultSchema, { results }, "task_await");
+      return parseToolResult(
+        TaskAwaitToolResultSchema,
+        {
+          results,
+          ...(foregroundWaitInterruption ? { interruption: foregroundWaitInterruption } : {}),
+        },
+        "task_await"
+      );
     },
   });
 };

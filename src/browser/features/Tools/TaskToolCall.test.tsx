@@ -327,6 +327,23 @@ describe("TaskAwaitToolCall", () => {
     expect(view.queryByText("task_await")).toBeNull();
   });
 
+  test("surfaces progress-report interruptions instead of presenting another wait", () => {
+    const view = renderTaskAwaitToolCall({
+      status: "completed",
+      result: {
+        results: [{ status: "running", taskId: "task-1" }],
+        interruption: {
+          reason: "progress_report_received",
+          sourceTaskId: "task-1",
+        },
+      },
+    });
+
+    expect(view.getByText("Wait paused for subagent update")).toBeDefined();
+    expect(view.getByText(/1 task still active/)).toBeDefined();
+    expect(view.queryByText(/still waiting/i)).toBeNull();
+  });
+
   test("renders interrupted waits as terminal instead of still waiting", () => {
     const view = renderTaskAwaitToolCall({
       status: "completed",
@@ -665,8 +682,9 @@ describe("TaskSendMessageToolCall", () => {
     );
 
     expect(view.getByText("queued")).toBeDefined();
-    fireEvent.click(view.getByText("task_send_message"));
+    expect(view.getByText("Sent guidance to")).toBeDefined();
     expect(view.getByText("child-task")).toBeDefined();
+    fireEvent.click(view.getByText("Sent guidance to"));
     expect(view.getByText("Use the corrected API shape.")).toBeDefined();
   });
 });

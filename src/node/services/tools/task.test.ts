@@ -1113,7 +1113,14 @@ describe("task tool", () => {
     const create = mock(() =>
       Ok({ taskId: "child-task", kind: "agent" as const, status: "queued" as const })
     );
-    const waitForAgentReport = mock(() => Promise.reject(new ForegroundWaitBackgroundedError()));
+    const waitForAgentReport = mock(() =>
+      Promise.reject(
+        new ForegroundWaitBackgroundedError({
+          reason: "progress_report_received",
+          sourceTaskId: "child-task",
+        })
+      )
+    );
     const getAgentTaskStatus = mock(() => "running" as const);
     const taskService = {
       create,
@@ -1145,6 +1152,13 @@ describe("task tool", () => {
     );
     expect(getAgentTaskStatus).toHaveBeenCalledWith("child-task");
     expectQueuedOrRunningTaskToolResult(result, { status: "running", taskId: "child-task" });
+    expect(result).toMatchObject({
+      interruption: {
+        reason: "progress_report_received",
+        sourceTaskId: "child-task",
+      },
+      note: "Foreground wait paused because a queued message needs attention.",
+    });
   });
 
   it("should throw when TaskService.create fails (e.g., depth limit)", async () => {

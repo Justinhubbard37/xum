@@ -385,6 +385,7 @@ function createWorkspaceServiceMocks(
     removeQueuedMessagesByDedupeKeyPrefix: ReturnType<typeof mock>;
     hasQueuedWorkspaceTurn: ReturnType<typeof mock>;
     hasQueuedMessages: ReturnType<typeof mock>;
+    getQueuedForegroundWaitInterruption: ReturnType<typeof mock>;
     isBusyForMessage: ReturnType<typeof mock>;
     hasPendingQueuedOrPreparingTurn: ReturnType<typeof mock>;
     hasPendingBashMonitorWakeContinuation: ReturnType<typeof mock>;
@@ -413,6 +414,7 @@ function createWorkspaceServiceMocks(
   removeQueuedMessagesByDedupeKeyPrefix: ReturnType<typeof mock>;
   hasQueuedWorkspaceTurn: ReturnType<typeof mock>;
   hasQueuedMessages: ReturnType<typeof mock>;
+  getQueuedForegroundWaitInterruption: ReturnType<typeof mock>;
   isBusyForMessage: ReturnType<typeof mock>;
   waitForIdleAndNoQueuedMessages: ReturnType<typeof mock>;
   waitForIdle: ReturnType<typeof mock>;
@@ -442,6 +444,8 @@ function createWorkspaceServiceMocks(
   const removeQueuedMessagesByDedupeKeyPrefix = mock((): Result<number> => Ok(0));
   const hasQueuedWorkspaceTurn = overrides?.hasQueuedWorkspaceTurn ?? mock(() => false);
   const hasQueuedMessages = overrides?.hasQueuedMessages ?? mock(() => false);
+  const getQueuedForegroundWaitInterruption =
+    overrides?.getQueuedForegroundWaitInterruption ?? mock(() => undefined);
   const isBusyForMessage = overrides?.isBusyForMessage ?? mock(() => false);
   const hasPendingQueuedOrPreparingTurn =
     overrides?.hasPendingQueuedOrPreparingTurn ?? mock(() => false);
@@ -492,6 +496,7 @@ function createWorkspaceServiceMocks(
       isBusyForMessage,
       hasQueuedWorkspaceTurn,
       hasQueuedMessages,
+      getQueuedForegroundWaitInterruption,
       hasPendingQueuedOrPreparingTurn,
       hasPendingBashMonitorWakeContinuation,
       hasPendingAutoRetry,
@@ -517,6 +522,7 @@ function createWorkspaceServiceMocks(
     removeQueuedMessagesByDedupeKeyPrefix,
     hasQueuedWorkspaceTurn,
     hasQueuedMessages,
+    getQueuedForegroundWaitInterruption,
     isBusyForMessage,
     hasPendingQueuedOrPreparingTurn,
     hasPendingAutoRetry,
@@ -2644,6 +2650,118 @@ describe("TaskService", () => {
 
     expect(sendMessage).not.toHaveBeenCalled();
     expect(await terminalAttentionStore.listPending(parentId)).toEqual([]);
+  });
+
+  test("progress response tracking distinguishes guidance from reflexive waits", async () => {
+    const config = await createTestConfig(rootDir);
+    const { historyService, taskService } = createTaskServiceHarness(config);
+    const internal = taskService as unknown as {
+      findProgressRespondedTaskIds: (
+        ownerWorkspaceId: string,
+        candidateTaskIds: ReadonlySet<string>
+      ) => Promise<Set<string>>;
+    };
+
+    const childId = "progress-child";
+    const siblingId = "progress-sibling";
+    const scenarios = [
+      {
+        name: "same-child-guidance",
+        expected: true,
+        part: {
+          type: "dynamic-tool" as const,
+          toolCallId: "guide-child",
+          toolName: "task_send_message" as const,
+          state: "output-available" as const,
+          input: { task_id: childId, message: "Good finding; continue." },
+          output: { status: "accepted", taskId: childId },
+        },
+      },
+      {
+        name: "same-child-rewait",
+        expected: false,
+        part: {
+          type: "dynamic-tool" as const,
+          toolCallId: "rewait-child",
+          toolName: "task_await" as const,
+          state: "output-available" as const,
+          input: { task_ids: [childId] },
+          output: { results: [{ status: "running", taskId: childId }] },
+        },
+      },
+      {
+        name: "sibling-guidance",
+        expected: false,
+        part: {
+          type: "dynamic-tool" as const,
+          toolCallId: "guide-sibling",
+          toolName: "task_send_message" as const,
+          state: "output-available" as const,
+          input: { task_id: siblingId, message: "Continue." },
+          output: { status: "accepted", taskId: siblingId },
+        },
+      },
+      {
+        name: "failed-guidance",
+        expected: false,
+        part: {
+          type: "dynamic-tool" as const,
+          toolCallId: "failed-guide",
+          toolName: "task_send_message" as const,
+          state: "output-available" as const,
+          input: { task_id: childId, message: "Continue." },
+          output: {
+            status: "not_active",
+            taskId: childId,
+            taskStatus: "reported",
+            error: "Task already completed.",
+          },
+        },
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      const parentId = `parent-${scenario.name}`;
+      await historyService.appendToHistory(
+        parentId,
+        createMuxMessage(
+          `${scenario.name}-progress`,
+          "user",
+          formatSubagentReportEnvelope({
+            taskId: childId,
+            agentType: "explore",
+            status: "in_progress",
+            title: "Progress",
+            reportMarkdown: "Found the relevant code path.",
+          }),
+          { timestamp: Date.now(), synthetic: true }
+        )
+      );
+      await historyService.appendToHistory(
+        parentId,
+        createMuxMessage(`${scenario.name}-response`, "assistant", "", { timestamp: Date.now() }, [
+          scenario.part,
+        ])
+      );
+      await historyService.appendToHistory(
+        parentId,
+        createMuxMessage(
+          `${scenario.name}-completed`,
+          "user",
+          formatSubagentReportEnvelope({
+            taskId: childId,
+            agentType: "explore",
+            status: "completed",
+            title: "Final report",
+            reportMarkdown: "Investigation complete.",
+          }),
+          { timestamp: Date.now(), synthetic: true, uiVisible: true }
+        )
+      );
+
+      const responded = await internal.findProgressRespondedTaskIds(parentId, new Set([childId]));
+      expect(responded.has(childId), scenario.name).toBe(scenario.expected);
+    }
   });
 
   test("completed subagent wake remains when its visible terminal report card is missing", async () => {
@@ -13304,11 +13422,16 @@ describe("TaskService", () => {
         backgroundOnMessageQueued: true,
       });
 
-      const count = taskService.backgroundForegroundWaitsForWorkspace(parentId);
+      const interruption = {
+        reason: "progress_report_received",
+        sourceTaskId: childId,
+      } as const;
+      const count = taskService.backgroundForegroundWaitsForWorkspace(parentId, interruption);
       expect(count).toBe(1);
 
       const err = await waitPromise.catch((e: unknown) => e);
       expect(err).toBeInstanceOf(ForegroundWaitBackgroundedError);
+      expect((err as ForegroundWaitBackgroundedError).interruption).toEqual(interruption);
 
       const count2 = taskService.backgroundForegroundWaitsForWorkspace(parentId);
       expect(count2).toBe(0);
@@ -13339,7 +13462,15 @@ describe("TaskService", () => {
       );
 
       const hasQueuedMessages = mock(() => true);
-      const { workspaceService } = createWorkspaceServiceMocks({ hasQueuedMessages });
+      const interruption = {
+        reason: "progress_report_received",
+        sourceTaskId: childId,
+      } as const;
+      const getQueuedForegroundWaitInterruption = mock(() => interruption);
+      const { workspaceService } = createWorkspaceServiceMocks({
+        hasQueuedMessages,
+        getQueuedForegroundWaitInterruption,
+      });
       const { taskService } = createTaskServiceHarness(config, { workspaceService });
       const internal = taskService as unknown as {
         backgroundableForegroundWaitersByWorkspaceId: Map<string, Set<unknown>>;
@@ -13355,7 +13486,9 @@ describe("TaskService", () => {
         .catch((error: unknown) => error);
 
       expect(waitError).toBeInstanceOf(ForegroundWaitBackgroundedError);
+      expect((waitError as ForegroundWaitBackgroundedError).interruption).toEqual(interruption);
       expect(hasQueuedMessages).toHaveBeenCalledWith(parentId, "tool-end");
+      expect(getQueuedForegroundWaitInterruption).toHaveBeenCalledWith(parentId, "tool-end");
       expect(taskService.backgroundForegroundWaitsForWorkspace(parentId)).toBe(0);
       expect(internal.backgroundableForegroundWaitersByWorkspaceId.has(parentId)).toBe(false);
       expect(internal.pendingStartWaitersByTaskId.has(childId)).toBe(false);

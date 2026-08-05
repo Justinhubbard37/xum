@@ -1601,7 +1601,14 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-backgrounded");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
 
-    const waitForAgentReport = mock(() => Promise.reject(new ForegroundWaitBackgroundedError()));
+    const waitForAgentReport = mock(() =>
+      Promise.reject(
+        new ForegroundWaitBackgroundedError({
+          reason: "progress_report_received",
+          sourceTaskId: "t1",
+        })
+      )
+    );
     const getAgentTaskStatus = mock(() => "running" as const);
 
     const taskService = {
@@ -1618,13 +1625,11 @@ describe("task_await tool", () => {
     );
 
     expect(result).toEqual({
-      results: [
-        {
-          status: "running",
-          taskId: "t1",
-          note: "Task sent to background because a new message was queued. Use task_await to monitor progress.",
-        },
-      ],
+      results: [{ status: "running", taskId: "t1" }],
+      interruption: {
+        reason: "progress_report_received",
+        sourceTaskId: "t1",
+      },
     });
   });
 
