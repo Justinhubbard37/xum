@@ -74,6 +74,9 @@ export const modelsExtra: Record<string, ModelData> = {
   // separate 2× multiplier at request time and is therefore not baked into these rates.
   "xai/grok-4.5": {
     max_input_tokens: 500000,
+    // Leave max_output_tokens unset: StreamManager forwards it as the request
+    // maxOutputTokens default. The published 500K figure is the context window,
+    // not a verified generation cap, so inventing one can reject nonempty prompts.
     input_cost_per_token: 0.000002, // $2 per million input tokens
     input_cost_per_token_above_200k_tokens: 0.000004, // $4 per million input tokens
     output_cost_per_token: 0.000006, // $6 per million output tokens
