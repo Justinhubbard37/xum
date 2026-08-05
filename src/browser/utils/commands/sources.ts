@@ -12,6 +12,7 @@ import {
 } from "@/common/types/thinking";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
+import { openaiDirectProviderOptionsAvailable } from "@/common/utils/ai/openaiProviderOptionsAvailability";
 import { openaiProModeAvailable } from "@/common/utils/ai/proMode";
 import {
   enforceThinkingPolicy,
@@ -85,19 +86,25 @@ export interface BuildSourcesParams {
     namedWorkspacePath: string;
     workspaceId: string;
   } | null;
+  /** Project-scoped preference ID used while a creation composer is active. */
+  creationScopeId?: string | null;
   streamingModels?: Map<string, string>;
   // UI actions
   getThinkingLevel: (workspaceId: string) => ThinkingLevel;
   onSetThinkingLevel: (workspaceId: string, level: ThinkingLevel) => void;
   getReasoningMode: (workspaceId: string) => OpenAIReasoningMode;
   onToggleReasoningMode: (workspaceId: string) => void;
-  /** Providers config for pro-mode availability (wire format + Codex OAuth detection). */
+  getFastMode: () => boolean;
+  onToggleFastMode: () => void | Promise<void>;
+  /** Effective model currently displayed by the workspace or creation composer. */
+  getEffectiveComposerModel: (scopeId: string) => string;
+  /** Providers config for route-aware provider-option availability. */
   providersConfig?: ProvidersConfigMap | null;
   /** Settings-resolved route for a canonical model ("direct" = no gateway). */
   getRouteForModel?: (canonicalModel: string) => string;
   /**
    * Explicit per-model minimum thinking override (undefined → built-in default floor).
-   * Used to hide off/low from the "Set Thinking Effort" picker, matching the slider.
+   * Used to hide off/low from the "Set Thinking Effort" picker, matching the selector.
    */
   getMinThinkingOverride?: (modelString: string) => ThinkingLevel | null | undefined;
 
@@ -1221,6 +1228,30 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
     ];
 
     const selectedWorkspace = p.selectedWorkspace;
+    const providerOptionScopeId = selectedWorkspace?.workspaceId ?? p.creationScopeId;
+    const providerOptionGateModel = providerOptionScopeId
+      ? p.getEffectiveComposerModel(providerOptionScopeId)
+      : undefined;
+    const currentModelString = providerOptionGateModel ?? p.selectedWorkspaceState?.currentModel;
+    const providerOptionRoute = providerOptionGateModel
+      ? p.getRouteForModel?.(normalizeToCanonical(providerOptionGateModel))
+      : undefined;
+    const fastModeAction: CommandAction | null =
+      p.providersConfig != null &&
+      openaiDirectProviderOptionsAvailable(providerOptionGateModel ?? "", {
+        providersConfig: p.providersConfig,
+        resolvedRouteProvider: providerOptionRoute,
+      })
+        ? {
+            id: CommandIds.toggleFastMode(),
+            title: "Toggle Fast Mode",
+            subtitle: `Current: ${p.getFastMode() ? "Fast — faster responses at higher cost" : "Standard"}`,
+            section: section.mode,
+            shortcutHint: formatKeybind(KEYBINDS.TOGGLE_FAST_MODE),
+            run: p.onToggleFastMode,
+          }
+        : null;
+
     if (selectedWorkspace) {
       const { workspaceId } = selectedWorkspace;
       const levelDescriptions: Record<ThinkingLevel, string> = {
@@ -1231,12 +1262,11 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         xhigh: "Max — deepest possible reasoning",
         max: "Max — deepest possible reasoning",
       };
-      // Display the floored level so it matches the slider (e.g. a stored "off" with a
+      // Display the floored level so it matches the selector (e.g. a stored "off" with a
       // medium floor reads as "medium").
-      const currentModelString = p.selectedWorkspaceState?.currentModel;
       const rawCurrentLevel = p.getThinkingLevel(workspaceId);
       // Pass providersConfig so mapped aliases (mappedToModel -> e.g. GPT-5.6)
-      // resolve to the target's ladder, matching the slider and send path.
+      // resolve to the target's ladder, matching the selector and send path.
       const currentLevel = currentModelString
         ? enforceThinkingPolicy(
             currentModelString,
@@ -1269,14 +1299,13 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               getOptions: () => {
                 // Filter thinking levels by the active model's policy AND its minimum
                 // floor, so users only see levels valid for the current model (matching
-                // the slider — off/low hidden unless the model's minimum is lowered).
-                const modelString = p.selectedWorkspaceState?.currentModel;
-                const allowedLevels = modelString
+                // the selector — off/low hidden unless the model's minimum is lowered).
+                const allowedLevels = currentModelString
                   ? getAvailableThinkingLevels(
-                      modelString,
+                      currentModelString,
                       resolveMinimumThinkingLevel(
-                        modelString,
-                        p.getMinThinkingOverride?.(modelString),
+                        currentModelString,
+                        p.getMinThinkingOverride?.(currentModelString),
                         p.providersConfig
                       ),
                       p.providersConfig
@@ -1305,6 +1334,10 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         },
       });
 
+      if (fastModeAction) {
+        list.push(fastModeAction);
+      }
+
       // Pro reasoning mode is only meaningful for models that support it
       // (GPT-5.6 family) on routes that deliver the native provider option
       // (direct OpenAI) with the Responses wire format; hide the action
@@ -1312,16 +1345,10 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       // that is the model the NEXT send will use — and only fall back to the
       // activity snapshot's currentModel (last streamed model, stale after a
       // model switch) when no selection exists. The mobile layout hides the
-      // PRO chip and relies on this palette action being reachable before the
+      // Pro row and relies on this palette action being reachable before the
       // first send with the newly selected model.
-      const persistedSelectionModel =
-        typeof window === "undefined"
-          ? undefined
-          : getSendOptionsFromStorage(workspaceId).model || undefined;
-      const proGateModelString = persistedSelectionModel ?? currentModelString;
-      const currentModelRoute = proGateModelString
-        ? p.getRouteForModel?.(normalizeToCanonical(proGateModelString))
-        : undefined;
+      const proGateModelString = providerOptionGateModel;
+      const currentModelRoute = providerOptionRoute;
       if (
         openaiProModeAvailable(proGateModelString ?? "", {
           providersConfig: p.providersConfig,
@@ -1339,6 +1366,9 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           },
         });
       }
+    } else if (fastModeAction) {
+      // Creation composers use their project-scoped model preference before a workspace exists.
+      list.push(fastModeAction);
     }
 
     return list;

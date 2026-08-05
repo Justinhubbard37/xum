@@ -47,6 +47,9 @@ const mk = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) => {
     onSetThinkingLevel: () => undefined,
     getReasoningMode: () => "standard",
     onToggleReasoningMode: () => undefined,
+    getFastMode: () => false,
+    onToggleFastMode: () => undefined,
+    getEffectiveComposerModel: () => "anthropic:claude-sonnet-4-5",
     onStartWorkspaceCreation: () => undefined,
     onStartScratchCreation: () => undefined,
     onStartMultiProjectWorkspaceCreation: () => undefined,
@@ -287,6 +290,25 @@ test("buildCoreSources adds thinking effort command", () => {
 
   expect(thinkingAction).toBeDefined();
   expect(thinkingAction?.subtitle).toContain("Medium");
+});
+
+test("thinking effort options use the visible effective model", async () => {
+  const actions = getActions({
+    selectedWorkspaceState: {
+      lifecycle: "active",
+      goal: null,
+      currentModel: "anthropic:claude-sonnet-4-5",
+    } as unknown as WorkspaceState,
+    getEffectiveComposerModel: () => "openai:gpt-5.6-sol",
+  });
+  const thinkingAction = actions.find((action) => action.id === "thinking:set-level");
+  const thinkingField = thinkingAction?.prompt?.fields.find((field) => field.type === "select");
+  if (thinkingField?.type !== "select") {
+    throw new Error("Expected thinking effort select field");
+  }
+  const options = await thinkingField.getOptions({});
+
+  expect(options.map((option) => option.id)).toEqual(["medium", "high", "xhigh", "max"]);
 });
 
 test("workspace switch commands include keywords for filtering", () => {
@@ -1038,6 +1060,107 @@ test("analytics rebuild command falls back to alert when chat input toast host i
     expect(alertMock).toHaveBeenCalledWith(
       "Analytics database rebuilt successfully (1 workspace ingested)."
     );
+  } finally {
+    globalThis.window = originalWindow;
+    globalThis.document = originalDocument;
+    globalThis.CustomEvent = originalCustomEvent;
+  }
+});
+
+test("fast mode command is route-aware and keyboard accessible", async () => {
+  const testWindow = new GlobalWindow();
+  const originalWindow = globalThis.window;
+  const originalDocument = globalThis.document;
+  const originalCustomEvent = globalThis.CustomEvent;
+
+  globalThis.window = testWindow as unknown as Window & typeof globalThis;
+  globalThis.document = testWindow.document as unknown as Document;
+  globalThis.CustomEvent = testWindow.CustomEvent as unknown as typeof CustomEvent;
+
+  try {
+    const onToggleFastMode = mock(() => undefined);
+    const directOpenAIActions = getActions({
+      selectedWorkspaceState: {
+        lifecycle: "active",
+        goal: null,
+        currentModel: "anthropic:claude-sonnet-4-5",
+      } as unknown as WorkspaceState,
+      getEffectiveComposerModel: () => "openai:gpt-5.6-sol",
+      providersConfig: {
+        openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+      },
+      getRouteForModel: () => "direct",
+      onToggleFastMode,
+    });
+    const fastAction = directOpenAIActions.find(
+      (action) => action.id === "thinking:toggle-fast-mode"
+    );
+
+    expect(fastAction?.shortcutHint).toBeDefined();
+    await fastAction?.run();
+    expect(onToggleFastMode).toHaveBeenCalledTimes(1);
+
+    const creationScopeId = "project:/repo/a";
+    const creationActions = getActions({
+      selectedWorkspace: null,
+      selectedWorkspaceState: null,
+      creationScopeId,
+      getEffectiveComposerModel: (scopeId) =>
+        scopeId === creationScopeId ? "openai:gpt-5.6-sol" : "anthropic:claude-sonnet-4-5",
+      providersConfig: {
+        openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+      },
+      getRouteForModel: () => "direct",
+      onToggleFastMode,
+    });
+    const creationFastAction = creationActions.find(
+      (action) => action.id === "thinking:toggle-fast-mode"
+    );
+    expect(creationFastAction?.shortcutHint).toBeDefined();
+    await creationFastAction?.run();
+    expect(onToggleFastMode).toHaveBeenCalledTimes(2);
+
+    const staleOpenAIActions = getActions({
+      selectedWorkspaceState: {
+        lifecycle: "active",
+        goal: null,
+        currentModel: "openai:gpt-5.6-sol",
+      } as unknown as WorkspaceState,
+      getEffectiveComposerModel: () => "anthropic:claude-sonnet-4-5",
+      providersConfig: {
+        openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+      },
+      getRouteForModel: () => "direct",
+    });
+    expect(staleOpenAIActions.some((action) => action.id === "thinking:toggle-fast-mode")).toBe(
+      false
+    );
+
+    const unloadedActions = getActions({
+      selectedWorkspaceState: {
+        lifecycle: "active",
+        goal: null,
+        currentModel: "openai:gpt-5.6-sol",
+      } as unknown as WorkspaceState,
+      getEffectiveComposerModel: () => "openai:gpt-5.6-sol",
+      providersConfig: null,
+      getRouteForModel: () => "direct",
+    });
+    expect(unloadedActions.some((action) => action.id === "thinking:toggle-fast-mode")).toBe(false);
+
+    const gatewayActions = getActions({
+      selectedWorkspaceState: {
+        lifecycle: "active",
+        goal: null,
+        currentModel: "openai:gpt-5.6-sol",
+      } as unknown as WorkspaceState,
+      getEffectiveComposerModel: () => "openai:gpt-5.6-sol",
+      providersConfig: {
+        openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+      },
+      getRouteForModel: () => "openrouter",
+    });
+    expect(gatewayActions.some((action) => action.id === "thinking:toggle-fast-mode")).toBe(false);
   } finally {
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;

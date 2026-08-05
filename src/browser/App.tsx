@@ -17,6 +17,7 @@ import {
 } from "./hooks/usePersistedState";
 import { useResizableSidebar } from "./hooks/useResizableSidebar";
 import { matchesKeybind, KEYBINDS } from "./utils/ui/keybinds";
+import { applyFastModeServiceTierChange } from "./utils/fastModeServiceTier";
 import { handleLayoutSlotHotkeys } from "./utils/ui/layoutSlotHotkeys";
 import { buildSortedWorkspacesByProject } from "./utils/ui/workspaceFiltering";
 import {
@@ -47,7 +48,10 @@ import {
 } from "@/constants/layout";
 import { buildCoreSources, type BuildSourcesParams } from "./utils/commands/sources";
 
-import { getTopLevelProjectEntries } from "@/common/utils/subProjects";
+import {
+  getTopLevelProjectEntries,
+  resolveWorkspaceCreationScope,
+} from "@/common/utils/subProjects";
 import {
   THINKING_LEVELS,
   coerceOpenAIReasoningMode,
@@ -61,6 +65,7 @@ import {
   getAgentsInitNudgeKey,
   getModelKey,
   getNotifyOnResponseKey,
+  getProjectScopeId,
   getThinkingLevelByModelKey,
   getReasoningModeKey,
   getThinkingLevelKey,
@@ -70,7 +75,8 @@ import {
   LEFT_SIDEBAR_COLLAPSED_KEY,
   LEFT_SIDEBAR_WIDTH_KEY,
 } from "@/common/constants/storage";
-import { normalizeSelectedModel, normalizeToCanonical } from "@/common/utils/ai/models";
+import { normalizeToCanonical } from "@/common/utils/ai/models";
+import { openaiDirectProviderOptionsAvailable } from "@/common/utils/ai/openaiProviderOptionsAvailability";
 import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import type { BranchListResult } from "@/common/orpc/types";
 import { useTelemetry } from "./hooks/useTelemetry";
@@ -81,6 +87,7 @@ import { requestActiveTurnThinkingLevel } from "@/browser/utils/activeTurnThinki
 import {
   clearPendingWorkspaceAiSettings,
   markPendingWorkspaceAiSettings,
+  resolveEffectiveComposerModel,
 } from "@/browser/utils/workspaceAiSettingsSync";
 import { AuthTokenModal } from "@/browser/components/AuthTokenModal/AuthTokenModal";
 
@@ -245,6 +252,15 @@ function AppInner() {
   }, [sidebarCollapsed]);
   const creationProjectPath =
     !selectedWorkspace && !currentWorkspaceId ? pendingNewWorkspaceProject : null;
+  // Sub-project creation shares the owning parent's model preference, matching ChatInput.
+  const creationScope = creationProjectPath
+    ? resolveWorkspaceCreationScope(
+        creationProjectPath,
+        userProjects,
+        pendingNewWorkspaceSubProjectPath
+      )
+    : null;
+  const creationScopeId = creationScope ? getProjectScopeId(creationScope.projectPath) : null;
 
   // History navigation (back/forward)
   const navigate = useNavigate();
@@ -430,11 +446,23 @@ function AppInner() {
   /**
    * Get the selected model for a workspace, preserving explicit gateway prefixes.
    */
-  const getModelForWorkspace = useCallback((workspaceId: string): string => {
-    const defaultModel = getDefaultModel();
-    const rawModel = readPersistedState<string>(getModelKey(workspaceId), defaultModel);
-    return normalizeSelectedModel(rawModel || defaultModel);
-  }, []);
+  const getModelForWorkspace = useCallback(
+    (workspaceId: string): string => {
+      const defaultModel = getDefaultModel();
+      const preferredModel = readPersistedState<string | null>(getModelKey(workspaceId), null);
+      const metadata = workspaceMetadata.get(workspaceId);
+      const persistedAgentId =
+        readPersistedState<string>(getAgentIdKey(workspaceId), WORKSPACE_DEFAULTS.agentId)
+          .trim()
+          .toLowerCase() || WORKSPACE_DEFAULTS.agentId;
+      const agentId =
+        metadata?.parentWorkspaceId != null && metadata.agentId
+          ? metadata.agentId
+          : persistedAgentId;
+      return resolveEffectiveComposerModel(preferredModel, metadata, agentId, defaultModel);
+    },
+    [workspaceMetadata]
+  );
 
   const getThinkingLevelForWorkspace = useCallback(
     (workspaceId: string): ThinkingLevel => {
@@ -478,7 +506,11 @@ function AppInner() {
 
   // Pro mode is Responses-only; the palette command hides under chatCompletions
   // and on non-passthrough routes (mirroring the send path's header gating).
-  const { config: providersConfig } = useProvidersConfig();
+  const {
+    config: providersConfig,
+    refresh: refreshProvidersConfig,
+    updateOptimistically,
+  } = useProvidersConfig();
   const routing = useRouting();
   const getRouteForModel = useCallback(
     (canonicalModel: string) => routing.resolveRoute(canonicalModel).route,
@@ -564,7 +596,7 @@ function AppInner() {
           });
 
         // Mid-turn change: also apply to the active turn's next model step so
-        // the palette/keybind path behaves like the slider (ThinkingProvider).
+        // the palette/keybind path behaves like the selector (ThinkingProvider).
         requestActiveTurnThinkingLevel(api, workspaceId, normalized);
       }
 
@@ -647,6 +679,58 @@ function AppInner() {
     },
     [api, getModelForWorkspace, getReasoningModeForWorkspace, getThinkingLevelForWorkspace]
   );
+
+  const fastModeToggleInFlightRef = useRef(false);
+  const fastModeActive = providersConfig?.openai?.serviceTier === "priority";
+  const toggleFastMode = useCallback(async () => {
+    const scopeId = selectedWorkspace?.workspaceId ?? creationScopeId;
+    if (!api || !scopeId || providersConfig == null || fastModeToggleInFlightRef.current) return;
+
+    // Creation composers use the same project-scoped model preference as their selector,
+    // so the global shortcut remains available before the first workspace exists.
+    // Serialize requests so a quick double press cannot compute two writes from stale config.
+    fastModeToggleInFlightRef.current = true;
+    const model = getModelForWorkspace(scopeId);
+    const route = getRouteForModel(normalizeToCanonical(model));
+    if (
+      !openaiDirectProviderOptionsAvailable(model, {
+        providersConfig,
+        resolvedRouteProvider: route,
+      })
+    ) {
+      fastModeToggleInFlightRef.current = false;
+      return;
+    }
+
+    try {
+      const change = await applyFastModeServiceTierChange(
+        api.providers,
+        providersConfig.openai?.serviceTier,
+        providersConfig.openai?.fastModePreviousServiceTier
+      );
+      if (change) {
+        updateOptimistically("openai", {
+          serviceTier: change.serviceTier,
+          fastModePreviousServiceTier: change.previousServiceTier,
+        });
+      } else {
+        await refreshProvidersConfig();
+      }
+    } catch {
+      await refreshProvidersConfig();
+    } finally {
+      fastModeToggleInFlightRef.current = false;
+    }
+  }, [
+    api,
+    creationScopeId,
+    getModelForWorkspace,
+    getRouteForModel,
+    providersConfig,
+    refreshProvidersConfig,
+    selectedWorkspace,
+    updateOptimistically,
+  ]);
 
   const registerParamsRef = useRef<BuildSourcesParams | null>(null);
 
@@ -882,11 +966,15 @@ function AppInner() {
     userProjects,
     workspaceMetadata,
     selectedWorkspace,
+    creationScopeId,
     themePreference,
     getThinkingLevel: getThinkingLevelForWorkspace,
     onSetThinkingLevel: setThinkingLevelFromPalette,
     getReasoningMode: getReasoningModeForWorkspace,
     onToggleReasoningMode: toggleReasoningModeFromPalette,
+    getFastMode: () => fastModeActive,
+    onToggleFastMode: toggleFastMode,
+    getEffectiveComposerModel: getModelForWorkspace,
     providersConfig,
     getRouteForModel,
     getMinThinkingOverride,
@@ -993,6 +1081,9 @@ function AppInner() {
             : undefined;
           openCommandPalette(initialQuery);
         }
+      } else if (matchesKeybind(e, KEYBINDS.TOGGLE_FAST_MODE)) {
+        e.preventDefault();
+        toggleFastMode().catch(() => undefined);
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_SIDEBAR)) {
         e.preventDefault();
         setSidebarCollapsed((prev) => !prev);
@@ -1024,6 +1115,7 @@ function AppInner() {
     isCommandPaletteOpen,
     closeCommandPalette,
     openCommandPalette,
+    toggleFastMode,
     openSettings,
     isAnalyticsOpen,
     navigateToAnalytics,
