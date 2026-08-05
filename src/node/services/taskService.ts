@@ -845,28 +845,34 @@ function isErrorEvent(value: unknown): value is ErrorEvent {
   return isTypedWorkspaceEvent(value, "error");
 }
 
-const KNOWN_STREAM_ERROR_TYPES: ReadonlySet<string> = new Set<StreamErrorType>([
-  "authentication",
-  "rate_limit",
-  "server_error",
-  "api",
-  "retry_failed",
-  "aborted",
-  "network",
-  "context_exceeded",
-  "quota",
-  "model_not_found",
-  "runtime_not_ready",
-  "runtime_start_failed",
-  "empty_output",
-  "stream_truncated",
-  "max_output_tokens",
-  "model_refusal",
-  "unknown",
-]);
+// Exhaustive map so adding a StreamErrorType to the schema fails typecheck until
+// this lookup is updated — otherwise a new retryable type would not be cached and
+// auto-retry-abandoned settlement would fall back to a generic abandon reason.
+const STREAM_ERROR_TYPE_LOOKUP = {
+  authentication: true,
+  rate_limit: true,
+  server_error: true,
+  api: true,
+  retry_failed: true,
+  aborted: true,
+  network: true,
+  context_exceeded: true,
+  quota: true,
+  model_not_found: true,
+  runtime_not_ready: true,
+  runtime_start_failed: true,
+  empty_output: true,
+  stream_truncated: true,
+  max_output_tokens: true,
+  model_refusal: true,
+  unknown: true,
+} as const satisfies Record<StreamErrorType, true>;
 
 function isStreamErrorType(value: unknown): value is StreamErrorType {
-  return typeof value === "string" && KNOWN_STREAM_ERROR_TYPES.has(value);
+  return (
+    typeof value === "string" &&
+    Object.prototype.hasOwnProperty.call(STREAM_ERROR_TYPE_LOOKUP, value)
+  );
 }
 
 function hasAncestorWorkspaceId(
