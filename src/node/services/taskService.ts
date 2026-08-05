@@ -5437,13 +5437,16 @@ export class TaskService {
       }
 
       if (message.role === "assistant" && message.metadata?.partial !== true) {
-        if (hasSubstantiveAssistantText(message)) {
-          // User-visible reasoning or synthesis can legitimately consume several sibling updates.
-          for (const taskId of awaitingResponse) {
-            responded.add(taskId);
-          }
-          awaitingResponse.clear();
-          continue;
+        // Plain text is safely attributable only when one child is awaiting a response. With
+        // multiple siblings, require same-child guidance so commentary about A cannot hide B's
+        // terminal report. Capture this before applying guidance from the same mixed turn.
+        const textResponseTaskId =
+          hasSubstantiveAssistantText(message) && awaitingResponse.size === 1
+            ? awaitingResponse.values().next().value
+            : undefined;
+        if (textResponseTaskId != null) {
+          awaitingResponse.delete(textResponseTaskId);
+          responded.add(textResponseTaskId);
         }
 
         // A wait-only or unrelated tool turn is not a response to the child. Only successful,

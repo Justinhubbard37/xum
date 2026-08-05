@@ -2764,6 +2764,80 @@ describe("TaskService", () => {
     }
   });
 
+  test("mixed text and guidance only respond to the targeted sibling", async () => {
+    const config = await createTestConfig(rootDir);
+    const { historyService, taskService } = createTaskServiceHarness(config);
+    const internal = taskService as unknown as {
+      findProgressRespondedTaskIds: (
+        ownerWorkspaceId: string,
+        candidateTaskIds: ReadonlySet<string>
+      ) => Promise<Set<string>>;
+    };
+
+    const parentId = "parent-mixed-progress-response";
+    const childA = "progress-child-a";
+    const childB = "progress-child-b";
+    for (const childId of [childA, childB]) {
+      await historyService.appendToHistory(
+        parentId,
+        createMuxMessage(
+          `${childId}-progress`,
+          "user",
+          formatSubagentReportEnvelope({
+            taskId: childId,
+            agentType: "explore",
+            status: "in_progress",
+            title: "Progress",
+            reportMarkdown: `Progress from ${childId}.`,
+          }),
+          { timestamp: Date.now(), synthetic: true }
+        )
+      );
+    }
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage(
+        "mixed-progress-response",
+        "assistant",
+        "I’ll steer child A and leave child B pending.",
+        { timestamp: Date.now() },
+        [
+          {
+            type: "dynamic-tool",
+            toolCallId: "guide-child-a",
+            toolName: "task_send_message",
+            state: "output-available",
+            input: { task_id: childA, message: "Continue with the current scope." },
+            output: { status: "accepted", taskId: childA },
+          },
+        ]
+      )
+    );
+    for (const childId of [childA, childB]) {
+      await historyService.appendToHistory(
+        parentId,
+        createMuxMessage(
+          `${childId}-completed`,
+          "user",
+          formatSubagentReportEnvelope({
+            taskId: childId,
+            agentType: "explore",
+            status: "completed",
+            title: "Final report",
+            reportMarkdown: `Final report from ${childId}.`,
+          }),
+          { timestamp: Date.now(), synthetic: true, uiVisible: true }
+        )
+      );
+    }
+
+    const responded = await internal.findProgressRespondedTaskIds(
+      parentId,
+      new Set([childA, childB])
+    );
+    expect([...responded]).toEqual([childA]);
+  });
+
   test("completed subagent wake remains when its visible terminal report card is missing", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
