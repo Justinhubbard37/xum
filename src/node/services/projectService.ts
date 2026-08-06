@@ -1119,7 +1119,7 @@ export class ProjectService {
       }
 
       if (projectConfig.parentProjectPath) {
-        const projectChatSessionId = projectConfig.projectChat?.sessionId;
+        let projectChatSessionId: string | undefined;
         try {
           await this.config.updateProjectSecrets(normalizedPath, []);
         } catch (error) {
@@ -1130,6 +1130,7 @@ export class ProjectService {
         // concurrent config edits (e.g. resurrect concurrently removed workspaces).
         await this.config.editConfig((freshConfig) => {
           const freshSubProject = freshConfig.projects.get(normalizedPath);
+          projectChatSessionId = freshSubProject?.projectChat?.sessionId;
           const parentPath = freshSubProject?.parentProjectPath;
           const parentProject = parentPath ? freshConfig.projects.get(parentPath) : undefined;
           if (parentProject) {

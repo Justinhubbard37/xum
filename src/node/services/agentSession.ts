@@ -13,7 +13,6 @@ import type { InitStateManager } from "@/node/services/initStateManager";
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
 import type { ForegroundWaitInterruption } from "@/common/types/foregroundWaitInterruption";
 import type { RuntimeConfig } from "@/common/types/runtime";
-import { isProjectSessionId } from "@/common/constants/projectChat";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
 import { computePriorHistoryFingerprint } from "@/common/orpc/onChatCursorFingerprint";
@@ -3942,11 +3941,9 @@ export class AgentSession {
         : await this.getPostCompactionAttachmentsIfNeeded();
     // Project Chat has no workspace plan file. Preserve useful TODO/report/diff context while
     // preventing basename-colliding plan references from leaking into the virtual session.
-    const postCompactionAttachments = isProjectSessionId(this.workspaceId)
-      ? (resolvedPostCompactionAttachments?.filter(
-          (attachment) => attachment.type !== "plan_file_reference"
-        ) ?? null)
-      : resolvedPostCompactionAttachments;
+    const postCompactionAttachments = this.filterPostCompactionAttachmentsForSession(
+      resolvedPostCompactionAttachments
+    );
     if (isStartupAbortRequested()) {
       return Ok(undefined);
     }
@@ -6196,6 +6193,17 @@ export class AgentSession {
       includesHotMemories: includeHotMemories,
     });
     return context ?? undefined;
+  }
+
+  private filterPostCompactionAttachmentsForSession(
+    attachments: PostCompactionAttachment[] | null
+  ): PostCompactionAttachment[] | null {
+    // Project Chat has no workspace plan file. Ownership comes from configured metadata rather than
+    // ID syntax because historical ordinary workspaces may legitimately use project-session_* IDs.
+    if (this.config.findProjectChatBySessionId?.(this.workspaceId) == null) {
+      return attachments;
+    }
+    return attachments?.filter((attachment) => attachment.type !== "plan_file_reference") ?? null;
   }
 
   /**

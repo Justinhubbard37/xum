@@ -1927,6 +1927,38 @@ exit 1
       expect(cleanupProjectChatSession).toHaveBeenCalledWith(projectChat.sessionId);
     });
 
+    it("cleans a sub-project chat created while removal waits on secret cleanup", async () => {
+      const parentPath = path.join(tempDir, "parent-racing-chat");
+      const subProjectPath = path.join(parentPath, "packages", "web");
+      await fs.mkdir(subProjectPath, { recursive: true });
+      await config.editConfig((cfg) => {
+        cfg.projects.set(parentPath, { trusted: true, workspaces: [] });
+        cfg.projects.set(subProjectPath, {
+          parentProjectPath: parentPath,
+          workspaces: [],
+        });
+        return cfg;
+      });
+
+      let createdSessionId: string | undefined;
+      const originalUpdateProjectSecrets = config.updateProjectSecrets.bind(config);
+      config.updateProjectSecrets = async (projectPath, secrets) => {
+        createdSessionId = (await config.ensureProjectChat(subProjectPath)).sessionId;
+        await originalUpdateProjectSecrets(projectPath, secrets);
+      };
+      const cleanupProjectChatSession = mock(() => Promise.resolve());
+      service.setWorkspaceService({
+        remove: () => Promise.resolve(Ok(undefined)),
+        cleanupProjectChatSession,
+      });
+
+      expect((await service.remove(subProjectPath)).success).toBe(true);
+
+      expect(createdSessionId).toBeDefined();
+      expect(cleanupProjectChatSession).toHaveBeenCalledWith(createdSessionId);
+      expect(config.loadConfigOrDefault().projects.has(subProjectPath)).toBe(false);
+    });
+
     it("never recursively deletes paths from a malformed persisted Project Chat ID", async () => {
       const projectPath = path.join(tempDir, "project-chat-malformed-id");
       const outsidePath = path.join(tempDir, "outside");

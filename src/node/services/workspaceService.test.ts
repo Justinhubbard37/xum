@@ -530,8 +530,22 @@ describe("WorkspaceService Project Chat", () => {
     const projectPath = path.join(config.rootDir, "project-chat-hidden");
     await fsPromises.mkdir(projectPath, { recursive: true });
     try {
+      const legacyWorkspaceId = "project-session_aaaaaaaaaa";
+      const legacyWorkspacePath = path.join(projectPath, "legacy-workspace");
+      await fsPromises.mkdir(legacyWorkspacePath, { recursive: true });
       await config.editConfig((cfg) => {
-        cfg.projects.set(projectPath, { trusted: true, workspaces: [] });
+        cfg.projects.set(projectPath, {
+          trusted: true,
+          workspaces: [
+            {
+              id: legacyWorkspaceId,
+              name: "legacy-workspace",
+              path: legacyWorkspacePath,
+              createdAt: "2026-08-06T00:00:00.000Z",
+              runtimeConfig: { type: "local" },
+            },
+          ],
+        });
         return cfg;
       });
       const projectChat = await config.ensureProjectChat(projectPath);
@@ -543,7 +557,12 @@ describe("WorkspaceService Project Chat", () => {
       };
       const extensionMetadata = {
         getAllSnapshots: mock(() =>
-          Promise.resolve(new Map([[projectChat.sessionId, hiddenSnapshot]]))
+          Promise.resolve(
+            new Map([
+              [projectChat.sessionId, hiddenSnapshot],
+              [legacyWorkspaceId, { ...hiddenSnapshot, streaming: false }],
+            ])
+          )
         ),
       } as unknown as ExtensionMetadataService;
       const workspaceService = createWorkspaceServiceForTest({
@@ -553,7 +572,9 @@ describe("WorkspaceService Project Chat", () => {
       });
 
       expect(await workspaceService.getInfo(projectChat.sessionId)).toBeNull();
-      expect(await workspaceService.getActivityList()).not.toHaveProperty(projectChat.sessionId);
+      const activity = await workspaceService.getActivityList();
+      expect(activity).not.toHaveProperty(projectChat.sessionId);
+      expect(activity[legacyWorkspaceId]).toMatchObject({ streaming: false });
     } finally {
       await cleanup();
     }

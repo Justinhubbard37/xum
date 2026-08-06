@@ -10135,7 +10135,7 @@ export class WorkspaceService extends EventEmitter {
         Array.from(
           workspaceIds,
           async (workspaceId): Promise<readonly [string, WorkspaceActivitySnapshot] | null> => {
-            if (isProjectSessionId(workspaceId)) return null;
+            if (this.config.findProjectChatBySessionId?.(workspaceId) != null) return null;
             const snapshot = snapshots.get(workspaceId) ?? null;
             const hadWorkflowActivityCache = this.activeWorkflowRunIdsByWorkspace.has(workspaceId);
             // Bash-monitor counterpart of the workflow tombstone: a monitor that stopped
