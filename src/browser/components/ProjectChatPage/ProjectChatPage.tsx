@@ -7,7 +7,6 @@ import { Button } from "@/browser/components/Button/Button";
 import { useAPI } from "@/browser/contexts/API";
 import {
   getAgentIdKey,
-  getModelKey,
   getReasoningModeKey,
   getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,

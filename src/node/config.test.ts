@@ -2,6 +2,9 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { Config } from "./config";
+import { HistoryService } from "./services/historyService";
+import { createMuxMessage } from "@/common/types/message";
+import { PROJECT_CHAT_SESSION_ID_PREFIX } from "@/common/constants/projectChat";
 import {
   CODER_ARCHIVE_BEHAVIORS,
   DEFAULT_CODER_ARCHIVE_BEHAVIOR,
@@ -37,6 +40,62 @@ describe("Config", () => {
   async function flushConfigEdits(): Promise<void> {
     await config.editConfig((cfg) => cfg);
   }
+
+  describe("Project Chat", () => {
+    it("atomically creates one stable project session and keeps history outside workspace sessions", async () => {
+      const projectPath = path.join(tempDir, "repo");
+      fs.mkdirSync(projectPath, { recursive: true });
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, { workspaces: [], trusted: false });
+        return cfg;
+      });
+
+      const [first, second] = await Promise.all([
+        config.ensureProjectChat(projectPath),
+        config.ensureProjectChat(`${projectPath}${path.sep}`),
+      ]);
+
+      expect(first.sessionId).toBe(second.sessionId);
+      expect(first.sessionId.startsWith(PROJECT_CHAT_SESSION_ID_PREFIX)).toBe(true);
+      expect(first.agentId).toBe("orchestrator");
+      expect(first.metadata).toMatchObject({
+        id: first.sessionId,
+        projectPath,
+        namedWorkspacePath: projectPath,
+        agentId: "orchestrator",
+      });
+      expect(config.getSessionDir(first.sessionId)).toBe(
+        path.join(tempDir, "project-sessions", first.sessionId)
+      );
+      expect(config.getSessionDir("ordinary-workspace")).toBe(
+        path.join(tempDir, "sessions", "ordinary-workspace")
+      );
+
+      const historyService = new HistoryService(config);
+      const append = await historyService.appendToHistory(
+        first.sessionId,
+        createMuxMessage("project-chat-message", "user", "persist me", { timestamp: 1 })
+      );
+      expect(append.success).toBe(true);
+
+      const restartedConfig = new Config(tempDir);
+      const reloaded = await restartedConfig.ensureProjectChat(projectPath);
+      expect(reloaded.sessionId).toBe(first.sessionId);
+      expect(restartedConfig.findProjectChatBySessionId(first.sessionId)?.projectPath).toBe(
+        projectPath
+      );
+      expect(
+        (await restartedConfig.getAllWorkspaceMetadata()).map((metadata) => metadata.id)
+      ).not.toContain(first.sessionId);
+
+      const restartedHistory = new HistoryService(restartedConfig);
+      const history = await restartedHistory.getHistoryFromLatestBoundary(first.sessionId);
+      expect(history.success).toBe(true);
+      if (history.success) {
+        expect(history.data.map((message) => message.id)).toEqual(["project-chat-message"]);
+      }
+    });
+  });
 
   describe("loadConfigOrDefault with trailing slash migration", () => {
     it("should strip trailing slashes from project paths on load", () => {

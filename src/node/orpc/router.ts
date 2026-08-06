@@ -3156,6 +3156,14 @@ export const router = (authToken?: string) => {
         .handler(({ context }) => {
           return context.projectService.list();
         }),
+      chat: {
+        getOrCreate: t
+          .input(schemas.projects.chat.getOrCreate.input)
+          .output(schemas.projects.chat.getOrCreate.output)
+          .handler(async ({ context, input }) => {
+            return context.projectService.getOrCreateChat(input.projectPath);
+          }),
+      },
       create: t
         .input(schemas.projects.create.input)
         .output(schemas.projects.create.output)

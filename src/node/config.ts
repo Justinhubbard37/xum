@@ -14,6 +14,7 @@ import {
 } from "@/common/types/secrets";
 import type {
   Workspace,
+  ProjectChatInfo,
   ProjectConfig,
   ProjectsConfig,
   UpdateChannel,
@@ -42,6 +43,13 @@ import {
   type RuntimeEnablementId,
 } from "@/common/types/runtime";
 import { SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
+import {
+  PROJECT_CHAT_AGENT_ID,
+  PROJECT_CHAT_SESSION_ID_PREFIX,
+  PROJECT_CHAT_VERSION,
+  isProjectSessionId,
+} from "@/common/constants/projectChat";
+import { ProjectChatConfigSchema } from "@/common/orpc/schemas";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { isIncompatibleRuntimeConfig } from "@/common/utils/runtimeCompatibility";
 import { getMuxHome } from "@/common/constants/paths";
@@ -740,6 +748,7 @@ function removeLegacyMuxChatEntries(projects: Map<string, ProjectConfig>): boole
 export class Config {
   readonly rootDir: string;
   readonly sessionsDir: string;
+  readonly projectSessionsDir: string;
   readonly srcDir: string;
   private readonly configFile: string;
   private readonly providersFile: string;
@@ -753,6 +762,9 @@ export class Config {
   constructor(rootDir?: string) {
     this.rootDir = rootDir ?? getMuxHome();
     this.sessionsDir = path.join(this.rootDir, "sessions");
+    // Project Chat transcripts live outside ordinary workspace sessions so older builds and
+    // workspace-wide background jobs can ignore them without a hidden WorkspaceConfig entry.
+    this.projectSessionsDir = path.join(this.rootDir, "project-sessions");
     this.srcDir = path.join(this.rootDir, "src");
     this.configFile = path.join(this.rootDir, "config.json");
     this.providersFile = path.join(this.rootDir, "providers.jsonc");
@@ -1773,10 +1785,123 @@ export class Config {
    */
 
   /**
-   * Get the session directory for a specific workspace
+   * Get the session directory for a workspace or Project Chat session.
+   *
+   * The explicit prefix keeps project sessions backend-owned and lets all existing history,
+   * replay, queue, interrupt, and attention stores reuse this seam without relocating ordinary
+   * workspace data from ~/.mux/sessions.
    */
-  getSessionDir(workspaceId: string): string {
-    return path.join(this.sessionsDir, workspaceId);
+  getSessionDir(sessionId: string): string {
+    return path.join(
+      isProjectSessionId(sessionId) ? this.projectSessionsDir : this.sessionsDir,
+      sessionId
+    );
+  }
+
+  private buildProjectChatInfo(projectPath: string, projectConfig: ProjectConfig): ProjectChatInfo {
+    const projectChat = ProjectChatConfigSchema.parse(projectConfig.projectChat);
+    return {
+      ...projectChat,
+      projectPath,
+      metadata: {
+        id: projectChat.sessionId,
+        name: "project-chat",
+        title: "Project Chat",
+        projectName: this.getProjectName(projectPath),
+        projectPath,
+        createdAt: projectChat.createdAt,
+        aiSettingsByAgent: projectChat.aiSettingsByAgent,
+        runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+        agentId: PROJECT_CHAT_AGENT_ID,
+        namedWorkspacePath: projectPath,
+      },
+    };
+  }
+
+  findProjectChatByProjectPath(projectPath: string): ProjectChatInfo | null {
+    const normalizedProjectPath = stripTrailingSlashes(projectPath);
+    const projectConfig = this.loadConfigOrDefault().projects.get(normalizedProjectPath);
+    if (!projectConfig) {
+      return null;
+    }
+
+    const parsed = ProjectChatConfigSchema.safeParse(projectConfig.projectChat);
+    if (!parsed.success || !isProjectSessionId(parsed.data.sessionId)) {
+      return null;
+    }
+
+    return this.buildProjectChatInfo(normalizedProjectPath, {
+      ...projectConfig,
+      projectChat: parsed.data,
+    });
+  }
+
+  findProjectChatBySessionId(sessionId: string): ProjectChatInfo | null {
+    if (!isProjectSessionId(sessionId)) {
+      return null;
+    }
+
+    const config = this.loadConfigOrDefault();
+    for (const [projectPath, projectConfig] of config.projects) {
+      const parsed = ProjectChatConfigSchema.safeParse(projectConfig.projectChat);
+      if (parsed.success && parsed.data.sessionId === sessionId) {
+        return this.buildProjectChatInfo(projectPath, {
+          ...projectConfig,
+          projectChat: parsed.data,
+        });
+      }
+    }
+    return null;
+  }
+
+  resolveProjectSessionMetadata(sessionId: string): FrontendWorkspaceMetadata | null {
+    return this.findProjectChatBySessionId(sessionId)?.metadata ?? null;
+  }
+
+  async ensureProjectChat(projectPath: string): Promise<ProjectChatInfo> {
+    const normalizedProjectPath = stripTrailingSlashes(projectPath);
+
+    await this.editConfig((config) => {
+      const projectConfig = config.projects.get(normalizedProjectPath);
+      if (!projectConfig) {
+        throw new Error(`Project not found: ${normalizedProjectPath}`);
+      }
+
+      const rawProjectChat = (projectConfig as ProjectConfig & { projectChat?: unknown })
+        .projectChat;
+      if (
+        rawProjectChat &&
+        typeof rawProjectChat === "object" &&
+        "version" in rawProjectChat &&
+        rawProjectChat.version !== PROJECT_CHAT_VERSION
+      ) {
+        // Preserve future-version blocks byte-for-byte on downgrade rather than replacing data
+        // this build cannot safely interpret.
+        throw new Error(`Unsupported Project Chat version for ${normalizedProjectPath}`);
+      }
+
+      const parsed = ProjectChatConfigSchema.safeParse(rawProjectChat);
+      if (!parsed.success || !isProjectSessionId(parsed.data.sessionId)) {
+        projectConfig.projectChat = {
+          version: PROJECT_CHAT_VERSION,
+          sessionId: `${PROJECT_CHAT_SESSION_ID_PREFIX}${this.generateStableId()}`,
+          createdAt: new Date().toISOString(),
+          agentId: PROJECT_CHAT_AGENT_ID,
+        };
+      } else {
+        projectConfig.projectChat = parsed.data;
+      }
+
+      return config;
+    });
+
+    const result = this.findProjectChatByProjectPath(normalizedProjectPath);
+    if (!result) {
+      throw new Error(`Failed to ensure Project Chat for ${normalizedProjectPath}`);
+    }
+
+    ensurePrivateDirSync(this.getSessionDir(result.sessionId));
+    return result;
   }
 
   /**

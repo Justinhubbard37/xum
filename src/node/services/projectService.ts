@@ -1,4 +1,5 @@
 import type { Config, ProjectConfig } from "@/node/config";
+import type { ProjectChatInfo } from "@/common/types/project";
 import { formatSshEndpoint } from "@/common/utils/ssh/formatSshEndpoint";
 import { spawn } from "child_process";
 import { createHash, randomBytes } from "crypto";
@@ -441,6 +442,20 @@ export class ProjectService {
   async pickDirectory(initialPath?: string | null): Promise<string | null> {
     if (!this.directoryPicker) return null;
     return this.directoryPicker(initialPath ?? null);
+  }
+
+  async getOrCreateChat(projectPath: string): Promise<Result<ProjectChatInfo>> {
+    try {
+      if (!projectPath || projectPath.trim().length === 0) {
+        return Err("Project path cannot be empty");
+      }
+
+      // Resolving/displaying Project Chat is safe before trust. The trust gate belongs at model
+      // execution so the user can open the persistent transcript and then choose to trust the repo.
+      return Ok(await this.config.ensureProjectChat(path.resolve(projectPath)));
+    } catch (error) {
+      return Err(getErrorMessage(error));
+    }
   }
 
   async create(

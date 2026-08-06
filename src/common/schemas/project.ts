@@ -1,8 +1,10 @@
+import { PROJECT_CHAT_AGENT_ID, PROJECT_CHAT_VERSION } from "@/common/constants/projectChat";
 import { RuntimeConfigSchema } from "@/common/orpc/schemas/runtime";
 import { WorkspaceMCPOverridesSchema } from "@/common/orpc/schemas/mcp";
 import {
   BestOfGroupSchema,
   ProjectRefSchema,
+  FrontendWorkspaceMetadataSchema,
   WorkflowTaskMetadataSchema,
   WorkspaceGoalDefaultsOverrideSchema,
   WorkspaceHeartbeatSettingsSchema,
@@ -251,6 +253,30 @@ export const WorkspaceConfigSchema = z.object({
   }),
 });
 
+export const ProjectChatConfigSchema = z.object({
+  version: z.literal(PROJECT_CHAT_VERSION).meta({
+    description: "Persisted Project Chat schema version",
+  }),
+  sessionId: z.string().min(1).meta({
+    description: "Backend-generated stable project-session ID",
+  }),
+  createdAt: z.string().meta({ description: "ISO 8601 Project Chat creation timestamp" }),
+  agentId: z.literal(PROJECT_CHAT_AGENT_ID).meta({
+    description: "Fixed built-in agent identity for Project Chat",
+  }),
+  aiSettingsByAgent: WorkspaceAISettingsByAgentSchema.optional().meta({
+    description: "Per-agent Project Chat AI settings; orchestrator is the active agent",
+  }),
+});
+
+export const ProjectChatInfoSchema = ProjectChatConfigSchema.extend({
+  projectPath: z.string().meta({ description: "Absolute path of the owning project" }),
+  metadata: FrontendWorkspaceMetadataSchema.meta({
+    description:
+      "Backend-owned virtual metadata for registering the chat session without exposing it through workspace APIs",
+  }),
+});
+
 export const ProjectConfigSchema = z.object({
   displayName: z.string().nullish().meta({
     description: "Custom display name for the project",
@@ -266,6 +292,9 @@ export const ProjectConfigSchema = z.object({
   parentProjectPath: z.string().optional().meta({
     description: "Absolute path to the top-level parent project for one-level sub-projects",
   }),
+  // Project Chat is intentionally separate from workspaces so workspace-wide background jobs,
+  // sidebar counts, archive blockers, and older hidden-workspace behavior cannot sweep it in.
+  projectChat: ProjectChatConfigSchema.optional(),
   workspaces: z.array(WorkspaceConfigSchema),
   idleCompactionHours: z.number().min(1).nullable().optional().meta({
     description:
@@ -290,5 +319,7 @@ export const ProjectConfigSchema = z.object({
   }),
 });
 
+export type ProjectChatConfig = z.infer<typeof ProjectChatConfigSchema>;
+export type ProjectChatInfo = z.infer<typeof ProjectChatInfoSchema>;
 export type WorktreeArchiveSnapshotProject = z.infer<typeof WorktreeArchiveSnapshotProjectSchema>;
 export type WorktreeArchiveSnapshot = z.infer<typeof WorktreeArchiveSnapshotSchema>;
