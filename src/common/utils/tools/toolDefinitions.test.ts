@@ -7,6 +7,7 @@ import {
   getAvailableTools,
   supportsGoogleNativeToolsWithFunctionTools,
   TaskToolArgsSchema,
+  TaskToolResultSchema,
   TaskWorkspaceLifecycleToolArgsSchema,
   TOOL_DEFINITIONS,
   WorkflowRunToolArgsSchema,
@@ -745,6 +746,39 @@ describe("TOOL_DEFINITIONS", () => {
     expect(buildTaskToolDescription(RUNTIME_MODE.LOCAL)).not.toBe(
       buildTaskToolDescription(RUNTIME_MODE.WORKTREE)
     );
+  });
+
+  it("documents handle-only task creation and task_await result retrieval", () => {
+    const description = buildTaskToolDescription(RUNTIME_MODE.WORKTREE);
+
+    expect(description).toContain("always returns promptly with created execution handle(s)");
+    expect(description).toContain("Retrieve terminal output with task_await");
+    expect(description).not.toContain("returns the completed report");
+  });
+
+  it("continues parsing historical completed task results", () => {
+    expect(
+      TaskToolResultSchema.safeParse({
+        status: "completed",
+        taskId: "legacy-task",
+        workspaceId: "legacy-workspace",
+        reportMarkdown: "Historical terminal report",
+        title: "Legacy result",
+        agentId: "explore",
+        agentType: "explore",
+      }).success
+    ).toBe(true);
+
+    expect(
+      TaskToolResultSchema.safeParse({
+        status: "completed",
+        taskIds: ["legacy-task-1", "legacy-task-2"],
+        reports: [
+          { taskId: "legacy-task-1", reportMarkdown: "First historical report" },
+          { taskId: "legacy-task-2", reportMarkdown: "Second historical report" },
+        ],
+      }).success
+    ).toBe(true);
   });
 
   it("accepts workspace turn queue dispatch mode", () => {

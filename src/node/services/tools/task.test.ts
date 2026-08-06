@@ -7,8 +7,7 @@ import { z } from "zod";
 import { createTaskTool, markBuiltInTaskTool, isBuiltInTaskTool } from "./task";
 import { createTestToolConfig, mockToolCallOptions, TestTempDir } from "./testHelpers";
 import { Ok, Err } from "@/common/types/result";
-import { ForegroundWaitBackgroundedError, type TaskService } from "@/node/services/taskService";
-import { ATTACH_FILE_ARTIFACT_GUIDANCE } from "@/common/utils/tools/toolDefinitions";
+import type { TaskService } from "@/node/services/taskService";
 
 function expectQueuedOrRunningTaskToolResult(
   result: unknown,
@@ -326,32 +325,18 @@ describe("task tool", () => {
     });
   });
 
-  it("returns durable attach_file descriptors and guidance from foreground workspace turns", async () => {
-    using tempDir = new TestTempDir("test-task-tool-project-chat-artifacts");
-    const artifact = {
-      path: "/owner/project-session/task-artifacts/wst_artifact/report.pdf",
-      filename: "report.pdf",
-      mediaType: "application/pdf",
-      sourceToolCallId: "attach-report",
-    };
-    const createWorkspaceTurn = mock(() =>
+  it("returns a foreground workspace-turn handle without waiting for terminal output", async () => {
+    using tempDir = new TestTempDir("test-task-tool-project-chat-foreground-handle");
+    const createWorkspaceTurn = mock((_args: Parameters<TaskService["createWorkspaceTurn"]>[0]) =>
       Ok({
-        taskId: "wst_artifact",
+        taskId: "wst_foreground",
         kind: "workspace_turn" as const,
         status: "running" as const,
         workspaceId: "child-workspace",
-        modelString: "openai:gpt-5.6-sol",
-        thinkingLevel: "high" as const,
-        reasoningMode: "standard" as const,
       })
     );
     const waitForWorkspaceTurn = mock(() =>
-      Promise.resolve({
-        taskId: "wst_artifact",
-        workspaceId: "child-workspace",
-        reportMarkdown: "Created the report.",
-        artifacts: { attachFiles: [artifact] },
-      })
+      Promise.resolve({ reportMarkdown: "terminal output must come from task_await" })
     );
     const taskService = { createWorkspaceTurn, waitForWorkspaceTurn } as unknown as TaskService;
     const taskTool = createTaskTool({
@@ -360,67 +345,26 @@ describe("task tool", () => {
       taskService,
     });
 
-    const result = (await taskTool.execute!(
+    const result = await taskTool.execute!(
       {
         prompt: "create a report",
         title: "Report",
         run_in_background: false,
       },
       mockToolCallOptions
-    )) as Record<string, unknown>;
+    );
 
+    expect(createWorkspaceTurn).toHaveBeenCalledWith(
+      expect.objectContaining({ attentionPolicy: "blocking_until_terminal" })
+    );
+    expect(waitForWorkspaceTurn).not.toHaveBeenCalled();
     expect(result).toMatchObject({
-      status: "completed",
-      taskId: "wst_artifact",
-      artifacts: { attachFiles: [artifact] },
-    });
-    expect(result.note).toContain(ATTACH_FILE_ARTIFACT_GUIDANCE);
-    expect(JSON.stringify(result)).not.toContain("base64");
-  });
-
-  it("backgrounds an explicit Project Chat foreground wait when new parent input arrives", async () => {
-    using tempDir = new TestTempDir("test-task-tool-project-chat-foreground");
-    const createWorkspaceTurn = mock((_args: Parameters<TaskService["createWorkspaceTurn"]>[0]) =>
-      Ok({
-        taskId: "wst_project-chat-foreground",
-        kind: "workspace_turn" as const,
-        status: "running" as const,
-        workspaceId: "child-workspace",
-      })
-    );
-    const waitForWorkspaceTurn = mock(() => Promise.reject(new ForegroundWaitBackgroundedError()));
-    const taskService = { createWorkspaceTurn, waitForWorkspaceTurn } as unknown as TaskService;
-    const ownerSessionId = "project-session_aaaaaaaaaa";
-    const taskTool = createTaskTool({
-      ...createTestToolConfig(tempDir.path, { workspaceId: ownerSessionId }),
-      projectChat: true,
-      taskService,
-    });
-
-    const result: unknown = await Promise.resolve(
-      taskTool.execute!(
-        {
-          kind: "workspace",
-          prompt: "implement",
-          title: "Implementation",
-          run_in_background: false,
-        },
-        mockToolCallOptions
-      )
-    );
-
-    expect(waitForWorkspaceTurn).toHaveBeenCalledWith(
-      "wst_project-chat-foreground",
-      expect.objectContaining({
-        requestingWorkspaceId: ownerSessionId,
-        backgroundOnMessageQueued: true,
-      })
-    );
-    expect(result).toMatchObject({
-      taskId: "wst_project-chat-foreground",
       status: "running",
+      taskId: "wst_foreground",
       workspaceId: "child-workspace",
+      handleKind: "workspace_turn",
     });
+    expect(result).not.toHaveProperty("reportMarkdown");
   });
 
   it("starts a background workspace turn without requiring a sub-agent id", async () => {
@@ -1065,192 +1009,51 @@ describe("task tool", () => {
     expect(typeof obj.note).toBe("string");
   });
 
-  it("returns one completed report per best-of task when run in foreground", async () => {
-    using tempDir = new TestTempDir("test-task-tool-best-of-foreground");
+  it("returns all best-of handles without waiting when blocking attention is requested", async () => {
+    using tempDir = new TestTempDir("test-task-tool-best-of-foreground-handles");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
 
     let createCount = 0;
-    const create = mock(() => {
+    const create = mock((_args: Parameters<TaskService["create"]>[0]) => {
       createCount += 1;
       return Ok({
         taskId: `child-task-${createCount}`,
+        workspaceId: `child-workspace-${createCount}`,
         kind: "agent" as const,
         status: "running" as const,
       });
     });
-    const waitForAgentReport = mock((taskId: string) =>
-      Promise.resolve({
-        reportMarkdown: `report for ${taskId}`,
-        title: `Report ${taskId}`,
-      })
+    const waitForAgentReport = mock(() =>
+      Promise.resolve({ reportMarkdown: "terminal output must come from task_await" })
     );
     const taskService = { create, waitForAgentReport } as unknown as TaskService;
+    const tool = createTaskTool({ ...baseConfig, taskService });
 
-    const tool = createTaskTool({
-      ...baseConfig,
-      taskService,
-    });
-
-    const result: unknown = await Promise.resolve(
-      tool.execute!(
-        {
-          subagent_type: "explore",
-          prompt: "compare two approaches",
-          title: "Best of 2",
-          run_in_background: false,
-          n: 2,
-        },
-        mockToolCallOptions
-      )
+    const result = await tool.execute!(
+      {
+        subagent_type: "explore",
+        prompt: "compare two approaches",
+        title: "Best of 2",
+        run_in_background: false,
+        n: 2,
+      },
+      mockToolCallOptions
     );
 
     expect(create).toHaveBeenCalledTimes(2);
-    expect(waitForAgentReport).toHaveBeenCalledTimes(2);
+    for (const call of create.mock.calls) {
+      expect(call[0]).toMatchObject({ attentionPolicy: "blocking_until_terminal" });
+    }
+    expect(waitForAgentReport).not.toHaveBeenCalled();
     expect(result).toMatchObject({
-      status: "completed",
+      status: "running",
       taskIds: ["child-task-1", "child-task-2"],
-      reports: [
-        {
-          taskId: "child-task-1",
-          reportMarkdown: "report for child-task-1",
-          title: "Report child-task-1",
-          agentId: "explore",
-          agentType: "explore",
-          groupKind: "bestOf",
-        },
-        {
-          taskId: "child-task-2",
-          reportMarkdown: "report for child-task-2",
-          title: "Report child-task-2",
-          agentId: "explore",
-          agentType: "explore",
-          groupKind: "bestOf",
-        },
+      tasks: [
+        { taskId: "child-task-1", workspaceId: "child-workspace-1", groupKind: "bestOf" },
+        { taskId: "child-task-2", workspaceId: "child-workspace-2", groupKind: "bestOf" },
       ],
     });
-  });
-
-  it("prefers report-time AI settings over the launch snapshot in completed results", async () => {
-    using tempDir = new TestTempDir("test-task-tool-report-time-settings");
-    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
-
-    // Launch resolves plan-phase settings; the report arrives after a plan-to-exec
-    // handoff rewrote the child's task settings.
-    const create = mock(() =>
-      Ok({
-        taskId: "child-task",
-        kind: "agent" as const,
-        status: "running" as const,
-        modelString: "openai:plan-model",
-        thinkingLevel: "low" as const,
-      })
-    );
-    const waitForAgentReport = mock(() =>
-      Promise.resolve({
-        reportMarkdown: "final report",
-        model: "anthropic:exec-model",
-        thinkingLevel: "high" as const,
-      })
-    );
-    const taskService = { create, waitForAgentReport } as unknown as TaskService;
-
-    const tool = createTaskTool({ ...baseConfig, taskService });
-
-    const result: unknown = await Promise.resolve(
-      tool.execute!(
-        {
-          subagent_type: "plan",
-          prompt: "plan then implement",
-          title: "Plan task",
-          run_in_background: false,
-        },
-        mockToolCallOptions
-      )
-    );
-
-    expect(result).toMatchObject({
-      status: "completed",
-      taskId: "child-task",
-      modelString: "anthropic:exec-model",
-      thinkingLevel: "high",
-    });
-  });
-
-  it("preserves completed best-of reports when another foreground wait times out", async () => {
-    using tempDir = new TestTempDir("test-task-tool-best-of-timeout-partial-complete");
-    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
-
-    let createCount = 0;
-    const create = mock(() => {
-      createCount += 1;
-      return Ok({
-        taskId: `child-task-${createCount}`,
-        kind: "agent" as const,
-        status: "running" as const,
-      });
-    });
-    const waitForAgentReport = mock((taskId: string) => {
-      if (taskId === "child-task-1") {
-        return Promise.resolve({
-          reportMarkdown: "report for child-task-1",
-          title: "Report child-task-1",
-        });
-      }
-      return Promise.reject(new Error("Timed out waiting for agent_report"));
-    });
-    const getAgentTaskStatus = mock((taskId: string) =>
-      taskId === "child-task-3" ? ("queued" as const) : ("running" as const)
-    );
-    const taskService = {
-      create,
-      waitForAgentReport,
-      getAgentTaskStatus,
-    } as unknown as TaskService;
-
-    const tool = createTaskTool({
-      ...baseConfig,
-      taskService,
-    });
-
-    const result: unknown = await Promise.resolve(
-      tool.execute!(
-        {
-          subagent_type: "explore",
-          prompt: "compare three approaches",
-          title: "Best of 3",
-          run_in_background: false,
-          n: 3,
-        },
-        mockToolCallOptions
-      )
-    );
-
-    expect(create).toHaveBeenCalledTimes(3);
-    expect(waitForAgentReport).toHaveBeenCalledTimes(3);
-    expect(getAgentTaskStatus).toHaveBeenCalledTimes(2);
-    expect(result).toBeTruthy();
-    expect(typeof result).toBe("object");
-    expect(result).not.toBeNull();
-
-    const obj = result as Record<string, unknown>;
-    expect(obj.status).toBe("running");
-    expect(obj.taskIds).toEqual(["child-task-1", "child-task-2", "child-task-3"]);
-    expect(obj.tasks).toMatchObject([
-      { taskId: "child-task-1", status: "completed", groupKind: "bestOf" },
-      { taskId: "child-task-2", status: "running", groupKind: "bestOf" },
-      { taskId: "child-task-3", status: "queued", groupKind: "bestOf" },
-    ]);
-    expect(obj.reports).toMatchObject([
-      {
-        taskId: "child-task-1",
-        reportMarkdown: "report for child-task-1",
-        title: "Report child-task-1",
-        agentId: "explore",
-        agentType: "explore",
-        groupKind: "bestOf",
-      },
-    ]);
-    expect(typeof obj.note).toBe("string");
+    expect(result).not.toHaveProperty("reports");
   });
 
   it("should allow sub-agent workspaces to spawn nested tasks", async () => {
@@ -1292,14 +1095,12 @@ describe("task tool", () => {
     expectQueuedOrRunningTaskToolResult(result, { status: "queued", taskId: "grandchild-task" });
   });
 
-  it("uses foreground mode when a strict provider normalizes run_in_background to null", async () => {
-    using tempDir = new TestTempDir("test-task-tool");
+  it("uses blocking attention and returns a handle when run_in_background is null", async () => {
+    using tempDir = new TestTempDir("test-task-tool-null-background");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
 
     const events: TaskCreatedEvent[] = [];
-    let didEmitTaskCreated = false;
-
-    const create = mock(() =>
+    const create = mock((_args: Parameters<TaskService["create"]>[0]) =>
       Ok({
         taskId: "exe_child",
         workspaceId: "child-workspace",
@@ -1307,173 +1108,47 @@ describe("task tool", () => {
         status: "running" as const,
       })
     );
-    const waitForAgentReport = mock(() => {
-      // The main thing we care about: emit the UI-only taskId before we block waiting for the report.
-      expect(didEmitTaskCreated).toBe(true);
-      return Promise.resolve({
-        reportMarkdown: "Hello from child",
-        title: "Result",
-      });
-    });
+    const waitForAgentReport = mock(() =>
+      Promise.resolve({ reportMarkdown: "terminal output must come from task_await" })
+    );
     const taskService = { create, waitForAgentReport } as unknown as TaskService;
 
     const tool = createTaskTool({
       ...baseConfig,
       emitChatEvent: (event) => {
-        if (event.type === "task-created") {
-          didEmitTaskCreated = true;
-          events.push(event);
-        }
+        if (event.type === "task-created") events.push(event);
       },
       taskService,
     });
 
-    const result: unknown = await Promise.resolve(
-      tool.execute!(
-        {
-          subagent_type: "explore",
-          prompt: "do it",
-          title: "Child task",
-          run_in_background: null,
-        },
-        mockToolCallOptions
-      )
+    const result = await tool.execute!(
+      {
+        subagent_type: "explore",
+        prompt: "do it",
+        title: "Child task",
+        run_in_background: null,
+      },
+      mockToolCallOptions
     );
 
-    expect(create).toHaveBeenCalled();
-    expect(waitForAgentReport).toHaveBeenCalledWith("exe_child", expect.any(Object));
-
+    expect(create).toHaveBeenCalledWith(
+      expect.objectContaining({ attentionPolicy: "blocking_until_terminal" })
+    );
+    expect(waitForAgentReport).not.toHaveBeenCalled();
     expect(events).toHaveLength(1);
-    const taskCreated = events[0];
-    if (!taskCreated) {
-      throw new Error("Expected a task-created event");
-    }
-
-    expect(taskCreated.type).toBe("task-created");
-
-    const parentWorkspaceId = baseConfig.workspaceId;
-    if (!parentWorkspaceId) {
-      throw new Error("Expected baseConfig.workspaceId to be set");
-    }
-    expect(taskCreated.workspaceId).toBe(parentWorkspaceId);
-    expect(taskCreated.toolCallId).toBe(mockToolCallOptions.toolCallId);
-    expect(taskCreated.taskId).toBe("exe_child");
-    expect(taskCreated.taskWorkspaceId).toBe("child-workspace");
-    expect(typeof taskCreated.timestamp).toBe("number");
-    expect(result).toEqual({
-      status: "completed",
+    expect(events[0]).toMatchObject({
+      type: "task-created",
+      workspaceId: "parent-workspace",
+      toolCallId: mockToolCallOptions.toolCallId,
+      taskId: "exe_child",
+      taskWorkspaceId: "child-workspace",
+    });
+    expect(result).toMatchObject({
+      status: "running",
       taskId: "exe_child",
       workspaceId: "child-workspace",
-      reportMarkdown: "Hello from child",
-      title: "Result",
-      agentId: "explore",
-      agentType: "explore",
     });
-  });
-
-  it("should return taskId if foreground wait times out", async () => {
-    using tempDir = new TestTempDir("test-task-tool");
-    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
-
-    const create = mock(() =>
-      Ok({ taskId: "child-task", kind: "agent" as const, status: "queued" as const })
-    );
-    const waitForAgentReport = mock(() =>
-      Promise.reject(new Error("Timed out waiting for agent_report"))
-    );
-    const getAgentTaskStatus = mock(() => "running" as const);
-    const taskService = {
-      create,
-      waitForAgentReport,
-      getAgentTaskStatus,
-    } as unknown as TaskService;
-
-    const tool = createTaskTool({
-      ...baseConfig,
-      taskService,
-    });
-
-    const result: unknown = await Promise.resolve(
-      tool.execute!(
-        {
-          subagent_type: "explore",
-          prompt: "do it",
-          title: "Child task",
-          run_in_background: false,
-        },
-        mockToolCallOptions
-      )
-    );
-
-    expect(create).toHaveBeenCalled();
-    expect(waitForAgentReport).toHaveBeenCalledWith("child-task", expect.any(Object));
-    expect(getAgentTaskStatus).toHaveBeenCalledWith("child-task");
-    expectQueuedOrRunningTaskToolResult(result, { status: "running", taskId: "child-task" });
-  });
-
-  it("should return background result when foreground wait is backgrounded", async () => {
-    using tempDir = new TestTempDir("test-task-tool");
-    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
-
-    const create = mock(() =>
-      Ok({ taskId: "child-task", kind: "agent" as const, status: "queued" as const })
-    );
-    const waitForAgentReport = mock(() =>
-      Promise.reject(
-        new ForegroundWaitBackgroundedError({
-          reason: "progress_report_received",
-          sourceTaskId: "child-task",
-          report: {
-            agentType: "explore",
-            title: "Progress",
-            reportMarkdown: "Found the relevant path.",
-          },
-        })
-      )
-    );
-    const getAgentTaskStatus = mock(() => "running" as const);
-    const taskService = {
-      create,
-      waitForAgentReport,
-      getAgentTaskStatus,
-    } as unknown as TaskService;
-
-    const tool = createTaskTool({
-      ...baseConfig,
-      taskService,
-    });
-
-    const result: unknown = await Promise.resolve(
-      tool.execute!(
-        {
-          subagent_type: "explore",
-          prompt: "do it",
-          title: "Child task",
-          run_in_background: false,
-        },
-        mockToolCallOptions
-      )
-    );
-
-    expect(create).toHaveBeenCalled();
-    expect(waitForAgentReport).toHaveBeenCalledWith(
-      "child-task",
-      expect.objectContaining({ backgroundOnMessageQueued: true })
-    );
-    expect(getAgentTaskStatus).toHaveBeenCalledWith("child-task");
-    expectQueuedOrRunningTaskToolResult(result, { status: "running", taskId: "child-task" });
-    expect(result).toMatchObject({
-      interruption: {
-        reason: "progress_report_received",
-        sourceTaskId: "child-task",
-        report: {
-          agentType: "explore",
-          title: "Progress",
-          reportMarkdown: "Found the relevant path.",
-        },
-      },
-      note: "Foreground wait paused because a queued message needs attention.",
-    });
+    expect(result).not.toHaveProperty("reportMarkdown");
   });
 
   it("should throw when TaskService.create fails (e.g., depth limit)", async () => {

@@ -349,17 +349,15 @@ export function buildTaskToolDescription(runtimeMode: RuntimeMode | undefined): 
     "Keep that pre-work lightweight: frame the task and provide useful starting points, but do not pre-solve the problem or over-constrain how the children reason about it. Then delegate the substantive analysis to the spawned sub-agents. " +
     "Do not also do a full parallel analysis in the parent. Call task_await when you are ready to act on child output; do not await reflexively just because tasks are running. " +
     "An in-progress child report is an interaction, not a terminal result: normally acknowledge or steer it with task_send_message before waiting again, unless it is a routine periodic report you explicitly requested. " +
-    "task_await returns as soon as the first awaited task completes by default (min_completed), so you can start dependent work on each terminal result as it lands instead of blocking on the whole batch; for best-of-N synthesis that must compare every candidate, pass min_completed equal to the batch size (or use a foreground grouped spawn, below). " +
+    "task_await returns as soon as the first awaited task completes by default (min_completed), so you can start dependent work on each terminal result as it lands instead of blocking on the whole batch; for best-of-N synthesis that must compare every candidate, pass min_completed equal to the batch size. " +
     "\n\nWhen delegating, include a compact task brief (Task / Background / Scope / Starting points / Acceptance / Deliverables / Constraints). " +
     "For now, persisted sub-agent goals are not supported; pass sub-agent objectives, success criteria, and deliverables directly in the prompt. " +
     "Sub-agents observe the same system instructions as the parent (project/global AGENTS.md and custom instructions), so do not restate that shared context in the prompt; spend the prompt on task-specific information the sub-agent cannot infer from those instructions. " +
     "Caveat: instruction files are read from the child's checkout, so uncommitted AGENTS.md edits in the parent follow the same runtime visibility rules above — commit them first or pass the relevant guidance in the prompt. " +
     "Avoid telling the sub-agent to read your plan file; child workspaces do not automatically have access to it. " +
-    "\n\nIf run_in_background is false, waits for the sub-agent to finish and returns the completed report. When grouped sibling tasks are requested via n or variants, the completed result includes one report per spawned task. " +
-    "If the foreground wait times out, returns queued/starting/running task metadata with a note while the task continues in background; wait again only when its output is needed. " +
-    "If run_in_background is true, returns immediately with queued/starting/running task metadata and the task runs non-blocking: you may end your turn without awaiting it, and Mux wakes this workspace when the task reaches a terminal state so you can integrate its result. Use task_await only when the current request depends on the output before you can answer, or to inspect progress. " +
-    "Prefer run_in_background: false when spawning a single task — it is equivalent to spawning background + immediately awaiting, but saves a round-trip. " +
-    "Use run_in_background: true when launching multiple tasks in parallel so you can act on each terminal result via task_await (which returns on the first completion by default); an in-progress report should normally receive task_send_message guidance first. A foreground grouped spawn (run_in_background: false) instead blocks until every sibling finishes and returns all reports at once. " +
+    "\n\nThe task tool always returns promptly with created execution handle(s) and workspace IDs; it never returns terminal task output for a new execution. " +
+    "run_in_background controls only the owner's attention policy: false uses blocking attention, while true allows the owner to continue and requests a terminal wake-up. " +
+    "Retrieve terminal output with task_await when the current request depends on it. Best-of and variant launches likewise return all created handles, which can be passed to task_await. " +
     "Do not call task_await in the same parallel tool-call batch; wait for the returned task metadata first. " +
     "Use task_send_message to respond to an in-progress child report or when later user guidance corrects or refines active work, instead of terminating and recreating the child. " +
     isolationGuidance +
@@ -626,7 +624,13 @@ const taskToolBaseShape = {
   subagent_type: SubagentTypeSchema.nullish(),
   prompt: z.string().min(1),
   title: z.string().min(1),
-  run_in_background: z.boolean().nullish().default(false),
+  run_in_background: z
+    .boolean()
+    .nullish()
+    .default(false)
+    .describe(
+      "Controls owner attention only. False uses blocking attention; true lets the owner continue and requests a terminal wake-up. The task call itself always returns created handles promptly; use task_await for terminal output."
+    ),
   sticky: z
     .boolean()
     .nullish()
@@ -700,7 +704,7 @@ export const ProjectChatTaskToolArgsSchema = z
       .nullish()
       .default(true)
       .describe(
-        "Run in background by default so Project Chat remains available while the workspace turn continues. Set false only when the result is required before continuing."
+        "Controls Project Chat attention only. True (the default) keeps this chat available and requests a terminal wake-up; false uses blocking attention. The task call always returns the created handle promptly; use task_await for terminal output."
       ),
     workspace: ProjectChatWorkspaceTaskTargetSchema.nullish().describe(
       'Workspace target. Omit for a fresh ordinary workspace in the current Project Chat scope. For mode="new", projectPath may select an exact backend-returned parent/sub-project path. Reuse only when project_workspace_list provides positive relevance evidence, and then pass mode="existing" with its canonical workspaceId.'
@@ -743,7 +747,7 @@ export function buildProjectChatTaskToolDescription(): string {
   return (
     'Start or continue an ordinary workspace turn in an authorized Project Chat scope. Project Chat may only use kind="workspace"; sub-agent fields are not accepted. ' +
     "A top-level parent Project Chat may coordinate its parent root and currently registered direct non-system child sub-projects; a child Project Chat is restricted to its exact child scope. " +
-    "Prefer the default background mode so this chat remains available while the child workspace runs. " +
+    "The task call always returns the created execution handle promptly; use task_await to retrieve terminal output. Prefer the default background attention policy so this chat remains available while the child workspace runs. " +
     "Create a fresh workspace by default. For mode=new, omit workspace.projectPath for the current scope or pass an exact projectPath returned by project_workspace_list; never synthesize filesystem descendants. " +
     "Reuse only when project_workspace_list provides positive relevance evidence for a specific canonical workspace ID, and pass that ID explicitly. " +
     "New and interrupted workspaces persist unless workspace.disposable is explicitly true; archive is the safe default cleanup action."
