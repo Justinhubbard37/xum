@@ -36,7 +36,10 @@ import { IdleDispatcher } from "@/node/services/idleDispatcher";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import { ExecutionRegistry } from "@/node/services/executionRegistry";
 import { ExecutionStore } from "@/node/services/executionStore";
-import { TaskHandleStore } from "@/node/services/taskHandleStore";
+import {
+  TaskHandleStore,
+  type WorkspaceTurnTaskHandleRecord,
+} from "@/node/services/taskHandleStore";
 import {
   TaskService,
   ForegroundWaitBackgroundedError,
@@ -875,7 +878,7 @@ describe("TaskService", () => {
       structuredOutput: { claims: ["durable"] },
     });
     expect(
-      await taskService.getScopedAgentExecutionSnapshot(parentId, created.data.workspaceId)
+      await taskService.getScopedExecutionSnapshot(parentId, created.data.workspaceId)
     ).toMatchObject({
       kind: "ok",
       source: "canonical",
@@ -887,7 +890,7 @@ describe("TaskService", () => {
       },
     });
     expect(
-      await taskService.waitForScopedAgentExecutionTerminal(parentId, created.data.taskId, {
+      await taskService.waitForScopedExecutionTerminal(parentId, created.data.taskId, {
         timeoutMs: 0,
       })
     ).toMatchObject({
@@ -903,14 +906,14 @@ describe("TaskService", () => {
       workspaceService: workspaceMocks.workspaceService,
     }).taskService;
     expect(
-      await restartedTaskService.getScopedAgentExecutionSnapshot(parentId, created.data.taskId)
+      await restartedTaskService.getScopedExecutionSnapshot(parentId, created.data.taskId)
     ).toMatchObject({
       kind: "ok",
       source: "canonical",
       handle: { status: "completed" },
     });
     expect(
-      await restartedTaskService.waitForScopedAgentExecutionTerminal(
+      await restartedTaskService.waitForScopedExecutionTerminal(
         parentId,
         created.data.workspaceId,
         { timeoutMs: 0 }
@@ -1149,7 +1152,12 @@ describe("TaskService", () => {
       workspaceMocks,
       aiMocks,
       historyService,
-      created: created.data,
+      created: {
+        ...created.data,
+        executionId: created.data.taskId,
+        // Most service tests exercise internal stream correlation, which intentionally stays wst_.
+        taskId: `wst_${options.stableIds?.[0] ?? "handle"}`,
+      },
     };
   }
 
@@ -1232,26 +1240,32 @@ describe("TaskService", () => {
     );
   });
 
-  test("workspace lifecycle treats existing follow-up handles as owned when the workspace was created by the parent", async () => {
-    const { parentId, taskService, taskHandleStore, archive } =
-      await createWorkspaceLifecycleHarness();
-    await taskHandleStore.upsertWorkspaceTurn({
+  test("workspace lifecycle treats canonical existing follow-up handles as owned when the workspace was created by the parent", async () => {
+    const { parentId, taskService, archive } = await createWorkspaceLifecycleHarness();
+    const now = new Date().toISOString();
+    await (
+      taskService as unknown as {
+        persistWorkspaceTurnRecord: (record: WorkspaceTurnTaskHandleRecord) => Promise<void>;
+      }
+    ).persistWorkspaceTurnRecord({
       kind: "workspace_turn",
+      executionId: "exe_existing",
       handleId: "wst_existing",
       ownerWorkspaceId: parentId,
       workspaceId: "childworkspace",
       turnId: "turn-existing",
       status: "completed",
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
+      createdAt: now,
+      updatedAt: now,
       createdWorkspace: false,
       disposableWorkspace: false,
       title: "Existing child",
+      reportMarkdown: "Done",
     });
 
     const result = await taskService.archiveOwnedWorkspaceTurnWorkspace(
       parentId,
-      { taskId: "wst_existing" },
+      { taskId: "exe_existing" },
       {}
     );
 
@@ -1259,7 +1273,7 @@ describe("TaskService", () => {
       Ok({
         status: "archived",
         action: "archive",
-        taskId: "wst_existing",
+        taskId: "exe_existing",
         workspaceId: "childworkspace",
         displayName: "Child workspace",
       })
@@ -2483,11 +2497,11 @@ describe("TaskService", () => {
       name: "subproject",
       archived: false,
       workspaceTurn: {
-        taskId: "wst_existinghandle",
         status: "running",
         title: "Sub-project follow-up",
       },
     });
+    expect(listed.data.workspaces[0]?.workspaceTurn?.taskId).toMatch(/^exe_/);
     expect(typeof listed.data.workspaces[0]?.workspaceTurn?.updatedAt).toBe("string");
   });
 
@@ -3059,15 +3073,17 @@ describe("TaskService", () => {
     expect(result.success).toBe(true);
     if (!result.success) return;
     expect(result.data).toMatchObject({
-      taskId: "wst_childworkspace",
       workspaceId: "childworkspace",
       kind: "workspace_turn",
       status: "running",
     });
+    expect(result.data.taskId).toMatch(/^exe_/);
+    expect(result.data.taskId).not.toBe(result.data.workspaceId);
     const canonicalExecutions = await new ExecutionStore(config).list(parentId);
     expect(canonicalExecutions).toHaveLength(1);
     const canonicalExecutionId = canonicalExecutions[0]?.executionId;
     assert(canonicalExecutionId, "canonical execution ID must exist");
+    expect(result.data.taskId).toBe(canonicalExecutionId);
     expect(canonicalExecutionId).toMatch(/^exe_/);
     expect(canonicalExecutions[0]).toMatchObject({
       aliases: ["wst_childworkspace"],
@@ -3083,6 +3099,30 @@ describe("TaskService", () => {
     );
     assert(shadow?.executionId, "shadow execution ID must exist");
     expect(canonicalExecutionId).toBe(shadow?.executionId);
+    expect(
+      await taskService.getScopedExecutionSnapshot(parentId, result.data.taskId)
+    ).toMatchObject({
+      kind: "ok",
+      source: "canonical",
+      handle: { executionId: result.data.taskId, status: "running" },
+      workspaceId: "childworkspace",
+    });
+    expect(
+      await taskService.getScopedExecutionSnapshot(parentId, "wst_childworkspace")
+    ).toMatchObject({
+      kind: "ok",
+      source: "canonical",
+      handle: { executionId: result.data.taskId, status: "running" },
+      workspaceId: "childworkspace",
+    });
+    expect(
+      await taskService.waitForScopedExecutionTerminal(parentId, result.data.taskId, {
+        timeoutMs: 0,
+      })
+    ).toMatchObject({
+      kind: "timeout",
+      snapshot: { executionId: result.data.taskId, status: "running" },
+    });
     const childConfig = findWorkspaceInConfig(config, "childworkspace");
     expect(childConfig?.parentWorkspaceId).toBeUndefined();
     expect(childConfig?.taskStatus).toBeUndefined();
@@ -3657,11 +3697,11 @@ describe("TaskService", () => {
     expect(second.success).toBe(true);
     if (!second.success) return;
     expect(second.data).toMatchObject({
-      taskId: "wst_secondhandle",
       workspaceId: "childworkspace",
       kind: "workspace_turn",
       status: "running",
     });
+    expect(second.data.taskId).toMatch(/^exe_/);
     expect(createWorkspace).toHaveBeenCalledTimes(1);
     expect(sendMessage).toHaveBeenCalledTimes(2);
     const secondSend = sendMessage.mock.calls[1];
@@ -3777,11 +3817,11 @@ describe("TaskService", () => {
     expect(second.success).toBe(true);
     if (!second.success) return;
     expect(second.data).toMatchObject({
-      taskId: "wst_secondhandle",
       workspaceId: "childworkspace",
       kind: "workspace_turn",
       status: "queued",
     });
+    expect(second.data.taskId).toMatch(/^exe_/);
     expect(createWorkspace).toHaveBeenCalledTimes(1);
     expect(sendMessage).toHaveBeenCalledTimes(2);
     const secondSend = sendMessage.mock.calls[1];
@@ -4276,7 +4316,8 @@ describe("TaskService", () => {
     sendMessage.mockClear();
 
     const context = {
-      handleId: created.data.taskId,
+      // Stream correlation remains on the shadow handle; public progress surfaces the execution ID.
+      handleId: "wst_handle",
       ownerWorkspaceId: projectChat.sessionId,
       turnId: "turn",
     };
@@ -4312,7 +4353,7 @@ describe("TaskService", () => {
     });
     expect(reportCalls[0]?.[0]).toBe(projectChat.sessionId);
     expect(reportCalls[0]?.[3]).toMatchObject({
-      queueDedupeKey: `agent-report:${created.data.taskId}:progress-1`,
+      queueDedupeKey: "agent-report:wst_handle:progress-1",
       foregroundWaitInterruption: {
         reason: "progress_report_received",
         sourceTaskId: created.data.taskId,
@@ -4349,7 +4390,7 @@ describe("TaskService", () => {
         finishReason: "stop",
         muxMetadata: {
           type: "workspace-turn-task",
-          taskHandleId: created.data.taskId,
+          taskHandleId: "wst_handle",
           ownerWorkspaceId: projectChat.sessionId,
           turnId: "turn",
         },
@@ -4540,7 +4581,7 @@ describe("TaskService", () => {
     expect(childConfig?.taskStatus).toBeUndefined();
   });
 
-  test("notify_on_terminal workspace turn wakes the owner via task_await on completion", async () => {
+  test("notify_on_terminal canonical workspace turn wakes the owner via task_await on completion", async () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["handle", "turn"]);
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
@@ -4568,11 +4609,14 @@ describe("TaskService", () => {
       workspaceService: workspaceMocks.workspaceService,
     });
 
-    const taskHandleStore = (taskService as unknown as { taskHandleStore: TaskHandleStore })
-      .taskHandleStore;
     const createdAt = "2026-06-19T00:00:00.000Z";
-    await taskHandleStore.upsertWorkspaceTurn({
+    await (
+      taskService as unknown as {
+        persistWorkspaceTurnRecord: (record: WorkspaceTurnTaskHandleRecord) => Promise<void>;
+      }
+    ).persistWorkspaceTurnRecord({
       kind: "workspace_turn",
+      executionId: "exe_handle",
       handleId: "wst_handle",
       ownerWorkspaceId: parentId,
       workspaceId: "childworkspace",
@@ -4622,7 +4666,7 @@ describe("TaskService", () => {
     await Promise.all([...internal.pendingTerminalAttentionDrains]);
 
     const wakeCall = sendMessage.mock.calls.find(
-      (call) => typeof call[1] === "string" && call[1].includes("wst_handle")
+      (call) => typeof call[1] === "string" && call[1].includes("exe_handle")
     );
     expect(wakeCall).toBeDefined();
     const prompt = wakeCall?.[1] as string;
@@ -4634,7 +4678,7 @@ describe("TaskService", () => {
         records: [
           {
             sourceKind: "workspace_turn",
-            sourceId: "wst_handle",
+            sourceId: "exe_handle",
             outcome: "completed",
             title: "Workspace turn",
             workspaceId: "childworkspace",
@@ -6061,7 +6105,7 @@ describe("TaskService", () => {
 
     await taskService.markWorkspaceTurnTerminalAttentionConsumed({
       ownerWorkspaceId: parentId,
-      handleId: "wst_consumed_then_enqueued",
+      taskId: "wst_consumed_then_enqueued",
       status: "completed",
     });
     await internal.enqueueTerminalAttention({
@@ -6085,7 +6129,7 @@ describe("TaskService", () => {
     });
     await taskService.markWorkspaceTurnTerminalAttentionConsumed({
       ownerWorkspaceId: parentId,
-      handleId: "wst_pending_then_consumed",
+      taskId: "wst_pending_then_consumed",
       status: "completed",
     });
     await internal.drainTerminalAttention(parentId);
@@ -6095,7 +6139,7 @@ describe("TaskService", () => {
 
     await taskService.markWorkspaceTurnTerminalAttentionConsumed({
       ownerWorkspaceId: parentId,
-      handleId: "wst_running_not_consumed",
+      taskId: "wst_running_not_consumed",
       status: "running",
     });
     await terminalAttentionStore.enqueueIfAbsent({
@@ -6931,8 +6975,8 @@ describe("TaskService", () => {
   });
 
   test("workspace-turn deferred marker does not rewrite terminal handles", async () => {
-    const { parentId, taskService } = await startWorkspaceTurnForTest();
-    const interruptResult = await taskService.interruptWorkspaceTurn(parentId, "wst_handle");
+    const { parentId, taskService, created } = await startWorkspaceTurnForTest();
+    const interruptResult = await taskService.interruptWorkspaceTurn(parentId, created.executionId);
     expect(interruptResult.success).toBe(true);
     await (
       taskService as unknown as {

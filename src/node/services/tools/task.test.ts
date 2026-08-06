@@ -373,7 +373,7 @@ describe("task tool", () => {
 
     const createWorkspaceTurn = mock(() =>
       Ok({
-        taskId: "wst_child-turn",
+        taskId: "exe_child-turn",
         kind: "workspace_turn" as const,
         status: "running" as const,
         workspaceId: "child-workspace",
@@ -418,7 +418,7 @@ describe("task tool", () => {
     });
     expect(result).toMatchObject({
       status: "running",
-      taskId: "wst_child-turn",
+      taskId: "exe_child-turn",
       workspaceId: "child-workspace",
       handleKind: "workspace_turn",
     });

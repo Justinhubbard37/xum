@@ -105,6 +105,31 @@ export const createTaskTerminateTool: ToolFactory = (config: ToolConfiguration) 
                 return await interruptWorkflowRun(config, workspaceId, taskId);
               }
 
+              if (typeof taskService.getScopedExecutionSnapshot === "function") {
+                const execution = await taskService.getScopedExecutionSnapshot(workspaceId, taskId);
+                if (
+                  execution.kind === "ok" &&
+                  execution.handle.launchPolicy.kind === "workspace_turn"
+                ) {
+                  const interruptResult = await taskService.interruptWorkspaceTurn(
+                    workspaceId,
+                    taskId
+                  );
+                  if (!interruptResult.success) {
+                    const msg = interruptResult.error;
+                    if (/not found/i.test(msg) || /scope/i.test(msg)) {
+                      return { status: "invalid_scope" as const, taskId };
+                    }
+                    return { status: "error" as const, taskId, error: msg };
+                  }
+                  return {
+                    status: "interrupted" as const,
+                    taskId,
+                    note: "Workspace turn interrupted. The full workspace is preserved for inspection and future prompts.",
+                  };
+                }
+              }
+
               if (isWorkspaceTurnTaskId(taskId)) {
                 const interruptResult = await taskService.interruptWorkspaceTurn(
                   workspaceId,

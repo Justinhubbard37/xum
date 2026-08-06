@@ -283,6 +283,7 @@ describe("task_list tool", () => {
     const listWorkspaceTurnTasks = mock(() => [
       {
         kind: "workspace_turn" as const,
+        executionId: "exe_turn" as const,
         handleId: "wst_turn",
         ownerWorkspaceId: "root-workspace",
         workspaceId: "child-workspace",
@@ -321,7 +322,7 @@ describe("task_list tool", () => {
     expect(result).toEqual({
       tasks: [
         {
-          taskId: "wst_turn",
+          taskId: "exe_turn",
           status: "running",
           parentWorkspaceId: "root-workspace",
           handleKind: "workspace_turn",

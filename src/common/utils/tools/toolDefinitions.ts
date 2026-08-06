@@ -1141,6 +1141,8 @@ export const TaskAwaitToolErrorResultSchema = z
   .object({
     status: z.literal("error"),
     taskId: z.string(),
+    handleKind: TaskHandleKindSchema.optional(),
+    workspaceId: z.string().optional(),
     error: z.string(),
     elapsed_ms: z.number().optional(),
     workflow: TaskAwaitWorkflowFailureStateSchema.optional(),

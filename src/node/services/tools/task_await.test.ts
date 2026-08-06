@@ -72,6 +72,31 @@ function canonicalAgentHandle(
   };
 }
 
+function canonicalWorkspaceTurnHandle(
+  status: ExecutionHandle["status"],
+  result?: ExecutionHandle["result"]
+): ExecutionHandle {
+  return {
+    version: 1,
+    executionId: "exe_workspace_turn",
+    aliases: ["wst_workspace_turn"],
+    ownerSessionId: "parent-workspace",
+    requesterWorkspaceId: "parent-workspace",
+    target: { kind: "workspace", workspaceId: "child-workspace", origin: "created" },
+    launchPolicy: { kind: "workspace_turn", turnId: "turn-1", title: "Workspace turn" },
+    completionPolicy: { kind: "final_assistant_message" },
+    retentionPolicy: { kind: "retain_workspace" },
+    attentionPolicy: "blocking_until_terminal",
+    status,
+    ...(result != null ? { result } : {}),
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:01.000Z",
+    ...(status === "completed" || status === "interrupted" || status === "error"
+      ? { terminalAt: "2026-01-01T00:00:01.000Z" }
+      : {}),
+  };
+}
+
 describe("task_await tool", () => {
   it("returns completed workspace-turn results without raw part duplication", async () => {
     using tempDir = new TestTempDir("test-task-await-workspace-turn");
@@ -152,7 +177,7 @@ describe("task_await tool", () => {
     expect(result.results[0]?.finalMessage).toBeUndefined();
     expect(markWorkspaceTurnTerminalAttentionConsumed).toHaveBeenCalledWith({
       ownerWorkspaceId: "parent-workspace",
-      handleId: "wst_done",
+      taskId: "wst_done",
       status: "completed",
     });
   });
@@ -317,7 +342,7 @@ describe("task_await tool", () => {
 
     expect(markWorkspaceTurnTerminalAttentionConsumed).toHaveBeenCalledWith({
       ownerWorkspaceId: "parent-workspace",
-      handleId: "wst_running",
+      taskId: "wst_running",
       status: "completed",
     });
     expect(observedTimeoutMs).toBe(600_000);
@@ -378,7 +403,7 @@ describe("task_await tool", () => {
     ]);
     expect(markWorkspaceTurnTerminalAttentionConsumed).toHaveBeenCalledWith({
       ownerWorkspaceId: "parent-workspace",
-      handleId: "wst_race",
+      taskId: "wst_race",
       status: "completed",
     });
   });
@@ -430,8 +455,90 @@ describe("task_await tool", () => {
     ]);
     expect(markWorkspaceTurnTerminalAttentionConsumed).toHaveBeenCalledWith({
       ownerWorkspaceId: "parent-workspace",
-      handleId: "wst_failed",
+      taskId: "wst_failed",
       status: "error",
+    });
+  });
+
+  it("routes canonical workspace-turn snapshots and wst aliases through execution handles", async () => {
+    using tempDir = new TestTempDir("test-task-await-canonical-workspace-turn");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    let handle = canonicalWorkspaceTurnHandle("running");
+    const markWorkspaceTurnTerminalAttentionConsumed = mock(() => Promise.resolve());
+    const taskService = {
+      listActiveDescendantAgentExecutionIds: mock(() => Promise.resolve([])),
+      listWorkspaceTurnTasks: mock(() => Promise.resolve([])),
+      isWorkflowOwnedDescendantAgentTask: mock(() => Promise.resolve(false)),
+      getAgentTaskStatuses: mock(() => new Map()),
+      getScopedExecutionSnapshot: mock(() =>
+        Promise.resolve({
+          kind: "ok" as const,
+          handle,
+          workspaceId: handle.target.workspaceId,
+          source: "canonical" as const,
+        })
+      ),
+      markWorkspaceTurnTerminalAttentionConsumed,
+    } as unknown as TaskService;
+    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const execute = async (taskId: string) =>
+      (await Promise.resolve(
+        tool.execute!({ task_ids: [taskId], timeout_secs: 0 }, mockToolCallOptions)
+      )) as { results: Array<Record<string, unknown>> };
+
+    expect((await execute("exe_workspace_turn")).results[0]).toMatchObject({
+      status: "running",
+      taskId: "exe_workspace_turn",
+      handleKind: "workspace_turn",
+      workspaceId: "child-workspace",
+      note: "Workspace turn is still running.",
+    });
+
+    handle = canonicalWorkspaceTurnHandle("completed", {
+      kind: "completed",
+      reportMarkdown: "Canonical result",
+      finalMessageRef: { messageId: "msg-canonical", textCharCount: 16 },
+      artifacts: { attachFiles: [] },
+    });
+    const canonicalCompleted = (await execute("exe_workspace_turn")).results[0];
+    const aliasCompleted = (await execute("wst_workspace_turn")).results[0];
+    expect(canonicalCompleted).toMatchObject({
+      status: "completed",
+      taskId: "exe_workspace_turn",
+      handleKind: "workspace_turn",
+      workspaceId: "child-workspace",
+      reportMarkdown: "Canonical result",
+      finalMessageRef: { messageId: "msg-canonical", textCharCount: 16 },
+    });
+    expect(aliasCompleted).toEqual({ ...canonicalCompleted, taskId: "wst_workspace_turn" });
+
+    handle = canonicalWorkspaceTurnHandle("error", {
+      kind: "error",
+      error: "Canonical failure",
+    });
+    expect((await execute("exe_workspace_turn")).results[0]).toMatchObject({
+      status: "error",
+      taskId: "exe_workspace_turn",
+      handleKind: "workspace_turn",
+      workspaceId: "child-workspace",
+      error: "Canonical failure",
+    });
+
+    handle = canonicalWorkspaceTurnHandle("interrupted", {
+      kind: "interrupted",
+      message: "Stopped",
+    });
+    expect((await execute("exe_workspace_turn")).results[0]).toMatchObject({
+      status: "interrupted",
+      taskId: "exe_workspace_turn",
+      handleKind: "workspace_turn",
+      workspaceId: "child-workspace",
+      note: "Stopped",
+    });
+    expect(markWorkspaceTurnTerminalAttentionConsumed).toHaveBeenCalledWith({
+      ownerWorkspaceId: "parent-workspace",
+      taskId: "exe_workspace_turn",
+      status: "completed",
     });
   });
 
@@ -605,7 +712,7 @@ describe("task_await tool", () => {
         Promise.resolve(taskIds)
       ),
       isWorkflowOwnedDescendantAgentTask: mock(() => Promise.resolve(false)),
-      getScopedAgentExecutionSnapshot: mock((_workspaceId: string, taskId: string) => {
+      getScopedExecutionSnapshot: mock((_workspaceId: string, taskId: string) => {
         const handle = handles.get(taskId);
         return Promise.resolve(
           handle == null
@@ -666,7 +773,7 @@ describe("task_await tool", () => {
       kind: "completed",
       reportMarkdown: "settled canonically",
     });
-    const getScopedAgentExecutionSnapshot = mock(() =>
+    const getScopedExecutionSnapshot = mock(() =>
       Promise.resolve({
         kind: "ok" as const,
         handle: running,
@@ -674,7 +781,7 @@ describe("task_await tool", () => {
         source: "canonical" as const,
       })
     );
-    const waitForScopedAgentExecutionTerminal = mock(() =>
+    const waitForScopedExecutionTerminal = mock(() =>
       Promise.resolve({ kind: "terminal" as const, handle: completed })
     );
     const taskService = {
@@ -683,8 +790,8 @@ describe("task_await tool", () => {
         Promise.resolve(taskIds)
       ),
       isWorkflowOwnedDescendantAgentTask: mock(() => Promise.resolve(false)),
-      getScopedAgentExecutionSnapshot,
-      waitForScopedAgentExecutionTerminal,
+      getScopedExecutionSnapshot,
+      waitForScopedExecutionTerminal,
       waitForAgentReport: mock(() => {
         throw new Error("legacy report fallback must not run");
       }),
@@ -706,7 +813,7 @@ describe("task_await tool", () => {
         },
       ],
     });
-    expect(waitForScopedAgentExecutionTerminal).toHaveBeenCalledWith(
+    expect(waitForScopedExecutionTerminal).toHaveBeenCalledWith(
       "parent-workspace",
       "running-alias",
       expect.objectContaining({ timeoutMs: 1000, backgroundOnMessageQueued: true })
@@ -744,7 +851,7 @@ describe("task_await tool", () => {
         Promise.resolve(taskIds)
       ),
       isWorkflowOwnedDescendantAgentTask: mock(() => Promise.resolve(false)),
-      getScopedAgentExecutionSnapshot: mock(() =>
+      getScopedExecutionSnapshot: mock(() =>
         Promise.resolve({
           kind: "ok" as const,
           handle: legacy,

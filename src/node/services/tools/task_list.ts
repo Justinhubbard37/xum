@@ -281,7 +281,7 @@ export const createTaskListTool: ToolFactory = (config: ToolConfiguration) => {
             continue;
           }
           tasks.push({
-            taskId: turn.handleId,
+            taskId: turn.executionId ?? turn.handleId,
             status: turn.status === "error" ? "failed" : turn.status,
             parentWorkspaceId: workspaceId,
             handleKind: "workspace_turn",
