@@ -18,7 +18,8 @@ export const createProjectWorkspaceListTool: ToolFactory = (config: ToolConfigur
       const ownerWorkspaceId = requireWorkspaceId(config, "project_workspace_list");
       const taskService = requireTaskService(config, "project_workspace_list");
       const result = await taskService.listProjectWorkspaces(ownerWorkspaceId, {
-        includeArchived: args.include_archived,
+        // Strict providers represent omitted optional tool inputs as null; preserve the true default.
+        includeArchived: args.include_archived ?? true,
       });
       if (!result.success) {
         throw new Error(result.error);

@@ -570,6 +570,7 @@ export const ProjectWorkspaceListToolArgsSchema = z
   .object({
     include_archived: z
       .boolean()
+      .nullish()
       .default(true)
       .describe("Include archived same-project workspaces. Defaults to true."),
   })

@@ -3,6 +3,7 @@ import { describe, expect, it, mock } from "bun:test";
 import type { TaskService } from "@/node/services/taskService";
 import { createTestToolConfig, mockToolCallOptions, TestTempDir } from "./testHelpers";
 import { createProjectWorkspaceListTool } from "./project_workspace_list";
+import { ProjectWorkspaceListToolArgsSchema } from "@/common/utils/tools/toolDefinitions";
 import { Ok } from "@/common/types/result";
 
 describe("project_workspace_list tool", () => {
@@ -55,6 +56,26 @@ describe("project_workspace_list tool", () => {
         },
       ],
     });
+  });
+
+  it("treats strict-provider null as the documented include-archived default", async () => {
+    using tempDir = new TestTempDir("project-workspace-list-null-default");
+    const listProjectWorkspaces = mock(() =>
+      Promise.resolve(Ok({ projectPath: "/project", workspaces: [] }))
+    );
+    const workspaceId = "project-session_aaaaaaaaaa";
+    const listTool = createProjectWorkspaceListTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId }),
+      projectChat: true,
+      taskService: { listProjectWorkspaces } as unknown as TaskService,
+    });
+
+    expect(ProjectWorkspaceListToolArgsSchema.safeParse({ include_archived: null }).success).toBe(
+      true
+    );
+    await Promise.resolve(listTool.execute!({ include_archived: null }, mockToolCallOptions));
+
+    expect(listProjectWorkspaces).toHaveBeenCalledWith(workspaceId, { includeArchived: true });
   });
 
   it("rejects non-Project-Chat callers", async () => {
