@@ -193,18 +193,30 @@ export class TaskHandleStore {
   async listAllWorkspaceTurns(
     options: { statuses?: readonly WorkspaceTurnTaskStatus[] } = {}
   ): Promise<WorkspaceTurnTaskHandleRecord[]> {
-    let entries: Array<{ isDirectory: () => boolean; name: string }>;
-    try {
-      entries = await fsPromises.readdir(this.config.sessionsDir, { withFileTypes: true });
-    } catch (error) {
-      if (isErrnoWithCode(error, "ENOENT")) return [];
-      throw error;
-    }
+    // Project Chat owners persist under project-sessions, while ordinary workspace owners remain
+    // under sessions. Restart recovery must inspect both roots or durable Project Chat handles would
+    // become invisible until another in-process event touched them.
+    const sessionRoots = [this.config.sessionsDir, this.config.projectSessionsDir];
+    const entriesByRoot = await Promise.all(
+      sessionRoots.map(async (sessionRoot) => {
+        try {
+          return await fsPromises.readdir(sessionRoot, { withFileTypes: true });
+        } catch (error) {
+          if (isErrnoWithCode(error, "ENOENT")) return [];
+          throw error;
+        }
+      })
+    );
 
+    const ownerWorkspaceIds = new Set(
+      entriesByRoot.flatMap((entries) =>
+        entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name)
+      )
+    );
     const recordsByOwner = await Promise.all(
-      entries
-        .filter((entry) => entry.isDirectory())
-        .map((entry) => this.listWorkspaceTurns(entry.name, options))
+      [...ownerWorkspaceIds].map((ownerWorkspaceId) =>
+        this.listWorkspaceTurns(ownerWorkspaceId, options)
+      )
     );
     return recordsByOwner.flat().sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }

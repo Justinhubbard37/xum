@@ -44,6 +44,45 @@ describe("TaskHandleStore", () => {
     expect(listed.map((item) => item.handleId)).toEqual([`${WORKSPACE_TURN_TASK_ID_PREFIX}abc`]);
   });
 
+  it("scans ordinary and Project Chat session roots for restart handles", async () => {
+    const { config } = await createTempConfig("task-handle-store-dual-root");
+    const store = new TaskHandleStore(config);
+    const records = [
+      {
+        kind: "workspace_turn" as const,
+        handleId: `${WORKSPACE_TURN_TASK_ID_PREFIX}ordinary`,
+        ownerWorkspaceId: "ordinary-owner",
+        workspaceId: "ordinary-child",
+        turnId: "ordinary-turn",
+        status: "completed" as const,
+        createdAt: "2026-06-19T00:00:00.000Z",
+        updatedAt: "2026-06-19T00:00:00.000Z",
+        createdWorkspace: true,
+        disposableWorkspace: false,
+      },
+      {
+        kind: "workspace_turn" as const,
+        handleId: `${WORKSPACE_TURN_TASK_ID_PREFIX}project`,
+        ownerWorkspaceId: "project-session_owner",
+        workspaceId: "project-child",
+        turnId: "project-turn",
+        status: "completed" as const,
+        createdAt: "2026-06-19T00:00:01.000Z",
+        updatedAt: "2026-06-19T00:00:01.000Z",
+        createdWorkspace: true,
+        disposableWorkspace: false,
+      },
+    ];
+    for (const record of records) {
+      await store.upsertWorkspaceTurn(record);
+    }
+
+    expect((await store.listAllWorkspaceTurns()).map((record) => record.handleId)).toEqual([
+      `${WORKSPACE_TURN_TASK_ID_PREFIX}ordinary`,
+      `${WORKSPACE_TURN_TASK_ID_PREFIX}project`,
+    ]);
+  });
+
   it("rejects unsafe handle IDs before composing paths", async () => {
     const { config } = await createTempConfig("task-handle-store-unsafe-id");
     const store = new TaskHandleStore(config);
