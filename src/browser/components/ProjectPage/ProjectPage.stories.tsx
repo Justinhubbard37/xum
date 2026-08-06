@@ -127,8 +127,8 @@ export const ProjectChat: AppStory = {
         throw new Error("Project Chat did not open");
       }
     });
-    expect(projectRow.getAttribute("aria-current")).toBe("page");
-    expect(storyRoot.querySelector('[data-testid="right-sidebar"]')).toBeNull();
+    await expect(projectRow.getAttribute("aria-current")).toBe("page");
+    await expect(storyRoot.querySelector('[data-testid="right-sidebar"]')).toBeNull();
   },
 };
 

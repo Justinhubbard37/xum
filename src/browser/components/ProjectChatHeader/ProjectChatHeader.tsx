@@ -38,16 +38,16 @@ export function ProjectChatHeader(props: ProjectChatHeaderProps) {
         </Button>
       )}
 
-      <FolderKanban className="h-4 w-4 shrink-0 text-content-secondary" aria-hidden="true" />
+      <FolderKanban className="text-content-secondary h-4 w-4 shrink-0" aria-hidden="true" />
       <Tooltip>
         <TooltipTrigger asChild>
-          <div className="min-w-0 flex-1 truncate text-sm font-medium text-content-primary">
+          <div className="text-content-primary min-w-0 flex-1 truncate text-sm font-medium">
             {props.projectName}
           </div>
         </TooltipTrigger>
         <TooltipContent align="start">{props.projectPath}</TooltipContent>
       </Tooltip>
-      <div className="border-border-medium bg-background-secondary shrink-0 rounded-full border px-2 py-0.5 text-[11px] font-medium text-content-secondary">
+      <div className="border-border-medium bg-background-secondary text-content-secondary shrink-0 rounded-full border px-2 py-0.5 text-[11px] font-medium">
         Orchestrator
       </div>
     </div>

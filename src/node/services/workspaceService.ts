@@ -51,6 +51,7 @@ import {
   runFullInit,
 } from "@/node/runtime/runtimeFactory";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
+import type { WorkspaceRuntimeContext } from "@/node/runtime/runtimeHelpers";
 import {
   createRuntimeContextForWorkspace,
   createRuntimeForWorkspace,
@@ -8531,18 +8532,20 @@ export class WorkspaceService extends EventEmitter {
     dataBase64: string;
   }): Promise<Result<StagedWorkspaceAttachment, string>> {
     const projectChatContext = resolveProjectChatSessionContext(this.config, input.workspaceId);
-    const metadataResult = await this.aiService.getWorkspaceMetadata(input.workspaceId);
-    if (!metadataResult.success) {
-      return Err("Workspace not found");
-    }
+    let runtimeContext: WorkspaceRuntimeContext | null = projectChatContext;
 
-    // Project Chat executes directly in an existing project root and has no workspace init hooks.
-    if (projectChatContext == null) {
+    // Preserve the ordinary workspace path through getInfo(): it carries enriched persisted paths
+    // and the existing init barrier. Project Chat has no provisioned checkout or init hook.
+    if (runtimeContext == null) {
+      const metadata = await this.getInfo(input.workspaceId);
+      if (metadata == null) {
+        return Err("Workspace not found");
+      }
       await this.initStateManager.waitForInit(input.workspaceId);
+      runtimeContext = createRuntimeContextForWorkspace(metadata);
     }
 
-    const { runtime, workspacePath } =
-      projectChatContext ?? createRuntimeContextForWorkspace(metadataResult.data);
+    const { runtime, workspacePath } = runtimeContext;
     return stageWorkspaceAttachment({
       runtime,
       workspacePath,

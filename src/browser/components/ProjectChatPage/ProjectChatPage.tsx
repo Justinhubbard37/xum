@@ -129,8 +129,8 @@ export function ProjectChatPage(props: ProjectChatPageProps) {
           <div className="border-border-light bg-background-secondary flex max-w-md flex-col items-center gap-3 rounded-lg border p-5 text-center">
             <AlertTriangle className="text-warning h-6 w-6" aria-hidden="true" />
             <div>
-              <div className="font-medium text-content-primary">Could not open Project Chat</div>
-              <div className="mt-1 text-sm text-content-secondary">{loadState.message}</div>
+              <div className="text-content-primary font-medium">Could not open Project Chat</div>
+              <div className="text-content-secondary mt-1 text-sm">{loadState.message}</div>
             </div>
             <Button variant="outline" onClick={() => setReloadKey((value) => value + 1)}>
               <RefreshCw className="h-4 w-4" aria-hidden="true" />
