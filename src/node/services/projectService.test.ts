@@ -1884,6 +1884,51 @@ exit 1
       expect(fs.access(sessionDir)).rejects.toMatchObject({ code: "ENOENT" });
     });
 
+    it("preserves Project Chat state when config deletion does not persist", async () => {
+      const parentPath = path.join(tempDir, "parent-config-write-failure");
+      const subProjectPath = path.join(parentPath, "packages", "web");
+      await fs.mkdir(subProjectPath, { recursive: true });
+      await config.editConfig((cfg) => {
+        cfg.projects.set(parentPath, { trusted: true, workspaces: [] });
+        cfg.projects.set(subProjectPath, {
+          parentProjectPath: parentPath,
+          workspaces: [],
+        });
+        return cfg;
+      });
+      const projectChat = await config.ensureProjectChat(subProjectPath);
+      const sessionDir = config.getSessionDir(projectChat.sessionId);
+      const transcriptPath = path.join(sessionDir, "chat.jsonl");
+      await fs.writeFile(transcriptPath, "preserve me\n", "utf-8");
+      const cleanupProjectChatSession = mock(() => Promise.resolve());
+      service.setWorkspaceService({
+        remove: () => Promise.resolve(Ok(undefined)),
+        cleanupProjectChatSession,
+      });
+      // Config.saveConfig intentionally logs and swallows startup-safe write failures. Simulate that
+      // seam directly: editConfig resolves, but a fresh disk-backed read still owns the chat.
+      (
+        config as unknown as {
+          saveConfig: (configSnapshot: unknown) => Promise<void>;
+        }
+      ).saveConfig = mock(() => Promise.resolve());
+
+      const result = await service.remove(subProjectPath);
+
+      expect(result.success).toBe(false);
+      if (result.success) throw new Error("Expected persistence verification failure");
+      expect(result.error.type).toBe("unknown");
+      if (result.error.type !== "unknown") {
+        throw new Error("Expected unknown removal error");
+      }
+      expect(result.error.message).toContain("config deletion was not persisted");
+      expect(cleanupProjectChatSession).not.toHaveBeenCalled();
+      expect(config.findProjectChatBySessionId(projectChat.sessionId)?.projectPath).toBe(
+        subProjectPath
+      );
+      expect(await fs.readFile(transcriptPath, "utf-8")).toBe("preserve me\n");
+    });
+
     it("retains a sub-project workspace while cleaning its Project Chat owner", async () => {
       const parentPath = path.join(tempDir, "parent-project");
       const subProjectPath = path.join(parentPath, "packages", "web");

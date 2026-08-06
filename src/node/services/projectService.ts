@@ -1078,9 +1078,40 @@ export class ProjectService {
     return Err("Clone did not return a completion event");
   }
 
+  private verifyProjectRemovalPersisted(
+    projectPaths: readonly string[],
+    projectChatSessionIds: readonly string[]
+  ): Result<void, ProjectRemoveError> {
+    const persisted = this.config.loadConfigOrDefault();
+    const remainingProjectPath = projectPaths.find((projectPath) =>
+      persisted.projects.has(projectPath)
+    );
+    const sessionIds = new Set(projectChatSessionIds.filter(isProjectSessionId));
+    const remainingSessionId = Array.from(persisted.projects.values())
+      .map((project) => project.projectChat?.sessionId)
+      .find((sessionId): sessionId is string => sessionId != null && sessionIds.has(sessionId));
+    if (remainingProjectPath == null && remainingSessionId == null) {
+      return Ok(undefined);
+    }
+
+    const remainingOwner = remainingProjectPath ?? `session ${remainingSessionId ?? "unknown"}`;
+    return Err({
+      type: "unknown" as const,
+      message: `Failed to remove project: config deletion was not persisted (${remainingOwner})`,
+    });
+  }
+
   private async cleanupProjectChatSessions(sessionIds: readonly string[]): Promise<void> {
     // Never pass corrupt persisted IDs to recursive deletion: session IDs are directory names.
     for (const sessionId of new Set(sessionIds.filter(isProjectSessionId))) {
+      // Never delete a session that a fresh disk-backed config still owns. Config writes are
+      // deliberately startup-safe/log-and-swallow, so callers must verify destructive follow-up.
+      if (this.config.findProjectChatBySessionId(sessionId) != null) {
+        log.error(
+          `Skipping Project Chat cleanup because session is still configured: ${sessionId}`
+        );
+        continue;
+      }
       // The config entry is removed before cleanup, but in-flight AgentSession/history writes must
       // keep resolving this captured ID to project-sessions until cleanup finishes.
       const projectSessionRoute = this.config.retainProjectSessionRouting(sessionId);
@@ -1143,6 +1174,13 @@ export class ProjectService {
           freshConfig.projects.delete(normalizedPath);
           return freshConfig;
         });
+        const persistedRemoval = this.verifyProjectRemovalPersisted(
+          [normalizedPath],
+          projectChatSessionId != null ? [projectChatSessionId] : []
+        );
+        if (!persistedRemoval.success) {
+          return persistedRemoval;
+        }
         if (projectChatSessionId) {
           await this.cleanupProjectChatSessions([projectChatSessionId]);
         }
@@ -1316,6 +1354,14 @@ export class ProjectService {
         freshConfig.projects.delete(normalizedPath);
         return freshConfig;
       });
+
+      const persistedRemoval = this.verifyProjectRemovalPersisted(
+        [normalizedPath, ...removedSubProjectPaths],
+        removedProjectChatSessionIds
+      );
+      if (!persistedRemoval.success) {
+        return persistedRemoval;
+      }
 
       await this.cleanupProjectChatSessions(removedProjectChatSessionIds);
 

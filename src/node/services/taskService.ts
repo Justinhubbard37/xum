@@ -3557,11 +3557,11 @@ export class TaskService {
       let creationTrunkBranch: string | undefined = args.workspace?.trunkBranch ?? parentMeta.name;
       if (projectChatOwner) {
         // Project Chat itself uses LocalRuntime, but new child workspaces should use the ordinary
-        // project creation contract: worktree by default (or explicit project-local default), with
-        // backend trunk detection. Non-git projects self-heal to local because worktrees are invalid.
+        // project creation contract: worktree by default (or the effective project/global default),
+        // with backend trunk detection. Non-git projects self-heal to local because worktrees are invalid.
         const branches = await listLocalBranches(parentMeta.projectPath).catch(() => []);
-        const useLocalRuntime =
-          taskProjectConfig.defaultRuntime === "local" || branches.length === 0;
+        const effectiveDefaultRuntime = taskProjectConfig.defaultRuntime ?? cfg.defaultRuntime;
+        const useLocalRuntime = effectiveDefaultRuntime === "local" || branches.length === 0;
         creationRuntimeConfig = useLocalRuntime ? { type: "local" } : undefined;
         creationTrunkBranch = useLocalRuntime
           ? undefined

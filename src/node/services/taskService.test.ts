@@ -1263,7 +1263,7 @@ describe("TaskService", () => {
 
   test("Project Chat can create and reuse ordinary same-project workspaces", async () => {
     const config = await createTestConfig(rootDir);
-    const projectPath = await createTestProject(rootDir, "repo", { initGit: false });
+    const projectPath = await createTestProject(rootDir, "repo");
     await saveWorkspaces(
       config,
       projectPath,
@@ -1272,7 +1272,7 @@ describe("TaskService", () => {
           runtimeConfig: { type: "local" },
         }),
       ],
-      testTaskSettings()
+      { taskSettings: testTaskSettings(), defaultRuntime: "local" }
     );
     const projectChat = await config.ensureProjectChat(projectPath);
     stubStableIds(config, ["newhandle", "newturn", "existinghandle", "existingturn"]);
@@ -1280,6 +1280,7 @@ describe("TaskService", () => {
     const createWorkspace = mock(
       async (...args: unknown[]): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
         expect(args[0]).toBe(projectPath);
+        expect(args[4]).toEqual({ type: "local" });
         expect(args[2]).toBeUndefined();
         await config.editConfig((cfg) => {
           const project = cfg.projects.get(projectPath);
@@ -1423,7 +1424,7 @@ describe("TaskService", () => {
 
   test("sub-project Project Chat reuses and lists workspaces from the parent storage bucket", async () => {
     const config = await createTestConfig(rootDir);
-    const parentProjectPath = await createTestProject(rootDir, "repo", { initGit: false });
+    const parentProjectPath = await createTestProject(rootDir, "repo");
     const subProjectPath = path.join(parentProjectPath, "packages", "web");
     await fsPromises.mkdir(subProjectPath, { recursive: true });
     await saveTestConfig(
@@ -1432,6 +1433,7 @@ describe("TaskService", () => {
         [
           parentProjectPath,
           {
+            defaultRuntime: "worktree",
             trusted: true,
             workspaces: [
               projectWorkspace(parentProjectPath, "parent", "parentworkspace", {
@@ -1443,6 +1445,7 @@ describe("TaskService", () => {
         [
           subProjectPath,
           {
+            defaultRuntime: "local",
             parentProjectPath,
             workspaces: [
               projectWorkspace(parentProjectPath, "subproject", "subprojectworkspace", {
@@ -1452,12 +1455,14 @@ describe("TaskService", () => {
           },
         ],
       ],
-      { taskSettings: testTaskSettings() }
+      { taskSettings: testTaskSettings(), defaultRuntime: "local" }
     );
     const projectChat = await config.ensureProjectChat(subProjectPath);
     stubStableIds(config, ["newhandle", "newturn", "existinghandle", "existingturn"]);
     const createWorkspace = mock(
       (...args: unknown[]): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
+        expect(args[2]).toBe("main");
+        expect(args[4]).toBeUndefined();
         expect(args[0]).toBe(subProjectPath);
         return Promise.resolve(
           Ok({
