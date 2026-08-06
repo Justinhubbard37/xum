@@ -73,6 +73,7 @@ import {
   EXECUTION_HANDLE_VERSION,
   isExecutionId,
   type ExecutionHandle,
+  type ExecutionResult,
   type ExecutionStatus,
 } from "@/common/types/execution";
 import {
@@ -508,13 +509,16 @@ const FAILED_BACKGROUND_SUBAGENT_HANDOFF_PROMPT =
  * it lives in the task handle store. So the wake-up must tell the agent to retrieve it with a
  * one-shot task_await (terminal already, timeout_secs: 0), not to keep waiting.
  */
-function buildCompletedWorkspaceTurnPrompt(handleIds: string[]): string {
-  assert(handleIds.length > 0, "buildCompletedWorkspaceTurnPrompt requires at least one handle id");
+function buildCompletedAwaitableExecutionPrompt(executionIds: string[]): string {
+  assert(
+    executionIds.length > 0,
+    "buildCompletedAwaitableExecutionPrompt requires at least one execution id"
+  );
   return (
     `${BACKGROUND_WORK_WAKE_OPENINGS.workspaceTurnsTerminal} ` +
-    `${handleIds.join(", ")}. ` +
-    `Call task_await now with task_ids: ${JSON.stringify(handleIds)} and timeout_secs: 0 to ` +
-    "retrieve their terminal output, then integrate it into your work. These handles are already " +
+    `${executionIds.join(", ")}. ` +
+    `Call task_await now with task_ids: ${JSON.stringify(executionIds)} and timeout_secs: 0 to ` +
+    "retrieve their terminal output, then integrate it into your work. These executions are already " +
     "terminal — do not repeatedly wait if task_await returns a terminal status."
   );
 }
@@ -1981,6 +1985,20 @@ export class TaskService {
     error?: string,
     phase?: "awaiting_report"
   ): Promise<void> {
+    if (status === "error" || status === "interrupted") {
+      await this.executionRegistry.settle(
+        handle.ownerSessionId,
+        handle.executionId,
+        status === "error"
+          ? { kind: "error", error: error ?? "Agent task failed" }
+          : {
+              kind: "interrupted",
+              ...(error != null ? { message: error } : {}),
+            }
+      );
+      return;
+    }
+
     const updatedAt = getIsoNow();
     await this.executionStore.upsert({
       ...handle,
@@ -1988,17 +2006,6 @@ export class TaskService {
       phase: status === "running" ? phase : undefined,
       updatedAt,
       ...(status === "running" && handle.startedAt == null ? { startedAt: updatedAt } : {}),
-      ...(status === "error"
-        ? { result: { kind: "error", error: error ?? "Agent task failed" }, terminalAt: updatedAt }
-        : status === "interrupted"
-          ? {
-              result: {
-                kind: "interrupted" as const,
-                ...(error != null ? { message: error } : {}),
-              },
-              terminalAt: updatedAt,
-            }
-          : {}),
     });
   }
 
@@ -2020,6 +2027,142 @@ export class TaskService {
         workspace.taskStatus === "awaiting_report" ? "awaiting_report" : undefined
       );
     }
+  }
+
+  private async getCanonicalAgentExecutionForWorkspace(
+    workspaceId: string,
+    entry: { workspace: WorkspaceConfigEntry } | null | undefined,
+    cfg: ProjectsConfig = this.config.loadConfigOrDefault()
+  ): Promise<ExecutionHandle | null> {
+    const executionId = entry?.workspace.executionId;
+    if (!isExecutionId(executionId)) return null;
+
+    const ownerSessionId = this.resolveExecutionOwnerSessionId(workspaceId, cfg);
+    const handle = await this.executionStore.get(ownerSessionId, executionId);
+    if (handle?.launchPolicy.kind !== "agent_task" || handle.target.workspaceId !== workspaceId) {
+      return null;
+    }
+    return handle;
+  }
+
+  private reportFromCanonicalExecution(handle: ExecutionHandle): {
+    reportMarkdown: string;
+    title?: string;
+    structuredOutput?: unknown;
+    model?: string;
+    thinkingLevel?: ThinkingLevel;
+  } {
+    assert(handle.result?.kind === "completed", "canonical execution must be completed");
+    return {
+      reportMarkdown: handle.result.reportMarkdown,
+      ...(handle.launchPolicy.title != null ? { title: handle.launchPolicy.title } : {}),
+      ...(handle.result.structuredOutput !== undefined
+        ? { structuredOutput: handle.result.structuredOutput }
+        : {}),
+    };
+  }
+
+  private throwCanonicalExecutionFailure(handle: ExecutionHandle): never {
+    assert(handle.result != null, "terminal canonical execution requires a result");
+    if (handle.result.kind === "interrupted") {
+      throw new Error(handle.result.message ?? "Task interrupted");
+    }
+    if (handle.result.kind === "error") {
+      throw new Error(handle.result.error);
+    }
+    throw new Error("Canonical execution is not a failure");
+  }
+
+  /**
+   * Canonical executions persist their immutable terminal result before any legacy waiter or
+   * attention side effect. Legacy workspace status remains as a compatibility projection only;
+   * terminal output is read from ExecutionRegistry and is never injected into parent history.
+   */
+  private async settleCanonicalAgentExecution(params: {
+    workspaceId: string;
+    entry: { projectPath: string; workspace: WorkspaceConfigEntry };
+    result: ExecutionResult;
+  }): Promise<boolean> {
+    const cfg = this.config.loadConfigOrDefault();
+    const handle = await this.getCanonicalAgentExecutionForWorkspace(
+      params.workspaceId,
+      params.entry,
+      cfg
+    );
+    if (handle == null) return false;
+
+    const hadForegroundWaiters =
+      (this.pendingWaitersByTaskId.get(params.workspaceId)?.length ?? 0) > 0;
+    const terminal = await this.executionRegistry.settle(
+      handle.ownerSessionId,
+      handle.executionId,
+      params.result
+    );
+    if (terminal == null || terminal.result == null) return false;
+
+    await this.editWorkspaceEntry(
+      params.workspaceId,
+      (workspace) => {
+        if (terminal.status === "completed") {
+          workspace.taskStatus = "reported";
+          workspace.reportedAt = terminal.terminalAt ?? terminal.updatedAt;
+          workspace.taskLaunchError = undefined;
+          delete workspace.taskRecoveryAttempts;
+        } else {
+          workspace.taskStatus = "interrupted";
+          workspace.reportedAt = undefined;
+          workspace.taskLaunchError =
+            terminal.result?.kind === "error"
+              ? terminal.result.error
+              : terminal.result?.kind === "interrupted"
+                ? terminal.result.message
+                : undefined;
+        }
+      },
+      { allowMissing: true }
+    );
+    await this.emitWorkspaceMetadata(params.workspaceId);
+
+    if (terminal.result.kind === "completed") {
+      this.resolveWaiters(params.workspaceId, this.reportFromCanonicalExecution(terminal));
+      await this.maybeStartPatchGenerationForReportedTask(params.workspaceId);
+      await this.maybeStartQueuedTasks();
+      await this.finalizeTerminationPhaseForReportedTask(params.workspaceId);
+    } else {
+      const message =
+        terminal.result.kind === "error"
+          ? terminal.result.error
+          : (terminal.result.message ?? "Task interrupted");
+      this.rejectWaiters(params.workspaceId, new Error(message));
+      this.scheduleMaybeStartQueuedTasks();
+    }
+
+    const isWorkflowOwned = params.entry.workspace.workflowTask != null;
+    if (hadForegroundWaiters || isWorkflowOwned) {
+      this.scheduleTerminalAttentionDrain(handle.requesterWorkspaceId);
+      return true;
+    }
+    if (resolveBackgroundWorkAttentionPolicy(handle.attentionPolicy) !== "notify_on_terminal") {
+      return true;
+    }
+
+    await this.enqueueTerminalAttention({
+      ownerWorkspaceId: handle.requesterWorkspaceId,
+      sourceKind: "agent_task",
+      sourceId: handle.executionId,
+      title:
+        coerceNonEmptyString(params.entry.workspace.title) ??
+        coerceNonEmptyString(params.entry.workspace.name) ??
+        "Sub-agent task",
+      outputDelivery: "requires_task_await",
+      terminalOutcome:
+        terminal.status === "completed"
+          ? "completed"
+          : terminal.status === "interrupted"
+            ? "interrupted"
+            : "error",
+    });
+    return true;
   }
 
   private async isExecutionHandleInScope(
@@ -5112,6 +5255,19 @@ export class TaskService {
           continue;
         }
 
+        const taskEntry = findWorkspaceEntry(cfg, id);
+        const canonicalExecution = await this.getCanonicalAgentExecutionForWorkspace(
+          id,
+          taskEntry,
+          cfg
+        );
+        if (canonicalExecution != null) {
+          await this.executionRegistry.settle(
+            canonicalExecution.ownerSessionId,
+            canonicalExecution.executionId,
+            { kind: "interrupted", message: terminationError.message }
+          );
+        }
         this.completedReportsByTaskId.delete(id);
         this.rejectWaiters(id, terminationError);
 
@@ -5166,7 +5322,6 @@ export class TaskService {
           continue;
         }
 
-        await this.updateExecutionStatusForWorkspace(id, "interrupted", "Task terminated");
         terminatedTaskIds.push(publicTaskIdByWorkspaceId.get(id) ?? id);
       }
     }
@@ -6103,7 +6258,13 @@ export class TaskService {
     cfg: ProjectsConfig
   ): Promise<BackgroundWorkWakeDisplayRecord> {
     if (notification.sourceKind === "agent_task") {
-      const taskEntry = findWorkspaceEntry(cfg, notification.sourceId);
+      const execution = await this.executionRegistry.get(
+        notification.ownerWorkspaceId,
+        notification.sourceId
+      );
+      const canonicalWorkspaceId =
+        execution?.launchPolicy.kind === "agent_task" ? execution.target.workspaceId : null;
+      const taskEntry = findWorkspaceEntry(cfg, canonicalWorkspaceId ?? notification.sourceId);
       return {
         sourceKind: notification.sourceKind,
         sourceId: notification.sourceId,
@@ -6113,8 +6274,7 @@ export class TaskService {
           coerceNonEmptyString(taskEntry?.workspace.title) ??
           coerceNonEmptyString(taskEntry?.workspace.name) ??
           "Sub-agent task",
-        // Agent task IDs are their workspace IDs, even after disposable cleanup removes config state.
-        workspaceId: notification.sourceId,
+        workspaceId: canonicalWorkspaceId ?? notification.sourceId,
       };
     }
 
@@ -6351,7 +6511,7 @@ export class TaskService {
     }
     if (awaitNotifications.length > 0) {
       promptSections.push(
-        buildCompletedWorkspaceTurnPrompt(
+        buildCompletedAwaitableExecutionPrompt(
           awaitNotifications.map((notification) => notification.sourceId)
         )
       );
@@ -7332,6 +7492,7 @@ export class TaskService {
     assert(taskId.length > 0, "waitForAgentReport: taskId must be non-empty");
 
     const requestingWorkspaceId = coerceNonEmptyString(options?.requestingWorkspaceId);
+    let scopedCanonicalExecution: ExecutionHandle | null = null;
     if (requestingWorkspaceId != null) {
       const directWorkspaceId = this.resolveLegacyWorkspaceAliasInScope(
         requestingWorkspaceId,
@@ -7344,8 +7505,23 @@ export class TaskService {
         const resolved = await this.resolveScopedAgentExecution(requestingWorkspaceId, taskId);
         if (resolved.kind === "invalid_scope") throw new Error("Task is not a descendant");
         if (resolved.kind === "not_found") throw new Error("Task not found");
+        scopedCanonicalExecution = await this.executionStore.get(
+          resolved.handle.ownerSessionId,
+          resolved.handle.executionId
+        );
         taskId = resolved.workspaceId;
       }
+    }
+
+    const canonicalEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
+    const canonicalExecution =
+      scopedCanonicalExecution ??
+      (await this.getCanonicalAgentExecutionForWorkspace(taskId, canonicalEntry));
+    if (canonicalExecution?.status === "completed") {
+      return this.reportFromCanonicalExecution(canonicalExecution);
+    }
+    if (canonicalExecution?.status === "interrupted" || canonicalExecution?.status === "error") {
+      this.throwCanonicalExecutionFailure(canonicalExecution);
     }
 
     // Report monotonicity invariant: check the in-memory cache before any status-based
@@ -10960,10 +11136,29 @@ export class TaskService {
     const reportArgs = isPlanLike ? null : finalAgentReportArgs;
     const proposePlanResult = this.findProposePlanSuccessInParts(event.parts);
 
+    const canonicalExecution = await this.getCanonicalAgentExecutionForWorkspace(
+      workspaceId,
+      entry,
+      cfg
+    );
+
     // Stream-end settlement: interrupted tasks must settle all pending waiters.
     // A workflow-owned plan step that successfully called propose_plan is already complete,
     // even if the interruption status landed before the provider emitted stream-end.
     if (status === "interrupted") {
+      if (canonicalExecution != null) {
+        await this.settleCanonicalAgentExecution({
+          workspaceId,
+          entry,
+          result: {
+            kind: "interrupted",
+            ...(entry.workspace.taskLaunchError != null
+              ? { message: entry.workspace.taskLaunchError }
+              : {}),
+          },
+        });
+        return;
+      }
       if (isPlanLike && proposePlanResult && entry.workspace.workflowTask != null) {
         await this.handleSuccessfulWorkflowProposePlan({ workspaceId, entry, proposePlanResult });
         return;
@@ -11048,6 +11243,12 @@ export class TaskService {
     // turn. Keep the task active until AgentSession accepts the reserved guidance and clears this
     // durable flag; otherwise turn-end dispatch could deliver a stale report before the correction.
     if ((entry.workspace.taskPendingGuidance?.length ?? 0) > 0) {
+      return;
+    }
+
+    if (canonicalExecution != null) {
+      const result = await this.resolveCanonicalAgentTaskCompletion(workspaceId, entry, event);
+      await this.settleCanonicalAgentExecution({ workspaceId, entry, result });
       return;
     }
 
@@ -11289,6 +11490,20 @@ export class TaskService {
       failure.errorMessage.length > 0,
       "failAgentTaskTerminally: errorMessage must be non-empty"
     );
+
+    if (
+      await this.settleCanonicalAgentExecution({
+        workspaceId,
+        entry,
+        result: {
+          kind: "error",
+          error: failure.errorMessage,
+          errorType: failure.errorType,
+        },
+      })
+    ) {
+      return;
+    }
 
     let transitionedToInterrupted = false;
     let parentWorkspaceId = entry.workspace.parentWorkspaceId;
@@ -12620,6 +12835,89 @@ export class TaskService {
       }
     }
     return null;
+  }
+
+  private async findLatestValidAgentReportArgsInHistory(
+    workspaceId: string,
+    options: { acceptSchemaShapedWorkflowReport?: boolean } = {}
+  ): Promise<{ reportMarkdown: string; title?: string; structuredOutput?: unknown } | null> {
+    const historyResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!historyResult.success) {
+      log.warn("Failed to read sub-agent history for canonical report metadata", {
+        workspaceId,
+        error: historyResult.error,
+      });
+      return null;
+    }
+
+    for (let index = historyResult.data.length - 1; index >= 0; index -= 1) {
+      const message = historyResult.data[index];
+      if (message.role !== "assistant") continue;
+      const report = this.findAgentReportArgsInParts(message.parts, options);
+      if (report != null) return report;
+    }
+    return null;
+  }
+
+  private async resolveCanonicalAgentTaskCompletion(
+    workspaceId: string,
+    entry: { projectPath: string; workspace: WorkspaceConfigEntry },
+    event: StreamEndEvent
+  ): Promise<ExecutionResult> {
+    const finalResponse = this.findFinalAssistantResponseInParts(event.parts);
+    if (finalResponse == null) {
+      return {
+        kind: "error",
+        error: "Task stream ended without final assistant text.",
+        errorType: "missing_final_assistant_text",
+      };
+    }
+
+    const workflowOutputSchema = entry.workspace.workflowTask?.outputSchema;
+    const acceptsSchemaShapedWorkflowReport =
+      workflowOutputSchema !== undefined &&
+      validateJsonSchemaSubsetSchema(workflowOutputSchema, { requireObjectSchema: true }).success;
+    const latestValidReport =
+      this.findAgentReportArgsInParts(event.parts, {
+        acceptSchemaShapedWorkflowReport: acceptsSchemaShapedWorkflowReport,
+      }) ??
+      (await this.findLatestValidAgentReportArgsInHistory(workspaceId, {
+        acceptSchemaShapedWorkflowReport: acceptsSchemaShapedWorkflowReport,
+      }));
+    const reportArgs = normalizeWorkflowAgentReportArgsForWorkflowTask(
+      entry.workspace.workflowTask,
+      {
+        reportMarkdown: finalResponse.reportMarkdown,
+        ...(latestValidReport?.title !== undefined ? { title: latestValidReport.title } : {}),
+        ...(latestValidReport?.structuredOutput !== undefined
+          ? { structuredOutput: latestValidReport.structuredOutput }
+          : {}),
+      }
+    );
+    const validationMessage = validateWorkflowAgentReportStructuredOutput({
+      workflowTask: entry.workspace.workflowTask,
+      reportArgs,
+      allowLegacyInvalidOutputSchema: await this.shouldAllowLegacyInvalidWorkflowOutputSchema(
+        workspaceId,
+        entry
+      ),
+    });
+    if (validationMessage != null) {
+      return {
+        kind: "error",
+        error: validationMessage,
+        errorType: "invalid_structured_output",
+      };
+    }
+
+    return {
+      kind: "completed",
+      reportMarkdown: finalResponse.reportMarkdown,
+      ...(reportArgs.structuredOutput !== undefined
+        ? { structuredOutput: reportArgs.structuredOutput }
+        : {}),
+      finalMessageRef: this.buildWorkspaceTurnFinalMessageRef(event),
+    };
   }
 
   private async resolveFinalAgentReportArgs(

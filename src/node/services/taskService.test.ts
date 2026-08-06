@@ -798,6 +798,186 @@ describe("TaskService", () => {
 
     const terminated = await taskService.terminateDescendantAgentTask(parentId, first.data.taskId);
     expect(terminated).toEqual(Ok({ terminatedTaskIds: [nested.data.taskId, first.data.taskId] }));
+    expect(await registry.get(parentId, first.data.taskId)).toMatchObject({
+      status: "interrupted",
+      result: { kind: "interrupted", message: "Task terminated" },
+    });
+    expect(await registry.get(parentId, nested.data.taskId)).toMatchObject({
+      status: "interrupted",
+      result: { kind: "interrupted", message: "Task terminated" },
+    });
+  });
+
+  test("canonical final assistant text settles the execution with the latest valid report payload", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["canonical-child"]);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const workspaceMocks = createWorkspaceServiceMocks();
+    const { historyService, taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const created = await createAgentTask(taskService, parentId, "Return a canonical result", {
+      attentionPolicy: "notify_on_terminal",
+    });
+    assert(created.success, "canonical task should be created");
+
+    await handleTaskServiceStreamEndForTest(taskService, {
+      type: "stream-end",
+      workspaceId: created.data.workspaceId,
+      messageId: "assistant-canonical-final",
+      metadata: { model: "openai:gpt-4o-mini", finishReason: "stop" },
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "agent-report-valid",
+          toolName: "agent_report",
+          input: { reportMarkdown: "Structured candidate" },
+          state: "output-available",
+          output: {
+            success: true,
+            report: {
+              reportMarkdown: "Structured candidate",
+              structuredOutput: { claims: ["durable"] },
+            },
+          },
+        },
+        {
+          type: "dynamic-tool",
+          toolCallId: "agent-report-invalid-newer",
+          toolName: "agent_report",
+          input: { reportMarkdown: "Invalid newer attempt" },
+          state: "output-available",
+          output: { success: false, error: "rejected" },
+        },
+        { type: "text", text: "Canonical final assistant text" },
+      ],
+    });
+
+    const registry = new ExecutionRegistry(config);
+    const handle = await registry.get(parentId, created.data.taskId);
+    expect(handle).toMatchObject({
+      executionId: created.data.taskId,
+      status: "completed",
+      result: {
+        kind: "completed",
+        reportMarkdown: "Canonical final assistant text",
+        structuredOutput: { claims: ["durable"] },
+      },
+    });
+    expect(
+      await taskService.waitForAgentReport(created.data.taskId, {
+        timeoutMs: 100,
+        requestingWorkspaceId: parentId,
+      })
+    ).toMatchObject({
+      reportMarkdown: "Canonical final assistant text",
+      structuredOutput: { claims: ["durable"] },
+    });
+
+    const parentHistory = await collectFullHistory(historyService, parentId);
+    expect(parentHistory).toEqual([]);
+    expect(
+      await readSubagentReportArtifact(config.getSessionDir(parentId), created.data.workspaceId)
+    ).toBeNull();
+    const attentionStore = new TerminalAttentionStore(config);
+    expect(
+      await attentionStore.get(
+        parentId,
+        TerminalAttentionStore.notificationId("agent_task", created.data.taskId)
+      )
+    ).toMatchObject({
+      sourceId: created.data.taskId,
+      outputDelivery: "requires_task_await",
+      terminalOutcome: "completed",
+    });
+  });
+
+  test("canonical required structured output failure is terminal without a recovery prompt", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["canonical-structured-error"]);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const workspaceMocks = createWorkspaceServiceMocks();
+    const { historyService, taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const created = await createAgentTask(taskService, parentId, "Return required output", {
+      workflowTask: {
+        runId: "wfr_canonical",
+        stepId: "collect",
+        outputSchema: {
+          type: "object",
+          properties: { claims: { type: "array", items: { type: "string" } } },
+          required: ["claims"],
+          additionalProperties: false,
+        },
+      },
+    });
+    assert(created.success, "canonical workflow task should be created");
+    workspaceMocks.sendMessage.mockClear();
+
+    await handleTaskServiceStreamEndForTest(taskService, {
+      type: "stream-end",
+      workspaceId: created.data.workspaceId,
+      messageId: "assistant-canonical-invalid-structured",
+      metadata: { model: "openai:gpt-4o-mini", finishReason: "stop" },
+      parts: [{ type: "text", text: "Final text without required structured output" }],
+    });
+
+    const registry = new ExecutionRegistry(config);
+    const handle = await registry.get(parentId, created.data.taskId);
+    expect(handle).toMatchObject({
+      status: "error",
+      result: {
+        kind: "error",
+        errorType: "invalid_structured_output",
+      },
+    });
+    expect(handle?.result?.kind === "error" ? handle.result.error : "").toContain(
+      "Required property is missing"
+    );
+    expect(workspaceMocks.sendMessage).not.toHaveBeenCalled();
+    expect(await collectFullHistory(historyService, parentId)).toEqual([]);
+    await expect(
+      taskService.waitForAgentReport(created.data.taskId, {
+        timeoutMs: 100,
+        requestingWorkspaceId: parentId,
+      })
+    ).rejects.toThrow("Required property is missing");
+  });
+
+  test("canonical missing final assistant text settles as an error without reprompting", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["canonical-missing-final"]);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const workspaceMocks = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const created = await createAgentTask(taskService, parentId, "Return final text");
+    assert(created.success, "canonical task should be created");
+    workspaceMocks.sendMessage.mockClear();
+
+    await handleTaskServiceStreamEndForTest(taskService, {
+      type: "stream-end",
+      workspaceId: created.data.workspaceId,
+      messageId: "assistant-canonical-missing-final",
+      metadata: { model: "openai:gpt-4o-mini", finishReason: "stop" },
+      parts: [],
+    });
+
+    const registry = new ExecutionRegistry(config);
+    expect(await registry.get(parentId, created.data.taskId)).toMatchObject({
+      status: "error",
+      result: {
+        kind: "error",
+        error: "Task stream ended without final assistant text.",
+        errorType: "missing_final_assistant_text",
+      },
+    });
+    expect(workspaceMocks.sendMessage).not.toHaveBeenCalled();
   });
 
   test("create persists sticky retention only when requested", async () => {
