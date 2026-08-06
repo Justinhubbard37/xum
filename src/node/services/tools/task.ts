@@ -5,8 +5,10 @@ import type { z } from "zod";
 
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import {
+  ProjectChatTaskToolArgsSchema,
+  TaskToolArgsSchema,
   TaskToolResultSchema,
-  TOOL_DEFINITIONS,
+  buildProjectChatTaskToolDescription,
   buildTaskToolAgentArgsSchema,
   buildTaskToolDescription,
 } from "@/common/utils/tools/toolDefinitions";
@@ -380,16 +382,19 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
   // supported. On local runtimes the field is omitted from the schema entirely, so it never
   // enters LLM context.
   const runtimeMode = resolveRuntimeMode(config);
-  const inputSchema = buildTaskToolAgentArgsSchema({
-    includeIsolation: runtimeModeSupportsSharedTaskWorkspace(runtimeMode),
-  });
+  const projectChat = config.projectChat === true;
+  const inputSchema: z.ZodType<z.infer<typeof TaskToolArgsSchema>> = projectChat
+    ? ProjectChatTaskToolArgsSchema
+    : buildTaskToolAgentArgsSchema({
+        includeIsolation: runtimeModeSupportsSharedTaskWorkspace(runtimeMode),
+      });
   const taskTool = tool({
-    description: buildTaskDescription(config),
+    description: projectChat ? buildProjectChatTaskToolDescription() : buildTaskDescription(config),
     inputSchema,
     execute: async (args, { abortSignal, toolCallId }): Promise<unknown> => {
       // Defensive: tool() should have already validated args via inputSchema,
       // but keep runtime validation here to preserve type-safety.
-      const parsedArgs = TOOL_DEFINITIONS.task.schema.safeParse(args);
+      const parsedArgs = inputSchema.safeParse(args);
       if (!parsedArgs.success) {
         const keys =
           args && typeof args === "object" ? Object.keys(args as Record<string, unknown>) : [];

@@ -3,6 +3,7 @@ import { RUNTIME_MODE } from "@/common/types/runtime";
 import {
   buildTaskToolAgentArgsSchema,
   buildTaskToolDescription,
+  ProjectChatTaskToolArgsSchema,
   getAvailableTools,
   supportsGoogleNativeToolsWithFunctionTools,
   TaskToolArgsSchema,
@@ -115,6 +116,37 @@ describe("TOOL_DEFINITIONS", () => {
         variants: ["frontend", " frontend "],
       }).success
     ).toBe(false);
+  });
+
+  it("restricts Project Chat task calls to workspace-only fields and defaults background", () => {
+    const schema = ProjectChatTaskToolArgsSchema;
+    const parsed = schema.safeParse({
+      prompt: "Implement the change",
+      title: "Implementation",
+    });
+
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.kind).toBe("workspace");
+      expect(parsed.data.run_in_background).toBe(true);
+    }
+
+    for (const forbidden of [
+      { agentId: "exec" },
+      { subagent_type: "explore" },
+      { n: 2 },
+      { variants: ["a", "b"] },
+      { sticky: true },
+      { isolation: "none" },
+    ]) {
+      expect(
+        schema.safeParse({
+          prompt: "Implement the change",
+          title: "Implementation",
+          ...forbidden,
+        }).success
+      ).toBe(false);
+    }
   });
 
   it("accepts workspace task args without an agent id", () => {
@@ -769,6 +801,15 @@ describe("TOOL_DEFINITIONS", () => {
     expect(schemaHasAnyOfEntry(properties?.script_source, { type: "null" })).toBe(true);
     expect(workflowSchema.required).not.toContain("script_path");
     expect(workflowSchema.required).not.toContain("script_source");
+  });
+
+  it("only includes project_workspace_list for Project Chat toolsets", () => {
+    expect(getAvailableTools("openai:gpt-5", { enableProjectWorkspaceList: false })).not.toContain(
+      "project_workspace_list"
+    );
+    expect(getAvailableTools("openai:gpt-5", { enableProjectWorkspaceList: true })).toContain(
+      "project_workspace_list"
+    );
   });
 
   it("only includes workflow tools when dynamic workflows are enabled", () => {

@@ -134,6 +134,45 @@ describe("task tool", () => {
     expect(parsed.success).toBe(false);
   });
 
+  it("uses the strict workspace-only schema and background default in Project Chat", async () => {
+    using tempDir = new TestTempDir("test-task-tool-project-chat-schema");
+    const createWorkspaceTurn = mock((_args: Parameters<TaskService["createWorkspaceTurn"]>[0]) =>
+      Ok({
+        taskId: "wst_project-chat-turn",
+        kind: "workspace_turn" as const,
+        status: "running" as const,
+        workspaceId: "child-workspace",
+      })
+    );
+    const taskService = { createWorkspaceTurn } as unknown as TaskService;
+    const tool = createTaskTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "project-session_owner" }),
+      projectChat: true,
+      taskService,
+    });
+    const schema = tool.inputSchema as { safeParse: (value: unknown) => { success: boolean } };
+
+    expect(
+      schema.safeParse({ prompt: "implement", title: "Implementation", agentId: "exec" }).success
+    ).toBe(false);
+    const result = await tool.execute!(
+      { prompt: "implement", title: "Implementation" },
+      mockToolCallOptions
+    );
+
+    expect(createWorkspaceTurn).toHaveBeenCalledTimes(1);
+    expect(createWorkspaceTurn.mock.calls[0]?.[0]).toMatchObject({
+      ownerWorkspaceId: "project-session_owner",
+      attentionPolicy: "notify_on_terminal",
+      workspace: { mode: "new" },
+    });
+    expect(result).toMatchObject({
+      taskId: "wst_project-chat-turn",
+      status: "running",
+      workspaceId: "child-workspace",
+    });
+  });
+
   it("starts a background workspace turn without requiring a sub-agent id", async () => {
     using tempDir = new TestTempDir("test-task-tool-workspace-turn");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });

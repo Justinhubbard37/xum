@@ -2216,6 +2216,7 @@ export class AIService extends EventEmitter {
           }
         },
         onConfigChanged: () => this.providerService.notifyConfigChanged(),
+        projectChat: projectChatContext != null,
         taskService: this.taskService,
         analyticsService: this.analyticsService,
         desktopSessionManager: this.desktopSessionManager,

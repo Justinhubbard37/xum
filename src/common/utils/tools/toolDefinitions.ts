@@ -534,6 +534,74 @@ export function buildTaskToolAgentArgsSchema(options: {
   return options.includeIsolation ? TaskToolArgsSchema : TaskToolArgsSchemaWithoutIsolation;
 }
 
+export const ProjectChatTaskToolArgsSchema = z
+  .object({
+    kind: z.literal("workspace").default("workspace"),
+    prompt: z.string().min(1),
+    title: z.string().min(1),
+    run_in_background: z
+      .boolean()
+      .default(true)
+      .describe(
+        "Run in background by default so Project Chat remains available while the workspace turn continues. Set false only when the result is required before continuing."
+      ),
+    workspace: WorkspaceTaskTargetSchema.nullish().describe(
+      'Workspace target. Omit for a new ordinary project workspace; use mode="existing" with a canonical workspaceId from project_workspace_list for a same-project follow-up.'
+    ),
+    model: TaskToolModelSchema.nullish().describe(
+      "Optional model override for this workspace turn. Omit to use the target/default Exec settings."
+    ),
+    thinking: TaskToolThinkingSchema.nullish().describe(
+      "Optional thinking-level override for this workspace turn. Omit to use the target/default Exec settings."
+    ),
+  })
+  .strict()
+  .superRefine((args, ctx) => refineTaskToolAgentArgs(args, ctx));
+
+export function buildProjectChatTaskToolDescription(): string {
+  return (
+    'Start or continue an ordinary same-project workspace turn. Project Chat may only use kind="workspace"; sub-agent fields are not accepted. ' +
+    "Prefer the default background mode so this chat remains available while the child workspace runs. " +
+    "Use project_workspace_list for canonical existing workspace IDs. New and interrupted workspaces persist unless workspace.disposable is explicitly true; archive is the safe default cleanup action."
+  );
+}
+
+export const ProjectWorkspaceListToolArgsSchema = z
+  .object({
+    include_archived: z
+      .boolean()
+      .default(true)
+      .describe("Include archived same-project workspaces. Defaults to true."),
+  })
+  .strict();
+
+const ProjectWorkspaceTurnSummarySchema = z
+  .object({
+    taskId: z.string().min(1),
+    status: z.enum(["queued", "starting", "running", "completed", "interrupted", "error"]),
+    title: z.string().optional(),
+    updatedAt: z.string().min(1),
+  })
+  .strict();
+
+export const ProjectWorkspaceSummarySchema = z
+  .object({
+    workspaceId: z.string().min(1),
+    name: z.string().min(1),
+    title: z.string().optional(),
+    archived: z.boolean(),
+    transcriptOnly: z.boolean().optional(),
+    workspaceTurn: ProjectWorkspaceTurnSummarySchema.optional(),
+  })
+  .strict();
+
+export const ProjectWorkspaceListToolResultSchema = z
+  .object({
+    projectPath: z.string().min(1),
+    workspaces: z.array(ProjectWorkspaceSummarySchema),
+  })
+  .strict();
+
 const TaskHandleKindSchema = z.enum(["agent_task", "workspace_turn"]);
 const TaskThinkingLevelSchema = z.enum(THINKING_LEVELS);
 const TaskToolSpawnedTaskSchema = z
@@ -2147,6 +2215,13 @@ export const TOOL_DEFINITIONS = {
       "After calling this tool, do not paste the plan contents or mention the plan file path; the UI already shows the full plan.",
     schema: z.object({}),
   },
+  project_workspace_list: {
+    description:
+      "List canonical ordinary workspaces in the current Project Chat's project in one bulk call. " +
+      "Returns active/archived summaries and the latest durable workspace-turn handle/status for each workspace when available. " +
+      "Use the returned workspaceId for task workspace.mode=existing and lifecycle calls; never synthesize IDs.",
+    schema: ProjectWorkspaceListToolArgsSchema,
+  },
   task: {
     description: buildTaskToolDescription(undefined),
     schema: TaskToolArgsSchema,
@@ -3048,6 +3123,7 @@ export type BridgeableToolName =
   // (webFetch_20250910) that has no execute(). ToolBridge's hasExecute filter will drop it
   // from the PTC sandbox for those sessions. That silent absence is intentional and accepted.
   | "web_fetch"
+  | "project_workspace_list"
   | "task"
   | "task_await"
   | "task_apply_git_patch"
@@ -3076,6 +3152,7 @@ export const RESULT_SCHEMAS: Record<BridgeableToolName, z.ZodType> = {
   file_edit_insert: FileEditInsertToolResultSchema,
   file_edit_replace_string: FileEditReplaceStringToolResultSchema,
   web_fetch: WebFetchToolResultSchema,
+  project_workspace_list: ProjectWorkspaceListToolResultSchema,
   task: TaskToolResultSchema,
   task_await: TaskAwaitToolResultSchema,
   task_apply_git_patch: TaskApplyGitPatchToolResultSchema,
@@ -3143,6 +3220,8 @@ export function getAvailableTools(
      * so sub-agents (child task workspaces) pass false to keep them from
      * pinning code to a pane the user never sees. Defaults to true.
      */
+    /** Whether Project Chat's canonical same-project workspace listing tool is available. */
+    enableProjectWorkspaceList?: boolean;
     enableReviewPane?: boolean;
     /** @deprecated Mux global tools are always included. */
     enableMuxGlobalAgentsTools?: boolean;
@@ -3157,6 +3236,7 @@ export function getAvailableTools(
   const enableTimelineEvent = options?.enableTimelineEvent ?? false;
   const enableToolSearch = options?.enableToolSearch ?? false;
   const enableReviewPane = options?.enableReviewPane ?? true;
+  const enableProjectWorkspaceList = options?.enableProjectWorkspaceList ?? false;
 
   // Base tools available for all models
   // Note: Tool availability is controlled by agent tool policy (allowlist), not mode checks here.
@@ -3192,6 +3272,7 @@ export function getAvailableTools(
     "ask_user_question",
     "propose_plan",
     "bash",
+    ...(enableProjectWorkspaceList ? ["project_workspace_list"] : []),
     "task",
     "task_await",
     "task_apply_git_patch",

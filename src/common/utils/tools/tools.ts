@@ -32,6 +32,7 @@ import { createToolSearchTool } from "@/node/services/tools/toolSearch";
 import { createAnalyticsQueryTool } from "@/node/services/tools/analyticsQuery";
 import { createDesktopTools } from "@/node/services/tools/desktopTools";
 import type { MuxToolScope } from "@/common/types/toolScope";
+import { createProjectWorkspaceListTool } from "@/node/services/tools/project_workspace_list";
 import { createTaskTool } from "@/node/services/tools/task";
 import { createTaskApplyGitPatchTool } from "@/node/services/tools/task_apply_git_patch";
 import { createTaskAwaitTool } from "@/node/services/tools/task_await";
@@ -198,6 +199,8 @@ export interface ToolConfiguration {
   onConfigChanged?: () => void;
   /** Best-effort callback for recording tool-initiated model usage in session totals. */
   reportModelUsage?: (event: ToolModelUsageEvent) => void;
+  /** Backend-derived Project Chat context; never sourced from model input. */
+  projectChat?: boolean;
   /** Task orchestration for sub-agent tasks */
   taskService?: TaskService;
   /** Durable workflow lifecycle service for dynamic workflow tools. */
@@ -792,6 +795,9 @@ export async function getToolsForModel(
     ...(config.timelineService && config.experiments?.timeline
       ? { timeline_event: createTimelineEventTool(config) }
       : {}),
+    ...(config.projectChat && config.taskService
+      ? { project_workspace_list: createProjectWorkspaceListTool(config) }
+      : {}),
     ask_user_question: createAskUserQuestionTool(config),
     propose_plan: createProposePlanTool(config),
     // propose_name and propose_status are intentionally NOT registered here —
@@ -944,6 +950,7 @@ export async function getToolsForModel(
   // Include MCP tools even if they're not in getAvailableTools().
   const allowlistedToolNames = new Set(
     getAvailableTools(capabilityModelString, {
+      enableProjectWorkspaceList: config.projectChat === true,
       enableAgentReport: config.enableAgentReport,
       enableAnalyticsQuery: Boolean(config.analyticsService),
       enableDynamicWorkflows: Boolean(

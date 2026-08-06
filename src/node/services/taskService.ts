@@ -33,6 +33,7 @@ import {
 } from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/resolveAgentInheritanceChain";
 import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
+import { detectDefaultTrunkBranch, listLocalBranches } from "@/node/git";
 import { orchestrateFork } from "@/node/services/utils/forkOrchestrator";
 import {
   createRuntimeContextForWorkspace,
@@ -226,6 +227,27 @@ interface ResolvedWorkspaceLifecycleTarget {
   taskTitle?: string;
   workspaceId: string;
   metadata: WorkspaceMetadata | null;
+}
+
+export interface ProjectWorkspaceTurnSummary {
+  taskId: string;
+  status: WorkspaceTurnTaskStatus;
+  title?: string;
+  updatedAt: string;
+}
+
+export interface ProjectWorkspaceSummary {
+  workspaceId: string;
+  name: string;
+  title?: string;
+  archived: boolean;
+  transcriptOnly?: boolean;
+  workspaceTurn?: ProjectWorkspaceTurnSummary;
+}
+
+export interface ProjectWorkspaceListResult {
+  projectPath: string;
+  workspaces: ProjectWorkspaceSummary[];
 }
 
 export interface TaskCreateArgs {
@@ -3483,12 +3505,28 @@ export class TaskService {
         [WORKSPACE_TURN_TASK_TAGS.ownerWorkspaceId]: ownerWorkspaceId,
         [WORKSPACE_TURN_TASK_TAGS.turn]: turnId,
       };
+      let creationRuntimeConfig: RuntimeConfig | undefined = parentMeta.runtimeConfig;
+      let creationTrunkBranch: string | undefined = args.workspace?.trunkBranch ?? parentMeta.name;
+      if (projectChatOwner) {
+        // Project Chat itself uses LocalRuntime, but new child workspaces should use the ordinary
+        // project creation contract: worktree by default (or explicit project-local default), with
+        // backend trunk detection. Non-git projects self-heal to local because worktrees are invalid.
+        const branches = await listLocalBranches(parentMeta.projectPath).catch(() => []);
+        const useLocalRuntime =
+          taskProjectConfig.defaultRuntime === "local" || branches.length === 0;
+        creationRuntimeConfig = useLocalRuntime ? { type: "local" } : undefined;
+        creationTrunkBranch = useLocalRuntime
+          ? undefined
+          : (args.workspace?.trunkBranch ??
+            (await detectDefaultTrunkBranch(parentMeta.projectPath, branches)) ??
+            branches[0]);
+      }
       const createResult = await this.workspaceService.create(
         parentMeta.projectPath,
         args.workspace?.branchName,
-        args.workspace?.trunkBranch ?? (projectChatOwner ? undefined : parentMeta.name),
+        creationTrunkBranch,
         title,
-        parentMeta.runtimeConfig,
+        creationRuntimeConfig,
         parentMeta.subProjectPath,
         false,
         tags
@@ -7346,6 +7384,74 @@ export class TaskService {
       }
     }
     return result;
+  }
+
+  async listProjectWorkspaces(
+    ownerWorkspaceId: string,
+    options: { includeArchived?: boolean } = {}
+  ): Promise<Result<ProjectWorkspaceListResult, string>> {
+    const owner = this.resolveProjectChatOwner(ownerWorkspaceId);
+    if (owner == null) {
+      return Err("project_workspace_list is only available in Project Chat");
+    }
+
+    try {
+      // One metadata load + one owner handle load keeps this bulk tool independent of frontend RPC
+      // loops while preserving backend-canonical IDs for legacy entries.
+      const [allMetadata, turns] = await Promise.all([
+        this.config.getAllWorkspaceMetadata(),
+        this.listWorkspaceTurnTasks(ownerWorkspaceId),
+      ]);
+      const cfg = this.config.loadConfigOrDefault();
+      const latestTurnByWorkspace = new Map<string, WorkspaceTurnTaskHandleRecord>();
+      for (const turn of turns) {
+        const previous = latestTurnByWorkspace.get(turn.workspaceId);
+        if (previous == null || previous.updatedAt.localeCompare(turn.updatedAt) < 0) {
+          latestTurnByWorkspace.set(turn.workspaceId, turn);
+        }
+      }
+
+      const includeArchived = options.includeArchived !== false;
+      const projectPath = stripTrailingSlashes(owner.projectPath);
+      const workspaces: ProjectWorkspaceSummary[] = [];
+      for (const metadata of allMetadata) {
+        if (stripTrailingSlashes(metadata.projectPath) !== projectPath) continue;
+        if (this.resolveProjectChatWorkspaceTarget(ownerWorkspaceId, metadata.id, cfg) == null) {
+          continue;
+        }
+        const archived = isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt);
+        if (archived && !includeArchived) continue;
+
+        const turn = latestTurnByWorkspace.get(metadata.id);
+        workspaces.push({
+          workspaceId: metadata.id,
+          name: metadata.name,
+          ...(metadata.title != null ? { title: metadata.title } : {}),
+          archived,
+          ...(metadata.transcriptOnly === true ? { transcriptOnly: true } : {}),
+          ...(turn != null
+            ? {
+                workspaceTurn: {
+                  taskId: turn.handleId,
+                  status: turn.status,
+                  ...(turn.title != null ? { title: turn.title } : {}),
+                  updatedAt: turn.updatedAt,
+                },
+              }
+            : {}),
+        });
+      }
+
+      workspaces.sort(
+        (left, right) =>
+          Number(left.archived) - Number(right.archived) ||
+          left.name.localeCompare(right.name) ||
+          left.workspaceId.localeCompare(right.workspaceId)
+      );
+      return Ok({ projectPath, workspaces });
+    } catch (error) {
+      return Err(`Failed to list project workspaces: ${getErrorMessage(error)}`);
+    }
   }
 
   async interruptWorkspaceTurn(

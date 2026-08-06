@@ -1339,6 +1339,108 @@ describe("TaskService", () => {
     ]);
   });
 
+  test("Project Chat bulk workspace list returns canonical ordinary scopes and latest turn state", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = await createTestProject(rootDir, "repo", { initGit: false });
+    const otherProjectPath = await createTestProject(rootDir, "other", { initGit: false });
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "active", "activeworkspace", {
+          title: "Active workspace",
+          runtimeConfig: { type: "local" },
+        }),
+        projectWorkspace(projectPath, "archived", "archivedworkspace", {
+          runtimeConfig: { type: "local" },
+          archivedAt: "2026-08-05T00:00:00.000Z",
+        }),
+        projectWorkspace(projectPath, "subagent", "subagent", {
+          runtimeConfig: { type: "local" },
+          parentWorkspaceId: "activeworkspace",
+          taskStatus: "running",
+        }),
+      ],
+      {
+        taskSettings: testTaskSettings(),
+        extraProjects: [
+          [
+            otherProjectPath,
+            {
+              trusted: true,
+              workspaces: [
+                projectWorkspace(otherProjectPath, "foreign", "foreign", {
+                  runtimeConfig: { type: "local" },
+                }),
+              ],
+            },
+          ],
+        ],
+      }
+    );
+    const projectChat = await config.ensureProjectChat(projectPath);
+    await new TaskHandleStore(config).upsertWorkspaceTurn({
+      kind: "workspace_turn",
+      handleId: "wst_active",
+      ownerWorkspaceId: projectChat.sessionId,
+      workspaceId: "activeworkspace",
+      turnId: "turn-active",
+      status: "completed",
+      createdAt: "2026-08-06T00:00:00.000Z",
+      updatedAt: "2026-08-06T00:01:00.000Z",
+      createdWorkspace: false,
+      disposableWorkspace: false,
+      title: "Active turn",
+    });
+    const { taskService } = createTaskServiceHarness(config);
+
+    expect(await taskService.listProjectWorkspaces(projectChat.sessionId)).toEqual(
+      Ok({
+        projectPath,
+        workspaces: [
+          {
+            workspaceId: "activeworkspace",
+            name: "active",
+            title: "Active workspace",
+            archived: false,
+            workspaceTurn: {
+              taskId: "wst_active",
+              status: "completed",
+              title: "Active turn",
+              updatedAt: "2026-08-06T00:01:00.000Z",
+            },
+          },
+          {
+            workspaceId: "archivedworkspace",
+            name: "archived",
+            archived: true,
+          },
+        ],
+      })
+    );
+    expect(
+      await taskService.listProjectWorkspaces(projectChat.sessionId, { includeArchived: false })
+    ).toEqual(
+      Ok({
+        projectPath,
+        workspaces: [
+          {
+            workspaceId: "activeworkspace",
+            name: "active",
+            title: "Active workspace",
+            archived: false,
+            workspaceTurn: {
+              taskId: "wst_active",
+              status: "completed",
+              title: "Active turn",
+              updatedAt: "2026-08-06T00:01:00.000Z",
+            },
+          },
+        ],
+      })
+    );
+  });
+
   test("Project Chat rejects invalid existing workspace scopes", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = await createTestProject(rootDir, "repo", { initGit: false });
