@@ -5340,6 +5340,13 @@ export class TaskService {
       ) {
         return Err({ code: "invalid_scope" as const });
       }
+      if (entry.workspace.transcriptOnly === true) {
+        return Err({
+          code: "not_active" as const,
+          taskStatus: entry.workspace.taskStatus ?? "unknown",
+          message: "Task workspace is transcript-only and cannot accept updated guidance.",
+        });
+      }
       if (isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)) {
         return Err({
           code: "not_active" as const,
@@ -5387,6 +5394,13 @@ export class TaskService {
         return Err({ code: "invalid_scope" as const });
       }
 
+      if (entry.workspace.transcriptOnly === true) {
+        return Err({
+          code: "not_active" as const,
+          taskStatus: entry.workspace.taskStatus ?? "unknown",
+          message: "Task workspace is transcript-only and cannot accept updated guidance.",
+        });
+      }
       if (isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)) {
         return Err({
           code: "not_active" as const,
@@ -5526,6 +5540,9 @@ export class TaskService {
       // Terminate the entire subtree to avoid orphaned descendant tasks.
       const descendants = this.listDescendantAgentTaskIdsFromIndex(index, taskId);
       const toTerminate = Array.from(new Set([taskId, ...descendants]));
+      if (toTerminate.some((id) => index.byId.get(id)?.transcriptOnly === true)) {
+        return Err("Task transcript is retained and cannot be directly terminated");
+      }
 
       const publicTaskIdByWorkspaceId = new Map(
         toTerminate.map((workspaceId) => [
@@ -10167,14 +10184,29 @@ export class TaskService {
     return result;
   }
 
-  /**
-   * Topology predicate: does this workspace still have child agent-task nodes in config?
-   * Unlike hasActiveDescendantAgentTasks (which checks runtime activity for scheduling),
-   * this checks structural tree shape — any child node blocks parent deletion regardless
-   * of its status.
-   */
-  private hasChildAgentTasks(index: AgentTaskIndex, workspaceId: string): boolean {
-    return (index.childrenByParent.get(workspaceId)?.length ?? 0) > 0;
+  private async hasBlockingChildAgentTasks(
+    index: AgentTaskIndex,
+    config: ReturnType<Config["loadConfigOrDefault"]>,
+    workspaceId: string
+  ): Promise<boolean> {
+    for (const childWorkspaceId of index.childrenByParent.get(workspaceId) ?? []) {
+      const childEntry = findWorkspaceEntry(config, childWorkspaceId);
+      if (childEntry?.workspace.transcriptOnly !== true) {
+        return true;
+      }
+      const canonicalExecution = await this.getCanonicalAgentExecutionForWorkspace(
+        childWorkspaceId,
+        childEntry,
+        config
+      );
+      if (
+        canonicalExecution == null ||
+        !["completed", "interrupted", "error"].includes(canonicalExecution.status)
+      ) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private getTaskDepth(
@@ -13939,7 +13971,11 @@ export class TaskService {
 
   private async canCleanupReportedTask(
     workspaceId: string
-  ): Promise<{ ok: true; parentWorkspaceId: string } | { ok: false; reason: string }> {
+  ): Promise<
+    | { ok: true; cleanup: "legacy-remove"; parentWorkspaceId: string }
+    | { ok: true; cleanup: "retire-to-transcript"; parentWorkspaceId: string }
+    | { ok: false; reason: string }
+  > {
     assert(workspaceId.length > 0, "canCleanupReportedTask: workspaceId must be non-empty");
 
     const config = this.config.loadConfigOrDefault();
@@ -13983,12 +14019,11 @@ export class TaskService {
       return { ok: false, reason: "still_streaming" };
     }
 
-    // Topology gate: a completed task can only be cleaned up when it is a structural leaf
-    // (has no child agent tasks in config). This stays status-agnostic so ancestor deletion
-    // never orphans descendants that have not been pruned yet.
+    // Transcript-only canonical children retain their config/sidebar node and direct session, but
+    // they no longer own an execution resource that should block their parent's retirement.
     const index = this.buildAgentTaskIndex(config);
     const isWorkflowOwnedTask = this.isWorkflowOwnedTaskUsingIndex(index, workspaceId);
-    if (this.hasChildAgentTasks(index, workspaceId)) {
+    if (await this.hasBlockingChildAgentTasks(index, config, workspaceId)) {
       return { ok: false, reason: "has_child_tasks" };
     }
 
@@ -14000,6 +14035,28 @@ export class TaskService {
         parentWorkspaceId,
       });
       return { ok: false, reason: "patch_pending" };
+    }
+
+    const hasCanonicalExecutionId = isExecutionId(entry.workspace.executionId);
+    const canonicalExecution = await this.getCanonicalAgentExecutionForWorkspace(
+      workspaceId,
+      entry,
+      config
+    );
+    if (hasCanonicalExecutionId) {
+      if (canonicalExecution == null) {
+        return { ok: false, reason: "canonical_execution_not_found" };
+      }
+      if (
+        canonicalExecution.status !== "completed" ||
+        canonicalExecution.result?.kind !== "completed"
+      ) {
+        return { ok: false, reason: "canonical_execution_not_completed" };
+      }
+      if (canonicalExecution.retentionPolicy.kind === "retain_workspace") {
+        return { ok: false, reason: "canonical_workspace_retained" };
+      }
+      return { ok: true, cleanup: "retire-to-transcript", parentWorkspaceId };
     }
 
     // Workflow task results are persisted in the workflow run/report artifacts before cleanup,
@@ -14014,7 +14071,7 @@ export class TaskService {
       return { ok: false, reason: "preserved_until_archive" };
     }
 
-    return { ok: true, parentWorkspaceId };
+    return { ok: true, cleanup: "legacy-remove", parentWorkspaceId };
   }
 
   private async cleanupReportedLeafTask(workspaceId: string): Promise<void> {
@@ -14036,6 +14093,24 @@ export class TaskService {
 
       const cleanupEligibility = await this.canCleanupReportedTask(currentWorkspaceId);
       if (!cleanupEligibility.ok) {
+        return;
+      }
+
+      if (cleanupEligibility.cleanup === "retire-to-transcript") {
+        const retireResult = await this.workspaceService.retireToTranscript(currentWorkspaceId);
+        if (!retireResult.success) {
+          log.error("Failed to retire completed canonical task workspace to transcript", {
+            workspaceId: currentWorkspaceId,
+            error: retireResult.error,
+          });
+        } else if (retireResult.data.kind !== "transcript-only") {
+          log.debug("Canonical task workspace retirement preserved the archived workspace", {
+            workspaceId: currentWorkspaceId,
+            result: retireResult.data,
+          });
+        }
+        // Canonical workspaces retain their config/sidebar node and direct session. Never continue
+        // the legacy parent-deletion cascade after attempting the bounded retirement.
         return;
       }
 

@@ -407,6 +407,7 @@ function createWorkspaceServiceMocks(
     waitForIdle: ReturnType<typeof mock>;
     waitForPendingStreamErrorRecoveryDecision: ReturnType<typeof mock>;
     archive: ReturnType<typeof mock>;
+    retireToTranscript: ReturnType<typeof mock>;
     deleteWorktree: ReturnType<typeof mock>;
     remove: ReturnType<typeof mock>;
     emit: ReturnType<typeof mock>;
@@ -441,6 +442,7 @@ function createWorkspaceServiceMocks(
   hasPendingAutoRetry: ReturnType<typeof mock>;
   waitForPendingStreamErrorRecoveryDecision: ReturnType<typeof mock>;
   archive: ReturnType<typeof mock>;
+  retireToTranscript: ReturnType<typeof mock>;
   deleteWorktree: ReturnType<typeof mock>;
   remove: ReturnType<typeof mock>;
   emit: ReturnType<typeof mock>;
@@ -483,6 +485,13 @@ function createWorkspaceServiceMocks(
   const archive =
     overrides?.archive ??
     mock((): Promise<Result<{ kind: "archived" }>> => Promise.resolve(Ok({ kind: "archived" })));
+  const retireToTranscript =
+    overrides?.retireToTranscript ??
+    mock(() =>
+      Promise.resolve(
+        Ok({ kind: "transcript-only" as const, cleanup: "worktree-deleted" as const })
+      )
+    );
   const deleteWorktree =
     overrides?.deleteWorktree ?? mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
   const remove =
@@ -541,6 +550,7 @@ function createWorkspaceServiceMocks(
       waitForIdle,
       waitForPendingStreamErrorRecoveryDecision,
       archive,
+      retireToTranscript,
       deleteWorktree,
       remove,
       emit,
@@ -571,6 +581,7 @@ function createWorkspaceServiceMocks(
     waitForIdle,
     waitForPendingStreamErrorRecoveryDecision,
     archive,
+    retireToTranscript,
     deleteWorktree,
     remove,
     emit,
@@ -24524,6 +24535,231 @@ describe("TaskService", () => {
     expect(remainingWorkspaceIds).toEqual(new Set([rootWorkspaceId]));
   });
 
+  describe("canonical reported task cleanup", () => {
+    type CleanupInternals = {
+      canCleanupReportedTask: (workspaceId: string) => Promise<
+        | {
+            ok: true;
+            cleanup: "legacy-remove" | "retire-to-transcript";
+            parentWorkspaceId: string;
+          }
+        | { ok: false; reason: string }
+      >;
+      cleanupReportedLeafTask: (workspaceId: string) => Promise<void>;
+    };
+
+    async function setupCanonicalCleanup(options?: {
+      retentionPolicy?: "delete_workspace_on_completion" | "retain_workspace";
+      nested?: boolean;
+      retireToTranscript?: ReturnType<typeof mock>;
+    }) {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      const rootWorkspaceId = "root-canonical-cleanup";
+      const parentTaskId = "parent-canonical-cleanup";
+      const childTaskId = options?.nested ? "child-canonical-cleanup" : parentTaskId;
+      const parentExecutionId = "exe_parent-canonical-cleanup" as const;
+      const childExecutionId = options?.nested
+        ? ("exe_child-canonical-cleanup" as const)
+        : parentExecutionId;
+      const completedAt = "2026-08-06T12:00:00.000Z";
+
+      const workspaces = [projectWorkspace(projectPath, "root", rootWorkspaceId)];
+      workspaces.push(
+        projectWorkspace(projectPath, "parent-task", parentTaskId, {
+          parentWorkspaceId: rootWorkspaceId,
+          agentType: "exec",
+          taskStatus: "reported",
+          reportedAt: completedAt,
+          executionId: parentExecutionId,
+        })
+      );
+      if (options?.nested) {
+        workspaces.push(
+          projectWorkspace(projectPath, "child-task", childTaskId, {
+            parentWorkspaceId: parentTaskId,
+            agentType: "explore",
+            taskStatus: "reported",
+            reportedAt: completedAt,
+            executionId: childExecutionId,
+          })
+        );
+      }
+      await saveWorkspaces(config, projectPath, workspaces, {
+        taskSettings: {
+          ...testTaskSettings(3, 5),
+          preserveSubagentsUntilArchive: false,
+        },
+      });
+
+      const executionStore = new ExecutionStore(config);
+      await executionStore.upsert({
+        version: 1,
+        executionId: parentExecutionId,
+        aliases: [parentTaskId],
+        ownerSessionId: rootWorkspaceId,
+        requesterWorkspaceId: rootWorkspaceId,
+        target: { kind: "workspace", workspaceId: parentTaskId, origin: "created" },
+        launchPolicy: { kind: "agent_task", agentId: "exec" },
+        completionPolicy: { kind: "final_assistant_message" },
+        retentionPolicy: {
+          kind: options?.retentionPolicy ?? "delete_workspace_on_completion",
+        },
+        attentionPolicy: "blocking_until_terminal",
+        status: "completed",
+        result: { kind: "completed", reportMarkdown: "Parent complete" },
+        createdAt: completedAt,
+        updatedAt: completedAt,
+        startedAt: completedAt,
+        terminalAt: completedAt,
+      });
+      if (options?.nested) {
+        await executionStore.upsert({
+          version: 1,
+          executionId: childExecutionId,
+          aliases: [childTaskId],
+          parentExecutionId,
+          ownerSessionId: rootWorkspaceId,
+          requesterWorkspaceId: parentTaskId,
+          target: { kind: "workspace", workspaceId: childTaskId, origin: "created" },
+          launchPolicy: { kind: "agent_task", agentId: "explore" },
+          completionPolicy: { kind: "final_assistant_message" },
+          retentionPolicy: {
+            kind: options.retentionPolicy ?? "delete_workspace_on_completion",
+          },
+          attentionPolicy: "blocking_until_terminal",
+          status: "completed",
+          result: { kind: "completed", reportMarkdown: "Child complete" },
+          createdAt: completedAt,
+          updatedAt: completedAt,
+          startedAt: completedAt,
+          terminalAt: completedAt,
+        });
+      }
+
+      const retireToTranscript =
+        options?.retireToTranscript ??
+        mock(async (workspaceId: string) => {
+          await config.editConfig((cfg) => {
+            const workspace = Array.from(cfg.projects.values())
+              .flatMap((project) => project.workspaces)
+              .find((entry) => entry.id === workspaceId);
+            assert(workspace, "canonical cleanup workspace must exist");
+            workspace.transcriptOnly = true;
+            workspace.archivedAt = completedAt;
+            return cfg;
+          });
+          return Ok({ kind: "transcript-only" as const, cleanup: "worktree-deleted" as const });
+        });
+      const remove = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+      const { workspaceService } = createWorkspaceServiceMocks({ retireToTranscript, remove });
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+      return {
+        config,
+        taskService,
+        internal: taskService as unknown as CleanupInternals,
+        retireToTranscript,
+        remove,
+        rootWorkspaceId,
+        parentTaskId,
+        childTaskId,
+        parentExecutionId,
+        childExecutionId,
+      };
+    }
+
+    test("delete-on-completion retires a canonical workspace without removing its config entry", async () => {
+      const { config, internal, retireToTranscript, remove, childTaskId, rootWorkspaceId } =
+        await setupCanonicalCleanup();
+
+      expect(await internal.canCleanupReportedTask(childTaskId)).toEqual({
+        ok: true,
+        cleanup: "retire-to-transcript",
+        parentWorkspaceId: rootWorkspaceId,
+      });
+      await internal.cleanupReportedLeafTask(childTaskId);
+
+      expect(retireToTranscript).toHaveBeenCalledWith(childTaskId);
+      expect(remove).not.toHaveBeenCalled();
+      expect(findWorkspaceInConfig(config, childTaskId)?.transcriptOnly).toBe(true);
+    });
+
+    test("retain_workspace leaves a completed canonical workspace untouched", async () => {
+      const { internal, retireToTranscript, remove, childTaskId } = await setupCanonicalCleanup({
+        retentionPolicy: "retain_workspace",
+      });
+
+      expect(await internal.canCleanupReportedTask(childTaskId)).toEqual({
+        ok: false,
+        reason: "canonical_workspace_retained",
+      });
+      await internal.cleanupReportedLeafTask(childTaskId);
+
+      expect(retireToTranscript).not.toHaveBeenCalled();
+      expect(remove).not.toHaveBeenCalled();
+    });
+
+    test("incomplete canonical retirement never falls back to legacy removal", async () => {
+      const retireToTranscript = mock()
+        .mockResolvedValueOnce(
+          Ok({
+            kind: "archived-only" as const,
+            cleanup: "unsupported" as const,
+            runtimeType: "local",
+          })
+        )
+        .mockResolvedValueOnce(Err("retirement failed"));
+      const { internal, remove, childTaskId } = await setupCanonicalCleanup({
+        retireToTranscript,
+      });
+
+      await internal.cleanupReportedLeafTask(childTaskId);
+      await internal.cleanupReportedLeafTask(childTaskId);
+
+      expect(retireToTranscript.mock.calls).toEqual([[childTaskId], [childTaskId]]);
+      expect(remove).not.toHaveBeenCalled();
+    });
+
+    test("transcript-only terminal children do not block their canonical parent or get recursively cleaned", async () => {
+      const {
+        config,
+        taskService,
+        internal,
+        retireToTranscript,
+        remove,
+        rootWorkspaceId,
+        parentTaskId,
+        childTaskId,
+        childExecutionId,
+      } = await setupCanonicalCleanup({ nested: true });
+
+      await internal.cleanupReportedLeafTask(childTaskId);
+
+      expect(retireToTranscript.mock.calls).toEqual([[childTaskId]]);
+      expect(remove).not.toHaveBeenCalled();
+      expect(findWorkspaceInConfig(config, childTaskId)?.transcriptOnly).toBe(true);
+      expect(findWorkspaceInConfig(config, parentTaskId)?.transcriptOnly).toBeUndefined();
+      expect(await internal.canCleanupReportedTask(parentTaskId)).toEqual({
+        ok: true,
+        cleanup: "retire-to-transcript",
+        parentWorkspaceId: rootWorkspaceId,
+      });
+
+      expect(
+        await taskService.sendMessageToDescendantAgentTask(
+          rootWorkspaceId,
+          childExecutionId,
+          "More guidance",
+          "tool-end"
+        )
+      ).toMatchObject({ success: false, error: { code: "not_active" } });
+      expect(
+        await taskService.terminateDescendantAgentTask(rootWorkspaceId, childExecutionId)
+      ).toEqual(Err("Task transcript is retained and cannot be directly terminated"));
+    });
+  });
+
   describe("preserve subagents until archive", () => {
     interface ReportedTaskNode {
       id: string;
@@ -24537,7 +24773,11 @@ describe("TaskService", () => {
     }
 
     type TaskCleanupEligibility =
-      | { ok: true; parentWorkspaceId: string }
+      | {
+          ok: true;
+          cleanup: "legacy-remove" | "retire-to-transcript";
+          parentWorkspaceId: string;
+        }
       | { ok: false; reason: string };
 
     interface TaskServiceCleanupInternals {
@@ -24775,6 +25015,7 @@ describe("TaskService", () => {
 
       expect(await internal.canCleanupReportedTask(childTaskId)).toEqual({
         ok: true,
+        cleanup: "legacy-remove",
         parentWorkspaceId: workflowTaskId,
       });
       expect(taskService.hasPreservedCompletedDescendants(rootWorkspaceId)).toBe(false);
@@ -24836,7 +25077,11 @@ describe("TaskService", () => {
       await archiveWorkspaceInTestConfig(config, grandparentTaskId);
 
       const cleanupEligibility = await internal.canCleanupReportedTask(childTaskId);
-      expect(cleanupEligibility).toEqual({ ok: true, parentWorkspaceId: parentTaskId });
+      expect(cleanupEligibility).toEqual({
+        ok: true,
+        cleanup: "legacy-remove",
+        parentWorkspaceId: parentTaskId,
+      });
 
       await internal.cleanupReportedLeafTask(childTaskId);
 
