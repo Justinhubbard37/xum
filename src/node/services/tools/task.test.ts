@@ -345,7 +345,7 @@ describe("task tool", () => {
       taskService,
     });
 
-    const result = await taskTool.execute!(
+    const result: unknown = await taskTool.execute!(
       {
         prompt: "create a report",
         title: "Report",
@@ -1029,7 +1029,7 @@ describe("task tool", () => {
     const taskService = { create, waitForAgentReport } as unknown as TaskService;
     const tool = createTaskTool({ ...baseConfig, taskService });
 
-    const result = await tool.execute!(
+    const result: unknown = await tool.execute!(
       {
         subagent_type: "explore",
         prompt: "compare two approaches",
@@ -1121,7 +1121,7 @@ describe("task tool", () => {
       taskService,
     });
 
-    const result = await tool.execute!(
+    const result: unknown = await tool.execute!(
       {
         subagent_type: "explore",
         prompt: "do it",

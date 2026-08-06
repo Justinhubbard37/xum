@@ -874,6 +874,51 @@ describe("TaskService", () => {
       reportMarkdown: "Canonical final assistant text",
       structuredOutput: { claims: ["durable"] },
     });
+    expect(
+      await taskService.getScopedAgentExecutionSnapshot(parentId, created.data.workspaceId)
+    ).toMatchObject({
+      kind: "ok",
+      source: "canonical",
+      workspaceId: created.data.workspaceId,
+      handle: {
+        executionId: created.data.taskId,
+        status: "completed",
+        result: { kind: "completed", reportMarkdown: "Canonical final assistant text" },
+      },
+    });
+    expect(
+      await taskService.waitForScopedAgentExecutionTerminal(parentId, created.data.taskId, {
+        timeoutMs: 0,
+      })
+    ).toMatchObject({
+      kind: "terminal",
+      handle: {
+        executionId: created.data.taskId,
+        status: "completed",
+      },
+    });
+
+    // A fresh service instance must resolve both the opaque ID and workspace alias from disk.
+    const restartedTaskService = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    }).taskService;
+    expect(
+      await restartedTaskService.getScopedAgentExecutionSnapshot(parentId, created.data.taskId)
+    ).toMatchObject({
+      kind: "ok",
+      source: "canonical",
+      handle: { status: "completed" },
+    });
+    expect(
+      await restartedTaskService.waitForScopedAgentExecutionTerminal(
+        parentId,
+        created.data.workspaceId,
+        { timeoutMs: 0 }
+      )
+    ).toMatchObject({
+      kind: "terminal",
+      handle: { executionId: created.data.taskId, status: "completed" },
+    });
 
     const parentHistory = await collectFullHistory(historyService, parentId);
     expect(parentHistory).toEqual([]);
@@ -939,12 +984,15 @@ describe("TaskService", () => {
     );
     expect(workspaceMocks.sendMessage).not.toHaveBeenCalled();
     expect(await collectFullHistory(historyService, parentId)).toEqual([]);
-    await expect(
-      taskService.waitForAgentReport(created.data.taskId, {
+    const waitError = await taskService
+      .waitForAgentReport(created.data.taskId, {
         timeoutMs: 100,
         requestingWorkspaceId: parentId,
       })
-    ).rejects.toThrow("Required property is missing");
+      .catch((error: unknown) => error);
+    expect(waitError).toBeInstanceOf(Error);
+    if (!(waitError instanceof Error)) throw new Error("Expected canonical wait to reject");
+    expect(waitError.message).toContain("Required property is missing");
   });
 
   test("canonical missing final assistant text settles as an error without reprompting", async () => {

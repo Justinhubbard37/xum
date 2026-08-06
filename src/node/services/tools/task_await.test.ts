@@ -9,6 +9,7 @@ import {
   COMPLETED_REPORT_REFETCH_NOTE,
   buildCompletedTaskResultNote,
 } from "@/common/utils/tools/toolDefinitions";
+import type { ExecutionHandle } from "@/common/types/execution";
 import type { WorkflowRunRecord, WorkflowRunStatus } from "@/common/types/workflow";
 import { createTaskAwaitTool } from "./task_await";
 import { TestTempDir, createTestToolConfig } from "./testHelpers";
@@ -41,6 +42,33 @@ function createWorkflowRun(
     updatedAt: "2026-01-01T00:00:05.000Z",
     events,
     steps: [],
+  };
+}
+
+function canonicalAgentHandle(
+  executionId: `exe_${string}`,
+  workspaceId: string,
+  status: ExecutionHandle["status"],
+  result?: ExecutionHandle["result"]
+): ExecutionHandle {
+  return {
+    version: 1,
+    executionId,
+    aliases: [workspaceId],
+    ownerSessionId: "parent-workspace",
+    requesterWorkspaceId: "parent-workspace",
+    target: { kind: "workspace", workspaceId, origin: "created" },
+    launchPolicy: { kind: "agent_task", agentId: "exec", title: `title:${workspaceId}` },
+    completionPolicy: { kind: "final_assistant_message" },
+    retentionPolicy: { kind: "delete_workspace_on_completion" },
+    attentionPolicy: "blocking_until_terminal",
+    status,
+    ...(result != null ? { result } : {}),
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:01.000Z",
+    ...(status === "completed" || status === "interrupted" || status === "error"
+      ? { terminalAt: "2026-01-01T00:00:01.000Z" }
+      : {}),
   };
 }
 
@@ -540,6 +568,212 @@ describe("task_await tool", () => {
       }),
     ]);
   });
+  it("maps canonical registry terminal results for execution ids and aliases", async () => {
+    using tempDir = new TestTempDir("test-task-await-canonical-terminal-results");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    const handles = new Map<string, ExecutionHandle>([
+      [
+        "exe_completed",
+        canonicalAgentHandle("exe_completed", "completed-alias", "completed", {
+          kind: "completed",
+          reportMarkdown: "canonical report",
+          structuredOutput: { durable: true },
+        }),
+      ],
+      [
+        "error-alias",
+        canonicalAgentHandle("exe_error", "error-alias", "error", {
+          kind: "error",
+          error: "canonical failure",
+          errorType: "provider_error",
+        }),
+      ],
+      [
+        "exe_interrupted",
+        canonicalAgentHandle("exe_interrupted", "interrupted-alias", "interrupted", {
+          kind: "interrupted",
+          message: "stopped by user",
+        }),
+      ],
+    ]);
+    const waitForAgentReport = mock(() => {
+      throw new Error("legacy report fallback must not run for canonical executions");
+    });
+    const taskService = {
+      listActiveDescendantAgentTaskIds: mock(() => []),
+      filterDescendantAgentTaskIds: mock((_workspaceId: string, taskIds: string[]) =>
+        Promise.resolve(taskIds)
+      ),
+      isWorkflowOwnedDescendantAgentTask: mock(() => Promise.resolve(false)),
+      getScopedAgentExecutionSnapshot: mock((_workspaceId: string, taskId: string) => {
+        const handle = handles.get(taskId);
+        return Promise.resolve(
+          handle == null
+            ? ({ kind: "not_found" } as const)
+            : ({
+                kind: "ok",
+                handle,
+                workspaceId: handle.target.workspaceId,
+                source: "canonical",
+              } as const)
+        );
+      }),
+      waitForAgentReport,
+    } as unknown as TaskService;
+
+    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const result = (await Promise.resolve(
+      tool.execute!(
+        {
+          task_ids: ["exe_completed", "error-alias", "exe_interrupted"],
+          timeout_secs: 0,
+        },
+        mockToolCallOptions
+      )
+    )) as { results: Array<Record<string, unknown>> };
+
+    expect(result.results).toEqual([
+      {
+        status: "completed",
+        taskId: "exe_completed",
+        reportMarkdown: "canonical report",
+        structuredOutput: { durable: true },
+        title: "title:completed-alias",
+        elapsed_ms: 1000,
+        note: COMPLETED_REPORT_REFETCH_NOTE,
+      },
+      {
+        status: "error",
+        taskId: "error-alias",
+        error: "canonical failure",
+        elapsed_ms: 1000,
+      },
+      {
+        status: "interrupted",
+        taskId: "exe_interrupted",
+        elapsed_ms: 1000,
+        note: "stopped by user",
+      },
+    ]);
+    expect(waitForAgentReport).not.toHaveBeenCalled();
+  });
+
+  it("waits through the canonical execution adapter and returns active timeout snapshots", async () => {
+    using tempDir = new TestTempDir("test-task-await-canonical-wait");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    const running = canonicalAgentHandle("exe_running", "running-alias", "running");
+    const completed = canonicalAgentHandle("exe_running", "running-alias", "completed", {
+      kind: "completed",
+      reportMarkdown: "settled canonically",
+    });
+    const getScopedAgentExecutionSnapshot = mock(() =>
+      Promise.resolve({
+        kind: "ok" as const,
+        handle: running,
+        workspaceId: "running-alias",
+        source: "canonical" as const,
+      })
+    );
+    const waitForScopedAgentExecutionTerminal = mock(() =>
+      Promise.resolve({ kind: "terminal" as const, handle: completed })
+    );
+    const taskService = {
+      listActiveDescendantAgentTaskIds: mock(() => []),
+      filterDescendantAgentTaskIds: mock((_workspaceId: string, taskIds: string[]) =>
+        Promise.resolve(taskIds)
+      ),
+      isWorkflowOwnedDescendantAgentTask: mock(() => Promise.resolve(false)),
+      getScopedAgentExecutionSnapshot,
+      waitForScopedAgentExecutionTerminal,
+      waitForAgentReport: mock(() => {
+        throw new Error("legacy report fallback must not run");
+      }),
+    } as unknown as TaskService;
+    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+
+    const completedResult: unknown = await Promise.resolve(
+      tool.execute!({ task_ids: ["running-alias"], timeout_secs: 1 }, mockToolCallOptions)
+    );
+    expect(completedResult).toEqual({
+      results: [
+        {
+          status: "completed",
+          taskId: "running-alias",
+          reportMarkdown: "settled canonically",
+          title: "title:running-alias",
+          elapsed_ms: 1000,
+          note: COMPLETED_REPORT_REFETCH_NOTE,
+        },
+      ],
+    });
+    expect(waitForScopedAgentExecutionTerminal).toHaveBeenCalledWith(
+      "parent-workspace",
+      "running-alias",
+      expect.objectContaining({ timeoutMs: 1000, backgroundOnMessageQueued: true })
+    );
+
+    const nowSpy = spyOn(Date, "now").mockReturnValue(Date.parse("2026-01-01T00:00:02.000Z"));
+    try {
+      const activeResult: unknown = await Promise.resolve(
+        tool.execute!({ task_ids: ["running-alias"], timeout_secs: 0 }, mockToolCallOptions)
+      );
+      expect(activeResult).toEqual({
+        results: [{ status: "running", taskId: "running-alias", elapsed_ms: 2000 }],
+      });
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it("keeps adapted legacy executions on the report artifact fallback", async () => {
+    using tempDir = new TestTempDir("test-task-await-adapted-legacy-fallback");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    const legacy = canonicalAgentHandle(
+      "exe_legacy_agent_task_deadbeef",
+      "legacy-child",
+      "completed",
+      {
+        kind: "completed",
+        reportMarkdown: "adapted snapshot",
+      }
+    );
+    const waitForAgentReport = mock(() => Promise.resolve({ reportMarkdown: "legacy artifact" }));
+    const taskService = {
+      listActiveDescendantAgentTaskIds: mock(() => []),
+      filterDescendantAgentTaskIds: mock((_workspaceId: string, taskIds: string[]) =>
+        Promise.resolve(taskIds)
+      ),
+      isWorkflowOwnedDescendantAgentTask: mock(() => Promise.resolve(false)),
+      getScopedAgentExecutionSnapshot: mock(() =>
+        Promise.resolve({
+          kind: "ok" as const,
+          handle: legacy,
+          workspaceId: "legacy-child",
+          source: "legacy" as const,
+        })
+      ),
+      getAgentTaskStatus: mock(() => "reported" as const),
+      waitForAgentReport,
+    } as unknown as TaskService;
+    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+
+    const result: unknown = await Promise.resolve(
+      tool.execute!({ task_ids: ["legacy-child"], timeout_secs: 0 }, mockToolCallOptions)
+    );
+    expect(result).toEqual({
+      results: [
+        {
+          status: "completed",
+          taskId: "legacy-child",
+          reportMarkdown: "legacy artifact",
+          title: undefined,
+          note: COMPLETED_REPORT_REFETCH_NOTE,
+        },
+      ],
+    });
+    expect(waitForAgentReport).toHaveBeenCalledTimes(1);
+  });
+
   it("returns completed results for all awaited tasks", async () => {
     using tempDir = new TestTempDir("test-task-await-tool");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });

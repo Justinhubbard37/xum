@@ -10,6 +10,7 @@ import {
   TOOL_DEFINITIONS,
 } from "@/common/utils/tools/toolDefinitions";
 import { canRetryWorkflowFromCheckpoint } from "@/common/utils/workflowRetryEligibility";
+import type { ExecutionHandle } from "@/common/types/execution";
 import type { ForegroundWaitInterruption } from "@/common/types/foregroundWaitInterruption";
 import {
   isActiveWorkflowRunStatus,
@@ -96,6 +97,30 @@ function getAgentTaskElapsedMs(
 
 function withElapsedMs(elapsedMs: number | undefined): { elapsed_ms?: number } {
   return elapsedMs == null ? {} : { elapsed_ms: elapsedMs };
+}
+
+function getExecutionElapsedMs(handle: ExecutionHandle): number | undefined {
+  const createdAtMs = parseTimestampMs(handle.createdAt);
+  if (createdAtMs == null) return undefined;
+  const endAtMs = parseTimestampMs(handle.terminalAt) ?? Date.now();
+  return Math.max(0, endAtMs - createdAtMs);
+}
+
+function buildCanonicalAgentActiveResult(taskId: string, handle: ExecutionHandle) {
+  const status = handle.phase === "awaiting_report" ? handle.phase : handle.status;
+  if (
+    status !== "queued" &&
+    status !== "starting" &&
+    status !== "running" &&
+    status !== "awaiting_report"
+  ) {
+    throw new Error(`Expected active canonical execution, received '${handle.status}'`);
+  }
+  return {
+    status,
+    taskId,
+    ...withElapsedMs(getExecutionElapsedMs(handle)),
+  };
 }
 
 function buildTaskAwaitSequencingError(taskId: string, suggestedTaskIds: string[]) {
@@ -261,10 +286,14 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
       const requestedIds: string[] | null =
         args.task_ids && args.task_ids.length > 0 ? args.task_ids : null;
 
-      const activeDescendantAgentTaskIds = taskService.listActiveDescendantAgentTaskIds(
-        workspaceId,
-        { excludeWorkflowTasks: true }
-      );
+      const activeDescendantAgentTaskIds =
+        typeof taskService.listActiveDescendantAgentExecutionIds === "function"
+          ? await taskService.listActiveDescendantAgentExecutionIds(workspaceId, {
+              excludeWorkflowTasks: true,
+            })
+          : taskService.listActiveDescendantAgentTaskIds(workspaceId, {
+              excludeWorkflowTasks: true,
+            });
       const isWorkflowOwnedDescendantAgentTask = async (taskId: string): Promise<boolean> =>
         (await taskService.isWorkflowOwnedDescendantAgentTask?.(workspaceId, taskId)) ?? false;
 
@@ -364,6 +393,55 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
       const readGitFormatPatchArtifact = async (childTaskId: string) => {
         if (!config.workspaceSessionDir) return null;
         return await readSubagentGitPatchArtifact(config.workspaceSessionDir, childTaskId);
+      };
+
+      const buildCanonicalAgentTerminalResult = async (taskId: string, handle: ExecutionHandle) => {
+        const result = handle.result;
+        if (result == null) {
+          return {
+            status: "error" as const,
+            taskId,
+            error: `Terminal execution '${handle.executionId}' is missing its result.`,
+          };
+        }
+        if (result.kind === "error") {
+          return {
+            status: "error" as const,
+            taskId,
+            error: result.error,
+            ...withElapsedMs(getExecutionElapsedMs(handle)),
+          };
+        }
+        if (result.kind === "interrupted") {
+          return {
+            status: "interrupted" as const,
+            taskId,
+            ...withElapsedMs(getExecutionElapsedMs(handle)),
+            note: result.message ?? "Task was interrupted.",
+          };
+        }
+
+        const gitFormatPatch = await readGitFormatPatchArtifact(handle.target.workspaceId);
+        const artifacts =
+          result.artifacts == null && gitFormatPatch == null
+            ? undefined
+            : {
+                ...result.artifacts,
+                ...(gitFormatPatch != null ? { gitFormatPatch } : {}),
+              };
+        return {
+          status: "completed" as const,
+          taskId,
+          reportMarkdown: result.reportMarkdown,
+          ...(result.structuredOutput !== undefined
+            ? { structuredOutput: result.structuredOutput }
+            : {}),
+          ...(handle.launchPolicy.title != null ? { title: handle.launchPolicy.title } : {}),
+          ...(result.finalMessageRef != null ? { finalMessageRef: result.finalMessageRef } : {}),
+          ...withElapsedMs(getExecutionElapsedMs(handle)),
+          ...(artifacts != null ? { artifacts } : {}),
+          note: buildCompletedTaskResultNote((artifacts?.attachFiles?.length ?? 0) > 0),
+        };
       };
 
       // Agent task records currently store creation/report timestamps, but not a separate
@@ -577,7 +655,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
             messageId: record.messageId,
             finalMessageRef: record.finalMessageRef,
             artifacts: record.artifacts,
-            note: buildCompletedTaskResultNote((record.artifacts?.attachFiles.length ?? 0) > 0),
+            note: buildCompletedTaskResultNote((record.artifacts?.attachFiles?.length ?? 0) > 0),
           });
           if (timeoutMs === 0 || !isWorkspaceTurnActiveStatus(snapshot.status)) {
             if (snapshot.status === "completed") {
@@ -630,7 +708,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
               messageId: report.messageId,
               finalMessageRef: report.finalMessageRef,
               artifacts: report.artifacts,
-              note: buildCompletedTaskResultNote((report.artifacts?.attachFiles.length ?? 0) > 0),
+              note: buildCompletedTaskResultNote((report.artifacts?.attachFiles?.length ?? 0) > 0),
             };
           } catch (error: unknown) {
             const message = getErrorMessage(error);
@@ -771,6 +849,92 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
             return { status: "not_found" as const, taskId, activeTaskIds };
           }
           return { status: "invalid_scope" as const, taskId, activeTaskIds };
+        }
+
+        if (typeof taskService.getScopedAgentExecutionSnapshot === "function") {
+          const execution = await taskService.getScopedAgentExecutionSnapshot(workspaceId, taskId);
+          if (execution.kind === "not_found") {
+            return { status: "not_found" as const, taskId };
+          }
+          if (execution.kind === "invalid_scope") {
+            return { status: "invalid_scope" as const, taskId };
+          }
+          if (execution.source === "canonical") {
+            if (
+              execution.handle.status === "completed" ||
+              execution.handle.status === "interrupted" ||
+              execution.handle.status === "error"
+            ) {
+              return await buildCanonicalAgentTerminalResult(taskId, execution.handle);
+            }
+            if (timeoutMs === 0) {
+              return buildCanonicalAgentActiveResult(taskId, execution.handle);
+            }
+
+            if (typeof taskService.waitForScopedAgentExecutionTerminal !== "function") {
+              return {
+                status: "error" as const,
+                taskId,
+                error: "Canonical execution wait adapter is unavailable.",
+              };
+            }
+            try {
+              const outcome = await taskService.waitForScopedAgentExecutionTerminal(
+                workspaceId,
+                taskId,
+                {
+                  timeoutMs: timeoutMs ?? DEFAULT_TASK_AWAIT_TIMEOUT_MS,
+                  abortSignal: taskSignal,
+                  backgroundOnMessageQueued: true,
+                }
+              );
+              if (outcome.kind === "terminal") {
+                return await buildCanonicalAgentTerminalResult(taskId, outcome.handle);
+              }
+              if (outcome.kind === "timeout") {
+                return buildCanonicalAgentActiveResult(taskId, outcome.snapshot);
+              }
+              if (outcome.kind === "aborted") {
+                if (abortSignal?.aborted) {
+                  return { status: "error" as const, taskId, error: "Interrupted" };
+                }
+                return buildCanonicalAgentActiveResult(taskId, outcome.snapshot);
+              }
+              if (outcome.kind === "not_found") {
+                return { status: "not_found" as const, taskId };
+              }
+              if (outcome.kind === "invalid_scope") {
+                return { status: "invalid_scope" as const, taskId };
+              }
+              // A canonical record cannot become legacy while waiting; surface a deterministic
+              // error instead of falling through to report artifacts under a different identity.
+              return {
+                status: "error" as const,
+                taskId,
+                error: "Canonical execution changed to a legacy adapter while waiting.",
+              };
+            } catch (error: unknown) {
+              if (error instanceof ForegroundWaitBackgroundedError) {
+                foregroundWaitInterruption ??= error.interruption;
+                const latest = await taskService.getScopedAgentExecutionSnapshot(
+                  workspaceId,
+                  taskId
+                );
+                if (latest.kind === "ok" && latest.source === "canonical") {
+                  if (
+                    latest.handle.status === "completed" ||
+                    latest.handle.status === "interrupted" ||
+                    latest.handle.status === "error"
+                  ) {
+                    return await buildCanonicalAgentTerminalResult(taskId, latest.handle);
+                  }
+                  return buildCanonicalAgentActiveResult(taskId, latest.handle);
+                }
+                return { status: "running" as const, taskId };
+              }
+              return { status: "error" as const, taskId, error: getErrorMessage(error) };
+            }
+          }
         }
 
         // When timeout_secs=0 (or rounds down to 0ms), task_await should be non-blocking.

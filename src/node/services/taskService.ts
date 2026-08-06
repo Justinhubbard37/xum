@@ -175,7 +175,7 @@ import type { StreamErrorType } from "@/common/types/errors";
 import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
-import { ExecutionRegistry } from "@/node/services/executionRegistry";
+import { ExecutionRegistry, type ExecutionWaitResult } from "@/node/services/executionRegistry";
 import { ExecutionStore } from "@/node/services/executionStore";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import {
@@ -1382,6 +1382,16 @@ type ScopedAgentExecutionResolution =
   | { kind: "not_found" }
   | { kind: "invalid_scope" };
 
+export type ScopedAgentExecutionSnapshot =
+  | { kind: "ok"; handle: ExecutionHandle; workspaceId: string; source: "canonical" | "legacy" }
+  | { kind: "not_found" }
+  | { kind: "invalid_scope" };
+
+export type ScopedAgentExecutionWaitResult =
+  | ExecutionWaitResult
+  | { kind: "legacy"; handle: ExecutionHandle; workspaceId: string }
+  | { kind: "invalid_scope" };
+
 interface TaskServiceExecutionDependencies {
   executionStore?: ExecutionStore;
   executionRegistry?: ExecutionRegistry;
@@ -2098,7 +2108,7 @@ export class TaskService {
       handle.executionId,
       params.result
     );
-    if (terminal == null || terminal.result == null) return false;
+    if (terminal?.result == null) return false;
 
     await this.editWorkspaceEntry(
       params.workspaceId,
@@ -2241,6 +2251,118 @@ export class TaskService {
       return { kind: "invalid_scope" };
     }
     return { kind: "not_found" };
+  }
+
+  /** Resolve an agent execution in requester scope and identify canonical registry records. */
+  async getScopedAgentExecutionSnapshot(
+    ancestorWorkspaceId: string,
+    executionIdOrAlias: string
+  ): Promise<ScopedAgentExecutionSnapshot> {
+    const resolved = await this.resolveScopedAgentExecution(
+      ancestorWorkspaceId,
+      executionIdOrAlias
+    );
+    if (resolved.kind !== "ok") return resolved;
+
+    const canonical = await this.executionStore.get(
+      resolved.handle.ownerSessionId,
+      resolved.handle.executionId
+    );
+    return {
+      kind: "ok",
+      handle: canonical ?? resolved.handle,
+      workspaceId: resolved.workspaceId,
+      source: canonical == null ? "legacy" : "canonical",
+    };
+  }
+
+  /**
+   * Wait on the canonical execution registry while retaining task foreground/background semantics.
+   * Adapted legacy executions are returned to the caller so it can use the report/failure fallback.
+   */
+  async waitForScopedAgentExecutionTerminal(
+    ancestorWorkspaceId: string,
+    executionIdOrAlias: string,
+    options: {
+      timeoutMs?: number;
+      abortSignal?: AbortSignal;
+      backgroundOnMessageQueued?: boolean;
+    } = {}
+  ): Promise<ScopedAgentExecutionWaitResult> {
+    const resolved = await this.getScopedAgentExecutionSnapshot(
+      ancestorWorkspaceId,
+      executionIdOrAlias
+    );
+    if (resolved.kind !== "ok") return resolved;
+    if (resolved.source === "legacy") {
+      return { kind: "legacy", handle: resolved.handle, workspaceId: resolved.workspaceId };
+    }
+    if (
+      resolved.handle.status === "completed" ||
+      resolved.handle.status === "interrupted" ||
+      resolved.handle.status === "error"
+    ) {
+      return { kind: "terminal", handle: resolved.handle };
+    }
+
+    this.markTaskForegroundRelevant(resolved.workspaceId);
+    const waitController = new AbortController();
+    const forwardAbort = () => waitController.abort();
+    if (options.abortSignal?.aborted) {
+      waitController.abort();
+    } else {
+      options.abortSignal?.addEventListener("abort", forwardAbort, { once: true });
+    }
+
+    let stopBlockingRequester: (() => void) | null = this.startForegroundAwait(ancestorWorkspaceId);
+    let rejectBackground!: (error: Error) => void;
+    const backgrounded = new Promise<never>((_resolve, reject) => {
+      rejectBackground = reject;
+    });
+    let cleanedUp = false;
+    const shouldBackgroundOnQueuedMessage = options.backgroundOnMessageQueued ?? true;
+    const waiter: BackgroundableForegroundWaiter = {
+      taskId: resolved.workspaceId,
+      requestingWorkspaceId: ancestorWorkspaceId,
+      backgroundOnMessageQueued: shouldBackgroundOnQueuedMessage,
+      reject: (error) => {
+        rejectBackground(error);
+        waitController.abort();
+      },
+      cleanup: () => {
+        if (cleanedUp) return;
+        cleanedUp = true;
+        if (shouldBackgroundOnQueuedMessage) {
+          this.unregisterBackgroundableForegroundWaiter(ancestorWorkspaceId, waiter);
+        }
+        options.abortSignal?.removeEventListener("abort", forwardAbort);
+        if (stopBlockingRequester != null) {
+          stopBlockingRequester();
+          stopBlockingRequester = null;
+        }
+      },
+    };
+
+    if (shouldBackgroundOnQueuedMessage) {
+      this.registerBackgroundableForegroundWaiter(ancestorWorkspaceId, waiter);
+    }
+    this.backgroundForegroundWaitIfQueued(shouldBackgroundOnQueuedMessage, ancestorWorkspaceId);
+
+    try {
+      return await Promise.race([
+        this.executionRegistry.waitForTerminal(
+          resolved.handle.ownerSessionId,
+          resolved.handle.executionId,
+          {
+            ...(options.timeoutMs != null ? { timeoutMs: options.timeoutMs } : {}),
+            abortSignal: waitController.signal,
+          }
+        ),
+        backgrounded,
+      ]);
+    } finally {
+      waiter.cleanup();
+    }
   }
 
   setTimelineRecorder(recorder: TimelineRecorder): void {
