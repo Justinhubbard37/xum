@@ -24536,7 +24536,7 @@ describe("TaskService", () => {
   });
 
   describe("canonical reported task cleanup", () => {
-    type CleanupInternals = {
+    interface CleanupInternals {
       canCleanupReportedTask: (workspaceId: string) => Promise<
         | {
             ok: true;
@@ -24546,7 +24546,7 @@ describe("TaskService", () => {
         | { ok: false; reason: string }
       >;
       cleanupReportedLeafTask: (workspaceId: string) => Promise<void>;
-    };
+    }
 
     async function setupCanonicalCleanup(options?: {
       retentionPolicy?: "delete_workspace_on_completion" | "retain_workspace";
