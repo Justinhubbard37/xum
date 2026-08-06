@@ -1293,7 +1293,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
 
           projectChatCounter += 1;
           const projectName = input.projectPath.split(/[\\/]/).filter(Boolean).at(-1) ?? "Project";
-          const sessionId = `project-session_story-${projectChatCounter}`;
+          const sessionId = `project-session_${projectChatCounter.toString(16).padStart(10, "0")}`;
           const createdAt = "2026-08-06T00:00:00.000Z";
           const metadata: FrontendWorkspaceMetadata = {
             id: sessionId,

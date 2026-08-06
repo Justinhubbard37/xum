@@ -1,4 +1,5 @@
 import type { Config, ProjectConfig } from "@/node/config";
+import { isProjectSessionId } from "@/common/constants/projectChat";
 import type { ProjectChatInfo } from "@/common/types/project";
 import { formatSshEndpoint } from "@/common/utils/ssh/formatSshEndpoint";
 import { spawn } from "child_process";
@@ -1078,7 +1079,8 @@ export class ProjectService {
   }
 
   private async cleanupProjectChatSessions(sessionIds: readonly string[]): Promise<void> {
-    for (const sessionId of new Set(sessionIds.filter((id) => id.trim().length > 0))) {
+    // Never pass corrupt persisted IDs to recursive deletion: session IDs are directory names.
+    for (const sessionId of new Set(sessionIds.filter(isProjectSessionId))) {
       try {
         if (this.workspaceService?.cleanupProjectChatSession) {
           await this.workspaceService.cleanupProjectChatSession(sessionId);

@@ -4,7 +4,7 @@ import * as path from "path";
 import { Config } from "./config";
 import { HistoryService } from "./services/historyService";
 import { createMuxMessage } from "@/common/types/message";
-import { PROJECT_CHAT_SESSION_ID_PREFIX } from "@/common/constants/projectChat";
+import { PROJECT_CHAT_SESSION_ID_PREFIX, isProjectSessionId } from "@/common/constants/projectChat";
 import {
   CODER_ARCHIVE_BEHAVIORS,
   DEFAULT_CODER_ARCHIVE_BEHAVIOR,
@@ -95,6 +95,33 @@ describe("Config", () => {
       if (history.success) {
         expect(history.data.map((message) => message.id)).toEqual(["project-chat-message"]);
       }
+    });
+
+    it("rejects malformed project-session IDs before resolving filesystem paths", async () => {
+      const projectPath = path.join(tempDir, "repo");
+      const maliciousSessionId = "project-session_aaaaaaaaaa/../../../outside";
+      fs.mkdirSync(projectPath, { recursive: true });
+
+      expect(isProjectSessionId("project-session_0123456789")).toBe(true);
+      expect(isProjectSessionId(maliciousSessionId)).toBe(false);
+      expect(() => config.getSessionDir(maliciousSessionId)).toThrow(
+        "Invalid Project Chat session ID"
+      );
+
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [],
+          projectChat: {
+            version: 1,
+            sessionId: maliciousSessionId,
+            createdAt: "2026-08-06T00:00:00.000Z",
+            agentId: "orchestrator",
+          },
+        });
+        return cfg;
+      });
+
+      expect(new Config(tempDir).findProjectChatBySessionId(maliciousSessionId)).toBeNull();
     });
   });
 

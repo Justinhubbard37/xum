@@ -1339,6 +1339,90 @@ describe("TaskService", () => {
     ]);
   });
 
+  test("sub-project Project Chat reuses and lists workspaces from the parent storage bucket", async () => {
+    const config = await createTestConfig(rootDir);
+    const parentProjectPath = await createTestProject(rootDir, "repo", { initGit: false });
+    const subProjectPath = path.join(parentProjectPath, "packages", "web");
+    await fsPromises.mkdir(subProjectPath, { recursive: true });
+    await saveTestConfig(
+      config,
+      [
+        [
+          parentProjectPath,
+          {
+            trusted: true,
+            workspaces: [
+              projectWorkspace(parentProjectPath, "parent", "parentworkspace", {
+                runtimeConfig: { type: "local" },
+              }),
+            ],
+          },
+        ],
+        [
+          subProjectPath,
+          {
+            parentProjectPath,
+            trusted: true,
+            workspaces: [
+              projectWorkspace(parentProjectPath, "subproject", "subprojectworkspace", {
+                runtimeConfig: { type: "local" },
+              }),
+            ],
+          },
+        ],
+      ],
+      { taskSettings: testTaskSettings() }
+    );
+    const projectChat = await config.ensureProjectChat(subProjectPath);
+    stubStableIds(config, ["existinghandle", "existingturn"]);
+    const sendMessage = mock(async (...args: unknown[]): Promise<Result<void>> => {
+      const internal = args[3] as { onAccepted?: () => Promise<void> | void } | undefined;
+      await internal?.onAccepted?.();
+      return Ok(undefined);
+    });
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: createWorkspaceServiceMocks({ sendMessage }).workspaceService,
+    });
+
+    expect(
+      await taskService.createWorkspaceTurn({
+        ownerWorkspaceId: projectChat.sessionId,
+        prompt: "Continue sub-project workspace",
+        title: "Sub-project follow-up",
+        workspace: { mode: "existing", workspaceId: "subprojectworkspace" },
+      })
+    ).toMatchObject({
+      success: true,
+      data: { workspaceId: "subprojectworkspace", status: "running" },
+    });
+    expect(
+      await taskService.createWorkspaceTurn({
+        ownerWorkspaceId: projectChat.sessionId,
+        prompt: "Do not cross into the parent project scope",
+        title: "Parent workspace",
+        workspace: { mode: "existing", workspaceId: "parentworkspace" },
+      })
+    ).toEqual(Err("Task.createWorkspaceTurn: invalid_scope for existing workspace"));
+    expect(sendMessage.mock.calls[0]?.[0]).toBe("subprojectworkspace");
+
+    const listed = await taskService.listProjectWorkspaces(projectChat.sessionId);
+    expect(listed.success).toBe(true);
+    if (!listed.success) throw new Error(listed.error);
+    expect(listed.data.projectPath).toBe(subProjectPath);
+    expect(listed.data.workspaces).toHaveLength(1);
+    expect(listed.data.workspaces[0]).toMatchObject({
+      workspaceId: "subprojectworkspace",
+      name: "subproject",
+      archived: false,
+      workspaceTurn: {
+        taskId: "wst_existinghandle",
+        status: "running",
+        title: "Sub-project follow-up",
+      },
+    });
+    expect(typeof listed.data.workspaces[0]?.workspaceTurn?.updatedAt).toBe("string");
+  });
+
   test("Project Chat bulk workspace list returns canonical ordinary scopes and latest turn state", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = await createTestProject(rootDir, "repo", { initGit: false });

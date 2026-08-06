@@ -1662,7 +1662,7 @@ describe("WorkspaceStore", () => {
     });
 
     it("preserves Project Chat sessions across normal workspace metadata sync", () => {
-      const projectChat = makeWorkspaceMetadata("project-session_test", {
+      const projectChat = makeWorkspaceMetadata("project-session_bbbbbbbbbb", {
         name: "project-chat",
         projectName: "project-1",
         projectPath: "/project-1",

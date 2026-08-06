@@ -493,7 +493,7 @@ describe("resolveAgentForStream fixed built-in policy", () => {
     );
 
     const metadata: WorkspaceMetadata = {
-      id: "project-session_test",
+      id: "project-session_bbbbbbbbbb",
       name: "project-chat",
       projectName: "project",
       projectPath,

@@ -1,4 +1,8 @@
-import { PROJECT_CHAT_AGENT_ID, PROJECT_CHAT_VERSION } from "@/common/constants/projectChat";
+import {
+  PROJECT_CHAT_AGENT_ID,
+  PROJECT_CHAT_VERSION,
+  isProjectSessionId,
+} from "@/common/constants/projectChat";
 import { RuntimeConfigSchema } from "@/common/orpc/schemas/runtime";
 import { WorkspaceMCPOverridesSchema } from "@/common/orpc/schemas/mcp";
 import {
@@ -257,8 +261,8 @@ export const ProjectChatConfigSchema = z.object({
   version: z.literal(PROJECT_CHAT_VERSION).meta({
     description: "Persisted Project Chat schema version",
   }),
-  sessionId: z.string().min(1).meta({
-    description: "Backend-generated stable project-session ID",
+  sessionId: z.string().refine(isProjectSessionId, {
+    message: "Project Chat session ID must use the generated filename-safe format",
   }),
   createdAt: z.string().meta({ description: "ISO 8601 Project Chat creation timestamp" }),
   agentId: z.literal(PROJECT_CHAT_AGENT_ID).meta({

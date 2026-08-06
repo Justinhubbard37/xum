@@ -11,7 +11,12 @@ import {
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
-import type { Config, ProjectsConfig, Workspace as WorkspaceConfigEntry } from "@/node/config";
+import type {
+  Config,
+  ProjectConfig,
+  ProjectsConfig,
+  Workspace as WorkspaceConfigEntry,
+} from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
 import type { WorkspaceService } from "@/node/services/workspaceService";
 import type { HistoryService } from "@/node/services/historyService";
@@ -56,6 +61,7 @@ import {
   normalizeTaskGroupLabel,
   type TaskGroupKind,
 } from "@/common/utils/tools/taskGroups";
+import { resolveWorkspaceCreationScope } from "@/common/utils/subProjects";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { Ok, Err, type Result } from "@/common/types/result";
 import {
@@ -3347,23 +3353,58 @@ export class TaskService {
     return { projectPath: projectChat.projectPath, metadata: projectChat.metadata };
   }
 
+  private resolveProjectChatWorkspaceScope(
+    ownerWorkspaceId: string,
+    cfg: ProjectsConfig
+  ): {
+    projectPath: string;
+    storageProjectPath: string;
+    subProjectPath: string | null;
+    project: ProjectConfig;
+  } | null {
+    const owner = this.resolveProjectChatOwner(ownerWorkspaceId);
+    if (owner == null) {
+      return null;
+    }
+
+    const projectPath = stripTrailingSlashes(owner.projectPath);
+    const ownerProject = cfg.projects.get(projectPath);
+    const creationScope = resolveWorkspaceCreationScope(projectPath, cfg.projects);
+    const project = cfg.projects.get(creationScope.projectPath);
+    if (
+      ownerProject == null ||
+      ownerProject.projectKind === "system" ||
+      project == null ||
+      project.projectKind === "system"
+    ) {
+      return null;
+    }
+
+    return {
+      projectPath,
+      storageProjectPath: creationScope.projectPath,
+      subProjectPath: creationScope.subProjectPath,
+      project,
+    };
+  }
+
   private resolveProjectChatWorkspaceTarget(
     ownerWorkspaceId: string,
     workspaceId: string,
     cfg: ProjectsConfig
   ): { projectPath: string; workspace: WorkspaceConfigEntry } | null {
-    const owner = this.resolveProjectChatOwner(ownerWorkspaceId);
-    if (owner == null) {
+    const scope = this.resolveProjectChatWorkspaceScope(ownerWorkspaceId, cfg);
+    if (scope == null) {
       return null;
     }
-    const projectPath = stripTrailingSlashes(owner.projectPath);
-    const project = cfg.projects.get(projectPath);
-    if (project == null || project.projectKind === "system") {
-      return null;
-    }
-    const workspace = project.workspaces.find((candidate) => candidate.id === workspaceId);
+
+    const workspace = scope.project.workspaces.find((candidate) => candidate.id === workspaceId);
+    const workspaceSubProjectPath = workspace?.subProjectPath
+      ? stripTrailingSlashes(workspace.subProjectPath)
+      : null;
     if (
       workspace == null ||
+      workspaceSubProjectPath !== scope.subProjectPath ||
       workspace.kind === "scratch" ||
       workspace.parentWorkspaceId != null ||
       workspace.taskStatus != null ||
@@ -3372,7 +3413,7 @@ export class TaskService {
     ) {
       return null;
     }
-    return { projectPath, workspace };
+    return { projectPath: scope.storageProjectPath, workspace };
   }
 
   async createWorkspaceTurn(
@@ -7412,10 +7453,17 @@ export class TaskService {
       }
 
       const includeArchived = options.includeArchived !== false;
-      const projectPath = stripTrailingSlashes(owner.projectPath);
+      const scope = this.resolveProjectChatWorkspaceScope(ownerWorkspaceId, cfg);
+      if (scope == null) {
+        return Err("Project Chat workspace scope is unavailable");
+      }
       const workspaces: ProjectWorkspaceSummary[] = [];
       for (const metadata of allMetadata) {
-        if (stripTrailingSlashes(metadata.projectPath) !== projectPath) continue;
+        if (stripTrailingSlashes(metadata.projectPath) !== scope.storageProjectPath) continue;
+        const metadataSubProjectPath = metadata.subProjectPath
+          ? stripTrailingSlashes(metadata.subProjectPath)
+          : null;
+        if (metadataSubProjectPath !== scope.subProjectPath) continue;
         if (this.resolveProjectChatWorkspaceTarget(ownerWorkspaceId, metadata.id, cfg) == null) {
           continue;
         }
@@ -7448,7 +7496,7 @@ export class TaskService {
           left.name.localeCompare(right.name) ||
           left.workspaceId.localeCompare(right.workspaceId)
       );
-      return Ok({ projectPath, workspaces });
+      return Ok({ projectPath: scope.projectPath, workspaces });
     } catch (error) {
       return Err(`Failed to list project workspaces: ${getErrorMessage(error)}`);
     }

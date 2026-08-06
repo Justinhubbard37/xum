@@ -63,7 +63,7 @@ describe("TaskHandleStore", () => {
       {
         kind: "workspace_turn" as const,
         handleId: `${WORKSPACE_TURN_TASK_ID_PREFIX}project`,
-        ownerWorkspaceId: "project-session_owner",
+        ownerWorkspaceId: "project-session_aaaaaaaaaa",
         workspaceId: "project-child",
         turnId: "project-turn",
         status: "completed" as const,

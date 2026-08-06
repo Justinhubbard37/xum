@@ -1792,6 +1792,9 @@ export class Config {
    * workspace data from ~/.mux/sessions.
    */
   getSessionDir(sessionId: string): string {
+    if (sessionId.startsWith(PROJECT_CHAT_SESSION_ID_PREFIX) && !isProjectSessionId(sessionId)) {
+      throw new Error("Invalid Project Chat session ID");
+    }
     return path.join(
       isProjectSessionId(sessionId) ? this.projectSessionsDir : this.sessionsDir,
       sessionId

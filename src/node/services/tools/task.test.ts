@@ -146,7 +146,7 @@ describe("task tool", () => {
     );
     const taskService = { createWorkspaceTurn } as unknown as TaskService;
     const tool = createTaskTool({
-      ...createTestToolConfig(tempDir.path, { workspaceId: "project-session_owner" }),
+      ...createTestToolConfig(tempDir.path, { workspaceId: "project-session_aaaaaaaaaa" }),
       projectChat: true,
       taskService,
     });
@@ -161,7 +161,7 @@ describe("task tool", () => {
 
     expect(createWorkspaceTurn).toHaveBeenCalledTimes(1);
     expect(createWorkspaceTurn.mock.calls[0]?.[0]).toMatchObject({
-      ownerWorkspaceId: "project-session_owner",
+      ownerWorkspaceId: "project-session_aaaaaaaaaa",
       attentionPolicy: "notify_on_terminal",
       workspace: { mode: "new" },
     });
@@ -184,7 +184,7 @@ describe("task tool", () => {
     );
     const waitForWorkspaceTurn = mock(() => Promise.reject(new ForegroundWaitBackgroundedError()));
     const taskService = { createWorkspaceTurn, waitForWorkspaceTurn } as unknown as TaskService;
-    const ownerSessionId = "project-session_owner";
+    const ownerSessionId = "project-session_aaaaaaaaaa";
     const taskTool = createTaskTool({
       ...createTestToolConfig(tempDir.path, { workspaceId: ownerSessionId }),
       projectChat: true,

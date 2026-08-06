@@ -124,7 +124,7 @@ describe("TerminalAttentionStore", () => {
       terminalOutcome: "completed",
     });
     await store.enqueueIfAbsent({
-      ownerWorkspaceId: "project-session_owner",
+      ownerWorkspaceId: "project-session_aaaaaaaaaa",
       sourceKind: "workspace_turn",
       sourceId: "wst-project",
       outputDelivery: "requires_task_await",
@@ -143,7 +143,7 @@ describe("TerminalAttentionStore", () => {
 
     expect(await store.listPendingOwnerWorkspaceIds()).toEqual([
       "owner-b",
-      "project-session_owner",
+      "project-session_aaaaaaaaaa",
     ]);
   });
 });

@@ -28,7 +28,7 @@ describe("project_workspace_list tool", () => {
       )
     );
     const taskService = { listProjectWorkspaces } as unknown as TaskService;
-    const workspaceId = "project-session_owner";
+    const workspaceId = "project-session_aaaaaaaaaa";
     const listTool = createProjectWorkspaceListTool({
       ...createTestToolConfig(tempDir.path, { workspaceId }),
       projectChat: true,

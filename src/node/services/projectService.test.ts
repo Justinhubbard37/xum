@@ -1884,6 +1884,40 @@ exit 1
       expect(fs.access(sessionDir)).rejects.toMatchObject({ code: "ENOENT" });
     });
 
+    it("never recursively deletes paths from a malformed persisted Project Chat ID", async () => {
+      const projectPath = path.join(tempDir, "project-chat-malformed-id");
+      const outsidePath = path.join(tempDir, "outside");
+      const sentinelPath = path.join(outsidePath, "keep.txt");
+      const maliciousSessionId = "project-session_aaaaaaaaaa/../../outside";
+      await fs.mkdir(projectPath, { recursive: true });
+      await fs.mkdir(outsidePath, { recursive: true });
+      await fs.writeFile(sentinelPath, "keep", "utf-8");
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [],
+          trusted: true,
+          projectChat: {
+            version: 1,
+            sessionId: maliciousSessionId,
+            createdAt: "2026-08-06T00:00:00.000Z",
+            agentId: "orchestrator",
+          },
+        });
+        return cfg;
+      });
+      const cleanupProjectChatSession = mock((_sessionId: string) => Promise.resolve());
+      service.setWorkspaceService({
+        remove: () => Promise.resolve(Ok(undefined)),
+        cleanupProjectChatSession,
+      });
+
+      const result = await service.remove(projectPath);
+
+      expect(result.success).toBe(true);
+      expect(cleanupProjectChatSession).not.toHaveBeenCalled();
+      expect(await fs.readFile(sentinelPath, "utf-8")).toBe("keep");
+    });
+
     it("keeps Project Chat cleanup best-effort after config removal", async () => {
       const projectPath = path.join(tempDir, "project-chat-cleanup-failure");
       await fs.mkdir(projectPath, { recursive: true });
