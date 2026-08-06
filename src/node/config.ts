@@ -2023,7 +2023,13 @@ export class Config {
         "Please upgrade mux to use this workspace.";
     }
 
-    // Mark worktree workspaces with missing checkout directories as transcript-only.
+    // Persisted retirement is authoritative across runtime types. For older worktree entries,
+    // keep inferring transcript-only state when the managed checkout has disappeared.
+    if (metadata.transcriptOnly === true) {
+      result.transcriptOnly = true;
+      return result;
+    }
+
     // Queued/starting agent tasks can briefly exist without a provisioned checkout, so keep
     // those workspaces interactive until the checkout is created.
     const workspacePathExists = await fs.promises
@@ -2424,6 +2430,7 @@ export class Config {
               taskThinkingLevel: workspace.taskThinkingLevel,
               taskPrompt: workspace.taskPrompt,
               taskTrunkBranch: workspace.taskTrunkBranch,
+              transcriptOnly: workspace.transcriptOnly,
               archivedAt: workspace.archivedAt,
               unarchivedAt: workspace.unarchivedAt,
               pinnedAt: workspace.pinnedAt,
@@ -2535,6 +2542,9 @@ export class Config {
             metadata.taskThinkingLevel ??= workspace.taskThinkingLevel;
             metadata.taskPrompt ??= workspace.taskPrompt;
             metadata.taskTrunkBranch ??= workspace.taskTrunkBranch;
+            if (workspace.transcriptOnly === true) {
+              metadata.transcriptOnly = true;
+            }
             // Preserve archived timestamps from config
             metadata.archivedAt ??= workspace.archivedAt;
             metadata.unarchivedAt ??= workspace.unarchivedAt;
@@ -2636,6 +2646,7 @@ export class Config {
               taskThinkingLevel: workspace.taskThinkingLevel,
               taskPrompt: workspace.taskPrompt,
               taskTrunkBranch: workspace.taskTrunkBranch,
+              transcriptOnly: workspace.transcriptOnly,
               archivedAt: workspace.archivedAt,
               unarchivedAt: workspace.unarchivedAt,
               pinnedAt: workspace.pinnedAt,
@@ -2700,6 +2711,7 @@ export class Config {
             taskThinkingLevel: workspace.taskThinkingLevel,
             taskPrompt: workspace.taskPrompt,
             taskTrunkBranch: workspace.taskTrunkBranch,
+            transcriptOnly: workspace.transcriptOnly,
             projects: workspaceProjects,
             subProjectPath: workspace.subProjectPath,
           };
@@ -2793,6 +2805,7 @@ export class Config {
         taskThinkingLevel: metadata.taskThinkingLevel,
         taskPrompt: metadata.taskPrompt,
         taskTrunkBranch: metadata.taskTrunkBranch,
+        transcriptOnly: metadata.transcriptOnly,
         archivedAt: metadata.archivedAt,
         unarchivedAt: metadata.unarchivedAt,
         pinnedAt: metadata.pinnedAt,

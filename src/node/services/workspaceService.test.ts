@@ -11403,6 +11403,231 @@ describe("WorkspaceService unarchive snapshot restore", () => {
   });
 });
 
+describe("WorkspaceService retireToTranscript", () => {
+  async function addWorkspace(options: {
+    config: Config;
+    workspaceId: string;
+    runtimeConfig: WorkspaceMetadata["runtimeConfig"];
+    transcriptOnly?: boolean;
+  }): Promise<{ projectPath: string; workspacePath: string }> {
+    const projectPath = path.join(options.config.rootDir, "retire-project");
+    const workspacePath = path.join(options.config.srcDir, "retire-project", options.workspaceId);
+    await fsPromises.mkdir(projectPath, { recursive: true });
+    await fsPromises.mkdir(workspacePath, { recursive: true });
+    await options.config.addWorkspace(projectPath, {
+      id: options.workspaceId,
+      name: options.workspaceId,
+      projectName: "retire-project",
+      projectPath,
+      runtimeConfig: options.runtimeConfig,
+      transcriptOnly: options.transcriptOnly,
+      namedWorkspacePath: workspacePath,
+    });
+    return { projectPath, workspacePath };
+  }
+
+  function createRetirementService(options: {
+    config: Config;
+    historyService: HistoryService;
+    aiService?: AIService;
+  }): WorkspaceService {
+    return createWorkspaceServiceForTest({
+      config: options.config,
+      historyService: options.historyService,
+      aiService: options.aiService ?? createMockAIService(),
+      initStateManager: mockInitStateManager as InitStateManager,
+    });
+  }
+
+  afterEach(() => {
+    mock.restore();
+  });
+
+  test("retires a worktree idempotently while preserving config, session, and history", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "retire-worktree";
+    try {
+      const { projectPath, workspacePath } = await addWorkspace({
+        config,
+        workspaceId,
+        runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+      });
+      const historyMessage = createMuxMessage("retire-history", "user", "preserve me", {
+        timestamp: 1,
+      });
+      expect((await historyService.appendToHistory(workspaceId, historyMessage)).success).toBe(
+        true
+      );
+      const sessionDir = config.getSessionDir(workspaceId);
+      const removeWorktree = spyOn(
+        removeManagedGitWorktreeModule,
+        "removeManagedGitWorktree"
+      ).mockImplementation(async () => {
+        await fsPromises.rm(workspacePath, { recursive: true, force: true });
+      });
+      const workspaceService = createRetirementService({ config, historyService });
+      const metadataEvents: FrontendWorkspaceMetadata[] = [];
+      workspaceService.on("metadata", (event: unknown) => {
+        const metadata = (event as { metadata?: FrontendWorkspaceMetadata }).metadata;
+        if (metadata) metadataEvents.push(metadata);
+      });
+
+      const first = await workspaceService.retireToTranscript(workspaceId);
+      const second = await workspaceService.retireToTranscript(workspaceId);
+
+      expect(first).toEqual(Ok({ kind: "transcript-only", cleanup: "worktree-deleted" }));
+      expect(second).toEqual(Ok({ kind: "transcript-only", cleanup: "already-transcript-only" }));
+      expect(removeWorktree).toHaveBeenCalledTimes(1);
+      const persisted = config.loadConfigOrDefault().projects.get(projectPath)?.workspaces[0];
+      expect(persisted?.transcriptOnly).toBe(true);
+      expect(persisted?.archivedAt).toBeDefined();
+      expect(config.findWorkspace(workspaceId)).not.toBeNull();
+      expect(await fsPromises.access(sessionDir).then(() => true)).toBe(true);
+      const history = await historyService.getLastMessages(workspaceId, 10);
+      expect(history.success).toBe(true);
+      if (history.success) {
+        expect(history.data.map((message) => message.id)).toContain(historyMessage.id);
+      }
+      expect(metadataEvents.at(-1)?.transcriptOnly).toBe(true);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("rejects retirement while a stream is active", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "retire-active";
+    try {
+      const { projectPath } = await addWorkspace({
+        config,
+        workspaceId,
+        runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+      });
+      const removeWorktree = spyOn(
+        removeManagedGitWorktreeModule,
+        "removeManagedGitWorktree"
+      ).mockResolvedValue(undefined);
+      const workspaceService = createRetirementService({
+        config,
+        historyService,
+        aiService: createMockAIService({ isStreaming: mock(() => true) }),
+      });
+
+      const result = await workspaceService.retireToTranscript(workspaceId);
+
+      expect(result).toEqual(Err("Cannot retire workspace while a turn is active"));
+      expect(removeWorktree).not.toHaveBeenCalled();
+      const persisted = config.loadConfigOrDefault().projects.get(projectPath)?.workspaces[0];
+      expect(persisted?.archivedAt).toBeUndefined();
+      expect(persisted?.transcriptOnly).toBeUndefined();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("returns archive confirmation instead of bypassing untracked-file safeguards", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "retire-untracked";
+    try {
+      await addWorkspace({
+        config,
+        workspaceId,
+        runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+      });
+      await config.editConfig((current) => {
+        current.worktreeArchiveBehavior = "snapshot";
+        return current;
+      });
+      const getMetadata = async () => {
+        const metadata = (await config.getAllWorkspaceMetadata()).find(
+          (candidate) => candidate.id === workspaceId
+        );
+        return metadata ? Ok(metadata) : Err("Workspace not found");
+      };
+      const workspaceService = createRetirementService({
+        config,
+        historyService,
+        aiService: createMockAIService({ getWorkspaceMetadata: mock(getMetadata) }),
+      });
+      workspaceService.setWorktreeArchiveSnapshotService({
+        preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
+        captureSnapshotForArchive: mock(() => Promise.resolve(Err("should not capture"))),
+        restoreSnapshotAfterUnarchive: mock(() => Promise.resolve(Ok("skipped" as const))),
+        getUnsupportedUntrackedPaths: mock(() => Promise.resolve(Ok(["scratch.txt"]))),
+      });
+      const removeWorktree = spyOn(
+        removeManagedGitWorktreeModule,
+        "removeManagedGitWorktree"
+      ).mockResolvedValue(undefined);
+
+      const result = await workspaceService.retireToTranscript(workspaceId);
+
+      expect(result).toEqual(Ok({ kind: "confirm-lossy-untracked-files", paths: ["scratch.txt"] }));
+      expect(removeWorktree).not.toHaveBeenCalled();
+      const persisted = config
+        .loadConfigOrDefault()
+        .projects.get(path.join(config.rootDir, "retire-project"))?.workspaces[0];
+      expect(persisted?.archivedAt).toBeUndefined();
+      expect(persisted?.transcriptOnly).toBeUndefined();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("archives unsupported non-worktree runtimes without marking them transcript-only", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "retire-local";
+    try {
+      const { projectPath } = await addWorkspace({
+        config,
+        workspaceId,
+        runtimeConfig: { type: "local" },
+      });
+      const workspaceService = createRetirementService({ config, historyService });
+
+      const result = await workspaceService.retireToTranscript(workspaceId);
+
+      expect(result).toEqual(
+        Ok({ kind: "archived-only", cleanup: "unsupported", runtimeType: "local" })
+      );
+      const persisted = config.loadConfigOrDefault().projects.get(projectPath)?.workspaces[0];
+      expect(persisted?.archivedAt).toBeDefined();
+      expect(persisted?.transcriptOnly).toBeUndefined();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("rejects sendMessage for persisted transcript-only workspaces", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "retire-send-guard";
+    try {
+      await addWorkspace({
+        config,
+        workspaceId,
+        runtimeConfig: { type: "local" },
+        transcriptOnly: true,
+      });
+      const workspaceService = createRetirementService({ config, historyService });
+
+      const result = await workspaceService.sendMessage(workspaceId, "hello", {
+        model: "test-model",
+        agentId: "exec",
+      });
+
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error).toEqual({
+          type: "unknown",
+          raw: "This workspace is transcript-only and cannot accept new messages.",
+        });
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+});
+
 describe("WorkspaceService deleteWorktree", () => {
   const workspaceId = "ws-delete-worktree";
   const projectName = "proj";

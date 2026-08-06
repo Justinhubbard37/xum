@@ -555,6 +555,22 @@ interface WorkspaceAgentStatus {
   url?: string;
 }
 type WorkspaceRuntimeStatus = "running" | "stopped" | "unknown" | "unsupported";
+export type RetireToTranscriptResult =
+  | ArchiveLossyUntrackedFilesConfirmation
+  | {
+      kind: "transcript-only";
+      cleanup:
+        | "already-transcript-only"
+        | "resource-already-absent"
+        | "worktree-deleted"
+        | "devcontainer-stopped";
+    }
+  | {
+      kind: "archived-only";
+      cleanup: "unsupported";
+      runtimeType: "local" | "ssh" | "coder" | "docker";
+    };
+
 const POST_COMPACTION_METADATA_REFRESH_DEBOUNCE_MS = 100;
 
 const STICKY_DESCENDANT_ARCHIVE_ERROR =
@@ -1916,6 +1932,12 @@ export class WorkspaceService extends EventEmitter {
   // Tracks workspaces currently being archived to prevent runtime-affecting operations (e.g. SSH)
   // from waking a dedicated workspace during archive().
   private readonly archivingWorkspaces = new Set<string>();
+
+  // Coalesce concurrent retirement requests so cleanup and persistence remain idempotent.
+  private readonly transcriptRetirements = new Map<
+    string,
+    Promise<Result<RetireToTranscriptResult>>
+  >();
 
   // Tracks stream generations that are compaction turns so background stop snapshots
   // can carry authoritative notification policy instead of forcing the frontend to
@@ -7155,6 +7177,140 @@ export class WorkspaceService extends EventEmitter {
     }
   }
 
+  async retireToTranscript(workspaceId: string): Promise<Result<RetireToTranscriptResult>> {
+    const inFlight = this.transcriptRetirements.get(workspaceId);
+    if (inFlight) {
+      return inFlight;
+    }
+
+    const retirement = this.performTranscriptRetirement(workspaceId);
+    this.transcriptRetirements.set(workspaceId, retirement);
+    try {
+      return await retirement;
+    } finally {
+      if (this.transcriptRetirements.get(workspaceId) === retirement) {
+        this.transcriptRetirements.delete(workspaceId);
+      }
+    }
+  }
+
+  private async performTranscriptRetirement(
+    workspaceId: string
+  ): Promise<Result<RetireToTranscriptResult>> {
+    try {
+      const persistedEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+      if (!persistedEntry) {
+        return Err("Workspace not found");
+      }
+      if (persistedEntry.workspace.transcriptOnly === true) {
+        return Ok({ kind: "transcript-only", cleanup: "already-transcript-only" });
+      }
+
+      const metadata = (await this.config.getAllWorkspaceMetadata()).find(
+        (candidate) => candidate.id === workspaceId
+      );
+      if (!metadata) {
+        return Err("Workspace not found");
+      }
+
+      const session = this.sessions.get(workspaceId);
+      if (this.aiService.isStreaming(workspaceId) || session?.isBusy() === true) {
+        return Err("Cannot retire workspace while a turn is active");
+      }
+      if (this.hasPendingQueuedOrPreparingTurn(workspaceId)) {
+        return Err(
+          "Cannot retire workspace while queued, preparing, or retrying messages are pending"
+        );
+      }
+      if (this.initStateManager.getInitState(workspaceId)?.status === "running") {
+        return Err("Cannot retire workspace while initialization is running");
+      }
+      if ((this.terminalService?.getWorkspaceActivity(workspaceId)?.totalSessions ?? 0) > 0) {
+        return Err("Cannot retire workspace while terminal sessions are active");
+      }
+
+      const wasArchived = isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt);
+      if (wasArchived && isWorktreeRuntime(metadata.runtimeConfig)) {
+        const resourceExists = await fsPromises
+          .access(metadata.namedWorkspacePath)
+          .then(() => true)
+          .catch(() => false);
+        if (!resourceExists) {
+          const persistResult = await this.persistTranscriptOnly(workspaceId);
+          if (!persistResult.success) {
+            return persistResult;
+          }
+          return Ok({ kind: "transcript-only", cleanup: "resource-already-absent" });
+        }
+      }
+
+      if (!wasArchived) {
+        const archiveResult = await this.archive(workspaceId);
+        if (!archiveResult.success) {
+          return Err(archiveResult.error);
+        }
+        if (archiveResult.data.kind === "confirm-lossy-untracked-files") {
+          return Ok(archiveResult.data);
+        }
+      }
+
+      if (isWorktreeRuntime(metadata.runtimeConfig)) {
+        await removeManagedGitWorktree(metadata.projectPath, metadata.namedWorkspacePath);
+        const persistResult = await this.persistTranscriptOnly(workspaceId);
+        if (!persistResult.success) {
+          return persistResult;
+        }
+        return Ok({ kind: "transcript-only", cleanup: "worktree-deleted" });
+      }
+
+      if (metadata.runtimeConfig.type === "devcontainer") {
+        const stopResult = await stopDevcontainer(
+          await this.getDevcontainerHostWorkspacePath(workspaceId)
+        );
+        if (stopResult.kind === "error") {
+          return Err(`Failed to stop devcontainer runtime: ${stopResult.message}`);
+        }
+
+        const persistResult = await this.persistTranscriptOnly(workspaceId);
+        if (!persistResult.success) {
+          return persistResult;
+        }
+        return Ok({
+          kind: "transcript-only",
+          cleanup:
+            stopResult.kind === "absent" ? "resource-already-absent" : "devcontainer-stopped",
+        });
+      }
+
+      const runtimeType =
+        metadata.runtimeConfig.type === "ssh" && metadata.runtimeConfig.coder != null
+          ? "coder"
+          : metadata.runtimeConfig.type;
+      return Ok({ kind: "archived-only", cleanup: "unsupported", runtimeType });
+    } catch (error) {
+      return Err(`Failed to retire workspace to transcript: ${getErrorMessage(error)}`);
+    }
+  }
+
+  private async persistTranscriptOnly(workspaceId: string): Promise<Result<void>> {
+    let found = false;
+    await this.config.editConfig((config) => {
+      const entry = findWorkspaceEntry(config, workspaceId);
+      if (entry) {
+        entry.workspace.transcriptOnly = true;
+        found = true;
+      }
+      return config;
+    });
+
+    if (!found) {
+      return Err("Workspace not found while persisting transcript-only state");
+    }
+
+    await this.emitCurrentWorkspaceMetadata(workspaceId);
+    return Ok(undefined);
+  }
+
   /**
    * Unarchive a workspace. Restores it to the main sidebar view.
    */
@@ -8745,27 +8901,33 @@ export class WorkspaceService extends EventEmitter {
         });
       }
 
+      const persistedWorkspace =
+        projectChat == null
+          ? findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
+          : undefined;
+      if (persistedWorkspace?.transcriptOnly === true) {
+        return Err({
+          type: "unknown",
+          raw: "This workspace is transcript-only and cannot accept new messages.",
+        });
+      }
+
       // Guard: queued agent tasks must not start streaming via generic sendMessage calls.
       // Project Chat is never an agent-task workspace.
       if (projectChat == null && !internal?.allowQueuedAgentTask) {
-        const config = this.config.loadConfigOrDefault();
-        for (const [_projectPath, project] of config.projects) {
-          const ws = project.workspaces.find((w) => w.id === workspaceId);
-          if (!ws) continue;
-          if (
-            ws.parentWorkspaceId &&
-            (ws.taskStatus === "queued" || ws.taskStatus === "starting")
-          ) {
-            taskQueueDebug("WorkspaceService.sendMessage blocked (queued/starting task)", {
-              workspaceId,
-              stack: new Error("sendMessage blocked").stack,
-            });
-            return Err({
-              type: "unknown",
-              raw: "This agent task is queued or starting and cannot accept generic messages yet.",
-            });
-          }
-          break;
+        if (
+          persistedWorkspace?.parentWorkspaceId &&
+          (persistedWorkspace.taskStatus === "queued" ||
+            persistedWorkspace.taskStatus === "starting")
+        ) {
+          taskQueueDebug("WorkspaceService.sendMessage blocked (queued/starting task)", {
+            workspaceId,
+            stack: new Error("sendMessage blocked").stack,
+          });
+          return Err({
+            type: "unknown",
+            raw: "This agent task is queued or starting and cannot accept generic messages yet.",
+          });
         }
       } else {
         taskQueueDebug("WorkspaceService.sendMessage allowed (internal dequeue)", {

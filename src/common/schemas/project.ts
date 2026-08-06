@@ -238,6 +238,10 @@ export const WorkspaceConfigSchema = z.object({
     description:
       "LEGACY: Per-workspace MCP overrides (migrated to <workspace>/.mux/mcp.local.jsonc)",
   }),
+  transcriptOnly: z.boolean().optional().meta({
+    description:
+      "True when live runtime resources were intentionally retired while config, session, and transcript history remain available.",
+  }),
   archivedAt: z.string().optional().meta({
     description:
       "ISO 8601 timestamp when workspace was last archived. Workspace is considered archived if archivedAt > unarchivedAt (or unarchivedAt is absent).",

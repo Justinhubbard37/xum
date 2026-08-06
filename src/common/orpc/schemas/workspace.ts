@@ -251,6 +251,10 @@ export const WorkspaceMetadataSchema = z.object({
     description:
       "Trunk branch used to create/init this agent task workspace (used for restart-safe init on queued tasks).",
   }),
+  transcriptOnly: z.boolean().optional().meta({
+    description:
+      "True when live runtime resources were intentionally retired while config, session, and transcript history remain available.",
+  }),
   archivedAt: z.string().optional().meta({
     description:
       "ISO 8601 timestamp when workspace was last archived. Workspace is considered archived if archivedAt > unarchivedAt (or unarchivedAt is absent).",
@@ -292,10 +296,6 @@ export const FrontendWorkspaceMetadataSchema = WorkspaceMetadataSchema.extend({
   isInitializing: z.boolean().optional().meta({
     description:
       "True if this workspace is currently initializing (postCreateSetup or initWorkspace running).",
-  }),
-  transcriptOnly: z.boolean().optional().meta({
-    description:
-      "True if this workspace's checkout directory is missing (worktree deleted). Chat history is available but the workspace cannot run commands.",
   }),
 });
 

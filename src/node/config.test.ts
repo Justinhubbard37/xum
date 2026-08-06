@@ -2534,6 +2534,28 @@ describe("Config", () => {
       expect(metadata.transcriptOnly).toBeUndefined();
     });
 
+    it("maps persisted transcriptOnly=true even when a non-worktree resource still exists", async () => {
+      const projectPath = "/fake/project";
+      const workspacePath = path.join(tempDir, "persisted-transcript-only");
+      fs.mkdirSync(workspacePath, { recursive: true });
+
+      await config.addWorkspace(projectPath, {
+        id: "workspace-persisted-transcript-only",
+        name: "persisted-transcript-only",
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+        transcriptOnly: true,
+        namedWorkspacePath: workspacePath,
+      });
+
+      const [metadata] = await config.getAllWorkspaceMetadata();
+      const persisted = config.loadConfigOrDefault().projects.get(projectPath)?.workspaces[0];
+
+      expect(metadata.transcriptOnly).toBe(true);
+      expect(persisted?.transcriptOnly).toBe(true);
+    });
+
     it("never returns transcriptOnly for non-worktree runtimes", async () => {
       const projectPath = "/fake/project";
       const workspacePath = path.join(tempDir, "missing-local-workspace");
