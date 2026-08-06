@@ -245,7 +245,7 @@ describe("task tool", () => {
       taskService,
     });
 
-    const result = await taskTool.execute!(
+    const result: unknown = await taskTool.execute!(
       {
         prompt: "implement",
         title: "Implementation",
