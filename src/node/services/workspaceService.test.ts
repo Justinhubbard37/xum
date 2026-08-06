@@ -390,6 +390,40 @@ describe("WorkspaceService Project Chat", () => {
     }
   });
 
+  test("interrupts and disposes the session before deleting Project Chat sidecars", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const projectPath = path.join(config.rootDir, "project-chat-cleanup");
+    await fsPromises.mkdir(projectPath, { recursive: true });
+    try {
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, { trusted: true, workspaces: [] });
+        return cfg;
+      });
+      const projectChat = await config.ensureProjectChat(projectPath);
+      const sessionDir = config.getSessionDir(projectChat.sessionId);
+      await fsPromises.writeFile(path.join(sessionDir, "sidecar.json"), "{}", "utf-8");
+      const interruptStream = mock(() => Promise.resolve(Ok(undefined)));
+      const dispose = mock(() => undefined);
+      const fakeSession = { interruptStream, dispose } as unknown as AgentSession;
+      const workspaceService = createWorkspaceServiceForTest({ config, historyService });
+      const sessions = (
+        workspaceService as unknown as {
+          sessions: Map<string, AgentSession>;
+        }
+      ).sessions;
+      sessions.set(projectChat.sessionId, fakeSession);
+
+      await workspaceService.cleanupProjectChatSession(projectChat.sessionId);
+
+      expect(interruptStream).toHaveBeenCalledWith({ abandonPartial: true });
+      expect(dispose).toHaveBeenCalledTimes(1);
+      expect(sessions.has(projectChat.sessionId)).toBe(false);
+      await expect(fsPromises.access(sessionDir)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("keeps Project Chat out of workspace info and activity snapshots", async () => {
     const { config, historyService, cleanup } = await createTestHistoryService();
     const projectPath = path.join(config.rootDir, "project-chat-hidden");

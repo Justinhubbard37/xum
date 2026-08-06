@@ -131,6 +131,7 @@ type ProjectRemoveError = z.infer<typeof ProjectRemoveErrorSchema>;
 
 interface WorkspaceRemover {
   remove(workspaceId: string, force?: boolean): Promise<Result<void>>;
+  cleanupProjectChatSession?(sessionId: string): Promise<void>;
 }
 
 function isTildePrefixedPath(value: string): boolean {
@@ -1076,6 +1077,33 @@ export class ProjectService {
     return Err("Clone did not return a completion event");
   }
 
+  private async cleanupProjectChatSessions(sessionIds: readonly string[]): Promise<void> {
+    for (const sessionId of new Set(sessionIds.filter((id) => id.trim().length > 0))) {
+      try {
+        if (this.workspaceService?.cleanupProjectChatSession) {
+          await this.workspaceService.cleanupProjectChatSession(sessionId);
+        } else {
+          await fsPromises.rm(this.config.getSessionDir(sessionId), {
+            recursive: true,
+            force: true,
+          });
+        }
+      } catch (error) {
+        // Project config removal is authoritative. Session shutdown and disk cleanup are best-effort
+        // so a damaged transcript cannot permanently block removing the owning project.
+        log.error(`Failed to clean up Project Chat session ${sessionId}:`, error);
+        try {
+          await fsPromises.rm(this.config.getSessionDir(sessionId), {
+            recursive: true,
+            force: true,
+          });
+        } catch (deleteError) {
+          log.error(`Failed to delete Project Chat session directory ${sessionId}:`, deleteError);
+        }
+      }
+    }
+  }
+
   async remove(projectPath: string, force = false): Promise<Result<void, ProjectRemoveError>> {
     try {
       const normalizedPath = stripTrailingSlashes(projectPath);
@@ -1087,6 +1115,7 @@ export class ProjectService {
       }
 
       if (projectConfig.parentProjectPath) {
+        const projectChatSessionId = projectConfig.projectChat?.sessionId;
         try {
           await this.config.updateProjectSecrets(normalizedPath, []);
         } catch (error) {
@@ -1109,6 +1138,9 @@ export class ProjectService {
           freshConfig.projects.delete(normalizedPath);
           return freshConfig;
         });
+        if (projectChatSessionId) {
+          await this.cleanupProjectChatSessions([projectChatSessionId]);
+        }
         return Ok(undefined);
       }
 
@@ -1258,10 +1290,20 @@ export class ProjectService {
       // FRESH config: persisting the pre-read snapshot would clobber concurrent config
       // edits (e.g. resurrect concurrently removed workspaces in other projects).
       const removedSubProjectPaths: string[] = [];
+      const removedProjectChatSessionIds: string[] = [];
       await this.config.editConfig((freshConfig) => {
         removedSubProjectPaths.length = 0;
+        removedProjectChatSessionIds.length = 0;
+        const freshProjectChatSessionId =
+          freshConfig.projects.get(normalizedPath)?.projectChat?.sessionId;
+        if (freshProjectChatSessionId) {
+          removedProjectChatSessionIds.push(freshProjectChatSessionId);
+        }
         for (const [candidatePath, candidateConfig] of Array.from(freshConfig.projects.entries())) {
           if (candidateConfig.parentProjectPath === normalizedPath) {
+            if (candidateConfig.projectChat?.sessionId) {
+              removedProjectChatSessionIds.push(candidateConfig.projectChat.sessionId);
+            }
             removedSubProjectPaths.push(candidatePath);
             freshConfig.projects.delete(candidatePath);
           }
@@ -1269,6 +1311,8 @@ export class ProjectService {
         freshConfig.projects.delete(normalizedPath);
         return freshConfig;
       });
+
+      await this.cleanupProjectChatSessions(removedProjectChatSessionIds);
 
       for (const subProjectPath of removedSubProjectPaths) {
         try {

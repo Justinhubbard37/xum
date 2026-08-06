@@ -3668,6 +3668,29 @@ export class WorkspaceService extends EventEmitter {
     this.sessions.get(trimmed)?.emitChatEvent(message);
   }
 
+  async cleanupProjectChatSession(sessionId: string): Promise<void> {
+    assert(isProjectSessionId(sessionId), "cleanupProjectChatSession requires a Project Chat ID");
+    const normalizedSessionId = sessionId.trim();
+    const session =
+      this.sessions.get(normalizedSessionId) ??
+      this.transientStartupRecoverySessions.get(normalizedSessionId);
+    if (session != null) {
+      const interrupted = await session.interruptStream({ abandonPartial: true });
+      if (!interrupted.success) {
+        log.debug("Project Chat cleanup could not interrupt session cleanly", {
+          sessionId: normalizedSessionId,
+          error: interrupted.error,
+        });
+      }
+    }
+    // Dispose before removing disk state so no retained session can recreate sidecars afterward.
+    this.disposeSession(normalizedSessionId);
+    await fsPromises.rm(this.config.getSessionDir(normalizedSessionId), {
+      recursive: true,
+      force: true,
+    });
+  }
+
   public disposeSession(workspaceId: string): void {
     const trimmed = workspaceId.trim();
     const transientSession = this.transientStartupRecoverySessions.get(trimmed);
