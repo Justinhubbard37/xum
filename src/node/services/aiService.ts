@@ -2387,7 +2387,7 @@ export class AIService extends EventEmitter {
         planContentForTransition,
         planFilePath,
         changedFileAttachments,
-        postCompactionAttachments: projectChatContext != null ? null : postCompactionAttachments,
+        postCompactionAttachments,
         runtime,
         workspacePath,
         abortSignal: combinedAbortSignal,

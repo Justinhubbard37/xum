@@ -38,7 +38,7 @@ import type { TerminalService } from "@/node/services/terminalService";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import type { WorktreeArchiveSnapshot } from "@/common/schemas/project";
 import type { BashToolResult } from "@/common/types/tools";
-import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import type { SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
 import { createMuxMessage } from "@/common/types/message";
 import { buildStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import {
@@ -280,6 +280,145 @@ describe("WorkspaceService.stageAttachment", () => {
       expect(result.success).toBe(true);
       if (!result.success) throw new Error(result.error);
       await fsPromises.access(path.join(workspacePath, result.data.stagedPath));
+    } finally {
+      await cleanup();
+    }
+  });
+});
+
+describe("WorkspaceService Project Chat", () => {
+  test("uses the project root for attachments without waiting for workspace init", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const projectPath = path.join(config.rootDir, "project-chat-attachments");
+    await fsPromises.mkdir(projectPath, { recursive: true });
+    try {
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, { trusted: true, workspaces: [] });
+        return cfg;
+      });
+      const projectChat = await config.ensureProjectChat(projectPath);
+      const waitForInit = mock(() => Promise.resolve());
+      const aiService = createMockAIService({
+        getWorkspaceMetadata: mock(() => Promise.resolve(Ok(projectChat.metadata))),
+      });
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        aiService,
+        initStateManager: {
+          ...mockInitStateManager,
+          waitForInit,
+        } as unknown as InitStateManager,
+      });
+
+      const staged = await workspaceService.stageAttachment({
+        workspaceId: projectChat.sessionId,
+        filename: "notes.md",
+        mediaType: "text/markdown",
+        sizeBytes: 8,
+        dataBase64: Buffer.from("markdown").toString("base64"),
+      });
+
+      expect(staged.success).toBe(true);
+      expect(waitForInit).not.toHaveBeenCalled();
+      if (!staged.success) throw new Error(staged.error);
+      await fsPromises.access(path.join(projectPath, staged.data.stagedPath));
+      const downloaded = await workspaceService.downloadStagedAttachment({
+        workspaceId: projectChat.sessionId,
+        stagedPath: staged.data.stagedPath,
+      });
+      expect(downloaded.success).toBe(true);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("accepts send and resume with fixed Orchestrator settings", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const projectPath = path.join(config.rootDir, "project-chat-send");
+    await fsPromises.mkdir(projectPath, { recursive: true });
+    try {
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, { trusted: true, workspaces: [] });
+        return cfg;
+      });
+      const projectChat = await config.ensureProjectChat(projectPath);
+      const sessionSend = mock((..._args: Parameters<AgentSession["sendMessage"]>) =>
+        Promise.resolve(Ok(undefined))
+      );
+      const sessionResume = mock((..._args: Parameters<AgentSession["resumeStream"]>) =>
+        Promise.resolve(Ok({ started: true }))
+      );
+      const fakeSession = {
+        isBusy: () => false,
+        sendMessage: sessionSend,
+        resumeStream: sessionResume,
+      } as unknown as AgentSession;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        aiService: createMockAIService(),
+      });
+      (
+        workspaceService as unknown as {
+          getOrCreateSession: (workspaceId: string) => AgentSession;
+        }
+      ).getOrCreateSession = () => fakeSession;
+      const options: SendMessageOptions = {
+        model: "openai:gpt-5.2",
+        thinkingLevel: "high",
+        agentId: "exec",
+      };
+
+      expect(
+        (await workspaceService.sendMessage(projectChat.sessionId, "coordinate", options)).success
+      ).toBe(true);
+      expect((await workspaceService.resumeStream(projectChat.sessionId, options)).success).toBe(
+        true
+      );
+
+      expect(sessionSend.mock.calls[0]?.[1]?.agentId).toBe("orchestrator");
+      expect(sessionResume.mock.calls[0]?.[0]?.agentId).toBe("orchestrator");
+      expect(
+        config.findProjectChatBySessionId(projectChat.sessionId)?.aiSettingsByAgent?.orchestrator
+      ).toMatchObject({
+        model: "openai:gpt-5.2",
+        thinkingLevel: "high",
+      });
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("keeps Project Chat out of workspace info and activity snapshots", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const projectPath = path.join(config.rootDir, "project-chat-hidden");
+    await fsPromises.mkdir(projectPath, { recursive: true });
+    try {
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, { trusted: true, workspaces: [] });
+        return cfg;
+      });
+      const projectChat = await config.ensureProjectChat(projectPath);
+      const hiddenSnapshot: WorkspaceActivitySnapshot = {
+        recency: Date.now(),
+        streaming: true,
+        lastModel: "openai:gpt-5.2",
+        lastThinkingLevel: "high",
+      };
+      const extensionMetadata = {
+        getAllSnapshots: mock(() =>
+          Promise.resolve(new Map([[projectChat.sessionId, hiddenSnapshot]]))
+        ),
+      } as unknown as ExtensionMetadataService;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+
+      expect(await workspaceService.getInfo(projectChat.sessionId)).toBeNull();
+      expect(await workspaceService.getActivityList()).not.toHaveProperty(projectChat.sessionId);
     } finally {
       await cleanup();
     }

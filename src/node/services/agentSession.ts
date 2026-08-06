@@ -13,6 +13,7 @@ import type { InitStateManager } from "@/node/services/initStateManager";
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
 import type { ForegroundWaitInterruption } from "@/common/types/foregroundWaitInterruption";
 import type { RuntimeConfig } from "@/common/types/runtime";
+import { isProjectSessionId } from "@/common/constants/projectChat";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
 import { computePriorHistoryFingerprint } from "@/common/orpc/onChatCursorFingerprint";
@@ -3935,10 +3936,17 @@ export class AgentSession {
     }
 
     // Check if post-compaction attachments should be injected.
-    const postCompactionAttachments =
+    const resolvedPostCompactionAttachments =
       disablePostCompactionAttachments === true
         ? null
         : await this.getPostCompactionAttachmentsIfNeeded();
+    // Project Chat has no workspace plan file. Preserve useful TODO/report/diff context while
+    // preventing basename-colliding plan references from leaking into the virtual session.
+    const postCompactionAttachments = isProjectSessionId(this.workspaceId)
+      ? (resolvedPostCompactionAttachments?.filter(
+          (attachment) => attachment.type !== "plan_file_reference"
+        ) ?? null)
+      : resolvedPostCompactionAttachments;
     if (isStartupAbortRequested()) {
       return Ok(undefined);
     }
