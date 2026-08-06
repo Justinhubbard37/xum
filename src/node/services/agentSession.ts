@@ -296,6 +296,62 @@ function extractAcpDelegatedTools(muxMetadata: unknown): string[] | undefined {
     (muxMetadata as Record<string, unknown>)[ACP_DELEGATED_TOOLS_METADATA_KEY]
   );
 }
+/**
+ * Find the still-open workspace-turn correlation for a bash-monitor-wake
+ * continuation stream.
+ *
+ * A queued monitor wake dispatched at a tool boundary cuts the in-flight
+ * stream (finishReason "tool-calls") and immediately continues the same
+ * delegated work in a new stream. That continuation must inherit the cut
+ * stream's workspace-turn metadata — otherwise the delegating parent sees the
+ * cut as a premature turn failure ("Workspace turn ended before completion")
+ * and the turn's real outcome can never settle the task handle (see
+ * TaskService.finalizeWorkspaceTurnFromStreamEnd).
+ *
+ * Scans newest→oldest: interleaved monitor wakes keep the chain open; any
+ * other user input (manual prompt, new workspace-turn prompt) supersedes the
+ * turn, and only a correlated assistant message that ended with "tool-calls"
+ * (a queue-dispatch cut) leaves the turn open. The inherited metadata is
+ * persisted on each continuation's assistant message, so chains survive
+ * restarts.
+ */
+export function inheritOpenWorkspaceTurnMetadata(
+  messages: readonly MuxMessage[]
+): Extract<MuxMessageMetadata, { type: "workspace-turn-task" }> | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    const muxMetadata = message.metadata?.muxMetadata;
+    if (message.role === "assistant") {
+      if (
+        muxMetadata?.type === "workspace-turn-task" &&
+        message.metadata?.partial !== true &&
+        message.metadata?.finishReason === "tool-calls"
+      ) {
+        return muxMetadata;
+      }
+      // On-send compaction can consume a monitor-wake continuation mid-turn,
+      // hiding the correlated queue-cut assistant behind the new boundary. The
+      // pre-compaction correlation is stamped on the summary's pending
+      // follow-up (see the on-send divert in sendMessage), so the wake
+      // continuation re-inherits it from there.
+      if (
+        muxMetadata?.type === "compaction-summary" &&
+        muxMetadata.pendingFollowUp?.workspaceTurnMetadata != null
+      ) {
+        return muxMetadata.pendingFollowUp.workspaceTurnMetadata;
+      }
+      return undefined;
+    }
+    if (message.role === "user") {
+      if (muxMetadata?.type === "bash-monitor-wake") {
+        continue;
+      }
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
 function isCompactionRequestMetadata(meta: unknown): meta is CompactionRequestMetadata {
   if (typeof meta !== "object" || meta === null) return false;
   const obj = meta as Record<string, unknown>;
@@ -525,6 +581,14 @@ export class AgentSession {
 
   /** Tracks whether the current stream included post-compaction attachments. */
   private activeStreamHadPostCompactionInjection = false;
+
+  /**
+   * muxMetadata of the queued entry currently being dispatched, held from
+   * dequeue until its sendMessage settles (the stream has started or failed).
+   * Lets hasPendingBashMonitorWakeContinuation see a wake continuation during
+   * the dequeue→stream-start window without consulting stale stream context.
+   */
+  private dispatchingQueuedEntryMuxMetadata?: unknown;
 
   /** Context needed to retry the current stream (cleared on stream end/abort/error). */
   private activeStreamContext?: {
@@ -2821,6 +2885,24 @@ export class AgentSession {
           filename: part.filename,
         }));
 
+        // A monitor-wake continuation of an open delegated turn is about to be
+        // consumed by compaction; capture the correlation from pre-compaction
+        // history now, because the correlated queue-cut assistant will be
+        // hidden behind the new boundary when the follow-up dispatches.
+        let inheritedWorkspaceTurnMetadata:
+          | Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
+          | undefined;
+        if (typedMuxMetadata?.type === "bash-monitor-wake") {
+          const preCompactionHistory = await this.historyService.getHistoryFromLatestBoundary(
+            this.workspaceId
+          );
+          if (preCompactionHistory.success) {
+            inheritedWorkspaceTurnMetadata = inheritOpenWorkspaceTurnMetadata(
+              preCompactionHistory.data
+            );
+          }
+        }
+
         const followUpContent = this.buildAutoCompactionFollowUp({
           messageText: message,
           options: optionsForStream,
@@ -2828,6 +2910,7 @@ export class AgentSession {
           fileParts: followUpFileParts,
           goalKind,
           muxMetadata: typedMuxMetadata,
+          workspaceTurnMetadata: inheritedWorkspaceTurnMetadata,
         });
 
         const autoCompactionRequest = this.buildAutoCompactionRequest({
@@ -3463,6 +3546,7 @@ export class AgentSession {
     fileParts?: FilePart[];
     goalKind?: GoalSyntheticMessageKind;
     muxMetadata?: MuxMessageMetadata;
+    workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
   }): CompactionFollowUpRequest {
     const followUp: CompactionFollowUpRequest = {
       text: params.messageText,
@@ -3481,6 +3565,10 @@ export class AgentSession {
 
     if (params.muxMetadata) {
       followUp.muxMetadata = params.muxMetadata;
+    }
+
+    if (params.workspaceTurnMetadata) {
+      followUp.workspaceTurnMetadata = params.workspaceTurnMetadata;
     }
 
     return followUp;
@@ -3888,12 +3976,17 @@ export class AgentSession {
 
     const optionsMuxMetadata = options?.muxMetadata as MuxMessageMetadata | undefined;
     const retryMuxMetadata = lastUserMessage?.metadata?.muxMetadata;
+    // Bash-monitor-wake continuations inherit the correlation of a delegated
+    // workspace turn that was cut mid-work by the wake's queued dispatch, so
+    // the turn's eventual terminal stream-end can settle the parent's handle.
     const streamMuxMetadata =
       optionsMuxMetadata?.type === "workspace-turn-task"
         ? optionsMuxMetadata
         : retryMuxMetadata?.type === "workspace-turn-task"
           ? retryMuxMetadata
-          : undefined;
+          : retryMuxMetadata?.type === "bash-monitor-wake"
+            ? inheritOpenWorkspaceTurnMetadata(historyResult.data)
+            : undefined;
     const acpPromptId =
       normalizeAcpPromptId(options?.acpPromptId) ?? extractAcpPromptId(optionsMuxMetadata);
     const delegatedToolNames =
@@ -5520,6 +5613,24 @@ export class AgentSession {
     );
   }
 
+  /**
+   * Whether a bash-monitor-wake continuation is pending dispatch: the next
+   * queued entry is a wake, or a dequeued wake is mid-dispatch (dequeue →
+   * stream start). Wake sends are the only input that inherits an open
+   * delegated workspace turn's correlation, so TaskService uses this — not
+   * generic queued/preparing state — to decide whether a correlated
+   * "tool-calls" queue cut will be continued rather than superseded. Once the
+   * wake's stream starts, TaskService matches the active stream's inherited
+   * correlation instead (see hasSameTurnWakeContinuation).
+   */
+  hasPendingBashMonitorWakeContinuation(): boolean {
+    if (this.messageQueue.isNextEntryBashMonitorWake()) {
+      return true;
+    }
+    const dispatching = this.dispatchingQueuedEntryMuxMetadata as MuxMessageMetadata | undefined;
+    return dispatching?.type === "bash-monitor-wake";
+  }
+
   /** Whether a message queued with this dedupe key is still pending (see MessageQueue.addOnce). */
   hasQueuedDedupeKey(dedupeKey: string): boolean {
     assert(dedupeKey.length > 0, "hasQueuedDedupeKey requires a dedupeKey");
@@ -5678,6 +5789,7 @@ export class AgentSession {
       // skills, workspace-turn follow-ups) own their turn, and anything queued
       // behind them dispatches on a later drain instead of batching into them.
       const { message, options, internal } = this.messageQueue.dequeueNext();
+      this.dispatchingQueuedEntryMuxMetadata = options?.muxMetadata;
       this.emitQueuedMessageChanged();
 
       // Re-arm dispatch signals for the remaining entries so the stream we are
@@ -5695,6 +5807,10 @@ export class AgentSession {
 
       void this.sendMessage(message, options, internal)
         .then(async (result) => {
+          // Dispatch settled: on success the stream is registered (TaskService
+          // switches to matching the active stream's correlation), on failure
+          // there is no continuation to wait for.
+          this.dispatchingQueuedEntryMuxMetadata = undefined;
           // If sendMessage fails before it can start streaming, ensure we don't
           // leave the session stuck in PREPARING and notify correlated internal callers.
           if (!result.success) {
@@ -5718,6 +5834,7 @@ export class AgentSession {
           }
         })
         .catch(() => {
+          this.dispatchingQueuedEntryMuxMetadata = undefined;
           if (this.turnPhase === TurnPhase.PREPARING) {
             this.setTurnPhase(TurnPhase.IDLE);
           }
