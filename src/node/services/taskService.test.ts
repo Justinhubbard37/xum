@@ -1555,6 +1555,108 @@ describe("TaskService", () => {
     expect(createWorkspace).toHaveBeenCalledTimes(1);
   });
 
+  test("parent Project Chat resolves runtime defaults from each exact logical target", async () => {
+    const config = await createTestConfig(rootDir);
+    const parentProjectPath = await createTestProject(rootDir, "runtime-default-parent");
+    const worktreeChildPath = path.join(parentProjectPath, "packages", "worktree-child");
+    const globalChildPath = path.join(parentProjectPath, "packages", "global-child");
+    await fsPromises.mkdir(worktreeChildPath, { recursive: true });
+    await fsPromises.mkdir(globalChildPath, { recursive: true });
+    await saveTestConfig(
+      config,
+      [
+        [parentProjectPath, { defaultRuntime: "local", trusted: true, workspaces: [] }],
+        [worktreeChildPath, { defaultRuntime: "worktree", parentProjectPath, workspaces: [] }],
+        [
+          globalChildPath,
+          {
+            runtimeOverridesEnabled: true,
+            parentProjectPath,
+            workspaces: [],
+          },
+        ],
+      ],
+      { taskSettings: testTaskSettings(10), defaultRuntime: "docker" }
+    );
+    const projectChat = await config.ensureProjectChat(parentProjectPath);
+    const createdWorkspaceIds = ["root-created", "worktree-created", "explicit-created"];
+    const createWorkspace = mock(
+      (...args: unknown[]): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
+        const workspaceId = createdWorkspaceIds.shift();
+        assert(workspaceId, "unexpected workspace creation");
+        return Promise.resolve(
+          Ok({
+            metadata: {
+              ...createWorkspaceTurnMetadata(parentProjectPath),
+              id: workspaceId,
+              subProjectPath: args[5] as string | undefined,
+            },
+          })
+        );
+      }
+    );
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace });
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const rootResult = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: projectChat.sessionId,
+      prompt: "Create in root",
+      title: "Root runtime",
+      workspace: { mode: "new" },
+    });
+    const worktreeChildResult = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: projectChat.sessionId,
+      prompt: "Create in worktree child",
+      title: "Worktree child runtime",
+      workspace: { mode: "new", projectPath: worktreeChildPath },
+    });
+    const globalChildResult = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: projectChat.sessionId,
+      prompt: "Create in global-default child",
+      title: "Global child runtime",
+      workspace: { mode: "new", projectPath: globalChildPath },
+    });
+    const explicitRuntime: RuntimeConfig = { type: "local" };
+    const explicitChildResult = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: projectChat.sessionId,
+      prompt: "Create in global-default child with explicit runtime",
+      title: "Explicit child runtime",
+      workspace: {
+        mode: "new",
+        projectPath: globalChildPath,
+        runtimeConfig: explicitRuntime,
+      },
+    });
+
+    expect(rootResult.success).toBe(true);
+    expect(worktreeChildResult.success).toBe(true);
+    expect(globalChildResult).toEqual(
+      Err(
+        "Task.createWorkspaceTurn: the default docker runtime requires frontend-only remembered configuration; pass workspace.runtimeConfig explicitly"
+      )
+    );
+    expect(explicitChildResult.success).toBe(true);
+    expect(createWorkspace).toHaveBeenCalledTimes(3);
+
+    const [rootCreate, worktreeChildCreate, explicitChildCreate] = createWorkspace.mock.calls;
+    expect(rootCreate?.[0]).toBe(parentProjectPath);
+    expect(rootCreate?.[2]).toBeUndefined();
+    expect(rootCreate?.[4]).toEqual({ type: "local" });
+    expect(rootCreate?.[5]).toBeUndefined();
+
+    expect(worktreeChildCreate?.[0]).toBe(parentProjectPath);
+    expect(worktreeChildCreate?.[2]).toBe("main");
+    expect(worktreeChildCreate?.[4]).toBeUndefined();
+    expect(worktreeChildCreate?.[5]).toBe(worktreeChildPath);
+
+    expect(explicitChildCreate?.[0]).toBe(parentProjectPath);
+    expect(explicitChildCreate?.[2]).toBeUndefined();
+    expect(explicitChildCreate?.[4]).toEqual(explicitRuntime);
+    expect(explicitChildCreate?.[5]).toBe(globalChildPath);
+  });
+
   test("Project Chat discovers the first devcontainer config for an omitted devcontainer default", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = await createTestProject(rootDir, "devcontainer-default");
@@ -1969,8 +2071,8 @@ describe("TaskService", () => {
     stubStableIds(config, ["newhandle", "newturn", "existinghandle", "existingturn"]);
     const createWorkspace = mock(
       (...args: unknown[]): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
-        expect(args[2]).toBe("main");
-        expect(args[4]).toBeUndefined();
+        expect(args[2]).toBeUndefined();
+        expect(args[4]).toEqual({ type: "local" });
         expect(args[0]).toBe(parentProjectPath);
         expect(args[5]).toBe(subProjectPath);
         return Promise.resolve(

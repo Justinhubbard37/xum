@@ -3403,7 +3403,8 @@ export class TaskService {
     kind: "parent" | "sub_project";
     storageProjectPath: string;
     subProjectPath: string | null;
-    project: ProjectConfig;
+    storageProject: ProjectConfig;
+    selectedProject: ProjectConfig;
   }> | null {
     const owner = this.resolveProjectChatOwner(ownerWorkspaceId);
     if (owner == null) return null;
@@ -3426,7 +3427,10 @@ export class TaskService {
       kind,
       storageProjectPath: ownerCreationScope.projectPath,
       subProjectPath: kind === "sub_project" ? projectPath : null,
-      project: storageProject,
+      // Storage, trust, secrets, and checkout ownership remain with the registered parent. Keep the
+      // exact selected project separately because manual creation resolves runtime defaults from it.
+      storageProject,
+      selectedProject: projectConfig,
     });
 
     // Child Project Chat is intentionally exact-scope. Parent Project Chat may coordinate only
@@ -3455,7 +3459,8 @@ export class TaskService {
     kind: "parent" | "sub_project";
     storageProjectPath: string;
     subProjectPath: string | null;
-    project: ProjectConfig;
+    storageProject: ProjectConfig;
+    selectedProject: ProjectConfig;
   } | null {
     const scopes = this.resolveProjectChatWorkspaceScopes(ownerWorkspaceId, cfg);
     if (scopes == null) return null;
@@ -3473,8 +3478,8 @@ export class TaskService {
     const scopes = this.resolveProjectChatWorkspaceScopes(ownerWorkspaceId, cfg);
     if (scopes == null || scopes.length === 0) return null;
 
-    const project = scopes[0].project;
-    const workspace = project.workspaces.find((candidate) => candidate.id === workspaceId);
+    const storageProject = scopes[0].storageProject;
+    const workspace = storageProject.workspaces.find((candidate) => candidate.id === workspaceId);
     const workspaceSubProjectPath = workspace?.subProjectPath
       ? stripTrailingSlashes(workspace.subProjectPath)
       : null;
@@ -3547,9 +3552,11 @@ export class TaskService {
     const projectChatWorkspaceScope = projectChatOwner
       ? this.resolveProjectChatWorkspaceScope(ownerWorkspaceId, cfg, args.workspace?.projectPath)
       : null;
-    const taskProjectConfig =
-      projectChatWorkspaceScope?.project ??
-      cfg.projects.get(stripTrailingSlashes(parentMeta.projectPath));
+    const parentProjectConfig = cfg.projects.get(stripTrailingSlashes(parentMeta.projectPath));
+    const taskStorageProjectConfig =
+      projectChatWorkspaceScope?.storageProject ?? parentProjectConfig;
+    const taskRuntimeDefaultsProjectConfig =
+      projectChatWorkspaceScope?.selectedProject ?? parentProjectConfig;
     if (projectChatOwner != null && projectChatWorkspaceScope == null) {
       const ownerProject = cfg.projects.get(stripTrailingSlashes(projectChatOwner.projectPath));
       if (
@@ -3567,7 +3574,7 @@ export class TaskService {
       // silently dropping secondary repos from a multi-project caller's task context.
       return Err("Task.createWorkspaceTurn: multi-project workspace turns are not supported yet");
     }
-    if (!taskProjectConfig?.trusted) {
+    if (!taskStorageProjectConfig?.trusted) {
       return Err(
         "This project must be trusted before creating workspaces. Trust the project in Settings → Security, or create a workspace from the project page."
       );
@@ -3670,7 +3677,8 @@ export class TaskService {
         // configs are discoverable from the project, so the backend can select the same first config as UI.
         const branchProjectPath =
           projectChatWorkspaceScope?.storageProjectPath ?? parentMeta.projectPath;
-        const effectiveDefaultRuntime = taskProjectConfig.defaultRuntime ?? cfg.defaultRuntime;
+        const effectiveDefaultRuntime =
+          taskRuntimeDefaultsProjectConfig?.defaultRuntime ?? cfg.defaultRuntime;
         if (explicitRuntimeConfig == null) {
           switch (effectiveDefaultRuntime) {
             case "local":
