@@ -46,6 +46,7 @@ import { ContainerManager } from "@/node/multiProject/containerManager";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as forkOrchestrator from "@/node/services/utils/forkOrchestrator";
+import * as gitModule from "@/node/git";
 import { Ok, Err, type Result } from "@/common/types/result";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { STRUCTURED_WORKFLOW_REPORT_PLACEHOLDER_MARKDOWN } from "@/common/constants/workflowReports";
@@ -1348,6 +1349,72 @@ describe("TaskService", () => {
     ]);
   });
 
+  test("Project Chat propagates Git branch discovery failures instead of dropping to local", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = await createTestProject(rootDir, "branch-discovery-failure");
+    await saveWorkspaces(config, projectPath, [], {
+      taskSettings: testTaskSettings(),
+      defaultRuntime: "worktree",
+    });
+    const projectChat = await config.ensureProjectChat(projectPath);
+    const workspaceMocks = createWorkspaceServiceMocks();
+    const listBranches = spyOn(gitModule, "listLocalBranches").mockRejectedValueOnce(
+      new Error("git unavailable")
+    );
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    try {
+      const result = await taskService.createWorkspaceTurn({
+        ownerWorkspaceId: projectChat.sessionId,
+        prompt: "Create workspace",
+        title: "Branch discovery",
+        workspace: { mode: "new" },
+      });
+
+      expect(result).toEqual(
+        Err("Task.createWorkspaceTurn: failed to inspect Git branches (git unavailable)")
+      );
+      expect(workspaceMocks.create).not.toHaveBeenCalled();
+    } finally {
+      listBranches.mockRestore();
+    }
+  });
+
+  test("Project Chat does not treat Git marker access failures as a non-Git project", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = await createTestProject(rootDir, "git-marker-failure");
+    await saveWorkspaces(config, projectPath, [], {
+      taskSettings: testTaskSettings(),
+      defaultRuntime: "worktree",
+    });
+    const projectChat = await config.ensureProjectChat(projectPath);
+    const workspaceMocks = createWorkspaceServiceMocks();
+    const stat = spyOn(fsPromises, "stat").mockRejectedValueOnce(
+      Object.assign(new Error("permission denied"), { code: "EACCES" })
+    );
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    try {
+      const result = await taskService.createWorkspaceTurn({
+        ownerWorkspaceId: projectChat.sessionId,
+        prompt: "Create workspace",
+        title: "Git marker failure",
+        workspace: { mode: "new" },
+      });
+
+      expect(result).toEqual(
+        Err("Task.createWorkspaceTurn: failed to inspect Git repository (permission denied)")
+      );
+      expect(workspaceMocks.create).not.toHaveBeenCalled();
+    } finally {
+      stat.mockRestore();
+    }
+  });
+
   test("Project Chat rejects unsupported automatic workspace runtime defaults", async () => {
     const unsupportedDefaults = ["ssh", "coder", "docker", "devcontainer"] as const;
 
@@ -1656,6 +1723,87 @@ describe("TaskService", () => {
       },
     });
     expect(typeof listed.data.workspaces[0]?.workspaceTurn?.updatedAt).toBe("string");
+  });
+
+  test("Project Chat lifecycle revalidates exact sub-project ownership after locking", async () => {
+    const config = await createTestConfig(rootDir);
+    const parentProjectPath = await createTestProject(rootDir, "lifecycle-parent", {
+      initGit: false,
+    });
+    const subProjectPath = path.join(parentProjectPath, "packages", "web");
+    const workspacePath = path.join(parentProjectPath, "workspace");
+    await fsPromises.mkdir(subProjectPath, { recursive: true });
+    await fsPromises.mkdir(workspacePath, { recursive: true });
+    await saveTestConfig(
+      config,
+      [
+        [
+          parentProjectPath,
+          {
+            trusted: true,
+            workspaces: [
+              projectWorkspace(parentProjectPath, "workspace", "workspace", {
+                runtimeConfig: { type: "local" },
+                subProjectPath,
+              }),
+            ],
+          },
+        ],
+        [subProjectPath, { parentProjectPath: parentProjectPath, workspaces: [] }],
+      ],
+      { taskSettings: testTaskSettings() }
+    );
+    const projectChat = await config.ensureProjectChat(subProjectPath);
+    const archive = mock(() => Promise.resolve(Ok({ kind: "archived" as const })));
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: createWorkspaceServiceMocks({ archive }).workspaceService,
+    });
+    type LifecycleResolution =
+      | { status: string }
+      | {
+          action: "archive" | "delete_worktree" | "remove";
+          taskId?: string;
+          taskTitle?: string;
+          ownerKind: "project_chat" | "workspace";
+          workspaceId: string;
+          metadata: WorkspaceMetadata | null;
+        };
+    const internal = taskService as unknown as {
+      resolveOwnedWorkspaceLifecycleTarget: (
+        ownerWorkspaceId: string,
+        action: "archive" | "delete_worktree" | "remove",
+        target: { taskId?: string; workspaceId?: string }
+      ) => Promise<LifecycleResolution>;
+    };
+    const resolveTarget = internal.resolveOwnedWorkspaceLifecycleTarget.bind(taskService);
+    internal.resolveOwnedWorkspaceLifecycleTarget = async (...args) => {
+      const resolved = await resolveTarget(...args);
+      if (!("status" in resolved)) {
+        await config.editConfig((cfg) => {
+          const parent = cfg.projects.get(parentProjectPath);
+          const workspace = parent?.workspaces.find((entry) => entry.id === "workspace");
+          if (workspace) {
+            workspace.subProjectPath = undefined;
+          }
+          cfg.projects.delete(subProjectPath);
+          return cfg;
+        });
+      }
+      return resolved;
+    };
+
+    const result = await taskService.archiveOwnedWorkspaceTurnWorkspace(projectChat.sessionId, {
+      workspaceId: "workspace",
+    });
+
+    expect(result).toEqual(
+      Ok({
+        status: "invalid_scope",
+        action: "archive",
+        workspaceId: "workspace",
+      })
+    );
+    expect(archive).not.toHaveBeenCalled();
   });
 
   test("Project Chat bulk workspace list returns canonical ordinary scopes and latest turn state", async () => {

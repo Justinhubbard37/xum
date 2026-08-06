@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import * as path from "node:path";
 import assert from "node:assert/strict";
 import * as fsPromises from "fs/promises";
 
@@ -63,6 +64,7 @@ import {
 } from "@/common/utils/tools/taskGroups";
 import { resolveWorkspaceCreationScope } from "@/common/utils/subProjects";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
+import { isErrnoWithCode } from "@/node/utils/fs";
 import { Ok, Err, type Result } from "@/common/types/result";
 import {
   DEFAULT_TASK_SETTINGS,
@@ -232,6 +234,7 @@ interface ResolvedWorkspaceLifecycleTarget {
   taskId?: string;
   taskTitle?: string;
   workspaceId: string;
+  ownerKind: "project_chat" | "workspace";
   metadata: WorkspaceMetadata | null;
 }
 
@@ -3559,7 +3562,29 @@ export class TaskService {
         // Project Chat itself uses LocalRuntime, but new child workspaces should use the ordinary
         // project creation contract: worktree by default (or the effective project/global default),
         // with backend trunk detection. Non-git projects self-heal to local because worktrees are invalid.
-        const branches = await listLocalBranches(parentMeta.projectPath).catch(() => []);
+        const branchProjectPath =
+          projectChatWorkspaceScope?.storageProjectPath ?? parentMeta.projectPath;
+        let isGitProject = false;
+        try {
+          await fsPromises.stat(path.join(branchProjectPath, ".git"));
+          isGitProject = true;
+        } catch (error) {
+          if (!isErrnoWithCode(error, "ENOENT") && !isErrnoWithCode(error, "ENOTDIR")) {
+            return Err(
+              `Task.createWorkspaceTurn: failed to inspect Git repository (${getErrorMessage(error)})`
+            );
+          }
+        }
+        let branches: string[] = [];
+        if (isGitProject) {
+          try {
+            branches = await listLocalBranches(branchProjectPath);
+          } catch (error) {
+            return Err(
+              `Task.createWorkspaceTurn: failed to inspect Git branches (${getErrorMessage(error)})`
+            );
+          }
+        }
         const effectiveDefaultRuntime = taskProjectConfig.defaultRuntime ?? cfg.defaultRuntime;
         if (
           effectiveDefaultRuntime != null &&
@@ -3575,7 +3600,7 @@ export class TaskService {
         creationTrunkBranch = useLocalRuntime
           ? undefined
           : (args.workspace?.trunkBranch ??
-            (await detectDefaultTrunkBranch(parentMeta.projectPath, branches)) ??
+            (await detectDefaultTrunkBranch(branchProjectPath, branches)) ??
             branches[0]);
       }
       const createResult = await this.workspaceService.create(
@@ -7703,7 +7728,7 @@ export class TaskService {
     );
     if ("status" in resolved) return Ok(resolved);
 
-    return await this.withWorkspaceLifecycleLock(resolved, async (resolved) => {
+    return await this.withWorkspaceLifecycleLock(ownerWorkspaceId, resolved, async (resolved) => {
       if (resolved.metadata == null) {
         return Ok({
           status: "not_found",
@@ -7770,7 +7795,7 @@ export class TaskService {
     );
     if ("status" in resolved) return Ok(resolved);
 
-    return await this.withWorkspaceLifecycleLock(resolved, async (resolved) => {
+    return await this.withWorkspaceLifecycleLock(ownerWorkspaceId, resolved, async (resolved) => {
       if (resolved.metadata == null) {
         return Ok({
           status: "not_found",
@@ -7831,7 +7856,7 @@ export class TaskService {
     );
     if ("status" in resolved) return Ok(resolved);
 
-    return await this.withWorkspaceLifecycleLock(resolved, async (resolved) => {
+    return await this.withWorkspaceLifecycleLock(ownerWorkspaceId, resolved, async (resolved) => {
       if (resolved.metadata == null) {
         return Ok({
           status: "already_removed",
@@ -7870,11 +7895,29 @@ export class TaskService {
     });
   }
 
-  private async withWorkspaceLifecycleLock<T>(
+  private async withWorkspaceLifecycleLock(
+    ownerWorkspaceId: string,
     resolved: ResolvedWorkspaceLifecycleTarget,
-    operation: (lockedResolved: ResolvedWorkspaceLifecycleTarget) => Promise<T>
-  ): Promise<T> {
+    operation: (
+      lockedResolved: ResolvedWorkspaceLifecycleTarget
+    ) => Promise<Result<WorkspaceLifecycleResult, string>>
+  ): Promise<Result<WorkspaceLifecycleResult, string>> {
     return await this.workspaceLifecycleLocks.withLock(resolved.workspaceId, async () => {
+      const cfg = this.config.loadConfigOrDefault();
+      const stillOwned =
+        resolved.ownerKind === "project_chat"
+          ? this.resolveProjectChatWorkspaceTarget(ownerWorkspaceId, resolved.workspaceId, cfg) !=
+            null
+          : await this.taskHandleStore.isWorkspaceOwnedBy(ownerWorkspaceId, resolved.workspaceId);
+      if (!stillOwned) {
+        return Ok({
+          status: "invalid_scope",
+          action: resolved.action,
+          ...(resolved.taskId != null ? { taskId: resolved.taskId } : {}),
+          workspaceId: resolved.workspaceId,
+        });
+      }
+
       const lockedResolved = {
         ...resolved,
         metadata: await this.findWorkspaceLifecycleMetadata(resolved.workspaceId),
@@ -7917,9 +7960,11 @@ export class TaskService {
     }
 
     const cfg = this.config.loadConfigOrDefault();
-    const owned = this.isProjectChatOwner(ownerWorkspaceId)
-      ? this.resolveProjectChatWorkspaceTarget(ownerWorkspaceId, workspaceId, cfg) != null
-      : await this.taskHandleStore.isWorkspaceOwnedBy(ownerWorkspaceId, workspaceId);
+    const ownerKind = this.isProjectChatOwner(ownerWorkspaceId) ? "project_chat" : "workspace";
+    const owned =
+      ownerKind === "project_chat"
+        ? this.resolveProjectChatWorkspaceTarget(ownerWorkspaceId, workspaceId, cfg) != null
+        : await this.taskHandleStore.isWorkspaceOwnedBy(ownerWorkspaceId, workspaceId);
     if (!owned) {
       return {
         status: "invalid_scope",
@@ -7934,6 +7979,7 @@ export class TaskService {
       action,
       ...(taskId != null ? { taskId } : {}),
       ...(taskTitle != null ? { taskTitle } : {}),
+      ownerKind,
       workspaceId,
       metadata,
     };

@@ -266,6 +266,25 @@ describe("Config", () => {
       );
     });
 
+    it("preserves verified Project Chat routing across config read failures", async () => {
+      const projectPath = path.join(tempDir, "routing-cache");
+      fs.mkdirSync(projectPath, { recursive: true });
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, { workspaces: [], trusted: true });
+        return cfg;
+      });
+      const projectChat = await config.ensureProjectChat(projectPath);
+      const expectedSessionDir = path.join(config.projectSessionsDir, projectChat.sessionId);
+      expect(config.getSessionDir(projectChat.sessionId)).toBe(expectedSessionDir);
+
+      fs.writeFileSync(path.join(tempDir, "config.json"), "{ malformed", "utf-8");
+
+      // An active process keeps the last verified owner route rather than splitting writes.
+      expect(config.getSessionDir(projectChat.sessionId)).toBe(expectedSessionDir);
+      // A new process with no verified route fails closed instead of guessing ~/.mux/sessions.
+      expect(() => new Config(tempDir).getSessionDir(projectChat.sessionId)).toThrow();
+    });
+
     it("rejects malformed project-session IDs before resolving filesystem paths", async () => {
       const projectPath = path.join(tempDir, "repo");
       const maliciousSessionId = "project-session_aaaaaaaaaa/../../../outside";

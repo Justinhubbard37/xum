@@ -756,6 +756,9 @@ export class Config {
   private readonly emitter = new EventEmitter();
   /** Keeps captured Project Chat ownership routable while project config is being removed. */
   private readonly retainedProjectSessionRoutes = new Map<string, number>();
+  /** Last successfully parsed Project Chat IDs; retained across transient config read failures. */
+  private readonly verifiedProjectSessionIds = new Set<string>();
+  private hasVerifiedProjectSessionRouting = false;
   /** Serializes editConfig calls; see editConfig for why. */
   private editConfigQueue: Promise<void> = Promise.resolve();
   /** One-shot guard for the queued load-time migration persist; see loadConfigOrDefault. */
@@ -801,6 +804,17 @@ export class Config {
     priority.push("direct");
 
     return priority.length > 1 ? priority : undefined;
+  }
+
+  private updateVerifiedProjectSessionRouting(projects: Map<string, ProjectConfig>): void {
+    this.verifiedProjectSessionIds.clear();
+    for (const project of projects.values()) {
+      const parsed = ProjectChatConfigSchema.safeParse(project.projectChat);
+      if (parsed.success) {
+        this.verifiedProjectSessionIds.add(parsed.data.sessionId);
+      }
+    }
+    this.hasVerifiedProjectSessionRouting = true;
   }
 
   loadConfigOrDefault(options?: { throwOnError?: boolean }): ProjectsConfig {
@@ -1049,6 +1063,8 @@ export class Config {
           claimedSessionIds.add(sessionId);
         }
 
+        this.updateVerifiedProjectSessionRouting(projectsMap);
+
         const taskSettings = normalizeTaskSettings(parsed.taskSettings);
 
         const muxGatewayEnabled = parseOptionalBoolean(parsed.muxGatewayEnabled);
@@ -1278,6 +1294,12 @@ export class Config {
       if (options?.throwOnError) {
         throw error;
       }
+    }
+
+    if (!fs.existsSync(this.configFile) && !this.hasVerifiedProjectSessionRouting) {
+      // A genuinely new config has no Project Chats. Do not clear a prior verified route when the
+      // file transiently disappears during an active process; last-known ownership is safer.
+      this.hasVerifiedProjectSessionRouting = true;
     }
 
     // Return default config
@@ -1880,9 +1902,14 @@ export class Config {
       throw new Error("Invalid session ID");
     }
 
+    if (isProjectSessionId(sessionId) && !this.hasVerifiedProjectSessionRouting) {
+      // Resolve once from a throwing read. If startup config is unreadable, fail the write rather
+      // than guessing the ordinary sessions root and splitting one transcript across both roots.
+      this.loadConfigOrDefault({ throwOnError: true });
+    }
     const isConfiguredProjectSession =
       this.retainedProjectSessionRoutes.has(sessionId) ||
-      (isProjectSessionId(sessionId) && this.findProjectChatBySessionId(sessionId) != null);
+      this.verifiedProjectSessionIds.has(sessionId);
     return path.join(
       isConfiguredProjectSession ? this.projectSessionsDir : this.sessionsDir,
       sessionId
