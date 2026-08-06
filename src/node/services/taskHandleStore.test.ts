@@ -83,6 +83,44 @@ describe("TaskHandleStore", () => {
     ]);
   });
 
+  it("persists workspace-turn attach_file descriptors across store restart", async () => {
+    const { config } = await createTempConfig("task-handle-store-artifacts");
+    const artifactPath = path.join(
+      config.getSessionDir("owner"),
+      "task-artifacts",
+      `${WORKSPACE_TURN_TASK_ID_PREFIX}artifacts`,
+      "chart.png"
+    );
+    const record = {
+      kind: "workspace_turn" as const,
+      handleId: `${WORKSPACE_TURN_TASK_ID_PREFIX}artifacts`,
+      ownerWorkspaceId: "owner",
+      workspaceId: "child",
+      turnId: "turn-artifacts",
+      status: "completed" as const,
+      createdAt: "2026-06-19T00:00:00.000Z",
+      updatedAt: "2026-06-19T00:00:01.000Z",
+      createdWorkspace: true,
+      disposableWorkspace: true,
+      reportMarkdown: "Done",
+      artifacts: {
+        attachFiles: [
+          {
+            path: artifactPath,
+            filename: "chart.png",
+            mediaType: "image/png",
+            sourceToolCallId: "attach-chart",
+          },
+        ],
+      },
+    };
+
+    await new TaskHandleStore(config).upsertWorkspaceTurn(record);
+    expect(await new TaskHandleStore(config).getWorkspaceTurn("owner", record.handleId)).toEqual(
+      record
+    );
+  });
+
   it("rejects unsafe handle IDs before composing paths", async () => {
     const { config } = await createTempConfig("task-handle-store-unsafe-id");
     const store = new TaskHandleStore(config);

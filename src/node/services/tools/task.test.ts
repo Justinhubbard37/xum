@@ -8,6 +8,7 @@ import { createTaskTool, markBuiltInTaskTool, isBuiltInTaskTool } from "./task";
 import { createTestToolConfig, mockToolCallOptions, TestTempDir } from "./testHelpers";
 import { Ok, Err } from "@/common/types/result";
 import { ForegroundWaitBackgroundedError, type TaskService } from "@/node/services/taskService";
+import { ATTACH_FILE_ARTIFACT_GUIDANCE } from "@/common/utils/tools/toolDefinitions";
 
 function expectQueuedOrRunningTaskToolResult(
   result: unknown,
@@ -322,6 +323,58 @@ describe("task tool", () => {
       thinkingLevel: "high",
       reasoningMode: "pro",
     });
+  });
+
+  it("returns durable attach_file descriptors and guidance from foreground workspace turns", async () => {
+    using tempDir = new TestTempDir("test-task-tool-project-chat-artifacts");
+    const artifact = {
+      path: "/owner/project-session/task-artifacts/wst_artifact/report.pdf",
+      filename: "report.pdf",
+      mediaType: "application/pdf",
+      sourceToolCallId: "attach-report",
+    };
+    const createWorkspaceTurn = mock(() =>
+      Ok({
+        taskId: "wst_artifact",
+        kind: "workspace_turn" as const,
+        status: "running" as const,
+        workspaceId: "child-workspace",
+        modelString: "openai:gpt-5.6-sol",
+        thinkingLevel: "high" as const,
+        reasoningMode: "standard" as const,
+      })
+    );
+    const waitForWorkspaceTurn = mock(() =>
+      Promise.resolve({
+        taskId: "wst_artifact",
+        workspaceId: "child-workspace",
+        reportMarkdown: "Created the report.",
+        artifacts: { attachFiles: [artifact] },
+      })
+    );
+    const taskService = { createWorkspaceTurn, waitForWorkspaceTurn } as unknown as TaskService;
+    const taskTool = createTaskTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "project-session_aaaaaaaaaa" }),
+      projectChat: true,
+      taskService,
+    });
+
+    const result = (await taskTool.execute!(
+      {
+        prompt: "create a report",
+        title: "Report",
+        run_in_background: false,
+      },
+      mockToolCallOptions
+    )) as Record<string, unknown>;
+
+    expect(result).toMatchObject({
+      status: "completed",
+      taskId: "wst_artifact",
+      artifacts: { attachFiles: [artifact] },
+    });
+    expect(result.note).toContain(ATTACH_FILE_ARTIFACT_GUIDANCE);
+    expect(JSON.stringify(result)).not.toContain("base64");
   });
 
   it("backgrounds an explicit Project Chat foreground wait when new parent input arrives", async () => {

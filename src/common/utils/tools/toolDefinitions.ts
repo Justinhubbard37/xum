@@ -62,6 +62,7 @@ import { zodToJsonSchema } from "zod-to-json-schema";
 import { extractToolFilePath } from "@/common/utils/tools/toolInputFilePath";
 import { TASK_VARIANT_PLACEHOLDER, TASK_GROUP_KIND_VALUES } from "@/common/utils/tools/taskGroups";
 import { WorkspaceTurnFinalMessageRefSchema } from "@/common/types/workspaceTurn";
+import { TaskAttachFileArtifactsSchema } from "@/common/types/taskArtifacts";
 import { ForegroundWaitInterruptionSchema } from "@/common/types/foregroundWaitInterruption";
 
 import {
@@ -862,6 +863,21 @@ export const TaskToolQueuedResultSchema = z
     }
   });
 
+export const TaskAttachFileArtifactsContainerSchema = z
+  .object({
+    attachFiles: TaskAttachFileArtifactsSchema,
+  })
+  .strict();
+
+export const ATTACH_FILE_ARTIFACT_GUIDANCE =
+  "Attached files are available in artifacts.attachFiles. Re-display an exact artifact without recreating child work by calling attach_file({ path, mediaType, filename }) with its descriptor values (omit filename when absent).";
+
+export function buildCompletedTaskResultNote(hasAttachFiles: boolean): string {
+  return hasAttachFiles
+    ? `${COMPLETED_REPORT_REFETCH_NOTE} ${ATTACH_FILE_ARTIFACT_GUIDANCE}`
+    : COMPLETED_REPORT_REFETCH_NOTE;
+}
+
 export const TaskToolCompletedResultSchema = z
   .object({
     status: z.literal("completed"),
@@ -881,6 +897,8 @@ export const TaskToolCompletedResultSchema = z
     modelString: z.string().optional(),
     thinkingLevel: TaskThinkingLevelSchema.optional(),
     reasoningMode: OpenAIReasoningModeSchema.optional(),
+    note: z.string().optional(),
+    artifacts: TaskAttachFileArtifactsContainerSchema.optional(),
   })
   .strict()
   .superRefine((value, ctx) => {
@@ -1034,6 +1052,7 @@ export type SubagentGitPatchArtifact = z.infer<typeof SubagentGitPatchArtifactSc
 const TaskAwaitToolArtifactsSchema = z
   .object({
     gitFormatPatch: SubagentGitPatchArtifactSchema.optional(),
+    attachFiles: TaskAttachFileArtifactsSchema.optional(),
   })
   .strict();
 
@@ -1556,6 +1575,7 @@ export const TaskListToolTaskSchema = z
     thinkingLevel: TaskThinkingLevelSchema.optional(),
     sticky: z.boolean().optional(),
     workflowProgress: WorkflowProgressSummarySchema.optional(),
+    artifacts: TaskAttachFileArtifactsContainerSchema.optional(),
     depth: z.number().int().min(0),
   })
   .strict();

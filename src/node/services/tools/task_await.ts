@@ -6,6 +6,7 @@ import { WorkflowRunRecordSchema } from "@/common/orpc/schemas";
 import {
   COMPLETED_REPORT_REFETCH_NOTE,
   TaskAwaitToolResultSchema,
+  buildCompletedTaskResultNote,
   TOOL_DEFINITIONS,
 } from "@/common/utils/tools/toolDefinitions";
 import { canRetryWorkflowFromCheckpoint } from "@/common/utils/workflowRetryEligibility";
@@ -575,7 +576,8 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
             title: record.title,
             messageId: record.messageId,
             finalMessageRef: record.finalMessageRef,
-            note: COMPLETED_REPORT_REFETCH_NOTE,
+            artifacts: record.artifacts,
+            note: buildCompletedTaskResultNote((record.artifacts?.attachFiles.length ?? 0) > 0),
           });
           if (timeoutMs === 0 || !isWorkspaceTurnActiveStatus(snapshot.status)) {
             if (snapshot.status === "completed") {
@@ -627,7 +629,8 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
               title: report.title,
               messageId: report.messageId,
               finalMessageRef: report.finalMessageRef,
-              note: COMPLETED_REPORT_REFETCH_NOTE,
+              artifacts: report.artifacts,
+              note: buildCompletedTaskResultNote((report.artifacts?.attachFiles.length ?? 0) > 0),
             };
           } catch (error: unknown) {
             const message = getErrorMessage(error);

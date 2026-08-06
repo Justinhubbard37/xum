@@ -237,6 +237,39 @@ describe("TaskToolCall", () => {
     expect(settings?.textContent).not.toContain("thinking: low");
   });
 
+  test("shows compact attach_file availability without duplicating previews", () => {
+    const view = render(
+      <TooltipProvider>
+        <TaskToolCall
+          args={workspaceTaskArgs}
+          result={{
+            status: "completed",
+            taskId: "wst_artifacts",
+            handleKind: "workspace_turn",
+            workspaceId: "child-workspace",
+            reportMarkdown: "Created the chart.",
+            artifacts: {
+              attachFiles: [
+                {
+                  path: "/owner/task-artifacts/wst_artifacts/chart.png",
+                  filename: "chart.png",
+                  mediaType: "image/png",
+                  sourceToolCallId: "attach-chart",
+                },
+              ],
+            },
+          }}
+          status="completed"
+        />
+      </TooltipProvider>
+    );
+
+    fireEvent.click(view.getByText("task"));
+
+    expect(view.getByText("Attachment available: chart.png")).toBeDefined();
+    expect(view.container.querySelector("img")).toBeNull();
+  });
+
   test("prefers linked report settings over the spawn snapshot after cleanup", () => {
     // Workspace already cleaned up; the task_await-linked report carries the exec
     // settings while the spawn result kept the stale plan-phase ones.
@@ -362,6 +395,39 @@ describe("TaskAwaitToolCall", () => {
 
     expect(view.getByText("Still waiting for 1 task")).toBeDefined();
     expect(view.queryByText("task_await")).toBeNull();
+  });
+
+  test("shows a compact attachment count for completed task awaits", () => {
+    const view = renderTaskAwaitToolCall({
+      status: "completed",
+      result: {
+        results: [
+          {
+            status: "completed",
+            taskId: "task-1",
+            reportMarkdown: "Done",
+            artifacts: {
+              attachFiles: [
+                {
+                  path: "/owner/task-artifacts/task-1/chart.png",
+                  filename: "chart.png",
+                  mediaType: "image/png",
+                },
+                {
+                  path: "/owner/task-artifacts/task-1/report.pdf",
+                  filename: "report.pdf",
+                  mediaType: "application/pdf",
+                },
+              ],
+            },
+          },
+        ],
+      },
+    });
+
+    fireEvent.click(view.getByLabelText("1 task completed. Show task wait details"));
+    expect(view.getByText("2 attachments available: chart.png +1")).toBeDefined();
+    expect(view.container.querySelector("img")).toBeNull();
   });
 
   test("surfaces progress-report interruptions instead of presenting another wait", () => {

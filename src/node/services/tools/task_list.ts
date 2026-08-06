@@ -288,6 +288,7 @@ export const createTaskListTool: ToolFactory = (config: ToolConfiguration) => {
             workspaceId: turn.workspaceId,
             title: turn.title,
             createdAt: turn.createdAt,
+            artifacts: turn.artifacts,
             depth: 1,
           });
         }

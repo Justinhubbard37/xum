@@ -31,6 +31,7 @@ import { useTaskToolLiveTaskIds } from "@/browser/stores/WorkspaceStore";
 import { useCopyToClipboard } from "@/browser/hooks/useCopyToClipboard";
 import { useBackgroundProcesses } from "@/browser/stores/BackgroundBashStore";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import type { TaskAttachFileArtifact } from "@/common/types/taskArtifacts";
 import { WORKSPACE_TURN_TASK_TAGS } from "@/constants/workspaceTags";
 import type {
   TaskToolArgs,
@@ -507,6 +508,7 @@ interface TaskToolDisplayEntry {
   label?: string;
   modelString?: string;
   thinkingLevel?: ThinkingLevel;
+  attachFiles?: readonly TaskAttachFileArtifact[];
 }
 
 interface TaskAiSettingsInfo {
@@ -547,6 +549,22 @@ interface TaskToolOwnReport {
   title?: string;
   groupKind?: TaskGroupKind;
   label?: string;
+  attachFiles?: readonly TaskAttachFileArtifact[];
+}
+
+function formatAttachFileArtifactSummary(
+  attachFiles: readonly TaskAttachFileArtifact[] | undefined
+): string | null {
+  if (attachFiles == null || attachFiles.length === 0) {
+    return null;
+  }
+
+  const first = attachFiles[0];
+  const pathSegments = first.path.split(/[\\/]/);
+  const label = first.filename ?? pathSegments.at(-1) ?? first.mediaType;
+  return attachFiles.length === 1
+    ? `Attachment available: ${label}`
+    : `${attachFiles.length} attachments available: ${label} +${attachFiles.length - 1}`;
 }
 
 function hasNonEmptyText(value: unknown): value is string {
@@ -815,6 +833,7 @@ function collectTaskToolResultDisplayData(result: TaskToolSuccessResult | null):
     ownReportsByTaskId.set(singleTaskId, {
       reportMarkdown: result.reportMarkdown,
       title: result.title,
+      attachFiles: result.artifacts?.attachFiles,
     });
   }
 
@@ -910,6 +929,7 @@ const TaskToolCandidateCard: React.FC<{
 }> = ({ entry, index, total, groupKind, onOpenTranscript }) => {
   const canViewTranscript = entry.status === "completed";
   const hasReport = hasNonEmptyText(entry.reportMarkdown);
+  const attachmentSummary = formatAttachFileArtifactSummary(entry.attachFiles);
   const memberLabel = formatTaskGroupMemberLabel({
     kind: entry.groupKind ?? groupKind,
     index,
@@ -943,6 +963,7 @@ const TaskToolCandidateCard: React.FC<{
         )}
       </div>
 
+      {attachmentSummary && <div className="text-muted mb-1 text-[10px]">{attachmentSummary}</div>}
       {hasReport && entry.reportMarkdown && <TaskReportMarkdown content={entry.reportMarkdown} />}
     </div>
   );
@@ -1061,6 +1082,7 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
         metadata?.taskThinkingLevel ??
         linkedReport?.thinkingLevel ??
         resultAiSettings?.thinkingLevel,
+      attachFiles: ownReport?.attachFiles,
     };
   });
 
@@ -1104,6 +1126,7 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
     interruptionReport?.title ??
     (isTaskGroup ? formatTaskGroupHeader(taskGroupKind, totalTaskGroupCount, preview) : preview);
   const singleEntry = !isTaskGroup ? displayEntries[0] : undefined;
+  const singleAttachmentSummary = formatAttachFileArtifactSummary(singleEntry?.attachFiles);
   const kindBadge = (
     <AgentTypeBadge
       type={taskKindLabel}
@@ -1227,10 +1250,19 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
                 </div>
               </div>
             ) : (
-              singleEntry?.reportMarkdown && (
+              (singleEntry?.reportMarkdown != null || singleAttachmentSummary != null) && (
                 <div className="task-divider border-t pt-2">
-                  <div className="text-muted mb-1 text-[10px] tracking-wide uppercase">Report</div>
-                  <TaskReportMarkdown content={singleEntry.reportMarkdown} />
+                  {singleAttachmentSummary && (
+                    <div className="text-muted mb-1 text-[10px]">{singleAttachmentSummary}</div>
+                  )}
+                  {singleEntry?.reportMarkdown && (
+                    <>
+                      <div className="text-muted mb-1 text-[10px] tracking-wide uppercase">
+                        Report
+                      </div>
+                      <TaskReportMarkdown content={singleEntry.reportMarkdown} />
+                    </>
+                  )}
                 </div>
               )
             )}
@@ -1631,6 +1663,10 @@ const TaskAwaitResult: React.FC<{
     result.status === "completed" ? result.artifacts?.gitFormatPatch : undefined;
 
   const patchSummary = formatGitPatchArtifactSummary(gitPatchArtifact);
+  const attachmentSummary =
+    result.status === "completed"
+      ? formatAttachFileArtifactSummary(result.artifacts?.attachFiles)
+      : null;
   const elapsedMs = "elapsed_ms" in result ? result.elapsed_ms : undefined;
 
   const openWorkspaceId = "workspaceId" in result ? result.workspaceId : undefined;
@@ -1682,6 +1718,7 @@ const TaskAwaitResult: React.FC<{
       </div>
 
       {showDetails && patchSummary && <div className="text-muted text-[10px]">{patchSummary}</div>}
+      {attachmentSummary && <div className="text-muted text-[10px]">{attachmentSummary}</div>}
 
       {showDetails && !isCompleted && output && output.length > 0 && (
         <div className="text-foreground bg-code-bg max-h-[140px] overflow-y-auto rounded-sm p-2 text-[11px] break-words whitespace-pre-wrap">

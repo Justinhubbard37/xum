@@ -178,6 +178,7 @@ import {
   type TerminalAttentionOutcome,
 } from "@/node/services/terminalAttentionStore";
 import { readAgentWorkflowRunReferences } from "@/node/services/agentWorkflowRunReferences";
+import { materializeWorkspaceTurnAttachFileArtifacts } from "@/node/services/workspaceTurnAttachFileArtifacts";
 import { isWorkflowRunTaskId } from "@/node/services/tools/taskId";
 import type { WorkspaceTurnReportContext } from "@/common/utils/tools/toolAvailability";
 import { normalizeWorkflowAgentReportPayloadForHostSchema } from "@/common/utils/tools/workflowReportPayload";
@@ -684,6 +685,7 @@ export interface WorkspaceTurnWaitResult {
   title?: string;
   messageId?: string;
   finalMessageRef?: WorkspaceTurnFinalMessageRef;
+  artifacts?: WorkspaceTurnTaskHandleRecord["artifacts"];
 }
 
 type WorkspaceTurnMuxMetadata = Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
@@ -6141,6 +6143,7 @@ export class TaskService {
       title: record.title,
       messageId: record.messageId,
       finalMessageRef: record.finalMessageRef,
+      artifacts: record.artifacts,
     };
   }
 
@@ -7594,7 +7597,7 @@ export class TaskService {
             deferredMessageIds: [event.messageId],
           });
         }
-        const recovered = this.buildTerminalWorkspaceTurnRecordFromEvent(record, event);
+        const recovered = await this.buildTerminalWorkspaceTurnRecordFromEvent(record, event);
         if (
           !options.repairFromHistory ||
           (recovered.status === record.status && recovered.messageId === record.messageId)
@@ -9991,13 +9994,14 @@ export class TaskService {
     };
   }
 
-  private buildTerminalWorkspaceTurnRecordFromEvent(
+  private async buildTerminalWorkspaceTurnRecordFromEvent(
     record: WorkspaceTurnTaskHandleRecord,
     event: StreamEndEvent
-  ): WorkspaceTurnTaskHandleRecord {
+  ): Promise<WorkspaceTurnTaskHandleRecord> {
     const baseRecord = { ...record };
     delete baseRecord.error;
     delete baseRecord.deferredMessageIds;
+    delete baseRecord.artifacts;
     // Truncated/non-stop provider finishes are partial output, not a completed delegated turn.
     if (event.metadata.finishReason != null && event.metadata.finishReason !== "stop") {
       return {
@@ -10013,6 +10017,24 @@ export class TaskService {
         },
       };
     }
+
+    let attachFiles: NonNullable<WorkspaceTurnTaskHandleRecord["artifacts"]>["attachFiles"] = [];
+    try {
+      attachFiles = await materializeWorkspaceTurnAttachFileArtifacts({
+        ownerSessionDir: this.config.getSessionDir(record.ownerWorkspaceId),
+        handleId: record.handleId,
+        parts: event.parts,
+      });
+    } catch (error) {
+      // Artifact handoff must never prevent terminal settlement. The original child output remains
+      // in history, so restart recovery can retry materialization while the child still exists.
+      log.warn("Workspace turn attachment materialization failed", {
+        handleId: record.handleId,
+        workspaceId: record.workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+
     return {
       ...baseRecord,
       status: "completed",
@@ -10024,6 +10046,7 @@ export class TaskService {
         messageId: event.messageId,
         metadata: event.metadata,
       },
+      ...(attachFiles.length > 0 ? { artifacts: { attachFiles } } : {}),
     };
   }
 
@@ -10057,7 +10080,7 @@ export class TaskService {
       }
       const event = this.buildWorkspaceTurnStreamEndEventFromHistory(record, message);
       if (event != null) {
-        return this.buildTerminalWorkspaceTurnRecordFromEvent(record, event);
+        return await this.buildTerminalWorkspaceTurnRecordFromEvent(record, event);
       }
     }
     return null;
@@ -10274,7 +10297,7 @@ export class TaskService {
       return true;
     }
 
-    const next = this.buildTerminalWorkspaceTurnRecordFromEvent(record, event);
+    const next = await this.buildTerminalWorkspaceTurnRecordFromEvent(record, event);
     await this.settleWorkspaceTurn({
       record,
       next,

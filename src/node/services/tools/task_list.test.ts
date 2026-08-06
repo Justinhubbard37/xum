@@ -293,6 +293,15 @@ describe("task_list tool", () => {
         createdWorkspace: true,
         disposableWorkspace: false,
         title: "Summary",
+        artifacts: {
+          attachFiles: [
+            {
+              path: "/owner/task-artifacts/wst_turn/chart.png",
+              filename: "chart.png",
+              mediaType: "image/png",
+            },
+          ],
+        },
       },
     ]);
     const taskService = {
@@ -319,6 +328,15 @@ describe("task_list tool", () => {
           workspaceId: "child-workspace",
           title: "Summary",
           createdAt: "2026-06-19T00:00:00.000Z",
+          artifacts: {
+            attachFiles: [
+              {
+                path: "/owner/task-artifacts/wst_turn/chart.png",
+                filename: "chart.png",
+                mediaType: "image/png",
+              },
+            ],
+          },
           depth: 1,
         },
       ],

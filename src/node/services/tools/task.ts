@@ -7,6 +7,7 @@ import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools"
 import {
   ProjectChatTaskToolArgsSchema,
   TaskToolResultSchema,
+  buildCompletedTaskResultNote,
   buildProjectChatTaskToolDescription,
   buildTaskToolAgentArgsSchema,
   buildTaskToolDescription,
@@ -557,6 +558,8 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
               title: report.title,
               messageId: report.messageId,
               finalMessageRef: report.finalMessageRef,
+              artifacts: report.artifacts,
+              note: buildCompletedTaskResultNote((report.artifacts?.attachFiles.length ?? 0) > 0),
               modelString: created.data.modelString,
               thinkingLevel: created.data.thinkingLevel,
               reasoningMode: created.data.reasoningMode,

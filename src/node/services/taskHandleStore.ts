@@ -6,6 +6,10 @@ import { z } from "zod";
 
 import type { Config } from "@/node/config";
 import type { CompletedMessagePart, StreamEndEvent } from "@/common/types/stream";
+import {
+  TaskAttachFileArtifactsSchema,
+  type TaskAttachFileArtifact,
+} from "@/common/types/taskArtifacts";
 import type {
   OpenAIReasoningMode,
   ParsedThinkingInput,
@@ -59,6 +63,9 @@ export interface WorkspaceTurnTaskHandleRecord {
     parts?: CompletedMessagePart[];
     metadata: StreamEndEvent["metadata"];
   };
+  artifacts?: {
+    attachFiles: TaskAttachFileArtifact[];
+  };
   deferredMessageIds?: string[];
   error?: string;
   /**
@@ -101,6 +108,12 @@ const WorkspaceTurnTaskHandleRecordSchema = z
         metadata: z.unknown(),
       })
       .passthrough()
+      .optional(),
+    artifacts: z
+      .object({
+        attachFiles: TaskAttachFileArtifactsSchema,
+      })
+      .strict()
       .optional(),
     deferredMessageIds: z.array(z.string().min(1)).optional(),
     error: z.string().optional(),

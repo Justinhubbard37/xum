@@ -4,7 +4,11 @@ import { describe, it, expect, mock, spyOn } from "bun:test";
 import type { ToolExecutionOptions } from "ai";
 
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
-import { COMPLETED_REPORT_REFETCH_NOTE } from "@/common/utils/tools/toolDefinitions";
+import {
+  ATTACH_FILE_ARTIFACT_GUIDANCE,
+  COMPLETED_REPORT_REFETCH_NOTE,
+  buildCompletedTaskResultNote,
+} from "@/common/utils/tools/toolDefinitions";
 import type { WorkflowRunRecord, WorkflowRunStatus } from "@/common/types/workflow";
 import { createTaskAwaitTool } from "./task_await";
 import { TestTempDir, createTestToolConfig } from "./testHelpers";
@@ -73,6 +77,16 @@ describe("task_await tool", () => {
             parts: [{ type: "text", text: "Done" }],
             metadata: {},
           },
+          artifacts: {
+            attachFiles: [
+              {
+                path: "/owner/task-artifacts/wst_done/report.pdf",
+                filename: "report.pdf",
+                mediaType: "application/pdf",
+                sourceToolCallId: "attach-report",
+              },
+            ],
+          },
         })
       ),
     } as unknown as TaskService;
@@ -92,9 +106,21 @@ describe("task_await tool", () => {
         title: "Summary",
         messageId: "msg_1",
         finalMessageRef: { messageId: "msg_1", partCount: 1, textCharCount: 4 },
-        note: COMPLETED_REPORT_REFETCH_NOTE,
+        artifacts: {
+          attachFiles: [
+            {
+              path: "/owner/task-artifacts/wst_done/report.pdf",
+              filename: "report.pdf",
+              mediaType: "application/pdf",
+              sourceToolCallId: "attach-report",
+            },
+          ],
+        },
+        note: buildCompletedTaskResultNote(true),
       },
     ]);
+    expect(result.results[0]?.note).toContain(ATTACH_FILE_ARTIFACT_GUIDANCE);
+    expect(JSON.stringify(result)).not.toContain("base64");
     expect(result.results[0]?.finalMessage).toBeUndefined();
     expect(markWorkspaceTurnTerminalAttentionConsumed).toHaveBeenCalledWith({
       ownerWorkspaceId: "parent-workspace",

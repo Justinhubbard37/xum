@@ -3757,17 +3757,43 @@ describe("TaskService", () => {
     const { parentId, taskService, historyService, created } = await startWorkspaceTurnForTest();
     const appendResult = await historyService.appendToHistory(
       created.workspaceId,
-      createMuxMessage("msg_completed", "assistant", "Recovered final text", {
-        model: "anthropic:claude-opus-4-6",
-        agentId: "exec",
-        finishReason: "stop",
-        muxMetadata: {
-          type: "workspace-turn-task",
-          taskHandleId: created.taskId,
-          ownerWorkspaceId: parentId,
-          turnId: "turn",
+      createMuxMessage(
+        "msg_completed",
+        "assistant",
+        "Recovered final text",
+        {
+          model: "anthropic:claude-opus-4-6",
+          agentId: "exec",
+          finishReason: "stop",
+          muxMetadata: {
+            type: "workspace-turn-task",
+            taskHandleId: created.taskId,
+            ownerWorkspaceId: parentId,
+            turnId: "turn",
+          },
         },
-      })
+        [
+          {
+            type: "dynamic-tool",
+            toolCallId: "attach-recovered",
+            toolName: "attach_file",
+            input: { path: "/coder/child/chart.png" },
+            state: "output-available",
+            output: {
+              type: "content",
+              value: [
+                { type: "text", text: "prepared" },
+                {
+                  type: "media",
+                  data: Buffer.from("recovered-image").toString("base64"),
+                  mediaType: "image/png",
+                  filename: "chart.png",
+                },
+              ],
+            },
+          },
+        ]
+      )
     );
     expect(appendResult.success).toBe(true);
     const internal = taskService as unknown as {
@@ -3786,6 +3812,16 @@ describe("TaskService", () => {
       reportMarkdown: "Recovered final text",
       finalMessageRef: { messageId: "msg_completed", finishReason: "stop", textCharCount: 20 },
     });
+    expect(snapshot?.artifacts?.attachFiles).toHaveLength(1);
+    const recoveredArtifact = snapshot?.artifacts?.attachFiles[0];
+    expect(recoveredArtifact).toMatchObject({
+      filename: "chart.png",
+      mediaType: "image/png",
+      sourceToolCallId: "attach-recovered",
+    });
+    expect(await fsPromises.readFile(recoveredArtifact?.path ?? "")).toEqual(
+      Buffer.from("recovered-image")
+    );
   });
 
   test("getWorkspaceTurnSnapshot recovers stale truncated handles from matching history as errors", async () => {
@@ -8233,9 +8269,44 @@ describe("TaskService", () => {
           turnId: "turn",
         },
       },
-      parts: [{ type: "text", text: "Done" }],
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "attach-disposable",
+          toolName: "attach_file",
+          input: { path: "/remote/disposable/report.pdf" },
+          state: "output-available",
+          output: {
+            type: "content",
+            value: [
+              { type: "text", text: "prepared" },
+              {
+                type: "media",
+                data: Buffer.from("%PDF-disposable").toString("base64"),
+                mediaType: "application/pdf",
+                filename: "report.pdf",
+              },
+            ],
+          },
+        },
+        { type: "text", text: "Done" },
+      ],
     });
     expect(completedRemove).toHaveBeenCalledWith("childworkspace", true);
+    const completedSnapshot = await completed.taskService.getWorkspaceTurnSnapshot(
+      completed.parentId,
+      "wst_handle"
+    );
+    expect(completedSnapshot?.artifacts?.attachFiles).toHaveLength(1);
+    const completedArtifact = completedSnapshot?.artifacts?.attachFiles[0];
+    expect(completedArtifact).toMatchObject({
+      filename: "report.pdf",
+      mediaType: "application/pdf",
+      sourceToolCallId: "attach-disposable",
+    });
+    expect(await fsPromises.readFile(completedArtifact?.path ?? "")).toEqual(
+      Buffer.from("%PDF-disposable")
+    );
 
     const errorRemove = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
     const failed = await startWorkspaceTurnForTest({ disposable: true, remove: errorRemove });
