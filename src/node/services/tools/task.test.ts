@@ -173,6 +173,49 @@ describe("task tool", () => {
     });
   });
 
+  it("backgrounds an explicit Project Chat foreground wait when new parent input arrives", async () => {
+    using tempDir = new TestTempDir("test-task-tool-project-chat-foreground");
+    const createWorkspaceTurn = mock((_args: Parameters<TaskService["createWorkspaceTurn"]>[0]) =>
+      Ok({
+        taskId: "wst_project-chat-foreground",
+        kind: "workspace_turn" as const,
+        status: "running" as const,
+        workspaceId: "child-workspace",
+      })
+    );
+    const waitForWorkspaceTurn = mock(() => Promise.reject(new ForegroundWaitBackgroundedError()));
+    const taskService = { createWorkspaceTurn, waitForWorkspaceTurn } as unknown as TaskService;
+    const ownerSessionId = "project-session_owner";
+    const taskTool = createTaskTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: ownerSessionId }),
+      projectChat: true,
+      taskService,
+    });
+
+    const result = await taskTool.execute!(
+      {
+        kind: "workspace",
+        prompt: "implement",
+        title: "Implementation",
+        run_in_background: false,
+      },
+      mockToolCallOptions
+    );
+
+    expect(waitForWorkspaceTurn).toHaveBeenCalledWith(
+      "wst_project-chat-foreground",
+      expect.objectContaining({
+        requestingWorkspaceId: ownerSessionId,
+        backgroundOnMessageQueued: true,
+      })
+    );
+    expect(result).toMatchObject({
+      taskId: "wst_project-chat-foreground",
+      status: "running",
+      workspaceId: "child-workspace",
+    });
+  });
+
   it("starts a background workspace turn without requiring a sub-agent id", async () => {
     using tempDir = new TestTempDir("test-task-tool-workspace-turn");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });

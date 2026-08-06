@@ -4354,6 +4354,50 @@ describe("TaskService", () => {
     expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(0);
   });
 
+  test("initialize drains persisted Project Chat terminal wake-ups from the separate session root", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = await createTestProject(rootDir, "project-chat-restart", {
+      initGit: false,
+    });
+    await saveWorkspaces(config, projectPath, [], testTaskSettings());
+    const projectChat = await config.ensureProjectChat(projectPath);
+    await config.editConfig((cfg) => {
+      const project = cfg.projects.get(projectPath);
+      assert(project?.projectChat, "Project Chat must exist");
+      project.projectChat.aiSettingsByAgent = {
+        orchestrator: { model: "openai:gpt-5.2", thinkingLevel: "high" },
+      };
+      return cfg;
+    });
+
+    const terminalAttentionStore = new TerminalAttentionStore(config);
+    await terminalAttentionStore.enqueueIfAbsent({
+      ownerWorkspaceId: projectChat.sessionId,
+      sourceKind: "workspace_turn",
+      sourceId: "wst_project_restart_pending",
+      outputDelivery: "requires_task_await",
+      terminalOutcome: "completed",
+    });
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    await taskService.initialize();
+    await flushTerminalAttentionDrains(taskService);
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage.mock.calls[0]?.[0]).toBe(projectChat.sessionId);
+    expect(String(sendMessage.mock.calls[0]?.[1])).toContain("wst_project_restart_pending");
+    expect(sendMessage.mock.calls[0]?.[2]).toMatchObject({
+      model: "openai:gpt-5.2",
+      agentId: "orchestrator",
+      thinkingLevel: "high",
+    });
+    expect(await terminalAttentionStore.listPending(projectChat.sessionId)).toHaveLength(0);
+  });
+
   test("initialize recovers terminal notify workspace turns without pending notification", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
