@@ -87,6 +87,18 @@ describe("built-in agent definitions", () => {
     expect(removed).toContain("workflow_resume");
   });
 
+  test("research verifier is workflow-only and cannot orchestrate", () => {
+    const pkgs = getBuiltInAgentDefinitions();
+    const byId = new Map(pkgs.map((pkg) => [pkg.id, pkg] as const));
+
+    const verifier = byId.get("research_verifier");
+    expect(verifier).toBeTruthy();
+    expect(verifier?.frontmatter.base).toBe("explore");
+    expect(verifier?.frontmatter.subagent?.runnable).toBe(false);
+    expect(verifier?.frontmatter.subagent?.workflow_runnable).toBe(true);
+    expect(verifier?.frontmatter.tools?.remove ?? []).toEqual(["task", "task_await"]);
+  });
+
   test("analytics_query remains unavailable in general-purpose built-in agents", () => {
     const pkgs = getBuiltInAgentDefinitions();
     const byId = new Map(pkgs.map((pkg) => [pkg.id, pkg] as const));

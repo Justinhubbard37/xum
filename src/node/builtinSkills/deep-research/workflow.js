@@ -27,6 +27,7 @@ const MAX_PARALLEL_FETCH = 5;
 const MAX_PARALLEL_VERIFY = 12;
 
 const EXPLORE_AGENT = "explore";
+const RESEARCH_VERIFIER_AGENT = "research_verifier";
 const EXEC_AGENT = "exec";
 
 const SCOPE_SCHEMA = {
@@ -265,7 +266,7 @@ export default function workflow({ args, phase, log, agent, parallel, pipeline }
       agent(buildVerifyPrompt(question, spec.claim, spec.voteIndex), {
         id: stableId("verify", spec.claimIndex + "-" + spec.voteIndex, spec.claim.claim),
         title: "Verify claim " + (spec.claimIndex + 1) + "." + (spec.voteIndex + 1),
-        agentId: EXPLORE_AGENT,
+        agentId: RESEARCH_VERIFIER_AGENT,
         onRefusal: "fail",
         schema: VERDICT_SCHEMA,
       })
@@ -368,7 +369,6 @@ function buildVerifyPrompt(question, claim, voteIndex) {
     "Supporting quote: " + claim.quote,
     "",
     "Use `web_search` and, if needed, `web_fetch` to check contradiction, overreach, source quality, and staleness.",
-    "Do not start workflows or delegate this task. Use the available search and fetch tools directly.",
     "Set refuted=true if the quote does not support the claim, credible sources contradict it, the source is too weak, or the claim is stale/marketing. Use an empty string for counterSource if no counter-source exists. Return structured output only.",
   ].join("\n");
 }

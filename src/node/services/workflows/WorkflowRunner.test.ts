@@ -91,7 +91,7 @@ describe("WorkflowRunner", () => {
     expect(lifecycle).toEqual(["agent", "ended"]);
   });
 
-  test("deep research claim verification uses leaf explore agents", async () => {
+  test("deep research claim verification uses the workflow-only verifier agent", async () => {
     using tmp = new DisposableTempDir("workflow-runner-deep-research-verifiers");
     const store = new WorkflowRunStore({
       sessionDir: tmp.path,
@@ -198,12 +198,7 @@ describe("WorkflowRunner", () => {
     await runner.run("wfr_deep_research_verifiers");
 
     expect(verifierSpecs).toHaveLength(3);
-    expect(verifierSpecs.every((spec) => spec.agentId === "explore")).toBe(true);
-    expect(
-      verifierSpecs.every((spec) =>
-        spec.prompt.includes("Do not start workflows or delegate this task")
-      )
-    ).toBe(true);
+    expect(verifierSpecs.every((spec) => spec.agentId === "research_verifier")).toBe(true);
   });
 
   test("rejects schema on built-in plan agent steps", async () => {
