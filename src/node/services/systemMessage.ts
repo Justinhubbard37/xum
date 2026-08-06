@@ -27,7 +27,10 @@ import type { Runtime } from "@/node/runtime/Runtime";
 import { resolveWorkspaceRootPath } from "@/node/runtime/runtimeHelpers";
 import { getMuxHome } from "@/common/constants/paths";
 import { getAvailableTools } from "@/common/utils/tools/toolDefinitions";
-import { getToolAvailabilityOptions } from "@/common/utils/tools/toolAvailability";
+import {
+  getToolAvailabilityOptions,
+  type WorkspaceTurnReportContext,
+} from "@/common/utils/tools/toolAvailability";
 import { assertNever } from "@/common/utils/assertNever";
 import assert from "@/common/utils/assert";
 
@@ -296,7 +299,8 @@ export async function readToolInstructions(
   runtime: Runtime,
   workspacePath: string,
   modelString: string,
-  agentInstructions?: readonly string[]
+  agentInstructions?: readonly string[],
+  workspaceTurnReportContext?: WorkspaceTurnReportContext
 ): Promise<Record<string, string>> {
   // Tool instructions read the same `AGENTS.md` files as the system prompt;
   // anchor at the workspace root so sub-project workspaces still see parent
@@ -310,6 +314,7 @@ export async function readToolInstructions(
     ...getToolAvailabilityOptions({
       workspaceId: metadata.id,
       parentWorkspaceId: metadata.parentWorkspaceId,
+      workspaceTurnReportContext,
     }),
     agentInstructions,
   });

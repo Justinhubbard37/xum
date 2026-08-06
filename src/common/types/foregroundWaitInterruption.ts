@@ -9,6 +9,8 @@ export const ForegroundWaitProgressReportSchema = z
     reportMarkdown: z.string().min(1),
     model: z.string().min(1).optional(),
     thinkingLevel: ThinkingLevelSchema.optional(),
+    workspaceId: z.string().min(1).optional(),
+    turnId: z.string().min(1).optional(),
     structuredOutput: z.unknown().optional(),
   })
   .strict();

@@ -2378,6 +2378,42 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     });
   });
 
+  it("enables correlated agent_report configuration for ordinary workspace-turn streams", async () => {
+    using muxHome = new DisposableTempDir("ai-service-workspace-turn-agent-report");
+    const projectPath = path.join(muxHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const workspaceId = "ordinary-workspace-turn";
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    const harness = createHarness(muxHome.path, metadata);
+
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("latest-user", "user", "continue")],
+      workspaceId,
+      modelString: "openai:gpt-5.2",
+      thinkingLevel: "medium",
+      muxMetadata: {
+        type: "workspace-turn-task",
+        taskHandleId: "wst_handle",
+        ownerWorkspaceId: "project-chat",
+        turnId: "turn-id",
+      },
+    });
+
+    expect(result.success).toBe(true);
+    const calls = harness.getToolsForModelSpy.mock.calls as unknown[][];
+    expect(calls[0]?.[1]).toMatchObject({
+      workspaceId,
+      enableAgentReport: true,
+      enableReviewPane: true,
+      workspaceTurnReportContext: {
+        handleId: "wst_handle",
+        ownerWorkspaceId: "project-chat",
+        turnId: "turn-id",
+      },
+    });
+  });
+
   it("omits routeProvider from initial stream metadata when unresolved", async () => {
     using muxHome = new DisposableTempDir("ai-service-route-provider-absent");
     const projectPath = path.join(muxHome.path, "project");

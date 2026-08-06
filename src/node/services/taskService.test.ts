@@ -1376,6 +1376,25 @@ describe("TaskService", () => {
       "createdworkspace",
       "existingworkspace",
     ]);
+    if (!reused.success) return;
+    sendMessage.mockClear();
+    await taskService.reportAgentProgress(
+      reused.data.workspaceId,
+      "existing-progress",
+      { reportMarkdown: "Existing workspace update" },
+      {
+        handleId: reused.data.taskId,
+        ownerWorkspaceId: projectChat.sessionId,
+        turnId: "existingturn",
+      }
+    );
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(parseSubagentReportEnvelope(sendMessage.mock.calls[0]?.[1] as string)).toMatchObject({
+      taskId: reused.data.taskId,
+      workspaceId: "existingworkspace",
+      turnId: "existingturn",
+      status: "in_progress",
+    });
   });
 
   test("Project Chat passes every explicit runtime config through and explicit config beats defaults", async () => {
@@ -3718,6 +3737,250 @@ describe("TaskService", () => {
 
     const snapshot = await taskService.getWorkspaceTurnSnapshot(parentId, "wst_handle");
     expect(snapshot).toMatchObject({ status: "interrupted", workspaceId: "childworkspace" });
+  });
+
+  test("active Project Chat workspace turns route progress without settling and task_await returns the final response", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = await createTestProject(rootDir, "workspace-turn-progress");
+    await saveWorkspaces(config, projectPath, [], {
+      taskSettings: testTaskSettings(),
+      defaultRuntime: "local",
+    });
+    const projectChat = await config.ensureProjectChat(projectPath);
+    stubStableIds(config, ["handle", "turn"]);
+
+    const createWorkspace = mock(
+      async (...args: unknown[]): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
+        const tags = args[7] as Record<string, string> | undefined;
+        await config.editConfig((cfg) => {
+          const project = cfg.projects.get(projectPath);
+          assert(project, "test project must exist");
+          project.workspaces.push({
+            path: path.join(projectPath, "workspace-turn"),
+            id: "childworkspace",
+            name: "workspace-turn",
+            title: "Workspace turn",
+            createdAt: "2026-08-06T00:00:00.000Z",
+            runtimeConfig: { type: "local" },
+            tags,
+          });
+          return cfg;
+        });
+        return Ok({
+          metadata: {
+            ...createWorkspaceTurnMetadata(projectPath),
+            id: "childworkspace",
+            name: "workspace-turn",
+          },
+        });
+      }
+    );
+    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const created = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: projectChat.sessionId,
+      prompt: "Investigate",
+      title: "Workspace turn",
+      workspace: { mode: "new" },
+    });
+    expect(created.success).toBe(true);
+    if (!created.success) return;
+    sendMessage.mockClear();
+
+    const context = {
+      handleId: created.data.taskId,
+      ownerWorkspaceId: projectChat.sessionId,
+      turnId: "turn",
+    };
+    await taskService.reportAgentProgress(
+      created.data.workspaceId,
+      "progress-1",
+      { reportMarkdown: "First update", title: "Progress" },
+      context
+    );
+    await taskService.reportAgentProgress(
+      created.data.workspaceId,
+      "progress-1",
+      { reportMarkdown: "Duplicate update" },
+      context
+    );
+    await taskService.reportAgentProgress(
+      created.data.workspaceId,
+      "progress-2",
+      { reportMarkdown: "Second update" },
+      context
+    );
+
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+    const reportCalls = sendMessage.mock.calls as unknown[][];
+    const firstReport = parseSubagentReportEnvelope(reportCalls[0]?.[1] as string);
+    expect(firstReport).toMatchObject({
+      taskId: created.data.taskId,
+      status: "in_progress",
+      agentType: "workspace",
+      workspaceId: created.data.workspaceId,
+      turnId: "turn",
+      reportMarkdown: "First update",
+    });
+    expect(reportCalls[0]?.[0]).toBe(projectChat.sessionId);
+    expect(reportCalls[0]?.[3]).toMatchObject({
+      queueDedupeKey: `agent-report:${created.data.taskId}:progress-1`,
+      foregroundWaitInterruption: {
+        reason: "progress_report_received",
+        sourceTaskId: created.data.taskId,
+        report: {
+          workspaceId: created.data.workspaceId,
+          turnId: "turn",
+          reportMarkdown: "First update",
+        },
+      },
+    });
+    expect(
+      await taskService.getWorkspaceTurnSnapshot(projectChat.sessionId, created.data.taskId)
+    ).toMatchObject({ status: "running" });
+    expect(
+      findWorkspaceInConfig(config, created.data.workspaceId)?.parentWorkspaceId
+    ).toBeUndefined();
+    expect(findWorkspaceInConfig(config, created.data.workspaceId)?.taskStatus).toBeUndefined();
+
+    const finalResultPromise = taskService.waitForWorkspaceTurn(created.data.taskId, {
+      requestingWorkspaceId: projectChat.sessionId,
+      timeoutMs: 1_000,
+      backgroundOnMessageQueued: false,
+    });
+    const internal = taskService as unknown as {
+      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
+    };
+    await internal.handleStreamEnd({
+      type: "stream-end",
+      workspaceId: created.data.workspaceId,
+      messageId: "msg-final",
+      metadata: {
+        model: "anthropic:claude-opus-4-6",
+        agentId: "exec",
+        finishReason: "stop",
+        muxMetadata: {
+          type: "workspace-turn-task",
+          taskHandleId: created.data.taskId,
+          ownerWorkspaceId: projectChat.sessionId,
+          turnId: "turn",
+        },
+      },
+      parts: [{ type: "text", text: "Final answer" }],
+    });
+
+    const finalResult = await finalResultPromise;
+    expect(finalResult).toMatchObject({
+      taskId: created.data.taskId,
+      workspaceId: created.data.workspaceId,
+      reportMarkdown: "Final answer",
+      messageId: "msg-final",
+      finalMessageRef: {
+        messageId: "msg-final",
+        agentId: "exec",
+        finishReason: "stop",
+        textCharCount: 12,
+      },
+    });
+  });
+
+  test("workspace-turn progress rejects mismatched, inactive, queued, and terminal correlations", async () => {
+    const { parentId, taskService, created } = await startWorkspaceTurnForTest();
+    const context = {
+      handleId: created.taskId,
+      ownerWorkspaceId: parentId,
+      turnId: "turn",
+    };
+
+    const expectProgressError = async (promise: Promise<void>, message: string) => {
+      let thrown: unknown;
+      try {
+        await promise;
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(Error);
+      expect((thrown as Error).message).toContain(message);
+    };
+
+    await expectProgressError(
+      taskService.reportAgentProgress(
+        "foreign-workspace",
+        "foreign",
+        { reportMarkdown: "no" },
+        context
+      ),
+      "does not belong to this workspace"
+    );
+    await expectProgressError(
+      taskService.reportAgentProgress(
+        created.workspaceId,
+        "wrong-turn",
+        { reportMarkdown: "no" },
+        { ...context, turnId: "wrong" }
+      ),
+      "correlation is stale"
+    );
+    await expectProgressError(
+      taskService.reportAgentProgress(
+        created.workspaceId,
+        "wrong-owner",
+        { reportMarkdown: "no" },
+        { ...context, ownerWorkspaceId: "wrong-owner" }
+      ),
+      "missing or owned by another workspace"
+    );
+
+    const internal = taskService as unknown as {
+      activeWorkspaceTurnHandleByWorkspaceId: Map<
+        string,
+        { handleId: string; ownerWorkspaceId: string }
+      >;
+      taskHandleStore: TaskHandleStore;
+    };
+    internal.activeWorkspaceTurnHandleByWorkspaceId.clear();
+    await expectProgressError(
+      taskService.reportAgentProgress(
+        created.workspaceId,
+        "stale",
+        { reportMarkdown: "no" },
+        context
+      ),
+      "no longer active"
+    );
+
+    const record = await internal.taskHandleStore.getWorkspaceTurn(parentId, created.taskId);
+    expect(record).not.toBeNull();
+    if (record == null) return;
+    internal.activeWorkspaceTurnHandleByWorkspaceId.set(created.workspaceId, {
+      handleId: created.taskId,
+      ownerWorkspaceId: parentId,
+    });
+    await internal.taskHandleStore.upsertWorkspaceTurn({ ...record, status: "queued" });
+    await expectProgressError(
+      taskService.reportAgentProgress(
+        created.workspaceId,
+        "queued",
+        { reportMarkdown: "no" },
+        context
+      ),
+      "only available from an active workspace turn"
+    );
+
+    await internal.taskHandleStore.upsertWorkspaceTurn({ ...record, status: "completed" });
+    await expectProgressError(
+      taskService.reportAgentProgress(
+        created.workspaceId,
+        "terminal",
+        { reportMarkdown: "no" },
+        context
+      ),
+      "after the workspace turn has completed"
+    );
   });
 
   test("workspace-turn stream-end finalizes the handle without agent_report semantics", async () => {

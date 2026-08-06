@@ -111,6 +111,7 @@ import { NOOP_TIMELINE_RECORDER, type TimelineRecorder } from "@/node/services/t
 import { getTotalCost, sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
 import {
   coerceOpenAIReasoningMode,
+  coerceThinkingLevel,
   type OpenAIReasoningMode,
   type ParsedThinkingInput,
   type ThinkingLevel,
@@ -178,6 +179,7 @@ import {
 } from "@/node/services/terminalAttentionStore";
 import { readAgentWorkflowRunReferences } from "@/node/services/agentWorkflowRunReferences";
 import { isWorkflowRunTaskId } from "@/node/services/tools/taskId";
+import type { WorkspaceTurnReportContext } from "@/common/utils/tools/toolAvailability";
 import { normalizeWorkflowAgentReportPayloadForHostSchema } from "@/common/utils/tools/workflowReportPayload";
 import {
   formatJsonSchemaValidationErrors,
@@ -347,28 +349,32 @@ export interface TaskCreateArgs {
 }
 
 function formatSubagentReportUserMessage(params: {
-  childWorkspaceId: string;
+  taskId: string;
   agentType: string;
   title: string;
   reportMarkdown: string;
   status: "in_progress" | "completed";
   model?: string;
   thinkingLevel?: ThinkingLevel;
+  workspaceId?: string;
+  turnId?: string;
   structuredOutput?: unknown;
 }): string {
-  assert(params.childWorkspaceId.length > 0, "subagent report message requires child id");
+  assert(params.taskId.length > 0, "subagent report message requires task id");
   assert(params.agentType.length > 0, "subagent report message requires agent type");
   assert(params.title.length > 0, "subagent report message requires title");
   assert(params.reportMarkdown.length > 0, "subagent report message requires markdown");
 
   return formatSubagentReportEnvelope({
-    taskId: params.childWorkspaceId,
+    taskId: params.taskId,
     agentType: params.agentType,
     status: params.status,
     title: params.title,
     reportMarkdown: params.reportMarkdown,
     ...(params.model != null ? { model: params.model } : {}),
     ...(params.thinkingLevel != null ? { thinkingLevel: params.thinkingLevel } : {}),
+    ...(params.workspaceId != null ? { workspaceId: params.workspaceId } : {}),
+    ...(params.turnId != null ? { turnId: params.turnId } : {}),
     ...(params.structuredOutput !== undefined ? { structuredOutput: params.structuredOutput } : {}),
   });
 }
@@ -1384,6 +1390,9 @@ export class TaskService {
     Set<BackgroundableForegroundWaiter>
   >();
   private readonly pendingWorkspaceTurnWaitersByHandleId = new Map<string, WorkspaceTurnWaiter[]>();
+  // Tool-call ids are unique within a live stream. Track accepted progress reports until terminal
+  // settlement so provider retries cannot wake the owner twice without changing durable records.
+  private readonly workspaceTurnProgressToolCallIdsByHandleId = new Map<string, Set<string>>();
   private readonly activeWorkspaceTurnHandleByWorkspaceId = new Map<
     string,
     { handleId: string; ownerWorkspaceId: string }
@@ -6238,6 +6247,7 @@ export class TaskService {
           ) {
             this.activeWorkspaceTurnHandleByWorkspaceId.delete(params.record.workspaceId);
           }
+          this.workspaceTurnProgressToolCallIdsByHandleId.delete(current.handleId);
           this.settleWorkspaceTurnWaiters(
             current.handleId,
             current.status === "completed"
@@ -6282,6 +6292,7 @@ export class TaskService {
         ) {
           this.activeWorkspaceTurnHandleByWorkspaceId.delete(params.record.workspaceId);
         }
+        this.workspaceTurnProgressToolCallIdsByHandleId.delete(params.record.handleId);
         const hadForegroundWaiter = this.settleWorkspaceTurnWaiters(
           params.record.handleId,
           params.waiterSettlement
@@ -6476,11 +6487,22 @@ export class TaskService {
   async reportAgentProgress(
     childWorkspaceId: string,
     toolCallId: string,
-    report: { reportMarkdown: string; title?: string; structuredOutput?: unknown }
+    report: { reportMarkdown: string; title?: string; structuredOutput?: unknown },
+    workspaceTurnContext?: WorkspaceTurnReportContext
   ): Promise<void> {
     assert(childWorkspaceId.length > 0, "reportAgentProgress requires childWorkspaceId");
     assert(toolCallId.length > 0, "reportAgentProgress requires toolCallId");
     assert(report.reportMarkdown.length > 0, "reportAgentProgress requires reportMarkdown");
+
+    if (workspaceTurnContext != null) {
+      await this.reportWorkspaceTurnProgress(
+        childWorkspaceId,
+        toolCallId,
+        report,
+        workspaceTurnContext
+      );
+      return;
+    }
 
     await this.workspaceEventLocks.withLock(childWorkspaceId, async () => {
       const cfg = this.config.loadConfigOrDefault();
@@ -6511,7 +6533,7 @@ export class TaskService {
       const agentType = coerceNonEmptyString(childEntry.workspace.agentType) ?? "agent";
       const title = coerceNonEmptyString(report.title) ?? `Subagent (${agentType}) update`;
       const reportContent = formatSubagentReportUserMessage({
-        childWorkspaceId,
+        taskId: childWorkspaceId,
         agentType,
         title,
         reportMarkdown: report.reportMarkdown,
@@ -6577,6 +6599,136 @@ export class TaskService {
           `agent_report failed to wake the parent workspace: ${formattedError.message}`
         );
       }
+    });
+  }
+
+  private async reportWorkspaceTurnProgress(
+    reportingWorkspaceId: string,
+    toolCallId: string,
+    report: { reportMarkdown: string; title?: string; structuredOutput?: unknown },
+    context: WorkspaceTurnReportContext
+  ): Promise<void> {
+    assert(context.handleId.length > 0, "workspace turn report requires handleId");
+    assert(context.ownerWorkspaceId.length > 0, "workspace turn report requires ownerWorkspaceId");
+    assert(context.turnId.length > 0, "workspace turn report requires turnId");
+
+    await this.workspaceTurnSettlementLocks.withLock(context.handleId, async () => {
+      const record = await this.taskHandleStore.getWorkspaceTurn(
+        context.ownerWorkspaceId,
+        context.handleId
+      );
+      if (record == null) {
+        throw new Error("agent_report workspace turn is missing or owned by another workspace");
+      }
+      if (record.workspaceId !== reportingWorkspaceId) {
+        throw new Error("agent_report workspace turn does not belong to this workspace");
+      }
+      if (record.turnId !== context.turnId) {
+        throw new Error("agent_report workspace turn correlation is stale");
+      }
+      if (this.isTerminalWorkspaceTurnStatus(record.status)) {
+        throw new Error("agent_report cannot send updates after the workspace turn has completed");
+      }
+      if (record.status !== "running") {
+        throw new Error("agent_report is only available from an active workspace turn");
+      }
+
+      const active = this.activeWorkspaceTurnHandleByWorkspaceId.get(reportingWorkspaceId);
+      if (
+        active?.handleId !== record.handleId ||
+        active.ownerWorkspaceId !== record.ownerWorkspaceId
+      ) {
+        throw new Error("agent_report workspace turn is no longer active");
+      }
+      const reportedToolCallIds =
+        this.workspaceTurnProgressToolCallIdsByHandleId.get(record.handleId) ?? new Set<string>();
+      if (reportedToolCallIds.has(toolCallId)) {
+        return;
+      }
+
+      const cfg = this.config.loadConfigOrDefault();
+      const ownerEntry = findWorkspaceEntry(cfg, record.ownerWorkspaceId);
+      const resumeOptions =
+        this.resolveProjectChatAutoResumeOptions(record.ownerWorkspaceId) ??
+        (ownerEntry != null
+          ? await this.resolveParentAutoResumeOptions(
+              record.ownerWorkspaceId,
+              ownerEntry,
+              defaultModel
+            )
+          : null);
+      if (resumeOptions == null) {
+        throw new Error("agent_report could not find the workspace turn owner");
+      }
+
+      const agentType = "workspace";
+      const title =
+        coerceNonEmptyString(report.title) ??
+        coerceNonEmptyString(record.title) ??
+        "Workspace turn update";
+      const reportContent = formatSubagentReportUserMessage({
+        taskId: record.handleId,
+        agentType,
+        title,
+        reportMarkdown: report.reportMarkdown,
+        status: "in_progress",
+        workspaceId: reportingWorkspaceId,
+        turnId: record.turnId,
+        ...(record.modelString != null ? { model: record.modelString } : {}),
+        ...(record.thinkingLevel != null
+          ? { thinkingLevel: coerceThinkingLevel(record.thinkingLevel) }
+          : {}),
+        ...(report.structuredOutput !== undefined
+          ? { structuredOutput: report.structuredOutput }
+          : {}),
+      });
+      const progressReport = {
+        agentType,
+        title,
+        reportMarkdown: report.reportMarkdown,
+        workspaceId: reportingWorkspaceId,
+        turnId: record.turnId,
+        ...(record.modelString != null ? { model: record.modelString } : {}),
+        ...(record.thinkingLevel != null
+          ? { thinkingLevel: coerceThinkingLevel(record.thinkingLevel) }
+          : {}),
+        ...(report.structuredOutput !== undefined
+          ? { structuredOutput: report.structuredOutput }
+          : {}),
+      };
+
+      const sendResult = await this.workspaceService.sendMessage(
+        record.ownerWorkspaceId,
+        reportContent,
+        {
+          model: resumeOptions.model,
+          agentId: resumeOptions.agentId,
+          thinkingLevel: resumeOptions.thinkingLevel,
+          reasoningMode: resumeOptions.reasoningMode,
+        },
+        {
+          skipAutoResumeReset: true,
+          synthetic: true,
+          agentInitiated: true,
+          startStreamInBackground: true,
+          queueDedupeKey: `agent-report:${record.handleId}:${toolCallId}`,
+          removableQueueDedupeKey: true,
+          foregroundWaitInterruption: {
+            reason: "progress_report_received",
+            sourceTaskId: record.handleId,
+            report: progressReport,
+          },
+        }
+      );
+      if (!sendResult.success) {
+        const formattedError = formatSendMessageError(sendResult.error);
+        throw new Error(
+          `agent_report failed to wake the workspace turn owner: ${formattedError.message}`
+        );
+      }
+
+      reportedToolCallIds.add(toolCallId);
+      this.workspaceTurnProgressToolCallIdsByHandleId.set(record.handleId, reportedToolCallIds);
     });
   }
 
@@ -12513,7 +12665,7 @@ export class TaskService {
         ? report.title
         : `Subagent (${agentType}) report`;
     const reportContent = formatSubagentReportUserMessage({
-      childWorkspaceId,
+      taskId: childWorkspaceId,
       agentType,
       title: titlePrefix,
       reportMarkdown: report.reportMarkdown,

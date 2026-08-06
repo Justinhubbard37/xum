@@ -32,7 +32,11 @@ import {
   type AdvisorStepCaptureRef,
   type ToolConfiguration,
 } from "@/common/utils/tools/tools";
-import { getGoalToolAvailability } from "@/common/utils/tools/toolAvailability";
+import {
+  getGoalToolAvailability,
+  getToolAvailabilityOptions,
+  type WorkspaceTurnReportContext,
+} from "@/common/utils/tools/toolAvailability";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
@@ -218,6 +222,19 @@ function replaceOrAppendMessageById(messages: MuxMessage[], replacement: MuxMess
   const next = [...messages];
   next[index] = replacement;
   return next;
+}
+
+function getWorkspaceTurnReportContext(
+  muxMetadata: MuxMessageMetadata | undefined
+): WorkspaceTurnReportContext | undefined {
+  if (muxMetadata?.type !== "workspace-turn-task") {
+    return undefined;
+  }
+  return {
+    handleId: muxMetadata.taskHandleId,
+    ownerWorkspaceId: muxMetadata.ownerWorkspaceId,
+    turnId: muxMetadata.turnId,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1072,6 +1089,7 @@ export class AIService extends EventEmitter {
       minThinkingLevel: providedMinThinkingLevel,
       activeTurnThinkingOverride,
     } = opts;
+    const workspaceTurnReportContext = getWorkspaceTurnReportContext(muxMetadata);
     // Support interrupts during startup (before StreamManager emits stream-start).
     // We register an AbortController up-front and let stopStream() abort it.
     const pendingAbortController = new AbortController();
@@ -1752,7 +1770,8 @@ export class AIService extends EventEmitter {
         runtime,
         workspacePath,
         capabilityModelString,
-        agentSystemPromptSections
+        agentSystemPromptSections,
+        workspaceTurnReportContext
       );
       recordStartupPhaseTiming("readToolInstructionsMs", readToolInstructionsStartedAt);
 
@@ -2041,6 +2060,11 @@ export class AIService extends EventEmitter {
       const assistantMessageId = createAssistantMessageId();
       const allowLegacyInvalidWorkflowAgentOutputSchema =
         await this.shouldAllowLegacyInvalidWorkflowAgentOutputSchema(metadata);
+      const toolAvailability = getToolAvailabilityOptions({
+        workspaceId,
+        parentWorkspaceId: metadata.parentWorkspaceId,
+        workspaceTurnReportContext,
+      });
       // Hoisted so the refusal-fallback prepare() can rebuild the toolset for a
       // different model with identical context (only the model string varies).
       const toolsForModelConfig: ToolConfiguration = {
@@ -2141,8 +2165,8 @@ export class AIService extends EventEmitter {
         goalService: workspaceGoalService,
         goalDefaults: effectiveGoalDefaults,
         enableGoalTools: goalToolAvailability,
-        // Only child workspaces (tasks) can report to a parent.
-        enableAgentReport: Boolean(metadata.parentWorkspaceId),
+        ...toolAvailability,
+        ...(workspaceTurnReportContext != null ? { workspaceTurnReportContext } : {}),
         workflowAgentOutputSchema: metadata.workflowTask?.outputSchema,
         allowLegacyInvalidWorkflowAgentOutputSchema,
         // External edit detection callback
