@@ -1797,6 +1797,10 @@ export class TaskService {
     });
   }
 
+  isProjectChatOwner(sessionId: string): boolean {
+    return this.config.findProjectChatBySessionId(sessionId) != null;
+  }
+
   setTimelineRecorder(recorder: TimelineRecorder): void {
     this.timelineRecorder = recorder;
   }
@@ -1898,6 +1902,28 @@ export class TaskService {
       canonicalModel,
       effectiveThinkingLevel,
       ...(effectiveReasoningMode != null ? { effectiveReasoningMode } : {}),
+    };
+  }
+
+  private resolveProjectChatAutoResumeOptions(ownerWorkspaceId: string): {
+    model: string;
+    agentId: string;
+    thinkingLevel?: ThinkingLevel;
+    reasoningMode?: OpenAIReasoningMode;
+  } | null {
+    const projectChat = this.config.findProjectChatBySessionId(ownerWorkspaceId);
+    if (projectChat == null) {
+      return null;
+    }
+    const orchestratorSettings = projectChat.aiSettingsByAgent?.[projectChat.agentId];
+    const model = coerceNonEmptyString(orchestratorSettings?.model) ?? defaultModel;
+    const thinkingLevel = orchestratorSettings?.thinkingLevel;
+    const reasoningMode = coerceOpenAIReasoningMode(orchestratorSettings?.reasoningMode);
+    return {
+      model,
+      agentId: projectChat.agentId,
+      ...(thinkingLevel != null ? { thinkingLevel } : {}),
+      ...(reasoningMode != null ? { reasoningMode } : {}),
     };
   }
 
@@ -3288,6 +3314,45 @@ export class TaskService {
     this.scheduleMaybeStartQueuedTasks();
   }
 
+  private resolveProjectChatOwner(ownerWorkspaceId: string): {
+    projectPath: string;
+    metadata: WorkspaceMetadata;
+  } | null {
+    const projectChat = this.config.findProjectChatBySessionId(ownerWorkspaceId);
+    if (projectChat == null) {
+      return null;
+    }
+    return { projectPath: projectChat.projectPath, metadata: projectChat.metadata };
+  }
+
+  private resolveProjectChatWorkspaceTarget(
+    ownerWorkspaceId: string,
+    workspaceId: string,
+    cfg: ProjectsConfig
+  ): { projectPath: string; workspace: WorkspaceConfigEntry } | null {
+    const owner = this.resolveProjectChatOwner(ownerWorkspaceId);
+    if (owner == null) {
+      return null;
+    }
+    const projectPath = stripTrailingSlashes(owner.projectPath);
+    const project = cfg.projects.get(projectPath);
+    if (project == null || project.projectKind === "system") {
+      return null;
+    }
+    const workspace = project.workspaces.find((candidate) => candidate.id === workspaceId);
+    if (
+      workspace == null ||
+      workspace.kind === "scratch" ||
+      workspace.parentWorkspaceId != null ||
+      workspace.taskStatus != null ||
+      workspace.workflowTask != null ||
+      (workspace.projects?.length ?? 0) > 1
+    ) {
+      return null;
+    }
+    return { projectPath, workspace };
+  }
+
   async createWorkspaceTurn(
     args: WorkspaceTurnCreateArgs
   ): Promise<Result<WorkspaceTurnCreateResult, string>> {
@@ -3311,7 +3376,10 @@ export class TaskService {
 
     await using _lock = await this.mutex.acquire();
 
-    const parentMetaResult = await this.aiService.getWorkspaceMetadata(ownerWorkspaceId);
+    const projectChatOwner = this.resolveProjectChatOwner(ownerWorkspaceId);
+    const parentMetaResult = projectChatOwner
+      ? Ok(projectChatOwner.metadata)
+      : await this.aiService.getWorkspaceMetadata(ownerWorkspaceId);
     if (!parentMetaResult.success) {
       return Err(`Task.createWorkspaceTurn: owner workspace not found (${parentMetaResult.error})`);
     }
@@ -3323,6 +3391,13 @@ export class TaskService {
       return Err("Task.createWorkspaceTurn: scratch workspace turns are not supported yet");
     }
     const taskProjectConfig = cfg.projects.get(stripTrailingSlashes(parentMeta.projectPath));
+    if (
+      projectChatOwner != null &&
+      (parentMeta.projectPath === SCRATCH_PROJECT_CONFIG_KEY ||
+        taskProjectConfig?.projectKind === "system")
+    ) {
+      return Err("Task.createWorkspaceTurn: hidden/system Project Chat owners are not supported");
+    }
     if ((parentMeta.projects?.length ?? 0) > 1) {
       // WorkspaceService.create only materializes one project checkout; fail loudly instead of
       // silently dropping secondary repos from a multi-project caller's task context.
@@ -3375,7 +3450,10 @@ export class TaskService {
       const ownsExistingWorkspace = ownerWorkspaceTurns.some(
         (record) => record.createdWorkspace && record.workspaceId === existingWorkspaceId
       );
-      if (!ownsExistingWorkspace) {
+      const projectChatTarget = projectChatOwner
+        ? this.resolveProjectChatWorkspaceTarget(ownerWorkspaceId, existingWorkspaceId, cfg)
+        : null;
+      if (!ownsExistingWorkspace && projectChatTarget == null) {
         return Err("Task.createWorkspaceTurn: invalid_scope for existing workspace");
       }
       targetWorkspaceId = existingWorkspaceId;
@@ -3408,7 +3486,7 @@ export class TaskService {
       const createResult = await this.workspaceService.create(
         parentMeta.projectPath,
         args.workspace?.branchName,
-        args.workspace?.trunkBranch ?? parentMeta.name,
+        args.workspace?.trunkBranch ?? (projectChatOwner ? undefined : parentMeta.name),
         title,
         parentMeta.runtimeConfig,
         parentMeta.subProjectPath,
@@ -5544,8 +5622,9 @@ export class TaskService {
 
     const cfg = this.config.loadConfigOrDefault();
     const entry = findWorkspaceEntry(cfg, ownerWorkspaceId);
-    if (entry == null) {
-      // Owner workspace no longer exists: the terminal artifacts remain retrievable elsewhere.
+    const projectChatResumeOptions = this.resolveProjectChatAutoResumeOptions(ownerWorkspaceId);
+    if (entry == null && projectChatResumeOptions == null) {
+      // Owner session no longer exists: the terminal artifacts remain retrievable elsewhere.
       for (const notification of pending) {
         await this.terminalAttentionStore.markSuperseded(ownerWorkspaceId, notification.id);
       }
@@ -5666,11 +5745,12 @@ export class TaskService {
       }
     };
 
-    const resumeOptions = await this.resolveParentAutoResumeOptions(
-      ownerWorkspaceId,
-      entry,
-      defaultModel
-    );
+    const resumeOptions =
+      projectChatResumeOptions ??
+      (entry != null
+        ? await this.resolveParentAutoResumeOptions(ownerWorkspaceId, entry, defaultModel)
+        : null);
+    assert(resumeOptions != null, "terminal attention owner resume options must be resolved");
 
     const sendOptions = {
       model: resumeOptions.model,
@@ -5690,7 +5770,8 @@ export class TaskService {
       const latestCfg = this.config.loadConfigOrDefault();
       const latestTaskIndex = this.buildAgentTaskIndex(latestCfg);
       if (
-        findWorkspaceEntry(latestCfg, ownerWorkspaceId) != null &&
+        (findWorkspaceEntry(latestCfg, ownerWorkspaceId) != null ||
+          this.resolveProjectChatAutoResumeOptions(ownerWorkspaceId) != null) &&
         !this.aiService.isStreaming(ownerWorkspaceId) &&
         !this.workspaceService.hasPendingQueuedOrPreparingTurn(ownerWorkspaceId) &&
         !this.interruptedParentWorkspaceIds.has(ownerWorkspaceId) &&
@@ -7568,7 +7649,10 @@ export class TaskService {
       workspaceId = target.workspaceId;
     }
 
-    const owned = await this.taskHandleStore.isWorkspaceOwnedBy(ownerWorkspaceId, workspaceId);
+    const cfg = this.config.loadConfigOrDefault();
+    const owned = this.isProjectChatOwner(ownerWorkspaceId)
+      ? this.resolveProjectChatWorkspaceTarget(ownerWorkspaceId, workspaceId, cfg) != null
+      : await this.taskHandleStore.isWorkspaceOwnedBy(ownerWorkspaceId, workspaceId);
     if (!owned) {
       return {
         status: "invalid_scope",

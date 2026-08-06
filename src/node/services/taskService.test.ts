@@ -1261,6 +1261,239 @@ describe("TaskService", () => {
     );
   });
 
+  test("Project Chat can create and reuse ordinary same-project workspaces", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = await createTestProject(rootDir, "repo", { initGit: false });
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "existing", "existingworkspace", {
+          runtimeConfig: { type: "local" },
+        }),
+      ],
+      testTaskSettings()
+    );
+    const projectChat = await config.ensureProjectChat(projectPath);
+    stubStableIds(config, ["newhandle", "newturn", "existinghandle", "existingturn"]);
+
+    const createWorkspace = mock(
+      async (...args: unknown[]): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
+        expect(args[0]).toBe(projectPath);
+        expect(args[2]).toBeUndefined();
+        await config.editConfig((cfg) => {
+          const project = cfg.projects.get(projectPath);
+          assert(project, "test project must exist");
+          project.workspaces.push(
+            projectWorkspace(projectPath, "created", "createdworkspace", {
+              title: "Created from Project Chat",
+              runtimeConfig: { type: "local" },
+            })
+          );
+          return cfg;
+        });
+        return Ok({
+          metadata: {
+            ...createWorkspaceTurnMetadata(projectPath),
+            id: "createdworkspace",
+            name: "created",
+          },
+        });
+      }
+    );
+    const sendMessage = mock(async (...args: unknown[]): Promise<Result<void>> => {
+      const internal = args[3] as { onAccepted?: () => Promise<void> | void } | undefined;
+      await internal?.onAccepted?.();
+      return Ok(undefined);
+    });
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    expect(taskService.isProjectChatOwner(projectChat.sessionId)).toBe(true);
+    const created = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: projectChat.sessionId,
+      prompt: "Create workspace",
+      title: "Created from Project Chat",
+      workspace: { mode: "new" },
+    });
+    expect(created).toMatchObject({
+      success: true,
+      data: { workspaceId: "createdworkspace", status: "running" },
+    });
+
+    const reused = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: projectChat.sessionId,
+      prompt: "Continue existing workspace",
+      title: "Existing",
+      workspace: { mode: "existing", workspaceId: "existingworkspace" },
+    });
+    expect(reused).toMatchObject({
+      success: true,
+      data: { workspaceId: "existingworkspace", status: "running" },
+    });
+    expect(sendMessage.mock.calls.map((call) => call[0])).toEqual([
+      "createdworkspace",
+      "existingworkspace",
+    ]);
+  });
+
+  test("Project Chat rejects invalid existing workspace scopes", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = await createTestProject(rootDir, "repo", { initGit: false });
+    const otherProjectPath = await createTestProject(rootDir, "other", { initGit: false });
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "ordinary", "ordinary", {
+          runtimeConfig: { type: "local" },
+        }),
+        projectWorkspace(projectPath, "subagent", "subagent", {
+          runtimeConfig: { type: "local" },
+          parentWorkspaceId: "ordinary",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "multi", "multi", {
+          runtimeConfig: { type: "local" },
+          projects: [
+            { projectPath, projectName: "repo" },
+            { projectPath: otherProjectPath, projectName: "other" },
+          ],
+        }),
+      ],
+      {
+        taskSettings: testTaskSettings(),
+        extraProjects: [
+          [
+            otherProjectPath,
+            {
+              trusted: true,
+              workspaces: [
+                projectWorkspace(otherProjectPath, "foreign", "foreign", {
+                  runtimeConfig: { type: "local" },
+                }),
+              ],
+            },
+          ],
+        ],
+      }
+    );
+    const projectChat = await config.ensureProjectChat(projectPath);
+    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: createWorkspaceServiceMocks({ sendMessage }).workspaceService,
+    });
+
+    for (const workspaceId of [projectChat.sessionId, "subagent", "multi", "foreign", "missing"]) {
+      const result = await taskService.createWorkspaceTurn({
+        ownerWorkspaceId: projectChat.sessionId,
+        prompt: `Use ${workspaceId}`,
+        title: workspaceId,
+        workspace: { mode: "existing", workspaceId },
+      });
+      expect(result).toEqual(Err("Task.createWorkspaceTurn: invalid_scope for existing workspace"));
+    }
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("Project Chat rejects hidden/system project ownership", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = await createTestProject(rootDir, "system", { initGit: false });
+    await saveTestConfig(
+      config,
+      [[projectPath, { projectKind: "system", trusted: true, workspaces: [] }]],
+      { taskSettings: testTaskSettings() }
+    );
+    const projectChat = await config.ensureProjectChat(projectPath);
+    const createWorkspace = mock(
+      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
+        Promise.resolve(Err("should not create workspace"))
+    );
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: createWorkspaceServiceMocks({ create: createWorkspace }).workspaceService,
+    });
+
+    expect(
+      await taskService.createWorkspaceTurn({
+        ownerWorkspaceId: projectChat.sessionId,
+        prompt: "Create hidden workspace",
+        title: "Hidden",
+        workspace: { mode: "new" },
+      })
+    ).toEqual(Err("Task.createWorkspaceTurn: hidden/system Project Chat owners are not supported"));
+    expect(createWorkspace).not.toHaveBeenCalled();
+  });
+
+  test("Project Chat lifecycle can archive ordinary same-project workspaces", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = await createTestProject(rootDir, "repo", { initGit: false });
+    const otherProjectPath = await createTestProject(rootDir, "other", { initGit: false });
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "ordinary", "ordinary", {
+          title: "Ordinary",
+          runtimeConfig: { type: "local" },
+        }),
+        projectWorkspace(projectPath, "subagent", "subagent", {
+          runtimeConfig: { type: "local" },
+          parentWorkspaceId: "ordinary",
+          taskStatus: "running",
+        }),
+      ],
+      {
+        taskSettings: testTaskSettings(),
+        extraProjects: [
+          [
+            otherProjectPath,
+            {
+              trusted: true,
+              workspaces: [
+                projectWorkspace(otherProjectPath, "foreign", "foreign", {
+                  runtimeConfig: { type: "local" },
+                }),
+              ],
+            },
+          ],
+        ],
+      }
+    );
+    const projectChat = await config.ensureProjectChat(projectPath);
+    const workspaceMocks = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    expect(
+      await taskService.archiveOwnedWorkspaceTurnWorkspace(
+        projectChat.sessionId,
+        { workspaceId: "ordinary" },
+        {}
+      )
+    ).toEqual(
+      Ok({
+        status: "archived",
+        action: "archive",
+        workspaceId: "ordinary",
+        displayName: "Ordinary",
+      })
+    );
+    expect(workspaceMocks.archive).toHaveBeenCalledWith("ordinary", undefined);
+
+    for (const workspaceId of ["subagent", "foreign", projectChat.sessionId]) {
+      expect(
+        await taskService.archiveOwnedWorkspaceTurnWorkspace(
+          projectChat.sessionId,
+          { workspaceId },
+          {}
+        )
+      ).toEqual(Ok({ status: "invalid_scope", action: "archive", workspaceId }));
+    }
+  });
+
   test("createWorkspaceTurn creates a normal workspace and starts a correlated turn", async () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["childworkspace", "turnhandle"]);
@@ -2455,6 +2688,60 @@ describe("TaskService", () => {
     // Restart-safe dedupe marker is persisted.
     const snapshot = await taskService.getWorkspaceTurnSnapshot(parentId, "wst_handle");
     expect(snapshot?.terminalAttentionNotifiedAt).toBeDefined();
+  });
+
+  test("Project Chat terminal attention uses persisted orchestrator settings and is one-shot", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = await createTestProject(rootDir, "repo", { initGit: false });
+    await saveWorkspaces(config, projectPath, [], testTaskSettings());
+    const projectChat = await config.ensureProjectChat(projectPath);
+    await config.editConfig((cfg) => {
+      const project = cfg.projects.get(projectPath);
+      assert(project?.projectChat, "Project Chat must exist");
+      project.projectChat.aiSettingsByAgent = {
+        orchestrator: {
+          model: "openai:gpt-5.3-codex",
+          thinkingLevel: "high",
+        },
+      };
+      return cfg;
+    });
+
+    const terminalAttentionStore = new TerminalAttentionStore(config);
+    const notification = await terminalAttentionStore.enqueueIfAbsent({
+      ownerWorkspaceId: projectChat.sessionId,
+      sourceKind: "workspace_turn",
+      sourceId: "wst_project",
+      outputDelivery: "requires_task_await",
+      terminalOutcome: "completed",
+    });
+    expect(notification).not.toBeNull();
+
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const internal = taskService as unknown as {
+      drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
+    };
+
+    await internal.drainTerminalAttention(projectChat.sessionId);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage.mock.calls[0]?.[0]).toBe(projectChat.sessionId);
+    expect(sendMessage.mock.calls[0]?.[1]).toContain("wst_project");
+    expect(sendMessage.mock.calls[0]?.[2]).toMatchObject({
+      model: "openai:gpt-5.3-codex",
+      agentId: "orchestrator",
+      thinkingLevel: "high",
+    });
+    expect(sendMessage.mock.calls[0]?.[3]).toMatchObject({ synthetic: true, requireIdle: true });
+    expect(await terminalAttentionStore.get(projectChat.sessionId, notification!.id)).toMatchObject(
+      { status: "delivered" }
+    );
+
+    await internal.drainTerminalAttention(projectChat.sessionId);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 
   test("notify_on_terminal workspace turn defers wake-up while owner has a queued turn", async () => {
