@@ -8735,11 +8735,18 @@ export class WorkspaceService extends EventEmitter {
         }
 
         if (effectiveQueueDispatchMode === "tool-end") {
-          this.taskService?.backgroundForegroundWaitsForWorkspace?.(
-            workspaceId,
+          const interruption =
             session.getQueuedForegroundWaitInterruption?.("tool-end") ??
-              GENERIC_FOREGROUND_WAIT_INTERRUPTION
-          );
+            GENERIC_FOREGROUND_WAIT_INTERRUPTION;
+          const backgroundedCount =
+            this.taskService?.backgroundForegroundWaitsForWorkspace?.(workspaceId, interruption) ??
+            0;
+          if (backgroundedCount > 0 && interruption.reason === "progress_report_received") {
+            session.consumeQueuedForegroundWaitInterruption?.(
+              interruption,
+              "Sub-agent update delivered through the interrupted foreground wait."
+            );
+          }
         }
 
         return Ok(undefined);
@@ -9447,6 +9454,18 @@ export class WorkspaceService extends EventEmitter {
     dispatchMode?: "tool-end" | "turn-end"
   ): ForegroundWaitInterruption | undefined {
     return this.sessions.get(workspaceId.trim())?.getQueuedForegroundWaitInterruption(dispatchMode);
+  }
+
+  consumeQueuedForegroundWaitInterruption(
+    workspaceId: string,
+    interruption: ForegroundWaitInterruption,
+    cancelReason: string
+  ): boolean {
+    return (
+      this.sessions
+        .get(workspaceId.trim())
+        ?.consumeQueuedForegroundWaitInterruption(interruption, cancelReason) ?? false
+    );
   }
 
   async waitForPendingStreamErrorRecoveryDecision(workspaceId: string): Promise<void> {

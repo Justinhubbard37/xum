@@ -1606,6 +1606,11 @@ describe("task_await tool", () => {
         new ForegroundWaitBackgroundedError({
           reason: "progress_report_received",
           sourceTaskId: "t1",
+          report: {
+            agentType: "explore",
+            title: "Progress",
+            reportMarkdown: "Found the relevant path.",
+          },
         })
       )
     );
@@ -1629,6 +1634,11 @@ describe("task_await tool", () => {
       interruption: {
         reason: "progress_report_received",
         sourceTaskId: "t1",
+        report: {
+          agentType: "explore",
+          title: "Progress",
+          reportMarkdown: "Found the relevant path.",
+        },
       },
     });
   });
@@ -1639,6 +1649,11 @@ describe("task_await tool", () => {
     const interruption = {
       reason: "progress_report_received",
       sourceTaskId: "t1",
+      report: {
+        agentType: "explore",
+        title: "Progress",
+        reportMarkdown: "Found the relevant path.",
+      },
     } as const;
     let interruptFirstWait: ((error: Error) => void) | undefined;
     let secondWaitSignal: AbortSignal | undefined;

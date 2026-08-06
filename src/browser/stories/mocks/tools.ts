@@ -10,6 +10,8 @@ import type {
 } from "@/browser/features/Tools/Shared/codeExecutionTypes";
 import type { TodoItem } from "@/common/types/tools";
 
+import type { ForegroundWaitInterruption } from "@/common/types/foregroundWaitInterruption";
+
 /** Part type for message construction */
 type MuxPart = MuxTextPart | MuxReasoningPart | MuxFilePart | MuxToolPart;
 
@@ -480,9 +482,7 @@ export function createTaskTool(
     run_in_background?: boolean;
     taskId: string;
     status: "queued" | "running";
-    interruption?:
-      | { reason: "progress_report_received"; sourceTaskId: string }
-      | { reason: "message_queued" };
+    interruption?: ForegroundWaitInterruption;
   }
 ): MuxPart {
   return {
@@ -658,9 +658,7 @@ export function createTaskAwaitTool(
       error?: string;
       note?: string;
     }>;
-    interruption?:
-      | { reason: "progress_report_received"; sourceTaskId: string }
-      | { reason: "message_queued" };
+    interruption?: ForegroundWaitInterruption;
   }
 ): MuxPart {
   return {

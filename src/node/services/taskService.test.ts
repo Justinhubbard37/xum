@@ -386,6 +386,7 @@ function createWorkspaceServiceMocks(
     hasQueuedWorkspaceTurn: ReturnType<typeof mock>;
     hasQueuedMessages: ReturnType<typeof mock>;
     getQueuedForegroundWaitInterruption: ReturnType<typeof mock>;
+    consumeQueuedForegroundWaitInterruption: ReturnType<typeof mock>;
     isBusyForMessage: ReturnType<typeof mock>;
     hasPendingQueuedOrPreparingTurn: ReturnType<typeof mock>;
     hasPendingBashMonitorWakeContinuation: ReturnType<typeof mock>;
@@ -415,6 +416,7 @@ function createWorkspaceServiceMocks(
   hasQueuedWorkspaceTurn: ReturnType<typeof mock>;
   hasQueuedMessages: ReturnType<typeof mock>;
   getQueuedForegroundWaitInterruption: ReturnType<typeof mock>;
+  consumeQueuedForegroundWaitInterruption: ReturnType<typeof mock>;
   isBusyForMessage: ReturnType<typeof mock>;
   waitForIdleAndNoQueuedMessages: ReturnType<typeof mock>;
   waitForIdle: ReturnType<typeof mock>;
@@ -446,6 +448,8 @@ function createWorkspaceServiceMocks(
   const hasQueuedMessages = overrides?.hasQueuedMessages ?? mock(() => false);
   const getQueuedForegroundWaitInterruption =
     overrides?.getQueuedForegroundWaitInterruption ?? mock(() => undefined);
+  const consumeQueuedForegroundWaitInterruption =
+    overrides?.consumeQueuedForegroundWaitInterruption ?? mock(() => false);
   const isBusyForMessage = overrides?.isBusyForMessage ?? mock(() => false);
   const hasPendingQueuedOrPreparingTurn =
     overrides?.hasPendingQueuedOrPreparingTurn ?? mock(() => false);
@@ -497,6 +501,7 @@ function createWorkspaceServiceMocks(
       hasQueuedWorkspaceTurn,
       hasQueuedMessages,
       getQueuedForegroundWaitInterruption,
+      consumeQueuedForegroundWaitInterruption,
       hasPendingQueuedOrPreparingTurn,
       hasPendingBashMonitorWakeContinuation,
       hasPendingAutoRetry,
@@ -523,6 +528,7 @@ function createWorkspaceServiceMocks(
     hasQueuedWorkspaceTurn,
     hasQueuedMessages,
     getQueuedForegroundWaitInterruption,
+    consumeQueuedForegroundWaitInterruption,
     isBusyForMessage,
     hasPendingQueuedOrPreparingTurn,
     hasPendingAutoRetry,
@@ -2764,6 +2770,93 @@ describe("TaskService", () => {
     }
   });
 
+  test("structured wait interruptions participate in per-child response tracking", async () => {
+    const config = await createTestConfig(rootDir);
+    const { historyService, taskService } = createTaskServiceHarness(config);
+    const internal = taskService as unknown as {
+      findProgressRespondedTaskIds: (
+        ownerWorkspaceId: string,
+        candidateTaskIds: ReadonlySet<string>
+      ) => Promise<Set<string>>;
+    };
+    const childId = "structured-progress-child";
+    const interruption = {
+      reason: "progress_report_received" as const,
+      sourceTaskId: childId,
+      report: {
+        agentType: "explore",
+        title: "Progress",
+        reportMarkdown: "Found the relevant code path.",
+      },
+    };
+
+    for (const scenario of [
+      { name: "text-before-report", guidance: false, expected: false },
+      { name: "same-turn-guidance", guidance: true, expected: true },
+    ]) {
+      const parentId = `parent-${scenario.name}`;
+      const parts: MuxMessage["parts"] = [
+        {
+          type: "dynamic-tool",
+          toolCallId: `${scenario.name}-task`,
+          toolName: "task",
+          state: "output-available",
+          input: {
+            subagent_type: "explore",
+            prompt: "Trace the path.",
+            title: "Trace",
+            run_in_background: false,
+          },
+          output: {
+            status: "running",
+            taskId: childId,
+            interruption,
+            note: "Foreground wait paused because a queued message needs attention.",
+          },
+        },
+      ];
+      if (scenario.guidance) {
+        parts.push({
+          type: "dynamic-tool",
+          toolCallId: `${scenario.name}-guidance`,
+          toolName: "task_send_message",
+          state: "output-available",
+          input: { task_id: childId, message: "Good finding; continue." },
+          output: { status: "accepted", taskId: childId },
+        });
+      }
+
+      await historyService.appendToHistory(
+        parentId,
+        createMuxMessage(
+          `${scenario.name}-response`,
+          "assistant",
+          scenario.guidance ? "" : "This text was emitted before the child report.",
+          { timestamp: Date.now() },
+          parts
+        )
+      );
+      await historyService.appendToHistory(
+        parentId,
+        createMuxMessage(
+          `${scenario.name}-completed`,
+          "user",
+          formatSubagentReportEnvelope({
+            taskId: childId,
+            agentType: "explore",
+            status: "completed",
+            title: "Final report",
+            reportMarkdown: "Investigation complete.",
+          }),
+          { timestamp: Date.now(), synthetic: true, uiVisible: true }
+        )
+      );
+
+      const responded = await internal.findProgressRespondedTaskIds(parentId, new Set([childId]));
+      expect(responded.has(childId), scenario.name).toBe(scenario.expected);
+    }
+  });
+
   test("plain text remains ambiguous when a non-candidate sibling also awaits a response", async () => {
     const config = await createTestConfig(rootDir);
     const { historyService, taskService } = createTaskServiceHarness(config);
@@ -2858,22 +2951,17 @@ describe("TaskService", () => {
     }
     await historyService.appendToHistory(
       parentId,
-      createMuxMessage(
-        "mixed-progress-response",
-        "assistant",
-        "I’ll steer child A and leave child B pending.",
-        { timestamp: Date.now() },
-        [
-          {
-            type: "dynamic-tool",
-            toolCallId: "guide-child-a",
-            toolName: "task_send_message",
-            state: "output-available",
-            input: { task_id: childA, message: "Continue with the current scope." },
-            output: { status: "accepted", taskId: childA },
-          },
-        ]
-      )
+      createMuxMessage("mixed-progress-response", "assistant", "", { timestamp: Date.now() }, [
+        {
+          type: "dynamic-tool",
+          toolCallId: "guide-child-a",
+          toolName: "task_send_message",
+          state: "output-available",
+          input: { task_id: childA, message: "Continue with the current scope." },
+          output: { status: "accepted", taskId: childA },
+        },
+        { type: "text", text: "I’ll steer child A and leave child B pending." },
+      ])
     );
     for (const childId of [childA, childB]) {
       await historyService.appendToHistory(
@@ -13561,6 +13649,11 @@ describe("TaskService", () => {
       const interruption = {
         reason: "progress_report_received",
         sourceTaskId: childId,
+        report: {
+          agentType: "explore",
+          title: "Progress",
+          reportMarkdown: "Found the relevant path.",
+        },
       } as const;
       const count = taskService.backgroundForegroundWaitsForWorkspace(parentId, interruption);
       expect(count).toBe(1);
@@ -13601,11 +13694,18 @@ describe("TaskService", () => {
       const interruption = {
         reason: "progress_report_received",
         sourceTaskId: childId,
+        report: {
+          agentType: "explore",
+          title: "Progress",
+          reportMarkdown: "Found the relevant path.",
+        },
       } as const;
       const getQueuedForegroundWaitInterruption = mock(() => interruption);
+      const consumeQueuedForegroundWaitInterruption = mock(() => true);
       const { workspaceService } = createWorkspaceServiceMocks({
         hasQueuedMessages,
         getQueuedForegroundWaitInterruption,
+        consumeQueuedForegroundWaitInterruption,
       });
       const { taskService } = createTaskServiceHarness(config, { workspaceService });
       const internal = taskService as unknown as {
@@ -13625,6 +13725,11 @@ describe("TaskService", () => {
       expect((waitError as ForegroundWaitBackgroundedError).interruption).toEqual(interruption);
       expect(hasQueuedMessages).toHaveBeenCalledWith(parentId, "tool-end");
       expect(getQueuedForegroundWaitInterruption).toHaveBeenCalledWith(parentId, "tool-end");
+      expect(consumeQueuedForegroundWaitInterruption).toHaveBeenCalledWith(
+        parentId,
+        interruption,
+        "Sub-agent update delivered through the interrupted foreground wait."
+      );
       expect(taskService.backgroundForegroundWaitsForWorkspace(parentId)).toBe(0);
       expect(internal.backgroundableForegroundWaitersByWorkspaceId.has(parentId)).toBe(false);
       expect(internal.pendingStartWaitersByTaskId.has(childId)).toBe(false);
@@ -17208,6 +17313,16 @@ describe("TaskService", () => {
         agentInitiated: true,
         startStreamInBackground: true,
         queueDedupeKey: "agent-report:child-progress:progress-1",
+        foregroundWaitInterruption: {
+          reason: "progress_report_received",
+          sourceTaskId: childId,
+          report: {
+            agentType: "review",
+            title: "Finding",
+            reportMarkdown: "Found a correctness issue.",
+            model: "openai:gpt-4o-mini",
+          },
+        },
       })
     );
     expect(sendMessage.mock.calls[0]?.[1]).toContain('"status": "in_progress"');
@@ -17216,7 +17331,7 @@ describe("TaskService", () => {
     expect(await readSubagentReportArtifact(config.getSessionDir(parentId), childId)).toBeNull();
   });
 
-  test("terminal report becomes a visible card without a second parent response after progress was answered", async () => {
+  test("terminal report becomes a visible card after embedded progress was answered", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
     const parentId = "parent-progress-terminal-card";
@@ -17259,18 +17374,34 @@ describe("TaskService", () => {
     });
     await historyService.appendToHistory(
       parentId,
-      createMuxMessage(
-        "accepted-progress",
-        "user",
-        formatSubagentReportEnvelope({
-          taskId: childId,
-          agentType: "explore",
-          status: "in_progress",
-          title: "Progress",
-          reportMarkdown: "Initial investigation complete.",
-        }),
-        { timestamp: Date.now(), synthetic: true }
-      )
+      createMuxMessage("accepted-progress", "assistant", "", { timestamp: Date.now() }, [
+        {
+          type: "dynamic-tool",
+          toolCallId: "accepted-progress-task",
+          toolName: "task",
+          state: "output-available",
+          input: {
+            subagent_type: "explore",
+            prompt: "Investigate the issue.",
+            title: "Investigate",
+            run_in_background: false,
+          },
+          output: {
+            status: "running",
+            taskId: childId,
+            interruption: {
+              reason: "progress_report_received",
+              sourceTaskId: childId,
+              report: {
+                agentType: "explore",
+                title: "Progress",
+                reportMarkdown: "Initial investigation complete.",
+              },
+            },
+            note: "Foreground wait paused because a queued message needs attention.",
+          },
+        },
+      ])
     );
     await historyService.appendToHistory(
       parentId,

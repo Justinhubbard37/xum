@@ -175,6 +175,11 @@ describe("TaskToolCall", () => {
             interruption: {
               reason: "progress_report_received",
               sourceTaskId: "task-child-progress",
+              report: {
+                agentType: "explore",
+                title: "Progress finding",
+                reportMarkdown: "Found the report rendering path.",
+              },
             },
             note: "Foreground wait paused because a queued message needs attention.",
           }}
@@ -184,6 +189,8 @@ describe("TaskToolCall", () => {
     );
 
     expect(view.getByText("Wait paused for subagent update")).toBeDefined();
+    expect(view.getByText("Progress finding")).toBeDefined();
+    expect(view.getByText("Found the report rendering path.")).toBeDefined();
     expect(view.queryByText("background")).toBeNull();
   });
 
@@ -365,12 +372,18 @@ describe("TaskAwaitToolCall", () => {
         interruption: {
           reason: "progress_report_received",
           sourceTaskId: "task-1",
+          report: {
+            agentType: "explore",
+            title: "Progress finding",
+            reportMarkdown: "Found the report rendering path.",
+          },
         },
       },
     });
 
     expect(view.getByText("Wait paused for subagent update")).toBeDefined();
-    expect(view.getByText(/1 task still active/)).toBeDefined();
+    expect(view.getAllByText("Progress finding").length).toBeGreaterThan(0);
+    expect(view.getByText("Found the report rendering path.")).toBeDefined();
     expect(view.queryByText(/still waiting/i)).toBeNull();
   });
 

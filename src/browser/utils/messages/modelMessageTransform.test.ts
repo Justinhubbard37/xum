@@ -300,6 +300,11 @@ describe("modelMessageTransform", () => {
                 interruption: {
                   reason: "progress_report_received",
                   sourceTaskId: "task1",
+                  report: {
+                    agentType: "explore",
+                    title: "Progress",
+                    reportMarkdown: "Found the relevant path.",
+                  },
                 },
               },
             },

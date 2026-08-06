@@ -89,6 +89,17 @@ interface QueuedMessageInternalOptions {
   cancelSignal?: AbortSignal;
 }
 
+function foregroundWaitInterruptionsEqual(
+  left: ForegroundWaitInterruption,
+  right: ForegroundWaitInterruption
+): boolean {
+  if (left.reason !== right.reason) return false;
+  return (
+    left.reason !== "progress_report_received" ||
+    (right.reason === "progress_report_received" && left.sourceTaskId === right.sourceTaskId)
+  );
+}
+
 type QueueClearCallbacks = Pick<
   QueuedMessageInternalOptions,
   "onCanceled" | "onAcceptedPreStreamFailure"
@@ -185,6 +196,24 @@ export class MessageQueue {
 
   getNextForegroundWaitInterruption(): ForegroundWaitInterruption | undefined {
     return this.entries[0]?.foregroundWaitInterruption;
+  }
+
+  consumeNextForegroundWaitInterruption(
+    expected: ForegroundWaitInterruption
+  ): QueueClearCallbacks | null {
+    const entry = this.entries[0];
+    const actual = entry?.foregroundWaitInterruption;
+    if (entry == null || actual == null || !foregroundWaitInterruptionsEqual(actual, expected)) {
+      return null;
+    }
+
+    this.entries.shift();
+    return {
+      ...(entry.onCanceled != null ? { onCanceled: entry.onCanceled } : {}),
+      ...(entry.onAcceptedPreStreamFailure != null
+        ? { onAcceptedPreStreamFailure: entry.onAcceptedPreStreamFailure }
+        : {}),
+    };
   }
 
   /**

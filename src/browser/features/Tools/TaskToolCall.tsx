@@ -1072,6 +1072,8 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
 
   const interruption =
     successResult?.status !== "completed" ? successResult?.interruption : undefined;
+  const interruptionReport =
+    interruption?.reason === "progress_report_received" ? interruption.report : undefined;
   const headerLabel =
     interruption?.reason === "progress_report_received"
       ? "Wait paused for subagent update"
@@ -1093,14 +1095,14 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
   // pass them as a live forceExpanded signal (latched) to open the row when one lands
   // instead of seeding once and hiding the failure behind the header.
   const { expanded, toggleExpanded } = useStickyExpand("tools", false, {
-    forceExpanded: !!errorResult,
+    forceExpanded: !!errorResult || interruptionReport != null,
   });
 
   const [transcriptTaskId, setTranscriptTaskId] = useState<string | null>(null);
   const preview = prompt.length > 60 ? prompt.slice(0, 60).trim() + "…" : prompt.split("\n")[0];
-  const collapsedPreview = isTaskGroup
-    ? formatTaskGroupHeader(taskGroupKind, totalTaskGroupCount, preview)
-    : preview;
+  const collapsedPreview =
+    interruptionReport?.title ??
+    (isTaskGroup ? formatTaskGroupHeader(taskGroupKind, totalTaskGroupCount, preview) : preview);
   const singleEntry = !isTaskGroup ? displayEntries[0] : undefined;
   const kindBadge = (
     <AgentTypeBadge
@@ -1189,6 +1191,15 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
                 </button>
               )}
             </div>
+
+            {interruptionReport && (
+              <div className="border-task-mode/20 bg-task-mode/5 mb-2 rounded-md border p-2">
+                <div className="text-foreground mb-1 text-[11px] font-medium">
+                  {interruptionReport.title}
+                </div>
+                <TaskReportMarkdown content={interruptionReport.reportMarkdown} />
+              </div>
+            )}
 
             <div className="mb-2">
               <div className="text-muted mb-1 text-[10px] tracking-wide uppercase">Prompt</div>
@@ -1282,6 +1293,8 @@ export const TaskAwaitToolCall: React.FC<TaskAwaitToolCallProps> = ({
   const callError = isToolErrorResult(result) ? result.error : undefined;
   const results = result && "results" in result ? result.results : [];
   const interruption = result && "interruption" in result ? result.interruption : undefined;
+  const interruptionReport =
+    interruption?.reason === "progress_report_received" ? interruption.report : undefined;
 
   const suppressReportInAwaitTaskIds = taskReportLinking?.suppressReportInAwaitTaskIds;
 
@@ -1413,7 +1426,7 @@ export const TaskAwaitToolCall: React.FC<TaskAwaitToolCallProps> = ({
     summaryTone = "active";
   } else if (interruption?.reason === "progress_report_received") {
     summaryTitle = "Wait paused for subagent update";
-    summaryDetail = pendingCount > 0 ? `${formatTasks(pendingCount)} still active` : undefined;
+    summaryDetail = interruption.report.title;
     summaryTone = "waiting";
   } else if (interruption?.reason === "message_queued") {
     summaryTitle = "Wait paused for queued message";
@@ -1436,7 +1449,8 @@ export const TaskAwaitToolCall: React.FC<TaskAwaitToolCallProps> = ({
   // semantic timeline row instead of repeating the full generic tool chrome, while keeping
   // failures expanded so the actionable details are never hidden.
   const { expanded, toggleExpanded } = useStickyExpand("tools", false, {
-    forceExpanded: callError != null || status === "failed" || failedCount > 0,
+    forceExpanded:
+      callError != null || status === "failed" || failedCount > 0 || interruptionReport != null,
   });
 
   const SummaryIcon =
@@ -1531,6 +1545,15 @@ export const TaskAwaitToolCall: React.FC<TaskAwaitToolCallProps> = ({
                 {timeoutSecs != null && <span>· {timeoutSecs}s timeout</span>}
                 {args.filter != null && <span className="truncate">· filter {args.filter}</span>}
                 {args.filter_exclude === true && <span>· excluding matches</span>}
+              </div>
+            )}
+
+            {interruptionReport && (
+              <div className="border-task-mode/20 bg-surface-primary/60 m-2 rounded-md border p-2.5">
+                <div className="text-foreground mb-1 text-[11px] font-medium">
+                  {interruptionReport.title}
+                </div>
+                <TaskReportMarkdown content={interruptionReport.reportMarkdown} />
               </div>
             )}
 

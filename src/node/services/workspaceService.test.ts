@@ -5238,6 +5238,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
     dropQueuedMessageWithOnlyDedupeKey: ReturnType<typeof mock>;
     queueMessage: ReturnType<typeof mock>;
     getQueuedForegroundWaitInterruption: ReturnType<typeof mock>;
+    consumeQueuedForegroundWaitInterruption: ReturnType<typeof mock>;
     sendMessage: ReturnType<typeof mock>;
     resumeStream: ReturnType<typeof mock>;
   };
@@ -5311,6 +5312,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
       dropQueuedMessageWithOnlyDedupeKey: mock(() => false),
       queueMessage: mock(() => "tool-end" as const),
       getQueuedForegroundWaitInterruption: mock(() => ({ reason: "message_queued" as const })),
+      consumeQueuedForegroundWaitInterruption: mock(() => true),
       sendMessage: mock(() => Promise.resolve(Ok(undefined))),
       resumeStream: mock(() => Promise.resolve(Ok({ started: true }))),
     };
@@ -5759,10 +5761,15 @@ describe("WorkspaceService sendMessage status clearing", () => {
     const interruption = {
       reason: "progress_report_received",
       sourceTaskId: "child-task",
+      report: {
+        agentType: "explore",
+        title: "Progress",
+        reportMarkdown: "Found the relevant path.",
+      },
     } as const;
     fakeSession.getQueuedForegroundWaitInterruption.mockReturnValue(interruption);
 
-    const backgroundForegroundWaitsForWorkspace = mock(() => 0);
+    const backgroundForegroundWaitsForWorkspace = mock(() => 1);
     workspaceService.setTaskService({
       getAgentTaskStatus: mock(() => "running" as const),
       backgroundForegroundWaitsForWorkspace,
@@ -5784,6 +5791,10 @@ describe("WorkspaceService sendMessage status clearing", () => {
     expect(backgroundForegroundWaitsForWorkspace).toHaveBeenCalledWith(
       "test-workspace",
       interruption
+    );
+    expect(fakeSession.consumeQueuedForegroundWaitInterruption).toHaveBeenCalledWith(
+      interruption,
+      "Sub-agent update delivered through the interrupted foreground wait."
     );
   });
 

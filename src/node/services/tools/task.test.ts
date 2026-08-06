@@ -1118,6 +1118,11 @@ describe("task tool", () => {
         new ForegroundWaitBackgroundedError({
           reason: "progress_report_received",
           sourceTaskId: "child-task",
+          report: {
+            agentType: "explore",
+            title: "Progress",
+            reportMarkdown: "Found the relevant path.",
+          },
         })
       )
     );
@@ -1156,6 +1161,11 @@ describe("task tool", () => {
       interruption: {
         reason: "progress_report_received",
         sourceTaskId: "child-task",
+        report: {
+          agentType: "explore",
+          title: "Progress",
+          reportMarkdown: "Found the relevant path.",
+        },
       },
       note: "Foreground wait paused because a queued message needs attention.",
     });

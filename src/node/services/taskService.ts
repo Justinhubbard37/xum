@@ -120,6 +120,7 @@ import {
 import {
   AgentReportInlineToolArgsSchema,
   AgentReportSubmittedReportSchema,
+  TaskAwaitToolResultSchema,
   TaskSendMessageToolArgsSchema,
   TaskSendMessageToolResultSchema,
   TaskToolResultSchema,
@@ -321,20 +322,51 @@ function formatSubagentReportUserMessage(params: {
   });
 }
 
-function hasSubstantiveAssistantText(message: MuxMessage): boolean {
-  return message.parts.some((part) => part.type === "text" && part.text.trim().length > 0);
+function getProgressReportInterruption(part: unknown): ForegroundWaitInterruption | undefined {
+  if (!isDynamicToolPart(part) || part.state !== "output-available") return undefined;
+  if (part.toolName === "task") {
+    const output = TaskToolResultSchema.safeParse(part.output);
+    return output.success && output.data.status !== "completed"
+      ? output.data.interruption
+      : undefined;
+  }
+  if (part.toolName === "task_await") {
+    const output = TaskAwaitToolResultSchema.safeParse(part.output);
+    return output.success ? output.data.interruption : undefined;
+  }
+  return undefined;
 }
 
-function getSuccessfulGuidanceTaskIds(message: MuxMessage): Set<string> {
-  const taskIds = new Set<string>();
+function applyAssistantProgressResponse(
+  message: MuxMessage,
+  awaitingResponse: Set<string>,
+  responded: Set<string>
+): void {
+  // Guidance in this turn must not make later prose look unambiguous for another sibling.
+  // Keep the candidates visible to text separate while still applying targeted guidance eagerly.
+  const textAttributionCandidates = new Set(awaitingResponse);
   for (const part of message.parts) {
-    if (
-      !isDynamicToolPart(part) ||
-      part.toolName !== "task_send_message" ||
-      part.state !== "output-available"
-    ) {
+    if (part.type === "text" && part.text.trim().length > 0) {
+      if (textAttributionCandidates.size === 1) {
+        const taskId = textAttributionCandidates.values().next().value;
+        if (taskId != null) {
+          if (awaitingResponse.delete(taskId)) {
+            responded.add(taskId);
+          }
+          textAttributionCandidates.delete(taskId);
+        }
+      }
       continue;
     }
+    const progressInterruption = getProgressReportInterruption(part);
+    if (progressInterruption?.reason === "progress_report_received") {
+      awaitingResponse.add(progressInterruption.sourceTaskId);
+      textAttributionCandidates.add(progressInterruption.sourceTaskId);
+      responded.delete(progressInterruption.sourceTaskId);
+      continue;
+    }
+    if (!isDynamicToolPart(part) || part.state !== "output-available") continue;
+    if (part.toolName !== "task_send_message") continue;
 
     const input = TaskSendMessageToolArgsSchema.safeParse(part.input);
     const output = TaskSendMessageToolResultSchema.safeParse(part.output);
@@ -342,12 +374,12 @@ function getSuccessfulGuidanceTaskIds(message: MuxMessage): Set<string> {
       input.success &&
       output.success &&
       (output.data.status === "accepted" || output.data.status === "queued") &&
-      output.data.taskId === input.data.task_id
+      output.data.taskId === input.data.task_id &&
+      awaitingResponse.delete(input.data.task_id)
     ) {
-      taskIds.add(input.data.task_id);
+      responded.add(input.data.task_id);
     }
   }
-  return taskIds;
 }
 
 // Failure twin of formatSubagentReportUserMessage: terminal child failures are
@@ -5438,25 +5470,7 @@ export class TaskService {
       }
 
       if (message.role === "assistant" && message.metadata?.partial !== true) {
-        // Plain text is safely attributable only when one child is awaiting a response. With
-        // multiple siblings, require same-child guidance so commentary about A cannot hide B's
-        // terminal report. Capture this before applying guidance from the same mixed turn.
-        const textResponseTaskId =
-          hasSubstantiveAssistantText(message) && awaitingResponse.size === 1
-            ? awaitingResponse.values().next().value
-            : undefined;
-        if (textResponseTaskId != null) {
-          awaitingResponse.delete(textResponseTaskId);
-          responded.add(textResponseTaskId);
-        }
-
-        // A wait-only or unrelated tool turn is not a response to the child. Only successful,
-        // same-child guidance discharges that child's latest update; sibling guidance remains scoped.
-        for (const taskId of getSuccessfulGuidanceTaskIds(message)) {
-          if (awaitingResponse.delete(taskId)) {
-            responded.add(taskId);
-          }
-        }
+        applyAssistantProgressResponse(message, awaitingResponse, responded);
       }
     }
     return new Set([...responded].filter((taskId) => visibleCompletedReports.has(taskId)));
@@ -5476,6 +5490,15 @@ export class TaskService {
       return false;
     }
     return historyResult.data.some((message) => {
+      if (message.role === "assistant" && message.metadata?.partial !== true) {
+        return message.parts.some((part) => {
+          const interruption = getProgressReportInterruption(part);
+          return (
+            interruption?.reason === "progress_report_received" &&
+            interruption.sourceTaskId === taskId
+          );
+        });
+      }
       if (message.role !== "user" || message.metadata?.synthetic !== true) return false;
       const text = message.parts
         .filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text")
@@ -5707,13 +5730,22 @@ export class TaskService {
       requestingWorkspaceId &&
       this.workspaceService.hasQueuedMessages(requestingWorkspaceId, "tool-end")
     ) {
-      this.backgroundForegroundWaitsForWorkspace(
-        requestingWorkspaceId,
+      const interruption =
         this.workspaceService.getQueuedForegroundWaitInterruption?.(
           requestingWorkspaceId,
           "tool-end"
-        ) ?? GENERIC_FOREGROUND_WAIT_INTERRUPTION
+        ) ?? GENERIC_FOREGROUND_WAIT_INTERRUPTION;
+      const backgroundedCount = this.backgroundForegroundWaitsForWorkspace(
+        requestingWorkspaceId,
+        interruption
       );
+      if (backgroundedCount > 0 && interruption.reason === "progress_report_received") {
+        this.workspaceService.consumeQueuedForegroundWaitInterruption?.(
+          requestingWorkspaceId,
+          interruption,
+          "Sub-agent update delivered through the interrupted foreground wait."
+        );
+      }
     }
   }
 
@@ -6160,6 +6192,20 @@ export class TaskService {
           foregroundWaitInterruption: {
             reason: "progress_report_received",
             sourceTaskId: childWorkspaceId,
+            report: {
+              agentType,
+              title,
+              reportMarkdown: report.reportMarkdown,
+              ...(childEntry.workspace.taskModelString != null
+                ? { model: childEntry.workspace.taskModelString }
+                : {}),
+              ...(childEntry.workspace.taskThinkingLevel != null
+                ? { thinkingLevel: childEntry.workspace.taskThinkingLevel }
+                : {}),
+              ...(report.structuredOutput !== undefined
+                ? { structuredOutput: report.structuredOutput }
+                : {}),
+            },
           },
         }
       );

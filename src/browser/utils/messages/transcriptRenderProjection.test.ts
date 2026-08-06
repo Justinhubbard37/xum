@@ -785,6 +785,11 @@ describe("operational bundle coalescing", () => {
             interruption: {
               reason: "progress_report_received",
               sourceTaskId: "task-1",
+              report: {
+                agentType: "explore",
+                title: "Progress",
+                reportMarkdown: "Found the relevant path.",
+              },
             },
           },
         }),

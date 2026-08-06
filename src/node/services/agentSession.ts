@@ -5641,6 +5641,22 @@ export class AgentSession {
       : undefined;
   }
 
+  consumeQueuedForegroundWaitInterruption(
+    interruption: ForegroundWaitInterruption,
+    cancelReason: string
+  ): boolean {
+    const callbacks = this.messageQueue.consumeNextForegroundWaitInterruption(interruption);
+    if (callbacks == null) return false;
+
+    this.emitQueuedMessageChanged();
+    this.backgroundProcessManager.setMessageQueued(
+      this.workspaceId,
+      !this.messageQueue.isEmpty() && this.messageQueue.getNextQueueDispatchMode() === "tool-end"
+    );
+    this.notifyQueuedMessageCleared(callbacks, cancelReason);
+    return true;
+  }
+
   /** Whether a message queued with this dedupe key is still pending (see MessageQueue.addOnce). */
   hasQueuedDedupeKey(dedupeKey: string): boolean {
     assert(dedupeKey.length > 0, "hasQueuedDedupeKey requires a dedupeKey");
