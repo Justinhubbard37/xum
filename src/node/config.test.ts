@@ -338,6 +338,98 @@ describe("Config", () => {
       );
     });
 
+    it("keeps the old Project Chat identity and retries when migration preparation fails", async () => {
+      const projectPath = path.join(tempDir, "migration-retry");
+      const collidingSessionId = "project-session_aaaaaaaaaa";
+      const replacementSessionId = `${PROJECT_CHAT_SESSION_ID_PREFIX}${crypto
+        .createHash("sha256")
+        .update([collidingSessionId, projectPath, "0"].join("\0"))
+        .digest("hex")
+        .slice(0, 10)}`;
+      const sourceSessionDir = path.join(config.projectSessionsDir, collidingSessionId);
+      const replacementSessionDir = path.join(config.projectSessionsDir, replacementSessionId);
+      fs.mkdirSync(sourceSessionDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(sourceSessionDir, "chat.jsonl"),
+        `${JSON.stringify({
+          ...createMuxMessage("retry-state", "user", "preserve me", { timestamp: 1 }),
+          workspaceId: collidingSessionId,
+        })}\n`,
+        "utf-8"
+      );
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          migrations: { defaultModelFallbacksSeeded: true },
+          projects: [
+            [
+              projectPath,
+              {
+                workspaces: [{ id: collidingSessionId, path: path.join(projectPath, "workspace") }],
+                projectChat: {
+                  version: 1,
+                  sessionId: collidingSessionId,
+                  createdAt: "2026-08-06T00:00:00.000Z",
+                  agentId: "orchestrator",
+                },
+              },
+            ],
+          ],
+        })
+      );
+
+      interface MigrationPreparer {
+        prepareProjectSessionStateMigration: (migration: {
+          oldSessionId: string;
+          newSessionId: string;
+        }) => void;
+      }
+      const migrationPreparer = config as unknown as MigrationPreparer;
+      const originalPrepareMigration = migrationPreparer.prepareProjectSessionStateMigration;
+      let attemptedMigration: { oldSessionId: string; newSessionId: string } | null = null;
+      migrationPreparer.prepareProjectSessionStateMigration = (migration) => {
+        attemptedMigration = migration;
+        throw new Error("injected preparation failure");
+      };
+
+      const failedLoad = config.loadConfigOrDefault();
+      expect(attemptedMigration).toEqual({
+        oldSessionId: collidingSessionId,
+        newSessionId: replacementSessionId,
+      });
+      expect(failedLoad.projects.get(projectPath)?.projectChat?.sessionId).toBe(collidingSessionId);
+      expect(config.findProjectChatBySessionId(collidingSessionId)?.projectPath).toBe(projectPath);
+      expect(fs.existsSync(sourceSessionDir)).toBe(true);
+      expect(fs.existsSync(replacementSessionDir)).toBe(false);
+      const persistedAfterFailure = JSON.parse(
+        fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")
+      ) as { projects: Array<[string, { projectChat?: { sessionId?: string } }]> };
+      expect(persistedAfterFailure.projects[0]?.[1].projectChat?.sessionId).toBe(
+        collidingSessionId
+      );
+
+      migrationPreparer.prepareProjectSessionStateMigration = originalPrepareMigration;
+      const retriedLoad = config.loadConfigOrDefault();
+      expect(retriedLoad.projects.get(projectPath)?.projectChat?.sessionId).toBe(
+        replacementSessionId
+      );
+      expect(fs.existsSync(sourceSessionDir)).toBe(true);
+      expect(fs.existsSync(replacementSessionDir)).toBe(true);
+      const retriedHistory = await new HistoryService(config).getHistoryFromLatestBoundary(
+        replacementSessionId
+      );
+      expect(retriedHistory.success).toBe(true);
+      if (retriedHistory.success) {
+        expect(retriedHistory.data.map((message) => message.id)).toContain("retry-state");
+      }
+
+      await flushConfigEdits();
+      expect(fs.existsSync(sourceSessionDir)).toBe(false);
+      expect(
+        new Config(tempDir).loadConfigOrDefault().projects.get(projectPath)?.projectChat?.sessionId
+      ).toBe(replacementSessionId);
+    });
+
     it("preserves verified Project Chat routing across config read failures", async () => {
       const projectPath = path.join(tempDir, "routing-cache");
       fs.mkdirSync(projectPath, { recursive: true });

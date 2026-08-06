@@ -1305,9 +1305,6 @@ export class Config {
               originalProjectSessionIds.has(sessionId) ||
               !this.canUseProjectSessionMigrationDestination(originalSessionId, sessionId)
             );
-            projectConfig.projectChat = { ...projectChat, sessionId };
-            configModified = true;
-
             // The first Project Chat with an original ID owns any state under that old directory.
             // Later duplicates intentionally start empty so shared state is never copied twice.
             if (ownsOriginalState) {
@@ -1316,15 +1313,21 @@ export class Config {
                 this.prepareProjectSessionStateMigration(migration);
                 projectSessionStateMigrations.push(migration);
               } catch (error) {
-                // Startup initialization must remain available. Keep the repaired identity and leave
-                // the source untouched so a future load can retry the copy.
+                // Keep the old identity active until its state has a usable prepared copy. Leaving
+                // config unchanged makes the same deterministic repair retry on the next load.
                 log.warn("Failed to prepare Project Chat session ID migration", {
                   oldSessionId: originalSessionId,
                   newSessionId: sessionId,
                   error,
                 });
+                projectConfig.projectChat = projectChat;
+                claimedSessionIds.add(originalSessionId);
+                continue;
               }
             }
+
+            projectConfig.projectChat = { ...projectChat, sessionId };
+            configModified = true;
           } else {
             projectConfig.projectChat = projectChat;
           }

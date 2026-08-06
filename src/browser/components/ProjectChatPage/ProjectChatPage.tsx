@@ -62,9 +62,13 @@ export function ProjectChatPage(props: ProjectChatPageProps) {
   const [locallyTrustedProjectPath, setLocallyTrustedProjectPath] = useState<string | null>(null);
   const [dismissedTrustProjectPath, setDismissedTrustProjectPath] = useState<string | null>(null);
   const [trustError, setTrustError] = useState<string | null>(null);
+  // Registered sub-projects inherit trust from their parent; keep the gate and optimistic state
+  // aligned with the same owner the backend checks before allowing Project Chat execution.
+  const projectConfig = getProjectConfig(props.projectPath);
+  const trustProjectPath = projectConfig?.parentProjectPath ?? props.projectPath;
   const trusted =
-    getProjectConfig(props.projectPath)?.trusted === true ||
-    locallyTrustedProjectPath === props.projectPath;
+    getProjectConfig(trustProjectPath)?.trusted === true ||
+    locallyTrustedProjectPath === trustProjectPath;
   const [loadState, setLoadState] = useState<ProjectChatLoadState>({ status: "loading" });
 
   useEffect(() => {
@@ -126,7 +130,7 @@ export function ProjectChatPage(props: ProjectChatPageProps) {
   }
 
   if (!trusted) {
-    const trustPromptOpen = dismissedTrustProjectPath !== props.projectPath;
+    const trustPromptOpen = dismissedTrustProjectPath !== trustProjectPath;
     return (
       <div className="bg-surface-primary flex flex-1 flex-col overflow-hidden">
         <ProjectChatHeader
@@ -172,8 +176,8 @@ export function ProjectChatPage(props: ProjectChatPageProps) {
           onConfirm={async () => {
             try {
               if (!api) throw new Error("API not available");
-              await api.projects.setTrust({ projectPath: props.projectPath, trusted: true });
-              setLocallyTrustedProjectPath(props.projectPath);
+              await api.projects.setTrust({ projectPath: trustProjectPath, trusted: true });
+              setLocallyTrustedProjectPath(trustProjectPath);
               setDismissedTrustProjectPath(null);
               setTrustError(null);
               refreshProjects().catch(() => {
@@ -181,10 +185,10 @@ export function ProjectChatPage(props: ProjectChatPageProps) {
               });
             } catch {
               setTrustError("Failed to trust project. Please try again.");
-              setDismissedTrustProjectPath(props.projectPath);
+              setDismissedTrustProjectPath(trustProjectPath);
             }
           }}
-          onCancel={() => setDismissedTrustProjectPath(props.projectPath)}
+          onCancel={() => setDismissedTrustProjectPath(trustProjectPath)}
         />
       </div>
     );
