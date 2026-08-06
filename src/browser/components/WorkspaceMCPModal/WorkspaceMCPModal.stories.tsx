@@ -16,6 +16,7 @@ import { getMCPTestResultsKey } from "@/common/constants/storage";
 import type { MCPServerInfo } from "@/common/types/mcp";
 
 import { WorkspaceMCPModal } from "./WorkspaceMCPModal";
+import { NOW } from "@/browser/stories/storyTime";
 
 const PROJECT_PATH = "/Users/test/my-app";
 const WORKSPACE_ID = "ws-mcp-test";
@@ -78,7 +79,7 @@ function setupWorkspaceMCPModalStory(options: WorkspaceMCPStoryOptions = {}): AP
     for (const [serverName, tools] of Object.entries(options.testResults)) {
       cachedResults[serverName] = {
         result: { success: true, tools },
-        testedAt: Date.now(),
+        testedAt: NOW,
       };
     }
 

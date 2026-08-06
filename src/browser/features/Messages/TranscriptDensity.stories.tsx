@@ -200,7 +200,7 @@ export const HyperEdgeCaseGallery: AppStory = {
       setup={() => {
         collapseLeftSidebar();
         setDensity("hyper");
-        const activeStartedAt = Date.now() - 39_000;
+        const activeStartedAt = STABLE_TIMESTAMP - 39_000;
         return setupSimpleChatStory({
           messages: [
             // Scenario 1: critical events remain visible in hyper density.

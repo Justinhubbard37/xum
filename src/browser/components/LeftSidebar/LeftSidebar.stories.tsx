@@ -72,7 +72,7 @@ interface LeftSidebarStoryOverrides {
 
 // Vite re-evaluates this module on story edits; use a fresh token so the shell
 // can deterministically remount provider state after each hot update.
-const MODULE_RENDER_TOKEN = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+const MODULE_RENDER_TOKEN = `storybook-left-sidebar-${NOW}`;
 
 function LeftSidebarStoryScene(props: { leftSidebarProps?: LeftSidebarStoryOverrides }) {
   const { userProjects } = useProjectContext();
