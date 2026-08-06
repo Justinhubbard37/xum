@@ -4409,24 +4409,41 @@ export class WorkspaceService extends EventEmitter {
           return config;
         });
       } catch (error: unknown) {
+        let rollbackErrorMessage: string | undefined;
         try {
           // Roll back only the just-created checkout; never force-delete a pre-existing branch.
-          await runtime.deleteWorkspace(
+          const rollbackResult = await runtime.deleteWorkspace(
             owningProjectPath,
             finalBranchName,
             false,
             initAbortController.signal,
             projectConfig.trusted ?? false
           );
+          if (!rollbackResult.success) {
+            rollbackErrorMessage = rollbackResult.error;
+          }
         } catch (rollbackError: unknown) {
+          rollbackErrorMessage = getErrorMessage(rollbackError);
+        }
+
+        if (rollbackErrorMessage != null) {
           log.error("Failed to roll back workspace after creation scope changed", {
             workspaceId,
             projectPath: owningProjectPath,
-            error: getErrorMessage(rollbackError),
+            workspacePath: createResult!.workspacePath,
+            error: rollbackErrorMessage,
           });
         }
+
         initLogger.logComplete(-1);
-        return Err(`Failed to create workspace: ${getErrorMessage(error)}`);
+        const creationError = `Failed to create workspace: ${getErrorMessage(error)}`;
+        if (rollbackErrorMessage == null) {
+          return Err(creationError);
+        }
+        return Err(
+          `${creationError}. Rollback failed for workspace "${finalBranchName}" at "${createResult!.workspacePath}": ${rollbackErrorMessage}. ` +
+            "Remove it manually before retrying."
+        );
       }
 
       const allMetadata = await this.config.getAllWorkspaceMetadata();

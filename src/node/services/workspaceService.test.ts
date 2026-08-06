@@ -12568,7 +12568,12 @@ describe("WorkspaceService init cancellation", () => {
     }
   });
 
-  test("create() revalidates sub-project registration before persistence and rolls back", async () => {
+  async function createAfterProjectScopeRemoval(
+    deleteWorkspaceImpl: () => Promise<
+      { success: true; deletedPath: string } | { success: false; error: string }
+    >,
+    removedScope: "parent" | "sub-project" = "sub-project"
+  ) {
     const workspaceId = "ws-sub-project-race";
     const projectPath = "/tmp/project-parent";
     const subProjectPath = "/tmp/project-parent/packages/web";
@@ -12579,11 +12584,6 @@ describe("WorkspaceService init cancellation", () => {
         [subProjectPath, { parentProjectPath: projectPath, workspaces: [] }],
       ]),
     };
-    const mockInitStateManager = {
-      on: mock(() => undefined as unknown as InitStateManager),
-      startInit: mock(() => undefined),
-      getInitState: mock(() => undefined),
-    } as unknown as InitStateManager;
     const mockConfig: Partial<Config> = {
       rootDir: "/tmp/mux-root",
       srcDir: "/tmp/src",
@@ -12597,32 +12597,26 @@ describe("WorkspaceService init cancellation", () => {
       getSessionDir: mock(() => "/tmp/test/sessions"),
       findWorkspace: mock(() => null),
     };
-    const mockAIService = {
-      isStreaming: mock(() => false),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      on: mock(() => {}),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      off: mock(() => {}),
-    } as unknown as AIService;
     const createWorkspaceMock = mock(() => {
-      configState.projects.delete(subProjectPath);
+      configState.projects.delete(removedScope === "parent" ? projectPath : subProjectPath);
       return Promise.resolve({ success: true as const, workspacePath });
     });
-    const deleteWorkspaceMock = mock(() => Promise.resolve({ success: true as const }));
+    const deleteWorkspaceMock = mock(deleteWorkspaceImpl);
     const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
       createWorkspace: createWorkspaceMock,
       deleteWorkspace: deleteWorkspaceMock,
     } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
 
     try {
-      const workspaceService = new WorkspaceService(
-        mockConfig as Config,
+      const workspaceService = createWorkspaceServiceForTest({
+        config: mockConfig,
         historyService,
-        mockAIService,
-        mockInitStateManager,
-        mockExtensionMetadataService as ExtensionMetadataService,
-        mockBackgroundProcessManager as BackgroundProcessManager
-      );
+        initStateManager: {
+          on: mock(() => undefined as unknown as InitStateManager),
+          startInit: mock(() => undefined),
+          getInitState: mock(() => undefined),
+        } as unknown as InitStateManager,
+      });
       const result = await workspaceService.create(
         projectPath,
         "child-change",
@@ -12632,22 +12626,91 @@ describe("WorkspaceService init cancellation", () => {
         subProjectPath
       );
 
-      expect(result).toEqual(
-        Err(
-          `Failed to create workspace: Sub-project was removed during workspace creation: ${subProjectPath}`
-        )
-      );
-      expect(configState.projects.get(projectPath)?.workspaces).toEqual([]);
-      expect(deleteWorkspaceMock).toHaveBeenCalledWith(
+      return {
+        result,
+        configState,
+        deleteWorkspaceMock,
         projectPath,
-        "child-change",
-        false,
-        expect.any(AbortSignal),
-        true
-      );
+        subProjectPath,
+        workspacePath,
+      };
     } finally {
       createRuntimeSpy.mockRestore();
     }
+  }
+
+  test("create() revalidates sub-project registration and rolls back the physical workspace", async () => {
+    const { result, configState, deleteWorkspaceMock, projectPath, subProjectPath } =
+      await createAfterProjectScopeRemoval(() =>
+        Promise.resolve({ success: true as const, deletedPath: "/tmp/project-parent/workspace" })
+      );
+
+    expect(result).toEqual(
+      Err(
+        `Failed to create workspace: Sub-project was removed during workspace creation: ${subProjectPath}`
+      )
+    );
+    expect(configState.projects.get(projectPath)?.workspaces).toEqual([]);
+    expect(deleteWorkspaceMock).toHaveBeenCalledWith(
+      projectPath,
+      "child-change",
+      false,
+      expect.any(AbortSignal),
+      true
+    );
+  });
+
+  test("create() reports a Result failure while rolling back a removed sub-project", async () => {
+    const { result, configState, projectPath, subProjectPath, workspacePath } =
+      await createAfterProjectScopeRemoval(() =>
+        Promise.resolve({ success: false as const, error: "cleanup blocked" })
+      );
+
+    expect(result).toEqual(
+      Err(
+        `Failed to create workspace: Sub-project was removed during workspace creation: ${subProjectPath}. ` +
+          `Rollback failed for workspace "child-change" at "${workspacePath}": cleanup blocked. ` +
+          "Remove it manually before retrying."
+      )
+    );
+    expect(configState.projects.get(projectPath)?.workspaces).toEqual([]);
+  });
+
+  test("create() reports an exception while rolling back a removed sub-project", async () => {
+    const { result, configState, projectPath, subProjectPath, workspacePath } =
+      await createAfterProjectScopeRemoval(() => Promise.reject(new Error("runtime unavailable")));
+
+    expect(result).toEqual(
+      Err(
+        `Failed to create workspace: Sub-project was removed during workspace creation: ${subProjectPath}. ` +
+          `Rollback failed for workspace "child-change" at "${workspacePath}": runtime unavailable. ` +
+          "Remove it manually before retrying."
+      )
+    );
+    expect(configState.projects.get(projectPath)?.workspaces).toEqual([]);
+  });
+
+  test("create() does not recreate metadata for an owning project removed during creation", async () => {
+    const { result, configState, deleteWorkspaceMock, projectPath } =
+      await createAfterProjectScopeRemoval(
+        () =>
+          Promise.resolve({ success: true as const, deletedPath: "/tmp/project-parent/workspace" }),
+        "parent"
+      );
+
+    expect(result).toEqual(
+      Err(
+        `Failed to create workspace: Project was removed during workspace creation: ${projectPath}`
+      )
+    );
+    expect(configState.projects.has(projectPath)).toBe(false);
+    expect(deleteWorkspaceMock).toHaveBeenCalledWith(
+      projectPath,
+      "child-change",
+      false,
+      expect.any(AbortSignal),
+      true
+    );
   });
 
   test("remove() aborts init and clears state before teardown", async () => {
