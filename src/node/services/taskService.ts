@@ -4117,6 +4117,7 @@ export class TaskService {
     };
 
     const handleId = `${WORKSPACE_TURN_TASK_ID_PREFIX}${this.config.generateStableId()}`;
+    const executionId = this.generateExecutionId();
     const turnId = this.config.generateStableId();
     const createdAt = getIsoNow();
     // Workspace turns currently always run the exec agent (see the sendMessage
@@ -4344,6 +4345,7 @@ export class TaskService {
 
     const record: WorkspaceTurnTaskHandleRecord = {
       kind: "workspace_turn",
+      executionId,
       handleId,
       ownerWorkspaceId,
       workspaceId: targetWorkspaceId,
@@ -4360,7 +4362,45 @@ export class TaskService {
       reasoningMode,
       ...(args.attentionPolicy != null ? { attentionPolicy: args.attentionPolicy } : {}),
     };
-    await this.taskHandleStore.upsertWorkspaceTurn(record);
+    const executionHandle: ExecutionHandle = {
+      version: EXECUTION_HANDLE_VERSION,
+      executionId,
+      aliases: [handleId],
+      ownerSessionId: ownerWorkspaceId,
+      requesterWorkspaceId: ownerWorkspaceId,
+      target: {
+        kind: "workspace",
+        workspaceId: targetWorkspaceId,
+        origin: createdWorkspace ? "created" : "existing",
+      },
+      launchPolicy: {
+        kind: "workspace_turn",
+        turnId,
+        title,
+        prompt,
+      },
+      completionPolicy: { kind: "final_assistant_message" },
+      retentionPolicy: {
+        kind:
+          createdWorkspace && args.workspace?.disposable === true
+            ? "delete_workspace_on_completion"
+            : "retain_workspace",
+      },
+      attentionPolicy: resolveBackgroundWorkAttentionPolicy(args.attentionPolicy),
+      status: record.status,
+      createdAt,
+      updatedAt: createdAt,
+      ...(record.status === "running" ? { startedAt: createdAt } : {}),
+    };
+    try {
+      await this.executionStore.upsert(executionHandle);
+      await this.taskHandleStore.upsertWorkspaceTurn(record);
+    } catch (error) {
+      await this.executionStore.delete(ownerWorkspaceId, executionId).catch(() => undefined);
+      return Err(
+        `Task.createWorkspaceTurn: failed to persist execution (${getErrorMessage(error)})`
+      );
+    }
     if (record.status !== "queued") {
       this.activeWorkspaceTurnHandleByWorkspaceId.set(targetWorkspaceId, {
         handleId,

@@ -23,6 +23,7 @@ import {
   WorkspaceTurnFinalMessageRefSchema,
   type WorkspaceTurnFinalMessageRef,
 } from "@/common/types/workspaceTurn";
+import { isExecutionId } from "@/common/types/execution";
 import { log } from "@/node/services/log";
 import { isErrnoWithCode } from "@/node/utils/fs";
 
@@ -41,6 +42,8 @@ export type WorkspaceTurnTaskStatus =
 
 export interface WorkspaceTurnTaskHandleRecord {
   kind: "workspace_turn";
+  /** Canonical execution identity for new records; legacy records use handleId only. */
+  executionId?: `exe_${string}`;
   handleId: string;
   ownerWorkspaceId: string;
   workspaceId: string;
@@ -84,6 +87,7 @@ export interface WorkspaceTurnTaskHandleRecord {
 const WorkspaceTurnTaskHandleRecordSchema = z
   .object({
     kind: z.literal("workspace_turn"),
+    executionId: z.string().refine(isExecutionId, "Invalid execution ID").optional(),
     handleId: z.string().min(1),
     ownerWorkspaceId: z.string().min(1),
     workspaceId: z.string().min(1),

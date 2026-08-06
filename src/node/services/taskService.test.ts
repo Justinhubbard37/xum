@@ -3064,6 +3064,25 @@ describe("TaskService", () => {
       kind: "workspace_turn",
       status: "running",
     });
+    const canonicalExecutions = await new ExecutionStore(config).list(parentId);
+    expect(canonicalExecutions).toHaveLength(1);
+    const canonicalExecutionId = canonicalExecutions[0]?.executionId;
+    assert(canonicalExecutionId, "canonical execution ID must exist");
+    expect(canonicalExecutionId).toMatch(/^exe_/);
+    expect(canonicalExecutions[0]).toMatchObject({
+      aliases: ["wst_childworkspace"],
+      ownerSessionId: parentId,
+      requesterWorkspaceId: parentId,
+      target: { kind: "workspace", workspaceId: "childworkspace", origin: "created" },
+      launchPolicy: { kind: "workspace_turn", title: "Workspace turn" },
+      status: "running",
+    });
+    const shadow = await new TaskHandleStore(config).getWorkspaceTurn(
+      parentId,
+      "wst_childworkspace"
+    );
+    assert(shadow?.executionId, "shadow execution ID must exist");
+    expect(canonicalExecutionId).toBe(shadow?.executionId);
     const childConfig = findWorkspaceInConfig(config, "childworkspace");
     expect(childConfig?.parentWorkspaceId).toBeUndefined();
     expect(childConfig?.taskStatus).toBeUndefined();
