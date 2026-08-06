@@ -3676,36 +3676,53 @@ export class WorkspaceService extends EventEmitter {
     const session =
       this.sessions.get(normalizedSessionId) ??
       this.transientStartupRecoverySessions.get(normalizedSessionId);
-    if (session != null) {
-      const interrupted = await session.interruptStream({ abandonPartial: true });
-      if (!interrupted.success) {
-        log.debug("Project Chat cleanup could not interrupt session cleanly", {
-          sessionId: normalizedSessionId,
-          error: interrupted.error,
-        });
-        const fallbackStop = await this.aiService.stopStream(normalizedSessionId, {
-          abandonPartial: true,
-          abortReason: "user",
-        });
-        if (!fallbackStop.success) {
-          throw new Error(`Failed to stop Project Chat stream: ${fallbackStop.error}`);
+
+    try {
+      if (session != null) {
+        const interrupted = await session.interruptStream({ abandonPartial: true });
+        if (!interrupted.success) {
+          log.debug("Project Chat cleanup could not interrupt session cleanly", {
+            sessionId: normalizedSessionId,
+            error: interrupted.error,
+          });
+          const fallbackStop = await this.aiService.stopStream(normalizedSessionId, {
+            abandonPartial: true,
+            abortReason: "user",
+          });
+          if (!fallbackStop.success) {
+            throw new Error(`Failed to stop Project Chat stream: ${fallbackStop.error}`);
+          }
         }
+
+        // interruptStream() only requests the abort. Wait until AgentSession has processed the
+        // forwarded stream-abort/stream-end event and finished its awaited history cleanup.
+        await session.waitForIdle();
       }
 
-      // interruptStream() only requests the abort. Wait until AgentSession has processed the
-      // forwarded stream-abort/stream-end event and finished its awaited history cleanup.
-      await session.waitForIdle();
-    }
-    // Timing listeners run independently from AgentSession's async event handler and can otherwise
-    // recreate the directory after deletion even though the session itself is idle.
-    await this.sessionTimingService?.waitForIdle(normalizedSessionId);
+      // Project Chat owns durable full-workspace turns. Make every live handle terminal before its
+      // owner session disappears so retained ordinary workspaces never become unsupervised.
+      const ownedTurnsInterrupted =
+        await this.taskService?.interruptAllWorkspaceTurnsForOwner(normalizedSessionId);
+      if (ownedTurnsInterrupted != null && !ownedTurnsInterrupted.success) {
+        throw new Error(ownedTurnsInterrupted.error);
+      }
 
-    // Dispose before removing disk state so no retained session can recreate sidecars afterward.
-    this.disposeSession(normalizedSessionId);
-    await fsPromises.rm(this.config.getSessionDir(normalizedSessionId), {
-      recursive: true,
-      force: true,
-    });
+      // Timing listeners run independently from AgentSession's async event handler and can otherwise
+      // recreate the directory after deletion even though the session itself is idle.
+      await this.sessionTimingService?.waitForIdle(normalizedSessionId);
+
+      // Dispose before removing disk state so no retained session can recreate sidecars afterward.
+      this.disposeSession(normalizedSessionId);
+      await fsPromises.rm(this.config.getSessionDir(normalizedSessionId), {
+        recursive: true,
+        force: true,
+      });
+    } catch (error) {
+      // Even an unsuccessful shutdown must unregister the owner session before ProjectService
+      // decides whether to preserve its directory; otherwise later writes can recreate ghost state.
+      this.disposeSession(normalizedSessionId);
+      throw error;
+    }
   }
 
   public disposeSession(workspaceId: string): void {

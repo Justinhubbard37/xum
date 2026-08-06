@@ -403,6 +403,7 @@ describe("WorkspaceService Project Chat", () => {
       const sessionDir = config.getSessionDir(projectChat.sessionId);
       await fsPromises.writeFile(path.join(sessionDir, "sidecar.json"), "{}", "utf-8");
 
+      const operations: string[] = [];
       let releaseSessionIdle: (() => void) | undefined;
       let signalSessionIdleWaitStarted: (() => void) | undefined;
       const sessionIdleWaitStarted = new Promise<void>((resolve) => {
@@ -412,12 +413,24 @@ describe("WorkspaceService Project Chat", () => {
       const waitForIdle = mock(
         () =>
           new Promise<void>((resolve) => {
-            releaseSessionIdle = resolve;
+            releaseSessionIdle = () => {
+              operations.push("owner-idle");
+              resolve();
+            };
             signalSessionIdleWaitStarted?.();
           })
       );
-      const dispose = mock(() => undefined);
-      const timingWaitForIdle = mock(() => Promise.resolve());
+      const dispose = mock(() => {
+        operations.push("dispose");
+      });
+      const interruptOwnedTurns = mock(() => {
+        operations.push("owned-turns");
+        return Promise.resolve(Ok(undefined));
+      });
+      const timingWaitForIdle = mock(() => {
+        operations.push("timing-idle");
+        return Promise.resolve();
+      });
       const fakeSession = { interruptStream, waitForIdle, dispose } as unknown as AgentSession;
       const workspaceService = createWorkspaceServiceForTest({
         config,
@@ -426,6 +439,9 @@ describe("WorkspaceService Project Chat", () => {
           waitForIdle: timingWaitForIdle,
         } as unknown as WorkspaceServiceArgs[10],
       });
+      workspaceService.setTaskService({
+        interruptAllWorkspaceTurnsForOwner: interruptOwnedTurns,
+      } as unknown as TaskService);
       const sessions = (
         workspaceService as unknown as {
           sessions: Map<string, AgentSession>;
@@ -438,16 +454,72 @@ describe("WorkspaceService Project Chat", () => {
 
       expect(interruptStream).toHaveBeenCalledWith({ abandonPartial: true });
       expect(dispose).not.toHaveBeenCalled();
+      expect(interruptOwnedTurns).not.toHaveBeenCalled();
       expect(timingWaitForIdle).not.toHaveBeenCalled();
       await fsPromises.access(sessionDir);
 
       releaseSessionIdle?.();
       await cleanupPromise;
 
+      expect(interruptOwnedTurns).toHaveBeenCalledWith(projectChat.sessionId);
       expect(timingWaitForIdle).toHaveBeenCalledWith(projectChat.sessionId);
+      expect(operations).toEqual(["owner-idle", "owned-turns", "timing-idle", "dispose"]);
       expect(dispose).toHaveBeenCalledTimes(1);
       expect(sessions.has(projectChat.sessionId)).toBe(false);
       expect(fsPromises.access(sessionDir)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("disposes but preserves Project Chat state when both stream-stop attempts fail", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const projectPath = path.join(config.rootDir, "project-chat-cleanup-failure");
+    await fsPromises.mkdir(projectPath, { recursive: true });
+    try {
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, { trusted: true, workspaces: [] });
+        return cfg;
+      });
+      const projectChat = await config.ensureProjectChat(projectPath);
+      const sessionDir = config.getSessionDir(projectChat.sessionId);
+      await fsPromises.writeFile(path.join(sessionDir, "sidecar.json"), "{}", "utf-8");
+
+      const interruptStream = mock(() => Promise.resolve(Err("session stop failed")));
+      const waitForIdle = mock(() => Promise.resolve());
+      const dispose = mock(() => undefined);
+      const fakeSession = { interruptStream, waitForIdle, dispose } as unknown as AgentSession;
+      const fallbackStop = mock(() => Promise.resolve(Err("AI stream stop failed")));
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        aiService: createMockAIService({ stopStream: fallbackStop }),
+      });
+      const sessions = (
+        workspaceService as unknown as {
+          sessions: Map<string, AgentSession>;
+        }
+      ).sessions;
+      sessions.set(projectChat.sessionId, fakeSession);
+
+      let cleanupError: unknown;
+      try {
+        await workspaceService.cleanupProjectChatSession(projectChat.sessionId);
+      } catch (error) {
+        cleanupError = error;
+      }
+      expect(cleanupError).toMatchObject({
+        message: "Failed to stop Project Chat stream: AI stream stop failed",
+      });
+
+      expect(fallbackStop).toHaveBeenCalledWith(projectChat.sessionId, {
+        abandonPartial: true,
+        abortReason: "user",
+      });
+      expect(waitForIdle).not.toHaveBeenCalled();
+      expect(dispose).toHaveBeenCalledTimes(1);
+      expect(sessions.has(projectChat.sessionId)).toBe(false);
+      await fsPromises.access(sessionDir);
     } finally {
       await cleanup();
     }

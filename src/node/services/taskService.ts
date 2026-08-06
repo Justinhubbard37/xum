@@ -7509,6 +7509,54 @@ export class TaskService {
     }
   }
 
+  async interruptAllWorkspaceTurnsForOwner(
+    ownerWorkspaceId: string
+  ): Promise<Result<void, string>> {
+    const normalizedOwnerWorkspaceId = ownerWorkspaceId.trim();
+    if (normalizedOwnerWorkspaceId.length === 0) {
+      return Err("Workspace-turn owner is required");
+    }
+
+    // Project removal must close the launch race: once this lock is held, no new workspace turn can
+    // be created for the owner before all currently-live handles are made terminal.
+    await using _lock = await this.mutex.acquire();
+    const activeRecords = await this.listWorkspaceTurnTasks(normalizedOwnerWorkspaceId, {
+      statuses: ["queued", "starting", "running"],
+    });
+    for (const record of activeRecords) {
+      const interruptResult = await this.interruptWorkspaceTurn(
+        normalizedOwnerWorkspaceId,
+        record.handleId
+      );
+      if (interruptResult.success) {
+        continue;
+      }
+
+      // A natural settlement can win the per-handle lock after the active snapshot. That is safe;
+      // only a handle that remains live after the failed interrupt must block owner cleanup.
+      const latest = await this.getWorkspaceTurnSnapshot(
+        normalizedOwnerWorkspaceId,
+        record.handleId
+      );
+      if (latest == null || !this.isActiveWorkspaceTurn(latest)) {
+        continue;
+      }
+      return Err(`Failed to interrupt workspace turn ${record.handleId}: ${interruptResult.error}`);
+    }
+
+    const remainingActive = await this.listWorkspaceTurnTasks(normalizedOwnerWorkspaceId, {
+      statuses: ["queued", "starting", "running"],
+    });
+    if (remainingActive.length > 0) {
+      return Err(
+        `Workspace-turn owner still has active tasks: ${remainingActive
+          .map((record) => record.handleId)
+          .join(", ")}`
+      );
+    }
+    return Ok(undefined);
+  }
+
   async interruptWorkspaceTurn(
     ownerWorkspaceId: string,
     handleId: string

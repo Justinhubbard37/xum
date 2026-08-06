@@ -1884,6 +1884,49 @@ exit 1
       expect(fs.access(sessionDir)).rejects.toMatchObject({ code: "ENOENT" });
     });
 
+    it("retains a sub-project workspace while cleaning its Project Chat owner", async () => {
+      const parentPath = path.join(tempDir, "parent-project");
+      const subProjectPath = path.join(parentPath, "packages", "web");
+      const workspacePath = path.join(parentPath, "workspace");
+      await fs.mkdir(subProjectPath, { recursive: true });
+      await fs.mkdir(workspacePath, { recursive: true });
+      await config.editConfig((cfg) => {
+        cfg.projects.set(parentPath, {
+          trusted: true,
+          workspaces: [
+            {
+              id: "sub-project-workspace",
+              path: workspacePath,
+              subProjectPath,
+            },
+          ],
+        });
+        cfg.projects.set(subProjectPath, {
+          parentProjectPath: parentPath,
+          workspaces: [],
+        });
+        return cfg;
+      });
+      const projectChat = await config.ensureProjectChat(subProjectPath);
+      const cleanupProjectChatSession = mock(() => Promise.resolve());
+      service.setWorkspaceService({
+        remove: () => Promise.resolve(Ok(undefined)),
+        cleanupProjectChatSession,
+      });
+
+      expect((await service.remove(subProjectPath)).success).toBe(true);
+
+      const reloaded = config.loadConfigOrDefault();
+      expect(reloaded.projects.has(subProjectPath)).toBe(false);
+      const retainedWorkspace = reloaded.projects.get(parentPath)?.workspaces[0];
+      expect(retainedWorkspace).toMatchObject({
+        id: "sub-project-workspace",
+        path: workspacePath,
+      });
+      expect(retainedWorkspace?.subProjectPath).toBeUndefined();
+      expect(cleanupProjectChatSession).toHaveBeenCalledWith(projectChat.sessionId);
+    });
+
     it("never recursively deletes paths from a malformed persisted Project Chat ID", async () => {
       const projectPath = path.join(tempDir, "project-chat-malformed-id");
       const outsidePath = path.join(tempDir, "outside");
@@ -1918,7 +1961,7 @@ exit 1
       expect(await fs.readFile(sentinelPath, "utf-8")).toBe("keep");
     });
 
-    it("keeps Project Chat cleanup best-effort after config removal", async () => {
+    it("preserves Project Chat routing and state when shutdown cleanup fails", async () => {
       const projectPath = path.join(tempDir, "project-chat-cleanup-failure");
       await fs.mkdir(projectPath, { recursive: true });
       const cfg = config.loadConfigOrDefault();
@@ -1939,10 +1982,16 @@ exit 1
 
       expect(result.success).toBe(true);
       expect(config.loadConfigOrDefault().projects.has(projectPath)).toBe(false);
-      expect(config.getSessionDir(projectChat.sessionId)).toBe(
-        path.join(config.sessionsDir, projectChat.sessionId)
+      expect(config.getSessionDir(projectChat.sessionId)).toBe(sessionDir);
+      await fs.writeFile(
+        path.join(config.getSessionDir(projectChat.sessionId), "late-write.json"),
+        "{}",
+        "utf-8"
       );
-      expect(fs.access(sessionDir)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await fs.readFile(path.join(sessionDir, "late-write.json"), "utf-8")).toBe("{}");
+      expect(fs.access(path.join(config.sessionsDir, projectChat.sessionId))).rejects.toMatchObject(
+        { code: "ENOENT" }
+      );
     });
 
     it("does not clean Project Chat while ordinary workspaces block removal", async () => {

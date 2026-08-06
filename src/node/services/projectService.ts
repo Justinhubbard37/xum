@@ -1083,7 +1083,8 @@ export class ProjectService {
     for (const sessionId of new Set(sessionIds.filter(isProjectSessionId))) {
       // The config entry is removed before cleanup, but in-flight AgentSession/history writes must
       // keep resolving this captured ID to project-sessions until cleanup finishes.
-      using _projectSessionRoute = this.config.retainProjectSessionRouting(sessionId);
+      const projectSessionRoute = this.config.retainProjectSessionRouting(sessionId);
+      let preserveProjectSessionRoute = false;
       try {
         if (this.workspaceService?.cleanupProjectChatSession) {
           await this.workspaceService.cleanupProjectChatSession(sessionId);
@@ -1094,16 +1095,14 @@ export class ProjectService {
           });
         }
       } catch (error) {
-        // Project config removal is authoritative. Session shutdown and disk cleanup are best-effort
-        // so a damaged transcript cannot permanently block removing the owning project.
+        // Project config removal is authoritative, but failed shutdown is not permission to delete
+        // live state. Preserve both the directory and its routing for the rest of this process so a
+        // late stream/history write cannot recreate the removed owner under ordinary sessions.
+        preserveProjectSessionRoute = this.workspaceService?.cleanupProjectChatSession != null;
         log.error(`Failed to clean up Project Chat session ${sessionId}:`, error);
-        try {
-          await fsPromises.rm(this.config.getSessionDir(sessionId), {
-            recursive: true,
-            force: true,
-          });
-        } catch (deleteError) {
-          log.error(`Failed to delete Project Chat session directory ${sessionId}:`, deleteError);
+      } finally {
+        if (!preserveProjectSessionRoute) {
+          projectSessionRoute[Symbol.dispose]();
         }
       }
     }

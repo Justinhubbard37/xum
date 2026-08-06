@@ -1339,6 +1339,88 @@ describe("TaskService", () => {
     ]);
   });
 
+  test("Project Chat cleanup interrupts every active owned workspace turn before deleting handles", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = await createTestProject(rootDir, "cleanup-owner", { initGit: false });
+    await saveWorkspaces(config, projectPath, [], testTaskSettings());
+    const projectChat = await config.ensureProjectChat(projectPath);
+    const isStreaming = mock((workspaceId: string) =>
+      ["activeworkspace", "startingworkspace", "foreignworkspace"].includes(workspaceId)
+    );
+    const aiMocks = createAIServiceMocks(config, { isStreaming });
+    const { taskService } = createTaskServiceHarness(config, { aiService: aiMocks.aiService });
+    const store = new TaskHandleStore(config);
+    const baseRecord = {
+      kind: "workspace_turn" as const,
+      ownerWorkspaceId: projectChat.sessionId,
+      turnId: "turn",
+      createdAt: "2026-08-06T00:00:00.000Z",
+      updatedAt: "2026-08-06T00:00:00.000Z",
+      createdWorkspace: true,
+      disposableWorkspace: false,
+    };
+    await store.upsertWorkspaceTurn({
+      ...baseRecord,
+      handleId: "wst_active",
+      workspaceId: "activeworkspace",
+      status: "running",
+    });
+    await store.upsertWorkspaceTurn({
+      ...baseRecord,
+      handleId: "wst_starting",
+      workspaceId: "startingworkspace",
+      status: "starting",
+    });
+    await store.upsertWorkspaceTurn({
+      ...baseRecord,
+      handleId: "wst_completed",
+      workspaceId: "completedworkspace",
+      status: "completed",
+    });
+    await store.upsertWorkspaceTurn({
+      ...baseRecord,
+      handleId: "wst_foreign",
+      ownerWorkspaceId: "ordinary-owner",
+      workspaceId: "foreignworkspace",
+      status: "running",
+    });
+
+    using _projectSessionRoute = config.retainProjectSessionRouting(projectChat.sessionId);
+    await config.editConfig((cfg) => {
+      cfg.projects.delete(projectPath);
+      return cfg;
+    });
+
+    expect(await taskService.interruptAllWorkspaceTurnsForOwner(projectChat.sessionId)).toEqual(
+      Ok(undefined)
+    );
+    expect(
+      Object.fromEntries(
+        (await store.listWorkspaceTurns(projectChat.sessionId)).map((record) => [
+          record.handleId,
+          record.status,
+        ])
+      )
+    ).toEqual({
+      wst_active: "interrupted",
+      wst_starting: "interrupted",
+      wst_completed: "completed",
+    });
+    expect(await store.getWorkspaceTurn("ordinary-owner", "wst_foreign")).toMatchObject({
+      status: "running",
+      workspaceId: "foreignworkspace",
+    });
+    expect(aiMocks.stopStream).toHaveBeenCalledWith("activeworkspace", {
+      abandonPartial: false,
+    });
+    expect(aiMocks.stopStream).toHaveBeenCalledWith("startingworkspace", {
+      abandonPartial: false,
+    });
+    expect(
+      fsPromises.access(path.join(config.sessionsDir, projectChat.sessionId))
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   test("sub-project Project Chat reuses and lists workspaces from the parent storage bucket", async () => {
     const config = await createTestConfig(rootDir);
     const parentProjectPath = await createTestProject(rootDir, "repo", { initGit: false });
