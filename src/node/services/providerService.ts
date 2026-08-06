@@ -399,7 +399,8 @@ export class ProviderService {
         providerInfo.wireFormat = wireFormat;
       }
 
-      // OpenAI-specific: response storage setting (required for ZDR)
+      // OpenAI-specific: response storage setting (required for ZDR).
+      // xAI Grok 4.5 always uses store=false in the request path (no settings surface).
       if (provider === "openai" && typeof config.store === "boolean") {
         providerInfo.store = config.store;
       }

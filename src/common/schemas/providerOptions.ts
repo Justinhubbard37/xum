@@ -64,6 +64,12 @@ export const MuxProviderOptionsSchema = z.object({
         description:
           'xAI processing tier: "priority" requests faster processing at 2× token pricing; "default" uses standard processing',
       }),
+      // Request-level escape hatch only. Grok 4.5 defaults to store=false in
+      // buildProviderOptions so ZDR and non-ZDR share one path (no settings UI).
+      store: z.boolean().optional().meta({
+        description:
+          "Whether xAI stores Responses. Grok 4.5 defaults to false (ZDR-safe); set true only to opt back into server storage.",
+      }),
       searchParameters: z
         .object({
           mode: z.enum(["auto", "off", "on"]),

@@ -400,6 +400,10 @@ export function ProvidersSection() {
   const [openaiServiceTierSelectOverride, setOpenaiServiceTierSelectOverride] =
     useState<OpenAIServiceTierSelectValue | null>(null);
   const [xaiServiceTierSaving, setXAIServiceTierSaving] = useState(false);
+  // Persist OpenAI ZDR store toggles before publishing UI state so a failed write
+  // cannot leave the dropdown claiming disabled while requests still send store=true.
+  // xAI Grok 4.5 always uses store=false in the request path (no settings surface).
+  const [openaiStoreSaving, setOpenAIStoreSaving] = useState(false);
 
   const routing = useRouting();
 
@@ -2639,17 +2643,30 @@ export function ProvidersSection() {
                                 </div>
                                 <Select
                                   value={config?.openai?.store === false ? "disabled" : "enabled"}
+                                  disabled={openaiStoreSaving}
                                   onValueChange={(next) => {
-                                    if (!api) return;
+                                    if (!api || openaiStoreSaving) return;
                                     if (next !== "enabled" && next !== "disabled") return;
 
                                     const store = next === "disabled" ? false : undefined;
-                                    updateOptimistically("openai", { store });
-                                    void api.providers.setProviderConfig({
-                                      provider: "openai",
-                                      keyPath: ["store"],
-                                      value: next === "disabled" ? false : "",
-                                    });
+                                    setOpenAIStoreSaving(true);
+                                    void api.providers
+                                      .setProviderConfig({
+                                        provider: "openai",
+                                        keyPath: ["store"],
+                                        value: next === "disabled" ? false : "",
+                                      })
+                                      .then(
+                                        (result) => {
+                                          if (result.success) {
+                                            updateOptimistically("openai", { store });
+                                            return undefined;
+                                          }
+                                          return refresh();
+                                        },
+                                        () => refresh()
+                                      )
+                                      .finally(() => setOpenAIStoreSaving(false));
                                   }}
                                 >
                                   <SelectTrigger className="w-40">

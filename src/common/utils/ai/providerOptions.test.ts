@@ -1641,11 +1641,12 @@ describe("buildProviderOptions - OpenRouter", () => {
 
 describe("buildProviderOptions - xAI", () => {
   test("maps Grok 4.5 thinking levels to reasoning effort without deprecated search defaults", () => {
+    // store:false is the default so ZDR and non-ZDR orgs share one request path.
     expect(buildProviderOptions("xai:grok-4.5", "medium")).toEqual({
-      xai: { reasoningEffort: "medium" },
+      xai: { reasoningEffort: "medium", store: false },
     });
     expect(buildProviderOptions("xai:grok-4.5", "max")).toEqual({
-      xai: { reasoningEffort: "high" },
+      xai: { reasoningEffort: "high", store: false },
     });
   });
 
@@ -1660,8 +1661,40 @@ describe("buildProviderOptions - xAI", () => {
     ).toEqual({
       xai: {
         reasoningEffort: "high",
+        store: false,
       },
     });
+  });
+
+  test("defaults Grok 4.5 store to false without an explicit override", () => {
+    expect(
+      buildProviderOptions("xai:grok-4.5", "medium", undefined, undefined, { xai: {} })
+    ).toEqual({
+      xai: {
+        reasoningEffort: "medium",
+        store: false,
+      },
+    });
+  });
+
+  test("allows explicit store: true escape hatch on Grok 4.5", () => {
+    expect(
+      buildProviderOptions("xai:grok-4.5", "medium", undefined, undefined, {
+        xai: { store: true },
+      })
+    ).toEqual({
+      xai: {
+        reasoningEffort: "medium",
+        store: true,
+      },
+    });
+  });
+
+  test("does not force store on legacy non-Grok-4.5 xAI chat models", () => {
+    const result = buildProviderOptions("xai:grok-4-1-fast", "off");
+    const xai = (result as { xai?: Record<string, unknown> }).xai;
+    expect(xai).toBeDefined();
+    expect("store" in xai!).toBe(false);
   });
 });
 
