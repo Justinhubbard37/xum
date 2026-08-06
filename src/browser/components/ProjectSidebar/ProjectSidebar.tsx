@@ -836,6 +836,18 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     [onSelectWorkspace, collapsed, onToggleCollapsed, persistMobileSidebarScrollTop]
   );
 
+  // Project rows open the persistent orchestration chat; the adjacent plus remains creation-only.
+  const handleSelectProject = useCallback(
+    (projectPath: string) => {
+      navigateToProject(projectPath);
+      if (window.innerWidth <= MOBILE_BREAKPOINT && !collapsed) {
+        persistMobileSidebarScrollTop(mobileScrollTopRef.current);
+        onToggleCollapsed();
+      }
+    },
+    [navigateToProject, collapsed, onToggleCollapsed, persistMobileSidebarScrollTop]
+  );
+
   // Wrapper to close sidebar on mobile after adding workspace
   const handleAddWorkspace = useCallback(
     (projectPath: string, subProjectPath?: string) => {
@@ -1930,6 +1942,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
           ? resolveEffectiveSectionId(meta, byId, validSectionIds)
           : undefined;
         handleAddWorkspace(selectedWorkspace.projectPath, subProjectPath);
+      } else if (matchesKeybind(e, KEYBINDS.NEW_WORKSPACE) && pendingNewWorkspaceProject != null) {
+        e.preventDefault();
+        handleAddWorkspace(pendingNewWorkspaceProject);
       } else if (matchesKeybind(e, KEYBINDS.ARCHIVE_WORKSPACE) && selectedWorkspace) {
         e.preventDefault();
         void handleArchiveWorkspace(selectedWorkspace.workspaceId);
@@ -1961,6 +1976,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   }, [
     closeProjectContextMenu,
     selectedWorkspace,
+    pendingNewWorkspaceProject,
     handleAddScratchWorkspace,
     handleAddWorkspace,
     handleArchiveWorkspace,
@@ -2256,12 +2272,16 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                       (workspace) => workspaceAttentionById.get(workspace.id) === true
                     );
 
+                    const isProjectSelected =
+                      pendingNewWorkspaceProject === projectPath &&
+                      pendingNewWorkspaceDraftId == null;
+
                     return (
                       <div key={projectPath}>
                         <DraggableProjectItem
                           projectPath={projectPath}
                           onReorder={handleReorder}
-                          selected={false}
+                          selected={isProjectSelected}
                           onClick={() => {
                             if (projectContextMenu.suppressClickIfLongPress()) {
                               return;
@@ -2269,7 +2289,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                             if (isEditingProjectDisplayName) {
                               return;
                             }
-                            handleAddWorkspace(projectPath);
+                            handleSelectProject(projectPath);
                           }}
                           onContextMenu={(event) => handleOpenProjectMenu(event, projectPath)}
                           onTouchStart={(event) =>
@@ -2284,14 +2304,15 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                             }
                             if (e.key === "Enter" || e.key === " ") {
                               e.preventDefault();
-                              handleAddWorkspace(projectPath);
+                              handleSelectProject(projectPath);
                             }
                           }}
                           role="button"
                           tabIndex={0}
+                          aria-current={isProjectSelected ? "page" : undefined}
                           aria-expanded={isExpanded}
                           aria-controls={workspaceListId}
-                          aria-label={`Create workspace in ${projectName}`}
+                          aria-label={`Open project ${projectName}`}
                           data-project-path={projectPath}
                         >
                           <button
@@ -2406,7 +2427,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                   event.stopPropagation();
                                   handleAddWorkspace(projectPath);
                                 }}
-                                aria-label={`New chat in ${projectName}`}
+                                aria-label={`New workspace in ${projectName}`}
                                 data-project-path={projectPath}
                                 className="text-content-secondary hover:bg-hover hover:border-border-light pointer-events-none flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded border border-transparent bg-transparent text-sm leading-none opacity-0 transition-all duration-200 focus-visible:pointer-events-auto focus-visible:opacity-100"
                               >
@@ -2414,7 +2435,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                               </button>
                             </TooltipTrigger>
                             <TooltipContent>
-                              New chat ({formatKeybind(KEYBINDS.NEW_WORKSPACE)})
+                              New workspace ({formatKeybind(KEYBINDS.NEW_WORKSPACE)})
                             </TooltipContent>
                           </Tooltip>
                           <Tooltip>

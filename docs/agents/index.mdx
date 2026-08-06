@@ -17,6 +17,12 @@ The same definition can be used in two places:
 
 An agent definition is a Markdown file: YAML frontmatter declares metadata, policy, and AI defaults; the body becomes the agent's instruction prompt.
 
+<Note>
+  Project Chat uses Mux's built-in **Orchestrator** agent. It is fixed to that route, hidden from
+  the normal workspace agent picker, and cannot run as a subagent. Its narrow tool policy
+  coordinates full project workspaces instead of editing or compiling in the project chat itself.
+</Note>
+
 ## Quick Start
 
 Drop a Markdown file in `.mux/agents/` (project) or `~/.mux/agents/` (global):

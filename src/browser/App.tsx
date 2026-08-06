@@ -343,12 +343,28 @@ function AppInner() {
       // Set document.title locally for browser mode, call backend for Electron
       document.title = title;
       void api?.window.setTitle({ title });
+    } else if (pendingNewWorkspaceProject && pendingNewWorkspaceDraftId == null) {
+      const projectConfig = userProjects.get(pendingNewWorkspaceProject);
+      const projectName =
+        projectConfig?.displayName ??
+        pendingNewWorkspaceProject.split(/[\\/]/).filter(Boolean).at(-1) ??
+        "Project";
+      const title = `${projectName} - Project Chat - mux`;
+      document.title = title;
+      void api?.window.setTitle({ title });
     } else {
       // Set document.title locally for browser mode, call backend for Electron
       document.title = "mux";
       void api?.window.setTitle({ title: "mux" });
     }
-  }, [selectedWorkspace, workspaceMetadata, api]);
+  }, [
+    selectedWorkspace,
+    workspaceMetadata,
+    pendingNewWorkspaceProject,
+    pendingNewWorkspaceDraftId,
+    userProjects,
+    api,
+  ]);
 
   // Validate selected workspace exists and has all required fields
   // Note: workspace validity is now primarily handled by RouterContext deriving
@@ -1467,7 +1483,12 @@ function AppInner() {
           </div>
         </div>
         <WorkspaceActiveGoalsWarningToast />
-        <CommandPalette getSlashContext={() => ({ workspaceId: selectedWorkspace?.workspaceId })} />
+        <CommandPalette
+          getSlashContext={() => ({
+            workspaceId:
+              selectedWorkspace?.workspaceId ?? workspaceStore.getActiveWorkspaceId() ?? undefined,
+          })}
+        />
         <ProjectCreateModal
           initialPath={projectCreateInitialPath}
           isOpen={isProjectCreateModalOpen}
