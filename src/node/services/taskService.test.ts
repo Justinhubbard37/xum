@@ -4282,6 +4282,20 @@ describe("TaskService", () => {
     const prompt = wakeCall?.[1] as string;
     expect(prompt).toContain("task_await");
     expect(prompt).toContain("timeout_secs: 0");
+    expect(wakeCall?.[2]).toMatchObject({
+      muxMetadata: {
+        type: "background-work-wake",
+        records: [
+          {
+            sourceKind: "workspace_turn",
+            sourceId: "wst_handle",
+            outcome: "completed",
+            title: "Workspace turn",
+            workspaceId: "childworkspace",
+          },
+        ],
+      },
+    });
     expect(wakeCall?.[3]).toMatchObject({ synthetic: true, requireIdle: true });
 
     // Restart-safe dedupe marker is persisted.
@@ -4333,6 +4347,19 @@ describe("TaskService", () => {
       model: "openai:gpt-5.3-codex",
       agentId: "orchestrator",
       thinkingLevel: "high",
+    });
+    expect(sendMessage.mock.calls[0]?.[2]).toMatchObject({
+      muxMetadata: {
+        type: "background-work-wake",
+        records: [
+          {
+            sourceKind: "workspace_turn",
+            sourceId: "wst_project",
+            outcome: "completed",
+            title: "Workspace turn",
+          },
+        ],
+      },
     });
     expect(sendMessage.mock.calls[0]?.[3]).toMatchObject({ synthetic: true, requireIdle: true });
     expect(await terminalAttentionStore.get(projectChat.sessionId, notification!.id)).toMatchObject(
@@ -4452,6 +4479,7 @@ describe("TaskService", () => {
       sourceId: "task_done",
       outputDelivery: "already_injected",
       terminalOutcome: "completed",
+      title: "Repository audit",
     });
     await terminalAttentionStore.enqueueIfAbsent({
       ownerWorkspaceId: parentId,
@@ -4459,6 +4487,37 @@ describe("TaskService", () => {
       sourceId: "wst_error",
       outputDelivery: "requires_task_await",
       terminalOutcome: "error",
+      title: "Verification turn",
+    });
+    const workflowRunId = "wfr_coalesced_research";
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    await runStore.createRun({
+      id: workflowRunId,
+      workspaceId: parentId,
+      workflow: {
+        name: "coalesced-research",
+        description: "Coalesced research workflow",
+        scope: "built-in",
+        executable: true,
+      },
+      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+      args: {},
+      attentionPolicy: "notify_on_terminal",
+      now: "2026-06-19T00:00:00.000Z",
+    });
+    await runStore.appendStatus(workflowRunId, "running", "2026-06-19T00:00:01.000Z");
+    await runStore.appendNextEvent(workflowRunId, {
+      type: "result",
+      at: "2026-06-19T00:00:02.000Z",
+      result: { reportMarkdown: "Research complete" },
+    });
+    await runStore.appendStatus(workflowRunId, "completed", "2026-06-19T00:00:03.000Z");
+    await terminalAttentionStore.enqueueIfAbsent({
+      ownerWorkspaceId: parentId,
+      sourceKind: "workflow_run",
+      sourceId: workflowRunId,
+      outputDelivery: "workflow_result_context",
+      terminalOutcome: "completed",
     });
 
     const sendMessage = mock(
@@ -4477,6 +4536,34 @@ describe("TaskService", () => {
     expect(prompt).toContain("Background sub-agent task(s) have completed");
     expect(prompt).not.toContain("failed terminally");
     expect(prompt).toContain("wst_error");
+    expect(prompt).toContain(workflowRunId);
+    expect(sendMessage.mock.calls[0]?.[2]).toMatchObject({
+      muxMetadata: {
+        type: "background-work-wake",
+        records: [
+          {
+            sourceKind: "agent_task",
+            sourceId: "task_done",
+            outcome: "completed",
+            title: "Repository audit",
+            workspaceId: "task_done",
+          },
+          {
+            sourceKind: "workspace_turn",
+            sourceId: "wst_error",
+            outcome: "error",
+            title: "Verification turn",
+          },
+          {
+            sourceKind: "workflow_run",
+            sourceId: workflowRunId,
+            outcome: "completed",
+            title: "coalesced-research",
+            workspaceId: parentId,
+          },
+        ],
+      },
+    });
     expect(prompt).toContain("task_await");
   });
 
@@ -5150,6 +5237,7 @@ describe("TaskService", () => {
       sourceKind: "agent_task",
       sourceId: "task_done",
       outputDelivery: "already_injected",
+      title: "Fallback audit",
       terminalOutcome: "completed",
     });
 
@@ -5230,6 +5318,22 @@ describe("TaskService", () => {
     expect(sendMessage).toHaveBeenCalledTimes(2);
     expect(sendMessage.mock.calls[0]?.[3]).toMatchObject({ requireIdle: true });
     expect(sendMessage.mock.calls[1]?.[3]).not.toMatchObject({ requireIdle: true });
+    expect(sendMessage.mock.calls[1]?.[1]).toBe(sendMessage.mock.calls[0]?.[1]);
+    expect(sendMessage.mock.calls[0]?.[2]).toMatchObject({
+      muxMetadata: {
+        type: "background-work-wake",
+        records: [
+          {
+            sourceKind: "agent_task",
+            sourceId: "task_done",
+            outcome: "completed",
+            title: "Fallback audit",
+            workspaceId: "task_done",
+          },
+        ],
+      },
+    });
+    expect(sendMessage.mock.calls[1]?.[2]).toEqual(sendMessage.mock.calls[0]?.[2]);
     expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(1);
     expect(acceptQueuedFallback).toBeDefined();
     await acceptQueuedFallback?.();
@@ -5911,6 +6015,7 @@ describe("TaskService", () => {
       createdWorkspace: false,
       disposableWorkspace: false,
       attentionPolicy: "notify_on_terminal",
+      title: "Recovered verification",
       reportMarkdown: "Done before notification persisted",
     });
 
@@ -5925,6 +6030,20 @@ describe("TaskService", () => {
 
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(String(sendMessage.mock.calls[0]?.[1])).toContain(handleId);
+    expect(sendMessage.mock.calls[0]?.[2]).toMatchObject({
+      muxMetadata: {
+        type: "background-work-wake",
+        records: [
+          {
+            sourceKind: "workspace_turn",
+            sourceId: handleId,
+            outcome: "completed",
+            title: "Recovered verification",
+            workspaceId: "childworkspace",
+          },
+        ],
+      },
+    });
     const snapshot = await taskService.getWorkspaceTurnSnapshot(parentId, handleId);
     expect(snapshot?.terminalAttentionNotifiedAt).toBeDefined();
   });

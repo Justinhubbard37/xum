@@ -83,7 +83,12 @@ import {
   type BackgroundWorkAttentionPolicy,
 } from "@/common/types/backgroundWorkAttention";
 
-import { createMuxMessage, type MuxMessage, type MuxMessageMetadata } from "@/common/types/message";
+import {
+  createMuxMessage,
+  type BackgroundWorkWakeDisplayRecord,
+  type MuxMessage,
+  type MuxMessageMetadata,
+} from "@/common/types/message";
 import {
   createCompactionSummaryMessageId,
   createTaskFailureMessageId,
@@ -5749,12 +5754,12 @@ export class TaskService {
     this.pendingTerminalAttentionDrains.add(promise);
   }
 
-  private async buildWorkflowTerminalPrompt(
+  private async buildWorkflowTerminalWake(
     ownerWorkspaceId: string,
     runId: string
-  ): Promise<string | null> {
-    assert(ownerWorkspaceId.length > 0, "buildWorkflowTerminalPrompt requires ownerWorkspaceId");
-    assert(runId.length > 0, "buildWorkflowTerminalPrompt requires runId");
+  ): Promise<{ prompt: string; title: string; workspaceId: string } | null> {
+    assert(ownerWorkspaceId.length > 0, "buildWorkflowTerminalWake requires ownerWorkspaceId");
+    assert(runId.length > 0, "buildWorkflowTerminalWake requires runId");
     const runStore = new WorkflowRunStore({
       sessionDir: this.config.getSessionDir(ownerWorkspaceId),
     });
@@ -5778,14 +5783,58 @@ export class TaskService {
       return null;
     }
     const scriptPath = run.workflow.sourcePath ?? run.workflow.name;
-    return buildWorkflowResultContextMessage({
-      rawCommand: `workflow_run ${scriptPath}`,
-      name: scriptPath,
-      runId: run.id,
-      status: run.status,
-      result: null,
-      run,
-    });
+    return {
+      prompt: buildWorkflowResultContextMessage({
+        rawCommand: `workflow_run ${scriptPath}`,
+        name: scriptPath,
+        runId: run.id,
+        status: run.status,
+        result: null,
+        run,
+      }),
+      title: run.workflow.name,
+      workspaceId: run.workspaceId,
+    };
+  }
+
+  private async buildTerminalAttentionDisplayRecord(
+    notification: TerminalAttentionNotification,
+    cfg: ProjectsConfig
+  ): Promise<BackgroundWorkWakeDisplayRecord> {
+    if (notification.sourceKind === "agent_task") {
+      const taskEntry = findWorkspaceEntry(cfg, notification.sourceId);
+      return {
+        sourceKind: notification.sourceKind,
+        sourceId: notification.sourceId,
+        outcome: notification.terminalOutcome,
+        title:
+          coerceNonEmptyString(notification.title) ??
+          coerceNonEmptyString(taskEntry?.workspace.title) ??
+          coerceNonEmptyString(taskEntry?.workspace.name) ??
+          "Sub-agent task",
+        // Agent task IDs are their workspace IDs, even after disposable cleanup removes config state.
+        workspaceId: notification.sourceId,
+      };
+    }
+
+    const workspaceTurn = await this.taskHandleStore.getWorkspaceTurn(
+      notification.ownerWorkspaceId,
+      notification.sourceId
+    );
+    const workspaceEntry =
+      workspaceTurn == null ? null : findWorkspaceEntry(cfg, workspaceTurn.workspaceId);
+    return {
+      sourceKind: notification.sourceKind,
+      sourceId: notification.sourceId,
+      outcome: notification.terminalOutcome,
+      title:
+        coerceNonEmptyString(notification.title) ??
+        coerceNonEmptyString(workspaceTurn?.title) ??
+        coerceNonEmptyString(workspaceEntry?.workspace.title) ??
+        coerceNonEmptyString(workspaceEntry?.workspace.name) ??
+        "Workspace turn",
+      ...(workspaceTurn != null ? { workspaceId: workspaceTurn.workspaceId } : {}),
+    };
   }
 
   private async findProgressRespondedTaskIds(
@@ -5973,10 +6022,9 @@ export class TaskService {
     const injectedNotifications = effectivePending.filter(
       (n) => n.outputDelivery === "already_injected"
     );
-    const injectedTaskIds = injectedNotifications.map((n) => n.sourceId);
-    const awaitHandleIds = effectivePending
-      .filter((n) => n.outputDelivery === "requires_task_await")
-      .map((n) => n.sourceId);
+    const awaitNotifications = effectivePending.filter(
+      (n) => n.outputDelivery === "requires_task_await"
+    );
     const workflowNotifications = effectivePending.filter(
       (n) => n.outputDelivery === "workflow_result_context"
     );
@@ -5985,31 +6033,61 @@ export class TaskService {
     );
 
     const promptSections: string[] = [];
-    if (injectedTaskIds.length > 0) {
+    const backgroundWorkWakeRecords: BackgroundWorkWakeDisplayRecord[] = [];
+    if (injectedNotifications.length > 0) {
       promptSections.push(
         anyInjectedFailure
           ? FAILED_BACKGROUND_SUBAGENT_HANDOFF_PROMPT
           : COMPLETED_BACKGROUND_SUBAGENT_HANDOFF_PROMPT
       );
+      backgroundWorkWakeRecords.push(
+        ...(await Promise.all(
+          injectedNotifications.map((notification) =>
+            this.buildTerminalAttentionDisplayRecord(notification, cfg)
+          )
+        ))
+      );
     }
-    if (awaitHandleIds.length > 0) {
-      promptSections.push(buildCompletedWorkspaceTurnPrompt(awaitHandleIds));
+    if (awaitNotifications.length > 0) {
+      promptSections.push(
+        buildCompletedWorkspaceTurnPrompt(
+          awaitNotifications.map((notification) => notification.sourceId)
+        )
+      );
+      backgroundWorkWakeRecords.push(
+        ...(await Promise.all(
+          awaitNotifications.map((notification) =>
+            this.buildTerminalAttentionDisplayRecord(notification, cfg)
+          )
+        ))
+      );
     }
     for (const notification of workflowNotifications) {
-      const workflowPrompt = await this.buildWorkflowTerminalPrompt(
+      const workflowWake = await this.buildWorkflowTerminalWake(
         ownerWorkspaceId,
         notification.sourceId
       );
-      if (workflowPrompt == null) {
+      if (workflowWake == null) {
         await this.terminalAttentionStore.markSuperseded(ownerWorkspaceId, notification.id);
         continue;
       }
-      promptSections.push(workflowPrompt);
+      promptSections.push(workflowWake.prompt);
+      backgroundWorkWakeRecords.push({
+        sourceKind: notification.sourceKind,
+        sourceId: notification.sourceId,
+        outcome: notification.terminalOutcome,
+        title: coerceNonEmptyString(notification.title) ?? workflowWake.title,
+        workspaceId: workflowWake.workspaceId,
+      });
     }
     if (promptSections.length === 0) {
       return;
     }
     const prompt = promptSections.join("\n\n");
+    const muxMetadata: Extract<MuxMessageMetadata, { type: "background-work-wake" }> = {
+      type: "background-work-wake",
+      records: backgroundWorkWakeRecords,
+    };
 
     const markPendingDelivered = async () => {
       for (const notification of effectivePending) {
@@ -6035,6 +6113,7 @@ export class TaskService {
       agentId: resumeOptions.agentId,
       thinkingLevel: resumeOptions.thinkingLevel,
       reasoningMode: resumeOptions.reasoningMode,
+      muxMetadata,
     };
     let sendResult = await this.workspaceService.sendMessage(
       ownerWorkspaceId,
@@ -11084,6 +11163,10 @@ export class TaskService {
       ownerWorkspaceId: parentWorkspaceId,
       sourceKind: "agent_task",
       sourceId: childWorkspaceId,
+      title:
+        coerceNonEmptyString(childEntry.workspace.title) ??
+        coerceNonEmptyString(childEntry.workspace.name) ??
+        "Sub-agent task",
       outputDelivery: "already_injected",
       terminalOutcome: "failed",
     });
@@ -12082,6 +12165,10 @@ export class TaskService {
       ownerWorkspaceId: parentWorkspaceId,
       sourceKind: "agent_task",
       sourceId: childWorkspaceId,
+      title:
+        coerceNonEmptyString(latestChildEntry?.workspace.title) ??
+        coerceNonEmptyString(latestChildEntry?.workspace.name) ??
+        "Sub-agent task",
       outputDelivery: "already_injected",
       terminalOutcome: "completed",
     });

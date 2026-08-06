@@ -10,6 +10,7 @@ import { collapseLeftSidebar } from "@/browser/stories/helpers/uiState";
 import { userEvent, waitFor, within } from "@storybook/test";
 import {
   createAssistantMessage,
+  createBackgroundWorkWakeMessage,
   createBashMonitorWakeMessage,
   createGoalBudgetLimitMessage,
   createGoalContinuationMessage,
@@ -656,6 +657,133 @@ export const SyntheticAutoResumeMessages: AppStory = {
       }}
     />
   ),
+};
+
+const BACKGROUND_WORK_WAKE_PROMPT = [
+  "Background sub-agent task(s) have completed.",
+  "",
+  "Background workspace turn(s) have reached a terminal state:",
+  "- wst_verify",
+  "",
+  'Call `task_await({ task_ids: ["wst_verify"], timeout_secs: 0 })` to retrieve the workspace-turn result.',
+  "",
+  "A workflow run also completed:",
+  "- coalesced-research (wfr_coalesced_research)",
+].join("\n");
+
+/**
+ * Terminal attention wakes use the same quiet right-aligned treatment as monitor
+ * wakes. Pixel covers both phone and laptop widths in dark and light themes; the
+ * play expands the coalesced row so the raw provider prompt is also snapshot.
+ */
+export const BackgroundWorkWakeMessages: AppStory = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    pixel: {
+      matrix: { themes: ["dark", "light"], viewports: ["phone", "laptop"] },
+    },
+  },
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        collapseLeftSidebar();
+        return setupSimpleChatStory({
+          workspaceId: "ws-background-work-wake",
+          messages: [
+            createUserMessage("msg-1", "Run the audit and verification work in the background", {
+              historySequence: 1,
+              timestamp: STABLE_TIMESTAMP - 300000,
+            }),
+            createAssistantMessage("msg-2", "The background work is running.", {
+              historySequence: 2,
+              timestamp: STABLE_TIMESTAMP - 295000,
+            }),
+            createBackgroundWorkWakeMessage("msg-3", {
+              historySequence: 3,
+              timestamp: STABLE_TIMESTAMP - 290000,
+              promptText: BACKGROUND_WORK_WAKE_PROMPT,
+              records: [
+                {
+                  sourceKind: "agent_task",
+                  sourceId: "task-audit",
+                  outcome: "completed",
+                  title: "Repository audit",
+                  workspaceId: "task-audit",
+                },
+                {
+                  sourceKind: "workspace_turn",
+                  sourceId: "wst_verify",
+                  outcome: "error",
+                  title: "Verification turn",
+                  workspaceId: "workspace-verify",
+                },
+                {
+                  sourceKind: "workflow_run",
+                  sourceId: "wfr_coalesced_research",
+                  outcome: "completed",
+                  title: "coalesced-research",
+                  workspaceId: "ws-background-work-wake",
+                },
+              ],
+            }),
+            createAssistantMessage(
+              "msg-4",
+              "The audit and research completed; the verification turn needs attention.",
+              { historySequence: 4, timestamp: STABLE_TIMESTAMP - 285000 }
+            ),
+            createBackgroundWorkWakeMessage("msg-5", {
+              historySequence: 5,
+              timestamp: STABLE_TIMESTAMP - 60000,
+              promptText: "Background sub-agent task(s) have completed.",
+              records: [
+                {
+                  sourceKind: "agent_task",
+                  sourceId: "task-finish",
+                  outcome: "completed",
+                  title: "Final cleanup",
+                  workspaceId: "task-finish",
+                },
+              ],
+            }),
+          ],
+        });
+      }}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const toggles = await waitFor(
+      () => {
+        const found = canvas.getAllByRole("button", { name: /show details/i });
+        if (found.length !== 2) {
+          throw new Error(`Expected 2 collapsed background work events, found ${found.length}`);
+        }
+        return found;
+      },
+      { timeout: 15_000 }
+    );
+
+    const wakeRows = canvasElement.querySelectorAll<HTMLElement>("[data-background-work-wake]");
+    if (wakeRows.length !== 2) {
+      throw new Error(`Expected 2 background work wake rows, found ${wakeRows.length}`);
+    }
+    for (const row of wakeRows) {
+      const toggle = row.querySelector<HTMLElement>("button");
+      if (!toggle) throw new Error("Background work wake toggle not rendered");
+      if (Math.abs(row.getBoundingClientRect().right - toggle.getBoundingClientRect().right) > 1) {
+        throw new Error("Background work wake summary is not right-aligned");
+      }
+    }
+
+    await userEvent.click(toggles[0]);
+    await waitFor(() => {
+      if (canvas.queryByText(/task_await/) == null) {
+        throw new Error("Expected expanded background work wake to reveal the raw prompt");
+      }
+    });
+  },
 };
 
 const BASH_MONITOR_WAKE_MATCH_PROMPT = [
