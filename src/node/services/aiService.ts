@@ -2085,6 +2085,7 @@ export class AIService extends EventEmitter {
         // Plan agent configuration for plan file access.
         // - read: plan file is readable in all agents (useful context)
         // - write: allowed in all agents; plan agents still lock other edits to the exact plan path
+        taskExploreOnly: effectiveAgentId === "explore",
         planFileOnly: agentIsPlanLike,
         emitChatEvent: (event) => {
           // Defensive: tools should only emit events for the workspace they belong to.

@@ -495,10 +495,11 @@ Custom planning instructions.
           "task_terminate",
           "task_workspace_lifecycle",
           "workflow_run",
+          "workflow_resume",
         ],
         toolPolicy
       )
-    ).toEqual(["task_await", "workflow_run"]);
+    ).toEqual(["task", "task_await"]);
   });
   test("same-name override: project agent with base: self extends built-in/global, not itself", async () => {
     using project = new DisposableTempDir("agent-same-name");
