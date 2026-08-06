@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { RUNTIME_MODE } from "@/common/types/runtime";
+import { RUNTIME_MODE, type RuntimeConfig } from "@/common/types/runtime";
 import {
   buildTaskToolAgentArgsSchema,
   buildTaskToolDescription,
@@ -159,6 +159,54 @@ describe("TOOL_DEFINITIONS", () => {
         }).success
       ).toBe(false);
     }
+  });
+
+  it("accepts every shared runtime config variant for new Project Chat workspaces", () => {
+    const runtimeConfigs: RuntimeConfig[] = [
+      { type: "local" },
+      { type: "local", srcBaseDir: "/tmp/legacy-worktrees" },
+      { type: "worktree", srcBaseDir: "/tmp/worktrees" },
+      { type: "ssh", host: "devbox", srcBaseDir: "~/mux" },
+      {
+        type: "ssh",
+        host: "coder://",
+        srcBaseDir: "~/mux",
+        coder: { template: "ubuntu", existingWorkspace: false },
+      },
+      { type: "docker", image: "node:20", shareCredentials: true },
+      {
+        type: "devcontainer",
+        configPath: ".devcontainer/devcontainer.json",
+        shareCredentials: true,
+      },
+    ];
+
+    for (const runtimeConfig of runtimeConfigs) {
+      const parsed = ProjectChatTaskToolArgsSchema.safeParse({
+        prompt: "Implement the change",
+        title: "Task handle",
+        workspace: { mode: "new", title: "Workspace display", runtimeConfig },
+      });
+      expect(parsed.success).toBe(true);
+      if (parsed.success) {
+        expect(parsed.data.workspace?.runtimeConfig).toEqual(runtimeConfig);
+        expect(parsed.data.workspace?.title).toBe("Workspace display");
+      }
+    }
+  });
+
+  it("rejects runtime configuration on existing Project Chat workspace turns", () => {
+    const parsed = ProjectChatTaskToolArgsSchema.safeParse({
+      prompt: "Continue the work",
+      title: "Task handle",
+      workspace: {
+        mode: "existing",
+        workspaceId: "child-workspace",
+        runtimeConfig: { type: "local" },
+      },
+    });
+
+    expect(parsed.success).toBe(false);
   });
 
   it("accepts strict-provider null for the ordinary task background default", () => {

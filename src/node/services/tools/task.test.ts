@@ -175,6 +175,56 @@ describe("task tool", () => {
     });
   });
 
+  it("forwards Project Chat workspace runtime and display title overrides", async () => {
+    using tempDir = new TestTempDir("test-task-tool-project-chat-runtime");
+    const createWorkspaceTurn = mock((_args: Parameters<TaskService["createWorkspaceTurn"]>[0]) =>
+      Ok({
+        taskId: "wst_project-chat-runtime",
+        kind: "workspace_turn" as const,
+        status: "running" as const,
+        workspaceId: "child-workspace",
+      })
+    );
+    const taskService = { createWorkspaceTurn } as unknown as TaskService;
+    const tool = createTaskTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "project-session_aaaaaaaaaa" }),
+      projectChat: true,
+      taskService,
+    });
+    const runtimeConfig = {
+      type: "ssh" as const,
+      host: "devbox",
+      srcBaseDir: "~/mux",
+      identityFile: "~/.ssh/project",
+      port: 2222,
+    };
+
+    await Promise.resolve(
+      tool.execute!(
+        {
+          prompt: "implement",
+          title: "Task handle",
+          workspace: {
+            mode: "new",
+            title: "Workspace display",
+            runtimeConfig,
+          },
+        },
+        mockToolCallOptions
+      )
+    );
+
+    expect(createWorkspaceTurn).toHaveBeenCalledTimes(1);
+    expect(createWorkspaceTurn.mock.calls[0]?.[0]).toMatchObject({
+      title: "Task handle",
+      workspace: {
+        mode: "new",
+        title: "Workspace display",
+        runtimeConfig,
+      },
+    });
+  });
+
   it("backgrounds an explicit Project Chat foreground wait when new parent input arrives", async () => {
     using tempDir = new TestTempDir("test-task-tool-project-chat-foreground");
     const createWorkspaceTurn = mock((_args: Parameters<TaskService["createWorkspaceTurn"]>[0]) =>

@@ -58,6 +58,7 @@ import {
 import { defaultModel } from "@/common/utils/ai/models";
 import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
+import type { RuntimeConfig } from "@/common/types/runtime";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { SendMessageError } from "@/common/types/errors";
 import type { ErrorEvent, StreamAbortEvent, StreamEndEvent } from "@/common/types/stream";
@@ -407,6 +408,7 @@ function createWorkspaceServiceMocks(
     emitChatEvent: ReturnType<typeof mock>;
     isWorkflowInvocationCurrent: ReturnType<typeof mock>;
     interruptWorkspaceTurnStream: ReturnType<typeof mock>;
+    updateTitle: ReturnType<typeof mock>;
     create: ReturnType<typeof mock>;
   }>
 ): {
@@ -437,6 +439,7 @@ function createWorkspaceServiceMocks(
   isExperimentEnabled: ReturnType<typeof mock>;
   emitChatEvent: ReturnType<typeof mock>;
   isWorkflowInvocationCurrent: ReturnType<typeof mock>;
+  updateTitle: ReturnType<typeof mock>;
   create: ReturnType<typeof mock>;
 } {
   const sendMessage =
@@ -490,6 +493,9 @@ function createWorkspaceServiceMocks(
     overrides?.interruptWorkspaceTurnStream ??
     mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
 
+  const updateTitle =
+    overrides?.updateTitle ?? mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+
   const create =
     overrides?.create ??
     mock(
@@ -500,6 +506,7 @@ function createWorkspaceServiceMocks(
   return {
     workspaceService: {
       interruptWorkspaceTurnStream,
+      updateTitle,
       create,
       sendMessage,
       resumeStream,
@@ -529,6 +536,7 @@ function createWorkspaceServiceMocks(
       isWorkflowInvocationCurrent,
     } as unknown as WorkspaceService,
     interruptWorkspaceTurnStream,
+    updateTitle,
     create,
     sendMessage,
     resumeStream,
@@ -1337,17 +1345,264 @@ describe("TaskService", () => {
     const reused = await taskService.createWorkspaceTurn({
       ownerWorkspaceId: projectChat.sessionId,
       prompt: "Continue existing workspace",
-      title: "Existing",
-      workspace: { mode: "existing", workspaceId: "existingworkspace" },
+      title: "Existing task handle",
+      workspace: {
+        mode: "existing",
+        workspaceId: "existingworkspace",
+        title: "Renamed existing workspace",
+      },
     });
     expect(reused).toMatchObject({
       success: true,
       data: { workspaceId: "existingworkspace", status: "running" },
     });
+    expect(workspaceMocks.updateTitle).toHaveBeenCalledWith(
+      "existingworkspace",
+      "Renamed existing workspace"
+    );
     expect(sendMessage.mock.calls.map((call) => call[0])).toEqual([
       "createdworkspace",
       "existingworkspace",
     ]);
+  });
+
+  test("Project Chat passes every explicit runtime config through and explicit config beats defaults", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = await createTestProject(rootDir, "runtime-overrides");
+    await saveWorkspaces(config, projectPath, [], {
+      taskSettings: { ...testTaskSettings(), maxParallelAgentTasks: 20 },
+      defaultRuntime: "local",
+    });
+    const projectChat = await config.ensureProjectChat(projectPath);
+    stubStableIds(config, [
+      "localhandle",
+      "localturn",
+      "worktreehandle",
+      "worktreeturn",
+      "sshhandle",
+      "sshturn",
+      "coderhandle",
+      "coderturn",
+      "dockerhandle",
+      "dockerturn",
+      "devcontainerhandle",
+      "devcontainerturn",
+    ]);
+
+    const runtimeConfigs: RuntimeConfig[] = [
+      { type: "local" },
+      { type: "worktree", srcBaseDir: "/tmp/project-chat-worktrees" },
+      {
+        type: "ssh",
+        host: "devbox",
+        srcBaseDir: "~/mux",
+        identityFile: "~/.ssh/project",
+        port: 2222,
+      },
+      {
+        type: "ssh",
+        host: "coder://",
+        srcBaseDir: "~/mux",
+        coder: { template: "ubuntu", templateOrg: "acme", preset: "large" },
+      },
+      { type: "docker", image: "node:20", shareCredentials: true },
+      {
+        type: "devcontainer",
+        configPath: ".devcontainer/devcontainer.json",
+        shareCredentials: true,
+      },
+    ];
+    let workspaceNumber = 0;
+    const createWorkspace = mock(
+      (...args: unknown[]): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
+        const runtimeConfig = args[4] as RuntimeConfig | undefined;
+        expect(runtimeConfig).toEqual(runtimeConfigs[workspaceNumber]);
+        expect(args[2]).toBe(runtimeConfig?.type === "local" ? undefined : "main");
+        expect(args[3]).toBe(`Workspace ${workspaceNumber + 1}`);
+        workspaceNumber += 1;
+        return Promise.resolve(
+          Ok({
+            metadata: {
+              ...createWorkspaceTurnMetadata(projectPath),
+              id: `childworkspace${workspaceNumber}`,
+            },
+          })
+        );
+      }
+    );
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace });
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    for (const [index, runtimeConfig] of runtimeConfigs.entries()) {
+      const result = await taskService.createWorkspaceTurn({
+        ownerWorkspaceId: projectChat.sessionId,
+        prompt: `Create workspace ${index + 1}`,
+        title: `Task handle ${index + 1}`,
+        workspace: {
+          mode: "new",
+          title: `Workspace ${index + 1}`,
+          runtimeConfig,
+        },
+      });
+      expect(result.success).toBe(true);
+    }
+
+    expect(createWorkspace).toHaveBeenCalledTimes(runtimeConfigs.length);
+  });
+
+  test("Project Chat rejects runtime mutation on existing workspace turns", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = await createTestProject(rootDir, "existing-runtime-rejection");
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [projectWorkspace(projectPath, "existing", "existingworkspace")],
+      testTaskSettings()
+    );
+    const projectChat = await config.ensureProjectChat(projectPath);
+    const workspaceMocks = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: projectChat.sessionId,
+      prompt: "Continue existing workspace",
+      title: "Existing",
+      workspace: {
+        mode: "existing",
+        workspaceId: "existingworkspace",
+        runtimeConfig: { type: "local" },
+      },
+    });
+
+    expect(result).toEqual(
+      Err(
+        'Task.createWorkspaceTurn: workspace.runtimeConfig is only accepted when workspace.mode="new"'
+      )
+    );
+    expect(workspaceMocks.create).not.toHaveBeenCalled();
+    expect(workspaceMocks.sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("Project Chat uses project runtime defaults before global defaults when runtime is omitted", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = await createTestProject(rootDir, "project-runtime-default");
+    await saveWorkspaces(config, projectPath, [], {
+      taskSettings: testTaskSettings(),
+      defaultRuntime: "worktree",
+    });
+    await config.editConfig((cfg) => {
+      const project = cfg.projects.get(projectPath);
+      assert(project, "test project must exist");
+      project.defaultRuntime = "local";
+      return cfg;
+    });
+    const projectChat = await config.ensureProjectChat(projectPath);
+    const createWorkspace = mock(
+      (...args: unknown[]): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
+        expect(args[2]).toBeUndefined();
+        expect(args[4]).toEqual({ type: "local" });
+        return Promise.resolve(Ok({ metadata: createWorkspaceTurnMetadata(projectPath) }));
+      }
+    );
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace });
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: projectChat.sessionId,
+      prompt: "Create with defaults",
+      title: "Default runtime",
+      workspace: { mode: "new" },
+    });
+
+    expect(result.success).toBe(true);
+    expect(createWorkspace).toHaveBeenCalledTimes(1);
+  });
+
+  test("Project Chat discovers the first devcontainer config for an omitted devcontainer default", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = await createTestProject(rootDir, "devcontainer-default");
+    await fsPromises.mkdir(path.join(projectPath, ".devcontainer"), { recursive: true });
+    await fsPromises.writeFile(
+      path.join(projectPath, ".devcontainer", "devcontainer.json"),
+      "{}",
+      "utf8"
+    );
+    await saveWorkspaces(config, projectPath, [], {
+      taskSettings: testTaskSettings(),
+      defaultRuntime: "devcontainer",
+    });
+    const projectChat = await config.ensureProjectChat(projectPath);
+    const createWorkspace = mock(
+      (...args: unknown[]): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
+        expect(args[2]).toBe("main");
+        expect(args[4]).toEqual({
+          type: "devcontainer",
+          configPath: ".devcontainer/devcontainer.json",
+        });
+        return Promise.resolve(Ok({ metadata: createWorkspaceTurnMetadata(projectPath) }));
+      }
+    );
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace });
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: projectChat.sessionId,
+      prompt: "Create devcontainer workspace",
+      title: "Devcontainer default",
+      workspace: { mode: "new" },
+    });
+
+    expect(result.success).toBe(true);
+    expect(createWorkspace).toHaveBeenCalledTimes(1);
+  });
+
+  test("Project Chat does not silently replace an explicit worktree runtime on non-Git projects", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = await createTestProject(rootDir, "explicit-worktree-non-git", {
+      initGit: false,
+    });
+    await saveWorkspaces(config, projectPath, [], {
+      taskSettings: testTaskSettings(),
+      defaultRuntime: "local",
+    });
+    const projectChat = await config.ensureProjectChat(projectPath);
+    const explicitRuntime: RuntimeConfig = {
+      type: "worktree",
+      srcBaseDir: "/tmp/project-chat-worktrees",
+    };
+    const createWorkspace = mock(
+      (...args: unknown[]): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
+        expect(args[2]).toBeUndefined();
+        expect(args[4]).toEqual(explicitRuntime);
+        return Promise.resolve(Err("Trunk branch is required for worktree and SSH runtimes"));
+      }
+    );
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace });
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: projectChat.sessionId,
+      prompt: "Create explicit worktree",
+      title: "Explicit worktree",
+      workspace: { mode: "new", runtimeConfig: explicitRuntime },
+    });
+
+    expect(result).toEqual(
+      Err(
+        "Task.createWorkspaceTurn: workspace create failed (Trunk branch is required for worktree and SSH runtimes)"
+      )
+    );
+    expect(createWorkspace).toHaveBeenCalledTimes(1);
   });
 
   test("Project Chat propagates Git branch discovery failures instead of dropping to local", async () => {

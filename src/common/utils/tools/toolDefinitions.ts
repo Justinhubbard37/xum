@@ -31,6 +31,7 @@ import { z } from "zod";
 import {
   AgentIdSchema,
   AgentSkillPackageSchema,
+  RuntimeConfigSchema,
   SkillNameSchema,
   WorkflowRunRecordSchema,
   WorkflowRunStatusSchema,
@@ -356,6 +357,17 @@ const WorkspaceTaskTargetSchema = z
     workspaceId: z.string().trim().min(1).nullish(),
     branchName: z.string().trim().min(1).nullish(),
     trunkBranch: z.string().trim().min(1).nullish(),
+    title: z
+      .string()
+      .trim()
+      .min(1)
+      .nullish()
+      .describe(
+        "Workspace display title. For mode=new, sets the created workspace title; for mode=existing, updates the target workspace title. This is separate from the task handle title."
+      ),
+    runtimeConfig: RuntimeConfigSchema.nullish().describe(
+      "Creation runtime configuration for mode=new. Omit to use the effective project/global default. Existing workspace follow-ups cannot change runtime configuration."
+    ),
     queueDispatchMode: z
       .enum(["tool-end", "turn-end"])
       .nullish()
@@ -376,7 +388,11 @@ function refineTaskToolAgentArgs(
     n?: number | null;
     variants?: string[] | null;
     sticky?: boolean | null;
-    workspace?: { mode?: "new" | "fork" | "existing" | null; workspaceId?: string | null } | null;
+    workspace?: {
+      mode?: "new" | "fork" | "existing" | null;
+      workspaceId?: string | null;
+      runtimeConfig?: unknown;
+    } | null;
   },
   ctx: z.RefinementCtx
 ): void {
@@ -418,6 +434,13 @@ function refineTaskToolAgentArgs(
         code: z.ZodIssueCode.custom,
         message: "workspace.workspaceId is required when workspace.mode is existing",
         path: ["workspace", "workspaceId"],
+      });
+    }
+    if ((args.workspace?.mode ?? "new") === "existing" && args.workspace?.runtimeConfig != null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "workspace.runtimeConfig is only accepted when workspace.mode is new",
+        path: ["workspace", "runtimeConfig"],
       });
     }
     return;

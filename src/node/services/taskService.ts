@@ -44,6 +44,7 @@ import {
   createRuntimeContextForWorkspace,
   createRuntimeForWorkspace,
 } from "@/node/runtime/runtimeHelpers";
+import { scanDevcontainerConfigs } from "@/node/runtime/devcontainerConfigs";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
 import { runBackgroundInit } from "@/node/runtime/runtimeFactory";
 import type { InitLogger, Runtime } from "@/node/runtime/Runtime";
@@ -621,6 +622,10 @@ export interface WorkspaceTurnCreateArgs {
     workspaceId?: string;
     branchName?: string;
     trunkBranch?: string;
+    /** Workspace display title, separate from the workspace-turn task handle title. */
+    title?: string;
+    /** Creation-only runtime override. Existing workspace turns cannot mutate runtime settings. */
+    runtimeConfig?: RuntimeConfig;
     queueDispatchMode?: WorkspaceTurnQueueDispatchMode;
     disposable?: boolean;
   };
@@ -3429,9 +3434,15 @@ export class TaskService {
       return Err("Task.createWorkspaceTurn: prompt is required");
     }
     const title = coerceNonEmptyString(args.title) ?? "Workspace task";
+    const workspaceTitle = coerceNonEmptyString(args.workspace?.title);
     const mode = args.workspace?.mode ?? "new";
     if (mode !== "new" && mode !== "fork" && mode !== "existing") {
       return Err("Task.createWorkspaceTurn: unsupported workspace mode");
+    }
+    if (mode === "existing" && args.workspace?.runtimeConfig != null) {
+      return Err(
+        'Task.createWorkspaceTurn: workspace.runtimeConfig is only accepted when workspace.mode="new"'
+      );
     }
     const queueDispatchMode = args.workspace?.queueDispatchMode ?? "tool-end";
     if (queueDispatchMode !== "tool-end" && queueDispatchMode !== "turn-end") {
@@ -3546,6 +3557,17 @@ export class TaskService {
         const slot = await ensureParallelSlot();
         if (!slot.success) return Err(slot.error);
       }
+      if (workspaceTitle != null) {
+        const updateTitleResult = await this.workspaceService.updateTitle(
+          existingWorkspaceId,
+          workspaceTitle
+        );
+        if (!updateTitleResult.success) {
+          return Err(
+            `Task.createWorkspaceTurn: workspace title update failed (${updateTitleResult.error})`
+          );
+        }
+      }
     } else {
       const slot = await ensureParallelSlot();
       if (!slot.success) return Err(slot.error);
@@ -3554,55 +3576,92 @@ export class TaskService {
         [WORKSPACE_TURN_TASK_TAGS.ownerWorkspaceId]: ownerWorkspaceId,
         [WORKSPACE_TURN_TASK_TAGS.turn]: turnId,
       };
-      let creationRuntimeConfig: RuntimeConfig | undefined = parentMeta.runtimeConfig;
+      const explicitRuntimeConfig = args.workspace?.runtimeConfig;
+      let creationRuntimeConfig: RuntimeConfig | undefined =
+        explicitRuntimeConfig ?? parentMeta.runtimeConfig;
       let creationTrunkBranch: string | undefined = args.workspace?.trunkBranch ?? parentMeta.name;
       if (projectChatOwner) {
-        // Project Chat itself uses LocalRuntime, but new child workspaces should use the ordinary
-        // project creation contract: worktree by default (or the effective project/global default),
-        // with backend trunk detection. Non-git projects self-heal to local because worktrees are invalid.
+        // Project Chat itself uses LocalRuntime, so omitted runtime settings must resolve through the
+        // same project/global mode defaults as manual creation rather than inheriting that local host.
+        // The backend persists the default mode but not manual creation's remembered SSH host, Coder
+        // template, or Docker image; those modes therefore require an explicit runtimeConfig. Devcontainer
+        // configs are discoverable from the project, so the backend can select the same first config as UI.
         const branchProjectPath =
           projectChatWorkspaceScope?.storageProjectPath ?? parentMeta.projectPath;
-        let isGitProject: boolean;
-        try {
-          isGitProject = await inspectInsideGitRepository(branchProjectPath);
-        } catch (error) {
-          return Err(
-            `Task.createWorkspaceTurn: failed to inspect Git repository (${getErrorMessage(error)})`
-          );
-        }
-        let branches: string[] = [];
-        if (isGitProject) {
-          try {
-            branches = await listLocalBranches(branchProjectPath);
-          } catch (error) {
-            return Err(
-              `Task.createWorkspaceTurn: failed to inspect Git branches (${getErrorMessage(error)})`
-            );
+        const effectiveDefaultRuntime = taskProjectConfig.defaultRuntime ?? cfg.defaultRuntime;
+        if (explicitRuntimeConfig == null) {
+          switch (effectiveDefaultRuntime) {
+            case "local":
+              creationRuntimeConfig = { type: "local" };
+              break;
+            case "devcontainer": {
+              const configPaths = await scanDevcontainerConfigs(branchProjectPath);
+              const configPath = configPaths[0];
+              if (configPath == null) {
+                return Err(
+                  "Task.createWorkspaceTurn: the default devcontainer runtime has no discoverable config; pass workspace.runtimeConfig explicitly"
+                );
+              }
+              creationRuntimeConfig = { type: "devcontainer", configPath };
+              break;
+            }
+            case "ssh":
+            case "coder":
+            case "docker":
+              return Err(
+                `Task.createWorkspaceTurn: the default ${effectiveDefaultRuntime} runtime requires frontend-only remembered configuration; pass workspace.runtimeConfig explicitly`
+              );
+            case "worktree":
+            case undefined:
+              creationRuntimeConfig = undefined;
+              break;
           }
         }
-        const effectiveDefaultRuntime = taskProjectConfig.defaultRuntime ?? cfg.defaultRuntime;
-        if (
-          effectiveDefaultRuntime != null &&
-          effectiveDefaultRuntime !== "local" &&
-          effectiveDefaultRuntime !== "worktree"
-        ) {
-          return Err(
-            `Task.createWorkspaceTurn: Project Chat cannot automatically create ${effectiveDefaultRuntime} workspaces; create one manually, then continue it with workspace.mode="existing".`
-          );
+
+        if (creationRuntimeConfig?.type === "local") {
+          creationTrunkBranch = undefined;
+        } else {
+          let isGitProject: boolean;
+          try {
+            isGitProject = await inspectInsideGitRepository(branchProjectPath);
+          } catch (error) {
+            return Err(
+              `Task.createWorkspaceTurn: failed to inspect Git repository (${getErrorMessage(error)})`
+            );
+          }
+          let branches: string[] = [];
+          if (isGitProject) {
+            try {
+              branches = await listLocalBranches(branchProjectPath);
+            } catch (error) {
+              return Err(
+                `Task.createWorkspaceTurn: failed to inspect Git branches (${getErrorMessage(error)})`
+              );
+            }
+          }
+
+          // Only an omitted/default worktree may self-heal to local for a non-Git project. Explicit
+          // worktree intent must reach WorkspaceService.create and return its normal actionable error.
+          const omittedDefaultWorktree =
+            explicitRuntimeConfig == null &&
+            (effectiveDefaultRuntime == null || effectiveDefaultRuntime === "worktree");
+          if (omittedDefaultWorktree && branches.length === 0) {
+            creationRuntimeConfig = { type: "local" };
+            creationTrunkBranch = undefined;
+          } else {
+            creationTrunkBranch =
+              args.workspace?.trunkBranch ??
+              (branches.length > 0
+                ? ((await detectDefaultTrunkBranch(branchProjectPath, branches)) ?? branches[0])
+                : undefined);
+          }
         }
-        const useLocalRuntime = effectiveDefaultRuntime === "local" || branches.length === 0;
-        creationRuntimeConfig = useLocalRuntime ? { type: "local" } : undefined;
-        creationTrunkBranch = useLocalRuntime
-          ? undefined
-          : (args.workspace?.trunkBranch ??
-            (await detectDefaultTrunkBranch(branchProjectPath, branches)) ??
-            branches[0]);
       }
       const createResult = await this.workspaceService.create(
         parentMeta.projectPath,
         args.workspace?.branchName,
         creationTrunkBranch,
-        title,
+        workspaceTitle ?? title,
         creationRuntimeConfig,
         parentMeta.subProjectPath,
         false,
