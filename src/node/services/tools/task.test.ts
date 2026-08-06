@@ -206,6 +206,7 @@ describe("task tool", () => {
           title: "Task handle",
           workspace: {
             mode: "new",
+            projectPath: "/repo/packages/web",
             title: "Workspace display",
             runtimeConfig,
           },
@@ -219,6 +220,7 @@ describe("task tool", () => {
       title: "Task handle",
       workspace: {
         mode: "new",
+        projectPath: "/repo/packages/web",
         title: "Workspace display",
         runtimeConfig,
       },

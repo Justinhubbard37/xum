@@ -13,10 +13,21 @@ describe("project_workspace_list tool", () => {
       Promise.resolve(
         Ok({
           projectPath: "/project",
+          availableProjects: [
+            { projectPath: "/project", displayName: "Project", kind: "parent" as const },
+            {
+              projectPath: "/project/packages/web",
+              displayName: "Web",
+              kind: "sub_project" as const,
+            },
+          ],
           workspaces: [
             {
               workspaceId: "canonical-workspace-id",
               name: "feature",
+              projectPath: "/project/packages/web",
+              projectDisplayName: "Web",
+              subProjectPath: "/project/packages/web",
               archived: false,
               createdAt: "2026-08-05T00:00:00.000Z",
               lastActivityAt: "2026-08-06T01:00:00.000Z",
@@ -48,16 +59,29 @@ describe("project_workspace_list tool", () => {
     });
 
     const result: unknown = await Promise.resolve(
-      listTool.execute!({ include_archived: true }, mockToolCallOptions)
+      listTool.execute!(
+        { include_archived: true, project_path: "/project/packages/web" },
+        mockToolCallOptions
+      )
     );
 
-    expect(listProjectWorkspaces).toHaveBeenCalledWith(workspaceId, { includeArchived: true });
+    expect(listProjectWorkspaces).toHaveBeenCalledWith(workspaceId, {
+      includeArchived: true,
+      projectPath: "/project/packages/web",
+    });
     expect(result).toEqual({
       projectPath: "/project",
+      availableProjects: [
+        { projectPath: "/project", displayName: "Project", kind: "parent" },
+        { projectPath: "/project/packages/web", displayName: "Web", kind: "sub_project" },
+      ],
       workspaces: [
         {
           workspaceId: "canonical-workspace-id",
           name: "feature",
+          projectPath: "/project/packages/web",
+          projectDisplayName: "Web",
+          subProjectPath: "/project/packages/web",
           archived: false,
           createdAt: "2026-08-05T00:00:00.000Z",
           lastActivityAt: "2026-08-06T01:00:00.000Z",
@@ -83,7 +107,15 @@ describe("project_workspace_list tool", () => {
   it("treats strict-provider null as the documented include-archived default", async () => {
     using tempDir = new TestTempDir("project-workspace-list-null-default");
     const listProjectWorkspaces = mock(() =>
-      Promise.resolve(Ok({ projectPath: "/project", workspaces: [] }))
+      Promise.resolve(
+        Ok({
+          projectPath: "/project",
+          availableProjects: [
+            { projectPath: "/project", displayName: "project", kind: "parent" as const },
+          ],
+          workspaces: [],
+        })
+      )
     );
     const workspaceId = "project-session_aaaaaaaaaa";
     const listTool = createProjectWorkspaceListTool({

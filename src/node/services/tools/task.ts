@@ -475,6 +475,14 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
         reasoningMode: projectChatAi?.reasoningMode ?? reasoningMode,
       });
 
+      const projectChatProjectPath =
+        projectChat &&
+        workspace != null &&
+        "projectPath" in workspace &&
+        typeof workspace.projectPath === "string"
+          ? workspace.projectPath
+          : undefined;
+
       const workspaceId = requireWorkspaceId(config, "task");
       const taskService = requireTaskService(config, "task");
 
@@ -502,6 +510,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
           attentionPolicy: runInBackground ? "notify_on_terminal" : "blocking_until_terminal",
           workspace: {
             mode: workspace?.mode ?? "new",
+            ...(projectChatProjectPath != null ? { projectPath: projectChatProjectPath } : {}),
             ...(workspace?.workspaceId != null ? { workspaceId: workspace.workspaceId } : {}),
             ...(workspace?.branchName != null ? { branchName: workspace.branchName } : {}),
             ...(workspace?.trunkBranch != null ? { trunkBranch: workspace.trunkBranch } : {}),

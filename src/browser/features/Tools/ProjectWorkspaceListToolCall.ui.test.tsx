@@ -59,10 +59,16 @@ describe("ProjectWorkspaceListToolCall", () => {
   test("unwraps valid results and self-heals malformed output", () => {
     const result = {
       projectPath: "/projects/demo",
+      availableProjects: [
+        { projectPath: "/projects/demo", displayName: "Demo", kind: "parent" as const },
+      ],
       workspaces: [
         {
           workspaceId: "ws-active",
           name: "feature-a",
+          projectPath: "/projects/demo",
+          projectDisplayName: "Demo",
+          subProjectPath: null,
           archived: false,
         },
       ],
@@ -88,10 +94,21 @@ describe("ProjectWorkspaceListToolCall", () => {
         defaultExpanded
         result={{
           projectPath: "/projects/demo",
+          availableProjects: [
+            { projectPath: "/projects/demo", displayName: "Demo", kind: "parent" },
+            {
+              projectPath: "/projects/demo/packages/a-very-long-child-project-name",
+              displayName: "A very long child project display name that must truncate",
+              kind: "sub_project",
+            },
+          ],
           workspaces: [
             {
               workspaceId: "ws-active",
               name: "feature-a",
+              projectPath: "/projects/demo",
+              projectDisplayName: "Demo",
+              subProjectPath: null,
               title: "Implement orchestration",
               archived: false,
               updatedAt: "2026-08-06T03:00:00.000Z",
@@ -111,6 +128,9 @@ describe("ProjectWorkspaceListToolCall", () => {
             {
               workspaceId: "ws-archived",
               name: "feature-b",
+              projectPath: "/projects/demo/packages/a-very-long-child-project-name",
+              projectDisplayName: "A very long child project display name that must truncate",
+              subProjectPath: "/projects/demo/packages/a-very-long-child-project-name",
               archived: true,
               transcriptOnly: true,
               workspaceTurn: {
@@ -126,6 +146,10 @@ describe("ProjectWorkspaceListToolCall", () => {
     );
 
     expect(view.getByText("Implement orchestration")).toBeTruthy();
+    expect(view.getByText("Demo")).toBeTruthy();
+    expect(
+      view.getByText("A very long child project display name that must truncate")
+    ).toBeTruthy();
     expect(view.getByText("Running")).toBeTruthy();
     expect(view.getByText("worktree")).toBeTruthy();
     expect(view.getByText("Exec: openai:gpt-5.6-sol · high · pro")).toBeTruthy();
@@ -134,8 +158,14 @@ describe("ProjectWorkspaceListToolCall", () => {
     expect(view.getByText("Archived")).toBeTruthy();
     expect(view.getByText("Transcript only")).toBeTruthy();
 
-    fireEvent.click(view.getByRole("button", { name: "Open workspace Implement orchestration" }));
+    fireEvent.click(
+      view.getByRole("button", { name: "Open workspace Implement orchestration in Demo" })
+    );
     expect(onNavigate).toHaveBeenCalledWith("ws-active");
-    expect(view.queryByRole("button", { name: "Open workspace feature-b" })).toBeNull();
+    expect(
+      view.queryByRole("button", {
+        name: "Open workspace feature-b in A very long child project display name that must truncate",
+      })
+    ).toBeNull();
   });
 });

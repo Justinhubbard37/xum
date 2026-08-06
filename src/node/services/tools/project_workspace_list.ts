@@ -20,6 +20,7 @@ export const createProjectWorkspaceListTool: ToolFactory = (config: ToolConfigur
       const result = await taskService.listProjectWorkspaces(ownerWorkspaceId, {
         // Strict providers represent omitted optional tool inputs as null; preserve the true default.
         includeArchived: args.include_archived ?? true,
+        ...(args.project_path != null ? { projectPath: args.project_path } : {}),
       });
       if (!result.success) {
         throw new Error(result.error);

@@ -602,11 +602,12 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 </details>
 
 <details>
-<summary>project_workspace_list (1)</summary>
+<summary>project_workspace_list (2)</summary>
 
-| Env var                           | JSON path          | Type    | Description                                                 |
-| --------------------------------- | ------------------ | ------- | ----------------------------------------------------------- |
-| `MUX_TOOL_INPUT_INCLUDE_ARCHIVED` | `include_archived` | boolean | Include archived same-project workspaces. Defaults to true. |
+| Env var                           | JSON path          | Type    | Description                                                                                                                                   |
+| --------------------------------- | ------------------ | ------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MUX_TOOL_INPUT_INCLUDE_ARCHIVED` | `include_archived` | boolean | Include archived authorized workspaces. Defaults to true.                                                                                     |
+| `MUX_TOOL_INPUT_PROJECT_PATH`     | `project_path`     | string  | Optional exact logical projectPath filter. Use only a path returned by availableProjects; invalid or unauthorized paths return invalid_scope. |
 
 </details>
 

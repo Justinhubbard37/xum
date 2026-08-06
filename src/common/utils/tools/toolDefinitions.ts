@@ -379,6 +379,17 @@ const WorkspaceTaskTargetSchema = z
   })
   .strict();
 
+const ProjectChatWorkspaceTaskTargetSchema = WorkspaceTaskTargetSchema.extend({
+  projectPath: z
+    .string()
+    .trim()
+    .min(1)
+    .nullish()
+    .describe(
+      "Creation-only logical project target. Omit for the current Project Chat scope; otherwise use an exact projectPath returned by project_workspace_list."
+    ),
+});
+
 /** Shared validation across both task-arg schema variants (with/without `isolation`). */
 function refineTaskToolAgentArgs(
   args: {
@@ -582,8 +593,8 @@ export const ProjectChatTaskToolArgsSchema = z
       .describe(
         "Run in background by default so Project Chat remains available while the workspace turn continues. Set false only when the result is required before continuing."
       ),
-    workspace: WorkspaceTaskTargetSchema.nullish().describe(
-      'Workspace target. Omit for a fresh ordinary project workspace. Reuse only when project_workspace_list provides positive relevance evidence, and then pass mode="existing" with its canonical workspaceId.'
+    workspace: ProjectChatWorkspaceTaskTargetSchema.nullish().describe(
+      'Workspace target. Omit for a fresh ordinary workspace in the current Project Chat scope. For mode="new", projectPath may select an exact backend-returned parent/sub-project path. Reuse only when project_workspace_list provides positive relevance evidence, and then pass mode="existing" with its canonical workspaceId.'
     ),
     ai: ProjectChatTaskAiSchema.nullish().describe(
       "Optional grouped AI overrides for this workspace turn. Do not duplicate model, thinking, or reasoningMode at the top level."
@@ -601,6 +612,13 @@ export const ProjectChatTaskToolArgsSchema = z
   .strict()
   .superRefine((args, ctx) => {
     refineTaskToolAgentArgs(args, ctx);
+    if (args.workspace?.projectPath != null && (args.workspace.mode ?? "new") !== "new") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'projectPath is only accepted when workspace.mode="new"',
+        path: ["workspace", "projectPath"],
+      });
+    }
     for (const field of ["model", "thinking", "reasoningMode"] as const) {
       if (args[field] != null && args.ai?.[field] != null) {
         ctx.addIssue({
@@ -614,9 +632,11 @@ export const ProjectChatTaskToolArgsSchema = z
 
 export function buildProjectChatTaskToolDescription(): string {
   return (
-    'Start or continue an ordinary same-project workspace turn. Project Chat may only use kind="workspace"; sub-agent fields are not accepted. ' +
+    'Start or continue an ordinary workspace turn in an authorized Project Chat scope. Project Chat may only use kind="workspace"; sub-agent fields are not accepted. ' +
+    "A top-level parent Project Chat may coordinate its parent root and currently registered direct non-system child sub-projects; a child Project Chat is restricted to its exact child scope. " +
     "Prefer the default background mode so this chat remains available while the child workspace runs. " +
-    "Create a fresh workspace by default. Reuse only when project_workspace_list provides positive relevance evidence for a specific canonical workspace ID, and pass that ID explicitly. " +
+    "Create a fresh workspace by default. For mode=new, omit workspace.projectPath for the current scope or pass an exact projectPath returned by project_workspace_list; never synthesize filesystem descendants. " +
+    "Reuse only when project_workspace_list provides positive relevance evidence for a specific canonical workspace ID, and pass that ID explicitly. " +
     "New and interrupted workspaces persist unless workspace.disposable is explicitly true; archive is the safe default cleanup action."
   );
 }
@@ -627,7 +647,15 @@ export const ProjectWorkspaceListToolArgsSchema = z
       .boolean()
       .nullish()
       .default(true)
-      .describe("Include archived same-project workspaces. Defaults to true."),
+      .describe("Include archived authorized workspaces. Defaults to true."),
+    project_path: z
+      .string()
+      .trim()
+      .min(1)
+      .nullish()
+      .describe(
+        "Optional exact logical projectPath filter. Use only a path returned by availableProjects; invalid or unauthorized paths return invalid_scope."
+      ),
   })
   .strict();
 
@@ -646,6 +674,9 @@ export const ProjectWorkspaceSummarySchema = z
   .object({
     workspaceId: z.string().min(1),
     name: z.string().min(1),
+    projectPath: z.string().min(1),
+    projectDisplayName: z.string().min(1),
+    subProjectPath: z.string().nullable(),
     title: z.string().optional(),
     archived: z.boolean(),
     transcriptOnly: z.boolean().optional(),
@@ -658,9 +689,18 @@ export const ProjectWorkspaceSummarySchema = z
   })
   .strict();
 
+const ProjectWorkspaceAvailableProjectSchema = z
+  .object({
+    projectPath: z.string().min(1),
+    displayName: z.string().min(1),
+    kind: z.enum(["parent", "sub_project"]),
+  })
+  .strict();
+
 export const ProjectWorkspaceListToolResultSchema = z
   .object({
     projectPath: z.string().min(1),
+    availableProjects: z.array(ProjectWorkspaceAvailableProjectSchema),
     workspaces: z.array(ProjectWorkspaceSummarySchema),
   })
   .strict();
@@ -2282,9 +2322,10 @@ export const TOOL_DEFINITIONS = {
   },
   project_workspace_list: {
     description:
-      "List canonical ordinary workspaces in the current Project Chat's project in one bulk call. " +
-      "Returns runtime, fixed Exec workspace-turn AI settings, canonical activity recency, and latest durable task context when available. " +
-      "Create a fresh workspace by default; reuse only when this context provides positive relevance evidence for a specific workspaceId. Never synthesize IDs.",
+      "List canonical ordinary workspaces across the Project Chat's authorized project scopes in one bulk call. " +
+      "A parent Project Chat can see its root plus registered direct non-system child sub-projects; a child Project Chat is restricted to its exact scope. " +
+      "Returns availableProjects (including empty scopes), logical project identity, runtime, fixed Exec workspace-turn AI settings, canonical activity recency, and latest durable task context when available. " +
+      "Use only backend-returned project paths and workspace IDs; never synthesize filesystem descendants or IDs.",
     schema: ProjectWorkspaceListToolArgsSchema,
   },
   task: {

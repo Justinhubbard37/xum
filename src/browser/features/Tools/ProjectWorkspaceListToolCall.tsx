@@ -101,6 +101,9 @@ function ProjectWorkspaceRow(props: { workspace: ProjectWorkspaceSummary }) {
   const content = (
     <>
       <div className="min-w-0">
+        <div className="text-muted truncate text-[10px] font-medium">
+          {props.workspace.projectDisplayName}
+        </div>
         <div className="text-foreground truncate text-[11px] font-medium">{displayName}</div>
         <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
           <span className="counter-nums-mono text-muted truncate text-[10px]">
@@ -150,7 +153,7 @@ function ProjectWorkspaceRow(props: { workspace: ProjectWorkspaceSummary }) {
   return canOpen ? (
     <button
       type="button"
-      aria-label={`Open workspace ${displayName}`}
+      aria-label={`Open workspace ${displayName} in ${props.workspace.projectDisplayName}`}
       className={cn(className, "cursor-pointer hover:bg-white/5")}
       onClick={() => workspaceStore.navigateToWorkspace(props.workspace.workspaceId)}
     >

@@ -4374,30 +4374,60 @@ export class WorkspaceService extends EventEmitter {
         createdAt: new Date().toISOString(),
       };
 
-      await this.config.editConfig((config) => {
-        let projectConfig = config.projects.get(owningProjectPath);
-        if (!projectConfig) {
-          projectConfig = { workspaces: [] };
-          config.projects.set(owningProjectPath, projectConfig);
-        }
-        projectConfig.workspaces.push({
-          path: createResult!.workspacePath!,
-          id: workspaceId,
-          name: finalBranchName,
-          title,
-          createdAt: metadata.createdAt,
-          runtimeConfig: finalRuntimeConfig,
-          subProjectPath: effectiveSubProjectPath,
-          // Persist tags atomically with creation so orchestration loops that
-          // look workspaces up by tag (e.g. workspace.ensure) never observe a
-          // created-but-untagged window after a crash.
-          ...(tags != null && Object.keys(tags).length > 0 ? { tags } : {}),
-          // Mirror /fork: when /new is invoked with a start message, defer title
-          // selection until the first message can drive LLM-based generation.
-          ...(pendingAutoTitle === true ? { pendingAutoTitle: true } : {}),
+      try {
+        await this.config.editConfig((config) => {
+          const freshProjectConfig = config.projects.get(owningProjectPath);
+          if (freshProjectConfig == null) {
+            throw new Error(`Project was removed during workspace creation: ${owningProjectPath}`);
+          }
+          if (
+            effectiveSubProjectPath != null &&
+            config.projects.get(effectiveSubProjectPath)?.parentProjectPath !== owningProjectPath
+          ) {
+            // Authorization must be revalidated inside the serialized config write. Otherwise a
+            // child removed while runtime creation is in flight could leave a stale subProjectPath.
+            throw new Error(
+              `Sub-project was removed during workspace creation: ${effectiveSubProjectPath}`
+            );
+          }
+          freshProjectConfig.workspaces.push({
+            path: createResult!.workspacePath!,
+            id: workspaceId,
+            name: finalBranchName,
+            title,
+            createdAt: metadata.createdAt,
+            runtimeConfig: finalRuntimeConfig,
+            subProjectPath: effectiveSubProjectPath,
+            // Persist tags atomically with creation so orchestration loops that
+            // look workspaces up by tag (e.g. workspace.ensure) never observe a
+            // created-but-untagged window after a crash.
+            ...(tags != null && Object.keys(tags).length > 0 ? { tags } : {}),
+            // Mirror /fork: when /new is invoked with a start message, defer title
+            // selection until the first message can drive LLM-based generation.
+            ...(pendingAutoTitle === true ? { pendingAutoTitle: true } : {}),
+          });
+          return config;
         });
-        return config;
-      });
+      } catch (error: unknown) {
+        try {
+          // Roll back only the just-created checkout; never force-delete a pre-existing branch.
+          await runtime.deleteWorkspace(
+            owningProjectPath,
+            finalBranchName,
+            false,
+            initAbortController.signal,
+            projectConfig.trusted ?? false
+          );
+        } catch (rollbackError: unknown) {
+          log.error("Failed to roll back workspace after creation scope changed", {
+            workspaceId,
+            projectPath: owningProjectPath,
+            error: getErrorMessage(rollbackError),
+          });
+        }
+        initLogger.logComplete(-1);
+        return Err(`Failed to create workspace: ${getErrorMessage(error)}`);
+      }
 
       const allMetadata = await this.config.getAllWorkspaceMetadata();
       const completeMetadata = allMetadata.find((m) => m.id === workspaceId);

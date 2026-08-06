@@ -161,6 +161,30 @@ describe("TOOL_DEFINITIONS", () => {
     }
   });
 
+  it("accepts Project Chat project paths only for new workspaces", () => {
+    expect(
+      ProjectChatTaskToolArgsSchema.safeParse({
+        prompt: "Implement the child change",
+        title: "Child implementation",
+        workspace: { mode: "new", projectPath: "/repo/packages/web" },
+      }).success
+    ).toBe(true);
+
+    for (const mode of ["existing", "fork"] as const) {
+      expect(
+        ProjectChatTaskToolArgsSchema.safeParse({
+          prompt: "Invalid target",
+          title: "Invalid target",
+          workspace: {
+            mode,
+            projectPath: "/repo/packages/web",
+            ...(mode === "existing" ? { workspaceId: "workspace" } : {}),
+          },
+        }).success
+      ).toBe(false);
+    }
+  });
+
   it("accepts every shared runtime config variant for new Project Chat workspaces", () => {
     const runtimeConfigs: RuntimeConfig[] = [
       { type: "local" },

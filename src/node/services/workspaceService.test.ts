@@ -12297,7 +12297,9 @@ describe("WorkspaceService init cancellation", () => {
       clearInMemoryState: clearInMemoryStateMock,
     };
 
-    const configState: ProjectsConfig = { projects: new Map() };
+    const configState: ProjectsConfig = {
+      projects: new Map([[projectPath, { workspaces: [], trusted: true }]]),
+    };
 
     const mockMetadata: FrontendWorkspaceMetadata = {
       id: workspaceId,
@@ -12445,7 +12447,20 @@ describe("WorkspaceService init cancellation", () => {
       }),
     };
 
-    const configState: ProjectsConfig = { projects: new Map() };
+    const configState: ProjectsConfig = {
+      projects: new Map([
+        [
+          projectPath,
+          {
+            workspaces: [
+              { id: "x", name: "workspace-1", path: "/tmp/proj-auto/workspace-1" },
+              { id: "y", name: "workspace-2", path: "/tmp/proj-auto/workspace-2" },
+            ],
+            trusted: true,
+          },
+        ],
+      ]),
+    };
 
     const mockMetadata: FrontendWorkspaceMetadata = {
       id: workspaceId,
@@ -12548,6 +12563,88 @@ describe("WorkspaceService init cancellation", () => {
       const newEntry = persisted.find((entry) => entry.id === workspaceId);
       expect(newEntry?.name).toBe("workspace-3");
       expect(newEntry?.pendingAutoTitle).toBe(true);
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+  });
+
+  test("create() revalidates sub-project registration before persistence and rolls back", async () => {
+    const workspaceId = "ws-sub-project-race";
+    const projectPath = "/tmp/project-parent";
+    const subProjectPath = "/tmp/project-parent/packages/web";
+    const workspacePath = "/tmp/project-parent/workspace";
+    const configState: ProjectsConfig = {
+      projects: new Map([
+        [projectPath, { trusted: true, workspaces: [] }],
+        [subProjectPath, { parentProjectPath: projectPath, workspaces: [] }],
+      ]),
+    };
+    const mockInitStateManager = {
+      on: mock(() => undefined as unknown as InitStateManager),
+      startInit: mock(() => undefined),
+      getInitState: mock(() => undefined),
+    } as unknown as InitStateManager;
+    const mockConfig: Partial<Config> = {
+      rootDir: "/tmp/mux-root",
+      srcDir: "/tmp/src",
+      generateStableId: mock(() => workspaceId),
+      loadConfigOrDefault: mock(() => configState),
+      editConfig: mock((editFn: (config: ProjectsConfig) => ProjectsConfig) => {
+        editFn(configState);
+        return Promise.resolve();
+      }),
+      getEffectiveSecrets: mock(() => []),
+      getSessionDir: mock(() => "/tmp/test/sessions"),
+      findWorkspace: mock(() => null),
+    };
+    const mockAIService = {
+      isStreaming: mock(() => false),
+      // eslint-disable-next-line @typescript-eslint/no-empty-function
+      on: mock(() => {}),
+      // eslint-disable-next-line @typescript-eslint/no-empty-function
+      off: mock(() => {}),
+    } as unknown as AIService;
+    const createWorkspaceMock = mock(() => {
+      configState.projects.delete(subProjectPath);
+      return Promise.resolve({ success: true as const, workspacePath });
+    });
+    const deleteWorkspaceMock = mock(() => Promise.resolve({ success: true as const }));
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      createWorkspace: createWorkspaceMock,
+      deleteWorkspace: deleteWorkspaceMock,
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+
+    try {
+      const workspaceService = new WorkspaceService(
+        mockConfig as Config,
+        historyService,
+        mockAIService,
+        mockInitStateManager,
+        mockExtensionMetadataService as ExtensionMetadataService,
+        mockBackgroundProcessManager as BackgroundProcessManager
+      );
+      const result = await workspaceService.create(
+        projectPath,
+        "child-change",
+        undefined,
+        "Child change",
+        { type: "local" },
+        subProjectPath
+      );
+
+      expect(result).toEqual(
+        Err(
+          `Failed to create workspace: Sub-project was removed during workspace creation: ${subProjectPath}`
+        )
+      );
+      expect(configState.projects.get(projectPath)?.workspaces).toEqual([]);
+      expect(deleteWorkspaceMock).toHaveBeenCalledWith(
+        projectPath,
+        "child-change",
+        false,
+        expect.any(AbortSignal),
+        true
+      );
     } finally {
       createRuntimeSpy.mockRestore();
     }

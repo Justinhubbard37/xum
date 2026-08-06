@@ -1952,7 +1952,8 @@ describe("TaskService", () => {
       (...args: unknown[]): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
         expect(args[2]).toBe("main");
         expect(args[4]).toBeUndefined();
-        expect(args[0]).toBe(subProjectPath);
+        expect(args[0]).toBe(parentProjectPath);
+        expect(args[5]).toBe(subProjectPath);
         return Promise.resolve(
           Ok({
             metadata: {
@@ -2005,6 +2006,14 @@ describe("TaskService", () => {
         workspace: { mode: "existing", workspaceId: "parentworkspace" },
       })
     ).toEqual(Err("Task.createWorkspaceTurn: invalid_scope for existing workspace"));
+    expect(
+      await taskService.createWorkspaceTurn({
+        ownerWorkspaceId: projectChat.sessionId,
+        prompt: "Do not create in the parent project scope",
+        title: "Parent creation",
+        workspace: { mode: "new", projectPath: parentProjectPath },
+      })
+    ).toEqual(Err(`Task.createWorkspaceTurn: invalid_scope for project path ${parentProjectPath}`));
     expect(sendMessage.mock.calls.map((call) => call[0])).toEqual([
       "createdsubproject",
       "subprojectworkspace",
@@ -2014,9 +2023,15 @@ describe("TaskService", () => {
     expect(listed.success).toBe(true);
     if (!listed.success) throw new Error(listed.error);
     expect(listed.data.projectPath).toBe(subProjectPath);
+    expect(listed.data.availableProjects).toEqual([
+      { projectPath: subProjectPath, displayName: "web", kind: "sub_project" },
+    ]);
     expect(listed.data.workspaces).toHaveLength(1);
     expect(listed.data.workspaces[0]).toMatchObject({
       workspaceId: "subprojectworkspace",
+      projectPath: subProjectPath,
+      projectDisplayName: "web",
+      subProjectPath,
       name: "subproject",
       archived: false,
       workspaceTurn: {
@@ -2026,6 +2041,109 @@ describe("TaskService", () => {
       },
     });
     expect(typeof listed.data.workspaces[0]?.workspaceTurn?.updatedAt).toBe("string");
+  });
+
+  test("parent Project Chat creates, reuses, and lifecycle-manages direct child workspaces", async () => {
+    const config = await createTestConfig(rootDir);
+    const parentProjectPath = await createTestProject(rootDir, "parent-coordinator", {
+      initGit: false,
+    });
+    const subProjectPath = path.join(parentProjectPath, "packages", "web");
+    await fsPromises.mkdir(subProjectPath, { recursive: true });
+    await saveTestConfig(
+      config,
+      [
+        [
+          parentProjectPath,
+          {
+            defaultRuntime: "local",
+            trusted: true,
+            workspaces: [
+              projectWorkspace(parentProjectPath, "root", "rootworkspace", {
+                runtimeConfig: { type: "local" },
+              }),
+              projectWorkspace(parentProjectPath, "child", "childworkspace", {
+                runtimeConfig: { type: "local" },
+                subProjectPath,
+              }),
+              projectWorkspace(parentProjectPath, "lifecycle", "childlifecycle", {
+                runtimeConfig: { type: "local" },
+                subProjectPath,
+              }),
+            ],
+          },
+        ],
+        [subProjectPath, { defaultRuntime: "worktree", parentProjectPath, workspaces: [] }],
+      ],
+      { taskSettings: testTaskSettings(), defaultRuntime: "worktree" }
+    );
+    const projectChat = await config.ensureProjectChat(parentProjectPath);
+    stubStableIds(config, ["newhandle", "newturn", "existinghandle", "existingturn"]);
+    const createWorkspace = mock(
+      (...args: unknown[]): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
+        expect(args[0]).toBe(parentProjectPath);
+        expect(args[2]).toBeUndefined();
+        expect(args[4]).toEqual({ type: "local" });
+        expect(args[5]).toBe(subProjectPath);
+        return Promise.resolve(
+          Ok({
+            metadata: {
+              ...createWorkspaceTurnMetadata(parentProjectPath),
+              id: "createdchild",
+              name: "created-child",
+              subProjectPath,
+            },
+          })
+        );
+      }
+    );
+    const sendMessage = mock(async (...args: unknown[]): Promise<Result<void>> => {
+      const internal = args[3] as { onAccepted?: () => Promise<void> | void } | undefined;
+      await internal?.onAccepted?.();
+      return Ok(undefined);
+    });
+    const archive = mock(() => Promise.resolve(Ok({ kind: "archived" as const })));
+    const workspaceMocks = createWorkspaceServiceMocks({
+      create: createWorkspace,
+      sendMessage,
+      archive,
+    });
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    expect(
+      await taskService.archiveOwnedWorkspaceTurnWorkspace(projectChat.sessionId, {
+        workspaceId: "childlifecycle",
+      })
+    ).toEqual(
+      Ok({
+        status: "archived",
+        action: "archive",
+        workspaceId: "childlifecycle",
+        displayName: "lifecycle",
+      })
+    );
+    expect(
+      await taskService.createWorkspaceTurn({
+        ownerWorkspaceId: projectChat.sessionId,
+        prompt: "Create in child",
+        title: "Child creation",
+        workspace: { mode: "new", projectPath: subProjectPath },
+      })
+    ).toMatchObject({ success: true, data: { workspaceId: "createdchild" } });
+    expect(
+      await taskService.createWorkspaceTurn({
+        ownerWorkspaceId: projectChat.sessionId,
+        prompt: "Continue child",
+        title: "Child reuse",
+        workspace: { mode: "existing", workspaceId: "childworkspace" },
+      })
+    ).toMatchObject({ success: true, data: { workspaceId: "childworkspace" } });
+    expect(sendMessage.mock.calls.map((call) => call[0])).toEqual([
+      "createdchild",
+      "childworkspace",
+    ]);
   });
 
   test("Project Chat lifecycle revalidates exact sub-project ownership after locking", async () => {
@@ -2109,9 +2227,13 @@ describe("TaskService", () => {
     expect(archive).not.toHaveBeenCalled();
   });
 
-  test("Project Chat bulk workspace list returns canonical ordinary scopes and latest turn state", async () => {
+  test("Project Chat bulk workspace list returns parent and child scopes with latest turn state", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = await createTestProject(rootDir, "repo", { initGit: false });
+    const subProjectPath = path.join(projectPath, "packages", "web");
+    const emptySubProjectPath = path.join(projectPath, "packages", "empty-child");
+    await fsPromises.mkdir(subProjectPath, { recursive: true });
+    await fsPromises.mkdir(emptySubProjectPath, { recursive: true });
     const otherProjectPath = await createTestProject(rootDir, "other", { initGit: false });
     await saveWorkspaces(
       config,
@@ -2145,6 +2267,11 @@ describe("TaskService", () => {
           runtimeConfig: { type: "local" },
           archivedAt: "2026-08-05T00:00:00.000Z",
         }),
+        projectWorkspace(projectPath, "child", "childworkspace", {
+          createdAt: "2026-08-01T00:00:00.000Z",
+          runtimeConfig: { type: "local" },
+          subProjectPath,
+        }),
         projectWorkspace(projectPath, "subagent", "subagent", {
           runtimeConfig: { type: "local" },
           parentWorkspaceId: "activeworkspace",
@@ -2154,6 +2281,8 @@ describe("TaskService", () => {
       {
         taskSettings: testTaskSettings(),
         extraProjects: [
+          [emptySubProjectPath, { parentProjectPath: projectPath, workspaces: [] }],
+          [subProjectPath, { parentProjectPath: projectPath, workspaces: [] }],
           [
             otherProjectPath,
             {
@@ -2202,14 +2331,27 @@ describe("TaskService", () => {
     if (!listed.success) throw new Error(listed.error);
     expect(getActivityList).toHaveBeenCalledTimes(1);
     expect(listed.data.projectPath).toBe(projectPath);
+    expect(listed.data.availableProjects).toEqual([
+      { projectPath, displayName: "repo", kind: "parent" },
+      {
+        projectPath: emptySubProjectPath,
+        displayName: "empty-child",
+        kind: "sub_project",
+      },
+      { projectPath: subProjectPath, displayName: "web", kind: "sub_project" },
+    ]);
     expect(listed.data.workspaces.map((workspace) => workspace.workspaceId)).toEqual([
       "activeworkspace",
       "fallbackworkspace",
+      "childworkspace",
       "archivedworkspace",
     ]);
     expect(listed.data.workspaces[0]).toMatchObject({
       workspaceId: "activeworkspace",
       name: "active",
+      projectPath,
+      projectDisplayName: "repo",
+      subProjectPath: null,
       title: "Active workspace",
       archived: false,
       createdAt: "2026-08-01T00:00:00.000Z",
@@ -2235,6 +2377,31 @@ describe("TaskService", () => {
       lastActivityAt: "2026-08-06T02:30:00.000Z",
       updatedAt: "2026-08-06T02:30:00.000Z",
     });
+    expect(listed.data.workspaces[2]).toMatchObject({
+      workspaceId: "childworkspace",
+      projectPath: subProjectPath,
+      projectDisplayName: "web",
+      subProjectPath,
+    });
+
+    const childOnly = await taskService.listProjectWorkspaces(projectChat.sessionId, {
+      projectPath: subProjectPath,
+    });
+    expect(childOnly.success).toBe(true);
+    if (!childOnly.success) throw new Error(childOnly.error);
+    expect(childOnly.data.workspaces.map((workspace) => workspace.workspaceId)).toEqual([
+      "childworkspace",
+    ]);
+
+    expect(
+      await taskService.listProjectWorkspaces(projectChat.sessionId, {
+        projectPath: path.join(projectPath, "unregistered"),
+      })
+    ).toEqual(
+      Err(
+        `project_workspace_list: invalid_scope for project_path ${path.join(projectPath, "unregistered")}; use an exact projectPath from availableProjects`
+      )
+    );
 
     const activeOnly = await taskService.listProjectWorkspaces(projectChat.sessionId, {
       includeArchived: false,
@@ -2244,6 +2411,7 @@ describe("TaskService", () => {
     expect(activeOnly.data.workspaces.map((workspace) => workspace.workspaceId)).toEqual([
       "activeworkspace",
       "fallbackworkspace",
+      "childworkspace",
     ]);
   });
 
