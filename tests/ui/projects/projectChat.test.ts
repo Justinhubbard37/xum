@@ -1,7 +1,7 @@
 import "../dom";
 
 import * as path from "node:path";
-import { fireEvent, waitFor } from "@testing-library/react";
+import { fireEvent, waitFor, within } from "@testing-library/react";
 
 import {
   cleanupTestEnvironment,
@@ -11,7 +11,7 @@ import {
 } from "../../ipc/setup";
 import { cleanupTempGitRepo, createTempGitRepo, trustProject } from "../../ipc/helpers";
 import { shouldRunIntegrationTests } from "../../testUtils";
-import { cleanupView } from "../helpers";
+import { addProjectViaUI, cleanupView } from "../helpers";
 import { installDom } from "../dom";
 import { renderApp } from "../renderReviewPanel";
 
@@ -21,6 +21,53 @@ describeIntegration("Project Chat (UI)", () => {
   beforeAll(async () => {
     await preloadTestModules();
   });
+
+  test("new untrusted projects open Project Chat behind an inline trust gate", async () => {
+    const env = await createTestEnvironment();
+    const projectPath = await createTempGitRepo();
+    await setupProviders(env, { anthropic: { apiKey: "project-chat-trust-test-key" } });
+    const cleanupDom = installDom();
+    const view = renderApp({ apiClient: env.orpc });
+
+    try {
+      await view.waitForReady();
+      await addProjectViaUI(view, projectPath);
+
+      const trustDialog = await waitFor(
+        () => {
+          if (window.location.search.includes("draft=")) {
+            throw new Error("New project incorrectly entered the manual workspace draft route");
+          }
+          if (!view.container.querySelector('[data-testid="project-chat-trust-gate"]')) {
+            throw new Error("Project Chat trust gate did not render");
+          }
+          const dialog = view.container.ownerDocument.body.querySelector('[role="dialog"]');
+          if (!dialog || !dialog.textContent?.includes("Trust this project?")) {
+            throw new Error("Project Chat trust confirmation did not render");
+          }
+          return dialog as HTMLElement;
+        },
+        { timeout: 10_000 }
+      );
+
+      fireEvent.click(within(trustDialog).getByRole("button", { name: /trust and continue/i }));
+      await waitFor(
+        () => {
+          if (view.container.querySelector('[data-testid="project-chat-trust-gate"]')) {
+            throw new Error("Project Chat remained behind the trust gate after confirmation");
+          }
+          if (!view.container.querySelector('[data-testid="project-chat-header"]')) {
+            throw new Error("Project Chat did not open after trust confirmation");
+          }
+        },
+        { timeout: 10_000 }
+      );
+    } finally {
+      await cleanupView(view, cleanupDom);
+      await cleanupTestEnvironment(env);
+      await cleanupTempGitRepo(projectPath);
+    }
+  }, 60_000);
 
   test("project row opens persistent Project Chat while plus opens a manual workspace draft", async () => {
     const env = await createTestEnvironment();

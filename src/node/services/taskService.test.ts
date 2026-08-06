@@ -47,6 +47,7 @@ import { createRuntime } from "@/node/runtime/runtimeFactory";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as forkOrchestrator from "@/node/services/utils/forkOrchestrator";
 import * as gitModule from "@/node/git";
+import * as pathUtilsModule from "@/node/utils/pathUtils";
 import { Ok, Err, type Result } from "@/common/types/result";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { STRUCTURED_WORKFLOW_REPORT_PLACEHOLDER_MARKDOWN } from "@/common/constants/workflowReports";
@@ -1382,17 +1383,17 @@ describe("TaskService", () => {
     }
   });
 
-  test("Project Chat does not treat Git marker access failures as a non-Git project", async () => {
+  test("Project Chat propagates enclosing Git repository inspection failures", async () => {
     const config = await createTestConfig(rootDir);
-    const projectPath = await createTestProject(rootDir, "git-marker-failure");
+    const projectPath = await createTestProject(rootDir, "git-inspection-failure");
     await saveWorkspaces(config, projectPath, [], {
       taskSettings: testTaskSettings(),
       defaultRuntime: "worktree",
     });
     const projectChat = await config.ensureProjectChat(projectPath);
     const workspaceMocks = createWorkspaceServiceMocks();
-    const stat = spyOn(fsPromises, "stat").mockRejectedValueOnce(
-      Object.assign(new Error("permission denied"), { code: "EACCES" })
+    const inspectGit = spyOn(pathUtilsModule, "inspectInsideGitRepository").mockRejectedValueOnce(
+      new Error("permission denied")
     );
     const { taskService } = createTaskServiceHarness(config, {
       workspaceService: workspaceMocks.workspaceService,
@@ -1402,7 +1403,7 @@ describe("TaskService", () => {
       const result = await taskService.createWorkspaceTurn({
         ownerWorkspaceId: projectChat.sessionId,
         prompt: "Create workspace",
-        title: "Git marker failure",
+        title: "Git inspection failure",
         workspace: { mode: "new" },
       });
 
@@ -1411,8 +1412,43 @@ describe("TaskService", () => {
       );
       expect(workspaceMocks.create).not.toHaveBeenCalled();
     } finally {
-      stat.mockRestore();
+      inspectGit.mockRestore();
     }
+  });
+
+  test("Project Chat uses worktrees for standalone projects nested in an enclosing repository", async () => {
+    const config = await createTestConfig(rootDir);
+    const repositoryPath = await createTestProject(rootDir, "enclosing-repo");
+    const projectPath = path.join(repositoryPath, "packages", "web");
+    await fsPromises.mkdir(projectPath, { recursive: true });
+    await saveWorkspaces(config, projectPath, [], {
+      taskSettings: testTaskSettings(),
+      defaultRuntime: "worktree",
+    });
+    const projectChat = await config.ensureProjectChat(projectPath);
+    const createWorkspace = mock(
+      (...args: unknown[]): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
+        expect(args[0]).toBe(projectPath);
+        expect(args[2]).toBe("main");
+        expect(args[4]).toBeUndefined();
+        return Promise.resolve(Ok({ metadata: createWorkspaceTurnMetadata(projectPath) }));
+      }
+    );
+    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: createWorkspaceServiceMocks({ create: createWorkspace, sendMessage })
+        .workspaceService,
+    });
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: projectChat.sessionId,
+      prompt: "Create workspace",
+      title: "Nested project",
+      workspace: { mode: "new" },
+    });
+
+    expect(result.success).toBe(true);
+    expect(createWorkspace).toHaveBeenCalledTimes(1);
   });
 
   test("Project Chat rejects unsupported automatic workspace runtime defaults", async () => {

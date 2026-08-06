@@ -1504,8 +1504,8 @@ function AppInner() {
               (prev) => [...(Array.isArray(prev) ? prev : []), normalizedPath],
               []
             );
-            // New projects now open their persistent control-plane chat; manual workspace creation
-            // remains available from the dedicated plus action and Ctrl/Cmd+N.
+            // Project Chat is the default destination; its trust gate blocks execution until the
+            // newly-added repository is explicitly trusted.
             navigateToProject(normalizedPath);
           }}
         />

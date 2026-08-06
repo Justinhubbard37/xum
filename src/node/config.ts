@@ -739,6 +739,13 @@ function removeLegacyMuxChatEntries(projects: Map<string, ProjectConfig>): boole
   return modified;
 }
 
+interface ProjectSessionStateMigration {
+  oldSessionId: string;
+  newSessionId: string;
+}
+
+const PROJECT_SESSION_MIGRATION_MARKER = ".project-session-id-migration.json";
+
 /**
  * Config - Centralized configuration management
  *
@@ -806,6 +813,233 @@ export class Config {
     return priority.length > 1 ? priority : undefined;
   }
 
+  private getProjectSessionMigrationMarkerPath(sessionId: string): string {
+    return path.join(this.projectSessionsDir, sessionId, PROJECT_SESSION_MIGRATION_MARKER);
+  }
+
+  private hasProjectSessionMigrationMarker(oldSessionId: string, newSessionId: string): boolean {
+    try {
+      const raw = fs.readFileSync(this.getProjectSessionMigrationMarkerPath(newSessionId), "utf-8");
+      const parsed = JSON.parse(raw) as { oldSessionId?: unknown; newSessionId?: unknown };
+      return parsed.oldSessionId === oldSessionId && parsed.newSessionId === newSessionId;
+    } catch {
+      return false;
+    }
+  }
+
+  private canUseProjectSessionMigrationDestination(
+    oldSessionId: string,
+    newSessionId: string
+  ): boolean {
+    const destination = path.join(this.projectSessionsDir, newSessionId);
+    return (
+      !fs.existsSync(destination) ||
+      this.hasProjectSessionMigrationMarker(oldSessionId, newSessionId)
+    );
+  }
+
+  private rewriteProjectSessionIdentity(
+    value: unknown,
+    oldSessionId: string,
+    newSessionId: string,
+    options: { metadataFile: boolean; rewriteRootWorkspaceId: boolean; depth?: number }
+  ): { value: unknown; changed: boolean } {
+    const depth = options.depth ?? 0;
+    if (Array.isArray(value)) {
+      let changed = false;
+      const next = value.map((entry) => {
+        const rewritten = this.rewriteProjectSessionIdentity(entry, oldSessionId, newSessionId, {
+          ...options,
+          depth: depth + 1,
+        });
+        changed ||= rewritten.changed;
+        return rewritten.value;
+      });
+      return { value: changed ? next : value, changed };
+    }
+    if (value == null || typeof value !== "object") {
+      return { value, changed: false };
+    }
+
+    let changed = false;
+    const record = value as Record<string, unknown>;
+    const next: Record<string, unknown> = { ...record };
+    for (const [key, entry] of Object.entries(record)) {
+      const identityKey =
+        key === "ownerWorkspaceId" ||
+        (depth === 0 && options.rewriteRootWorkspaceId && key === "workspaceId") ||
+        (depth === 0 && key === "sessionId") ||
+        (depth === 0 && options.metadataFile && key === "id");
+      if (identityKey && entry === oldSessionId) {
+        next[key] = newSessionId;
+        changed = true;
+        continue;
+      }
+      const rewritten = this.rewriteProjectSessionIdentity(entry, oldSessionId, newSessionId, {
+        ...options,
+        depth: depth + 1,
+      });
+      if (rewritten.changed) {
+        next[key] = rewritten.value;
+        changed = true;
+      }
+    }
+    return { value: changed ? next : value, changed };
+  }
+
+  private rewriteProjectSessionStateFile(
+    filePath: string,
+    oldSessionId: string,
+    newSessionId: string
+  ): void {
+    const basename = path.basename(filePath);
+    if (!basename.endsWith(".json") && !basename.endsWith(".jsonl")) {
+      return;
+    }
+
+    const raw = fs.readFileSync(filePath, "utf-8");
+    if (basename.endsWith(".jsonl")) {
+      let changed = false;
+      const lines = raw.split("\n").map((line) => {
+        if (line.trim().length === 0) return line;
+        try {
+          const rewritten = this.rewriteProjectSessionIdentity(
+            JSON.parse(line) as unknown,
+            oldSessionId,
+            newSessionId,
+            { metadataFile: false, rewriteRootWorkspaceId: true }
+          );
+          changed ||= rewritten.changed;
+          return rewritten.changed ? JSON.stringify(rewritten.value) : line;
+        } catch {
+          // Keep malformed/self-healed history rows byte-for-byte; request builders filter them.
+          return line;
+        }
+      });
+      if (changed) {
+        writeFileAtomic.sync(filePath, lines.join("\n"), { encoding: "utf-8" });
+      }
+      return;
+    }
+
+    try {
+      const rewritten = this.rewriteProjectSessionIdentity(
+        JSON.parse(raw) as unknown,
+        oldSessionId,
+        newSessionId,
+        {
+          metadataFile: basename === "metadata.json",
+          // JSON sidecars commonly contain target workspace IDs; only JSONL rows are tagged with
+          // the owning session ID at the root. OwnerWorkspaceId is still rewritten recursively.
+          rewriteRootWorkspaceId: false,
+        }
+      );
+      if (rewritten.changed) {
+        writeFileAtomic.sync(filePath, JSON.stringify(rewritten.value, null, 2), {
+          encoding: "utf-8",
+        });
+      }
+    } catch {
+      // Persisted sidecars are independently self-healing; leave malformed files untouched.
+    }
+  }
+
+  private rewriteProjectSessionStateDirectory(
+    directory: string,
+    oldSessionId: string,
+    newSessionId: string
+  ): void {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const entryPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        this.rewriteProjectSessionStateDirectory(entryPath, oldSessionId, newSessionId);
+      } else if (entry.isFile()) {
+        this.rewriteProjectSessionStateFile(entryPath, oldSessionId, newSessionId);
+      }
+    }
+  }
+
+  private prepareProjectSessionStateMigration(migration: ProjectSessionStateMigration): void {
+    const source = path.join(this.projectSessionsDir, migration.oldSessionId);
+    const destination = path.join(this.projectSessionsDir, migration.newSessionId);
+    if (this.hasProjectSessionMigrationMarker(migration.oldSessionId, migration.newSessionId)) {
+      return;
+    }
+    if (!fs.existsSync(source)) {
+      return;
+    }
+    if (fs.existsSync(destination)) {
+      throw new Error(`Project Chat migration destination already exists: ${destination}`);
+    }
+
+    ensurePrivateDirSync(this.projectSessionsDir);
+    try {
+      // Copy first and remove the source only after the repaired config is durably verified. This
+      // keeps the original transcript available if the startup-safe config write is swallowed.
+      fs.cpSync(source, destination, { recursive: true, errorOnExist: true, force: false });
+      this.rewriteProjectSessionStateDirectory(
+        destination,
+        migration.oldSessionId,
+        migration.newSessionId
+      );
+      writeFileAtomic.sync(
+        this.getProjectSessionMigrationMarkerPath(migration.newSessionId),
+        JSON.stringify(migration, null, 2),
+        { encoding: "utf-8" }
+      );
+    } catch (error) {
+      fs.rmSync(destination, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
+  private readPersistedProjectSessionIds(): Set<string> {
+    const raw = fs.readFileSync(this.configFile, "utf-8");
+    const parsed = JSON.parse(raw) as Partial<AppConfigOnDisk> & Record<string, unknown>;
+    const sessionIds = new Set<string>();
+    if (!Array.isArray(parsed.projects)) {
+      return sessionIds;
+    }
+    for (const entry of parsed.projects) {
+      if (!Array.isArray(entry) || entry.length < 2) continue;
+      const project = entry[1];
+      if (project == null || typeof project !== "object") continue;
+      const projectChat = ProjectChatConfigSchema.safeParse(
+        (project as { projectChat?: unknown }).projectChat
+      );
+      if (projectChat.success) {
+        sessionIds.add(projectChat.data.sessionId);
+      }
+    }
+    return sessionIds;
+  }
+
+  private finalizeProjectSessionStateMigrations(
+    migrations: readonly ProjectSessionStateMigration[]
+  ): void {
+    if (migrations.length === 0) return;
+    try {
+      // Read raw disk state: loadConfigOrDefault applies the same in-memory repair even when the
+      // queued write was swallowed, which would falsely authorize deleting the only old copy.
+      const configuredSessionIds = this.readPersistedProjectSessionIds();
+      for (const migration of migrations) {
+        if (
+          configuredSessionIds.has(migration.newSessionId) &&
+          !configuredSessionIds.has(migration.oldSessionId) &&
+          this.hasProjectSessionMigrationMarker(migration.oldSessionId, migration.newSessionId)
+        ) {
+          fs.rmSync(path.join(this.projectSessionsDir, migration.oldSessionId), {
+            recursive: true,
+            force: true,
+          });
+        }
+      }
+    } catch (error) {
+      // Startup stays available; leaving the old copy is safe and a later load can retry cleanup.
+      log.warn("Failed to finalize Project Chat session ID migration", { error });
+    }
+  }
+
   private updateVerifiedProjectSessionRouting(projects: Map<string, ProjectConfig>): void {
     this.verifiedProjectSessionIds.clear();
     for (const project of projects.values()) {
@@ -822,6 +1056,7 @@ export class Config {
       if (fs.existsSync(this.configFile)) {
         const data = fs.readFileSync(this.configFile, "utf-8");
         const parsed = JSON.parse(data) as Partial<AppConfigOnDisk> & Record<string, unknown>;
+        const projectSessionStateMigrations: ProjectSessionStateMigration[] = [];
         let configModified = false;
         let shouldInvalidateSessionUsageCaches = false;
 
@@ -1015,9 +1250,9 @@ export class Config {
         }
 
         // Imported/corrupted config can assign a Project Chat ID to an ordinary workspace or to
-        // multiple projects. Workspace IDs include parent-owned sub-project workspaces after the
-        // merge above; reserve all of them before repairing chats so history/store identities cannot
-        // alias and every generated replacement avoids an existing workspace.
+        // multiple projects. Reserve workspace identities, every original Project Chat identity,
+        // and each final assignment separately so an early replacement can never steal a later
+        // project's existing session ID or overwrite another session directory.
         const claimedSessionIds = new Set<string>();
         for (const [projectPath, projectConfig] of projectsMap) {
           for (const workspace of projectConfig.workspaces) {
@@ -1035,13 +1270,24 @@ export class Config {
             claimedSessionIds.add(this.generateLegacyId(projectPath, workspace.path));
           }
         }
-        for (const [projectPath, projectConfig] of projectsMap) {
-          const parsedProjectChat = ProjectChatConfigSchema.safeParse(projectConfig.projectChat);
-          if (!parsedProjectChat.success) {
-            continue;
+        const projectChatEntries = Array.from(projectsMap.entries()).flatMap(
+          ([projectPath, projectConfig]) => {
+            const parsedProjectChat = ProjectChatConfigSchema.safeParse(projectConfig.projectChat);
+            return parsedProjectChat.success
+              ? [{ projectPath, projectConfig, projectChat: parsedProjectChat.data }]
+              : [];
           }
+        );
+        const originalProjectSessionIds = new Set(
+          projectChatEntries.map((entry) => entry.projectChat.sessionId)
+        );
+        const seenOriginalProjectSessionIds = new Set<string>();
+        for (const { projectPath, projectConfig, projectChat } of projectChatEntries) {
+          const originalSessionId = projectChat.sessionId;
+          const ownsOriginalState = !seenOriginalProjectSessionIds.has(originalSessionId);
+          seenOriginalProjectSessionIds.add(originalSessionId);
 
-          let sessionId = parsedProjectChat.data.sessionId;
+          let sessionId = originalSessionId;
           if (claimedSessionIds.has(sessionId)) {
             // Load migrations can be observed more than once before their queued write lands. Derive
             // the replacement deterministically so every read resolves this project to one identity.
@@ -1049,16 +1295,38 @@ export class Config {
             do {
               const suffix = crypto
                 .createHash("sha256")
-                .update(`${sessionId}\0${projectPath}\0${collisionIndex}`)
+                .update(`${originalSessionId}\0${projectPath}\0${collisionIndex}`)
                 .digest("hex")
                 .slice(0, 10);
               sessionId = `${PROJECT_CHAT_SESSION_ID_PREFIX}${suffix}`;
               collisionIndex += 1;
-            } while (claimedSessionIds.has(sessionId));
-            projectConfig.projectChat = { ...parsedProjectChat.data, sessionId };
+            } while (
+              claimedSessionIds.has(sessionId) ||
+              originalProjectSessionIds.has(sessionId) ||
+              !this.canUseProjectSessionMigrationDestination(originalSessionId, sessionId)
+            );
+            projectConfig.projectChat = { ...projectChat, sessionId };
             configModified = true;
+
+            // The first Project Chat with an original ID owns any state under that old directory.
+            // Later duplicates intentionally start empty so shared state is never copied twice.
+            if (ownsOriginalState) {
+              const migration = { oldSessionId: originalSessionId, newSessionId: sessionId };
+              try {
+                this.prepareProjectSessionStateMigration(migration);
+                projectSessionStateMigrations.push(migration);
+              } catch (error) {
+                // Startup initialization must remain available. Keep the repaired identity and leave
+                // the source untouched so a future load can retry the copy.
+                log.warn("Failed to prepare Project Chat session ID migration", {
+                  oldSessionId: originalSessionId,
+                  newSessionId: sessionId,
+                  error,
+                });
+              }
+            }
           } else {
-            projectConfig.projectChat = parsedProjectChat.data;
+            projectConfig.projectChat = projectChat;
           }
           claimedSessionIds.add(sessionId);
         }
@@ -1198,7 +1466,10 @@ export class Config {
           // re-applied on every load, so the identity transform re-reads disk, re-runs them,
           // and persists the migrated form under the queue. One-shot guard: while a persist
           // is in flight, the loads it performs internally must not re-schedule.
-          this.migrationPersist = this.enqueueConfigEdit((migratedConfig) => migratedConfig)
+          this.migrationPersist = this.enqueueConfigEdit(
+            (migratedConfig) => migratedConfig,
+            () => this.finalizeProjectSessionStateMigrations(projectSessionStateMigrations)
+          )
             .catch((error: unknown) => {
               // Keep startup resilient even if persisting migration fails.
               log.warn("Failed to persist migrated config", { error });
@@ -1609,11 +1880,15 @@ export class Config {
    * spied/overridden in tests, and the internally scheduled write is an implementation
    * detail rather than a caller-initiated mutation.
    */
-  private enqueueConfigEdit(fn: (config: ProjectsConfig) => ProjectsConfig): Promise<void> {
+  private enqueueConfigEdit(
+    fn: (config: ProjectsConfig) => ProjectsConfig,
+    afterSave?: () => void | Promise<void>
+  ): Promise<void> {
     const run = this.editConfigQueue.then(async () => {
       const config = this.loadConfigOrDefault();
       const newConfig = fn(config);
       await this.saveConfig(newConfig);
+      await afterSave?.();
       // Backend-initiated config edits (for example gateway auth changes) use this signal
       // so frontend subscribers can refresh derived state without polling.
       this.notifyConfigChanged();

@@ -184,6 +184,53 @@ export const IPhone16eProjectChat: AppStory = {
   },
 };
 
+export const IPhone16eProjectChatTrustGate: AppStory = {
+  tags: ["project-chat-trust-gate"],
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        const projectPath = "/Users/dev/projects/untrusted-customer-platform";
+        clearWorkspaceSelection();
+        updatePersistedState(LEFT_SIDEBAR_COLLAPSED_KEY, true);
+        updatePersistedState(
+          LAST_VISITED_ROUTE_KEY,
+          `/project?project=${getProjectRouteId(projectPath)}`
+        );
+        return createMockORPCClient({
+          projects: new Map([
+            [projectPath, { workspaces: [], trusted: false, displayName: "Customer Platform" }],
+          ]),
+          workspaces: [],
+        });
+      }}
+    />
+  ),
+  decorators: [IPhone16eDecorator],
+  parameters: {
+    ...appMeta.parameters,
+    // The trust dialog portals outside the fixed-width frame in the Storybook test runner. Keep the
+    // story as a deterministic interaction contract; responsive capture is validated at phone width.
+    pixel: PIXEL_DISABLED,
+  },
+  play: async ({ canvasElement }) => {
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    await waitFor(() => {
+      if (!storyRoot.querySelector('[data-testid="project-chat-trust-gate"]')) {
+        throw new Error("Project Chat trust gate not rendered");
+      }
+      const dialog = document.body.querySelector<HTMLElement>('[role="dialog"]');
+      if (!dialog?.textContent?.includes("Trust this project?")) {
+        throw new Error("Project Chat trust confirmation not rendered");
+      }
+      if (storyRoot.scrollWidth > storyRoot.clientWidth) {
+        throw new Error(
+          `Project Chat trust gate overflowed horizontally: ${storyRoot.scrollWidth}px > ${storyRoot.clientWidth}px`
+        );
+      }
+    });
+  },
+};
+
 /**
  * The PR badge lives in the footer info bar on wide viewports and in the workspace header on narrow
  * ones. Pixel captures the narrow placement; the play assertion covers whichever side the ambient

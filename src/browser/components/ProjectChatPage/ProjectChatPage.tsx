@@ -4,7 +4,9 @@ import { useEffect, useState } from "react";
 import { ProjectChatHeader } from "@/browser/components/ProjectChatHeader/ProjectChatHeader";
 import { AIView } from "@/browser/components/AIView/AIView";
 import { Button } from "@/browser/components/Button/Button";
+import { ConfirmationModal } from "@/browser/components/ConfirmationModal/ConfirmationModal";
 import { useAPI } from "@/browser/contexts/API";
+import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import {
   getAgentIdKey,
   getReasoningModeKey,
@@ -54,8 +56,15 @@ function seedProjectChatAiSettings(info: ProjectChatInfo): void {
 /** Persistent, project-owned control-plane chat. Its session never appears as a workspace row. */
 export function ProjectChatPage(props: ProjectChatPageProps) {
   const { api } = useAPI();
+  const { getProjectConfig, refreshProjects, loading: projectsLoading } = useProjectContext();
   const workspaceStore = useWorkspaceStoreRaw();
   const [reloadKey, setReloadKey] = useState(0);
+  const [locallyTrustedProjectPath, setLocallyTrustedProjectPath] = useState<string | null>(null);
+  const [dismissedTrustProjectPath, setDismissedTrustProjectPath] = useState<string | null>(null);
+  const [trustError, setTrustError] = useState<string | null>(null);
+  const trusted =
+    getProjectConfig(props.projectPath)?.trusted === true ||
+    locallyTrustedProjectPath === props.projectPath;
   const [loadState, setLoadState] = useState<ProjectChatLoadState>({ status: "loading" });
 
   useEffect(() => {
@@ -64,7 +73,7 @@ export function ProjectChatPage(props: ProjectChatPageProps) {
     setLoadState({ status: "loading" });
 
     const load = async () => {
-      if (!api) {
+      if (!api || projectsLoading || !trusted) {
         return;
       }
 
@@ -98,7 +107,88 @@ export function ProjectChatPage(props: ProjectChatPageProps) {
         workspaceStore.removeAuxiliaryChat(registeredSessionId);
       }
     };
-  }, [api, props.projectPath, reloadKey, workspaceStore]);
+  }, [api, projectsLoading, props.projectPath, reloadKey, trusted, workspaceStore]);
+
+  if (projectsLoading) {
+    return (
+      <div className="bg-surface-primary flex flex-1 flex-col overflow-hidden">
+        <ProjectChatHeader
+          projectName={props.projectName}
+          projectPath={props.projectPath}
+          leftSidebarCollapsed={props.leftSidebarCollapsed}
+          onToggleLeftSidebarCollapsed={props.onToggleLeftSidebarCollapsed}
+        />
+        <div className="flex flex-1 items-center justify-center" role="status">
+          <div className="text-content-secondary text-sm">Opening Project Chat…</div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!trusted) {
+    const trustPromptOpen = dismissedTrustProjectPath !== props.projectPath;
+    return (
+      <div className="bg-surface-primary flex flex-1 flex-col overflow-hidden">
+        <ProjectChatHeader
+          projectName={props.projectName}
+          projectPath={props.projectPath}
+          leftSidebarCollapsed={props.leftSidebarCollapsed}
+          onToggleLeftSidebarCollapsed={props.onToggleLeftSidebarCollapsed}
+        />
+        <div
+          className="flex flex-1 items-center justify-center p-6"
+          data-testid="project-chat-trust-gate"
+        >
+          <div className="border-border-light bg-background-secondary flex max-w-md flex-col items-center gap-3 rounded-lg border p-5 text-center">
+            <AlertTriangle className="text-warning h-6 w-6" aria-hidden="true" />
+            <div>
+              <div className="text-content-primary font-medium">
+                Trust this project to use Project Chat
+              </div>
+              <div className="text-content-secondary mt-1 text-sm">
+                Project Chat may delegate work that executes repository scripts and Git hooks.
+              </div>
+              {trustError && <div className="text-error mt-2 text-sm">{trustError}</div>}
+            </div>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setTrustError(null);
+                setDismissedTrustProjectPath(null);
+              }}
+            >
+              Trust project
+            </Button>
+          </div>
+        </div>
+        <ConfirmationModal
+          isOpen={trustPromptOpen}
+          title="Trust this project?"
+          description="Using Project Chat may execute repository scripts. Only trust projects from sources you trust."
+          warning="This includes .mux/init, .mux/tool_env, .mux/tool_pre, .mux/tool_post, and git hooks."
+          confirmLabel="Trust and continue"
+          cancelLabel="Not now"
+          confirmVariant="default"
+          onConfirm={async () => {
+            try {
+              if (!api) throw new Error("API not available");
+              await api.projects.setTrust({ projectPath: props.projectPath, trusted: true });
+              setLocallyTrustedProjectPath(props.projectPath);
+              setDismissedTrustProjectPath(null);
+              setTrustError(null);
+              refreshProjects().catch(() => {
+                // Trust is already persisted; a later project refresh will reconcile the context.
+              });
+            } catch {
+              setTrustError("Failed to trust project. Please try again.");
+              setDismissedTrustProjectPath(props.projectPath);
+            }
+          }}
+          onCancel={() => setDismissedTrustProjectPath(props.projectPath)}
+        />
+      </div>
+    );
+  }
 
   if (loadState.status === "loading") {
     return (

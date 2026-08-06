@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import * as path from "node:path";
 import assert from "node:assert/strict";
 import * as fsPromises from "fs/promises";
 
@@ -63,8 +62,7 @@ import {
   type TaskGroupKind,
 } from "@/common/utils/tools/taskGroups";
 import { resolveWorkspaceCreationScope } from "@/common/utils/subProjects";
-import { stripTrailingSlashes } from "@/node/utils/pathUtils";
-import { isErrnoWithCode } from "@/node/utils/fs";
+import { inspectInsideGitRepository, stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { Ok, Err, type Result } from "@/common/types/result";
 import {
   DEFAULT_TASK_SETTINGS,
@@ -3564,16 +3562,13 @@ export class TaskService {
         // with backend trunk detection. Non-git projects self-heal to local because worktrees are invalid.
         const branchProjectPath =
           projectChatWorkspaceScope?.storageProjectPath ?? parentMeta.projectPath;
-        let isGitProject = false;
+        let isGitProject: boolean;
         try {
-          await fsPromises.stat(path.join(branchProjectPath, ".git"));
-          isGitProject = true;
+          isGitProject = await inspectInsideGitRepository(branchProjectPath);
         } catch (error) {
-          if (!isErrnoWithCode(error, "ENOENT") && !isErrnoWithCode(error, "ENOTDIR")) {
-            return Err(
-              `Task.createWorkspaceTurn: failed to inspect Git repository (${getErrorMessage(error)})`
-            );
-          }
+          return Err(
+            `Task.createWorkspaceTurn: failed to inspect Git repository (${getErrorMessage(error)})`
+          );
         }
         let branches: string[] = [];
         if (isGitProject) {

@@ -3,6 +3,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { Config } from "./config";
+import { TaskHandleStore } from "./services/taskHandleStore";
 import { HistoryService } from "./services/historyService";
 import { createMuxMessage } from "@/common/types/message";
 import { PROJECT_CHAT_SESSION_ID_PREFIX, isProjectSessionId } from "@/common/constants/projectChat";
@@ -111,6 +112,16 @@ describe("Config", () => {
       const duplicateSessionId = "project-session_aaaaaaaaaa";
       fs.mkdirSync(firstProjectPath, { recursive: true });
       fs.mkdirSync(secondProjectPath, { recursive: true });
+      const duplicateSessionDir = path.join(config.projectSessionsDir, duplicateSessionId);
+      fs.mkdirSync(duplicateSessionDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(duplicateSessionDir, "chat.jsonl"),
+        `${JSON.stringify({
+          ...createMuxMessage("duplicate-state", "user", "first owner", { timestamp: 1 }),
+          workspaceId: duplicateSessionId,
+        })}\n`,
+        "utf-8"
+      );
       fs.writeFileSync(
         path.join(tempDir, "config.json"),
         JSON.stringify({
@@ -152,6 +163,19 @@ describe("Config", () => {
       expect(config.findProjectChatBySessionId(duplicateSessionId)?.projectPath).toBe(
         firstProjectPath
       );
+      const history = new HistoryService(config);
+      const firstHistory = await history.getHistoryFromLatestBoundary(firstSessionId ?? "");
+      expect(firstHistory.success).toBe(true);
+      if (firstHistory.success) {
+        expect(firstHistory.data.map((message) => message.id)).toContain("duplicate-state");
+      }
+      const secondHistory = await history.getHistoryFromLatestBoundary(secondSessionId ?? "");
+      expect(secondHistory.success).toBe(true);
+      if (secondHistory.success) {
+        expect(secondHistory.data).toHaveLength(0);
+      }
+      expect(fs.existsSync(duplicateSessionDir)).toBe(true);
+
       expect(config.findProjectChatBySessionId(secondSessionId ?? "")?.projectPath).toBe(
         secondProjectPath
       );
@@ -174,6 +198,31 @@ describe("Config", () => {
         .update([collidingSessionId, subProjectPath, "0"].join("\0"))
         .digest("hex")
         .slice(0, 10)}`;
+      const collidingProjectSessionDir = path.join(config.projectSessionsDir, collidingSessionId);
+      fs.mkdirSync(path.join(collidingProjectSessionDir, "task-handles"), { recursive: true });
+      fs.writeFileSync(
+        path.join(collidingProjectSessionDir, "chat.jsonl"),
+        `${JSON.stringify({
+          ...createMuxMessage("migrated-message", "user", "preserve state", { timestamp: 1 }),
+          workspaceId: collidingSessionId,
+        })}\n`,
+        "utf-8"
+      );
+      fs.writeFileSync(
+        path.join(collidingProjectSessionDir, "task-handles", "wst_migrated.json"),
+        JSON.stringify({
+          kind: "workspace_turn",
+          handleId: "wst_migrated",
+          ownerWorkspaceId: collidingSessionId,
+          workspaceId: collidingSessionId,
+          turnId: "turn",
+          status: "running",
+          createdAt: "2026-08-06T00:00:00.000Z",
+          updatedAt: "2026-08-06T00:00:00.000Z",
+          createdWorkspace: true,
+          disposableWorkspace: false,
+        })
+      );
       fs.mkdirSync(subProjectPath, { recursive: true });
       const basenameSessionDir = path.join(config.sessionsDir, legacyCollidingSessionId);
       fs.mkdirSync(basenameSessionDir, { recursive: true });
@@ -249,6 +298,28 @@ describe("Config", () => {
           path.join(config.projectSessionsDir, repairedSessionId ?? "")
         );
       }
+      const migratedSessionId = subProjectSessionId;
+      expect(migratedSessionId).toBeDefined();
+      const migratedHistory = await new HistoryService(config).getHistoryFromLatestBoundary(
+        migratedSessionId ?? ""
+      );
+      expect(migratedHistory.success).toBe(true);
+      if (migratedHistory.success) {
+        expect(migratedHistory.data.map((message) => message.id)).toContain("migrated-message");
+      }
+      expect(
+        await new TaskHandleStore(config).getWorkspaceTurn(migratedSessionId ?? "", "wst_migrated")
+      ).toMatchObject({
+        ownerWorkspaceId: migratedSessionId,
+        workspaceId: collidingSessionId,
+      });
+      expect(fs.existsSync(collidingProjectSessionDir)).toBe(true);
+      expect(fs.existsSync(path.join(config.projectSessionsDir, migratedSessionId ?? ""))).toBe(
+        true
+      );
+      expect(
+        config.loadConfigOrDefault().projects.get(subProjectPath)?.projectChat?.sessionId
+      ).toBe(migratedSessionId);
       expect(config.findWorkspace(legacyCollidingSessionId)?.workspacePath).toBe(
         path.join(parentProjectPath, legacyCollidingSessionId)
       );
@@ -257,6 +328,7 @@ describe("Config", () => {
       }
 
       await flushConfigEdits();
+      expect(fs.existsSync(collidingProjectSessionDir)).toBe(false);
       const restarted = new Config(tempDir).loadConfigOrDefault();
       expect(restarted.projects.get(parentProjectPath)?.projectChat?.sessionId).toBe(
         parentSessionId
