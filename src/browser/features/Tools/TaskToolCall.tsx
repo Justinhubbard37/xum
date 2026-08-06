@@ -1,5 +1,5 @@
 import React, { useRef, useState } from "react";
-import { CircleAlert, CircleCheck, Clock3, Info, LoaderCircle } from "lucide-react";
+import { ArrowUpRight, CircleAlert, CircleCheck, Clock3, Info, LoaderCircle } from "lucide-react";
 import {
   ToolContainer,
   ToolHeader,
@@ -32,7 +32,7 @@ import { useCopyToClipboard } from "@/browser/hooks/useCopyToClipboard";
 import { useBackgroundProcesses } from "@/browser/stores/BackgroundBashStore";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { TaskAttachFileArtifact } from "@/common/types/taskArtifacts";
-import { WORKSPACE_TURN_TASK_TAGS } from "@/constants/workspaceTags";
+import { isWorkspaceArchived } from "@/common/utils/archive";
 import type {
   TaskToolArgs,
   TaskToolResult,
@@ -163,41 +163,48 @@ function getAgentTypeStyle(type: string): string {
   }
 }
 
-function findWorkspaceForTaskTarget(
+interface ExecutionWorkspaceTarget {
+  workspace?: FrontendWorkspaceMetadata;
+  hasCanonicalWorkspaceId: boolean;
+}
+
+function resolveExecutionWorkspaceTarget(
   workspaceMetadata: ReadonlyMap<string, FrontendWorkspaceMetadata> | undefined,
   taskId: string,
-  openWorkspaceId?: string
-): FrontendWorkspaceMetadata | undefined {
-  const explicitWorkspaceId = trimToNonEmptyString(openWorkspaceId);
-  if (explicitWorkspaceId) {
-    const explicitWorkspace = workspaceMetadata?.get(explicitWorkspaceId);
-    if (explicitWorkspace) {
-      return explicitWorkspace;
-    }
+  workspaceId?: string
+): ExecutionWorkspaceTarget {
+  const canonicalWorkspaceId = trimToNonEmptyString(workspaceId);
+  if (canonicalWorkspaceId) {
+    return {
+      workspace: workspaceMetadata?.get(canonicalWorkspaceId),
+      hasCanonicalWorkspaceId: true,
+    };
   }
 
-  const directWorkspace = workspaceMetadata?.get(taskId);
-  if (directWorkspace) {
-    return directWorkspace;
-  }
-
-  // Workspace-turn task IDs (`wst_...`) are handles, not workspace IDs. Newly-created
-  // workspace tasks tag the actual workspace with the handle so stale tool results remain clickable
-  // after the result's explicit workspaceId falls out of view.
+  // Historical task results did not carry workspaceId. executionId is the only safe live
+  // back-reference: taskId is opaque and must never be treated as a workspace ID.
   for (const metadata of workspaceMetadata?.values() ?? []) {
-    if (metadata.tags?.[WORKSPACE_TURN_TASK_TAGS.handle] === taskId) {
-      return metadata;
+    if (metadata.executionId === taskId) {
+      return { workspace: metadata, hasCanonicalWorkspaceId: false };
     }
   }
 
-  return undefined;
+  return { hasCanonicalWorkspaceId: false };
+}
+
+function isExecutionWorkspaceOpenable(workspace: FrontendWorkspaceMetadata | undefined): boolean {
+  return Boolean(
+    workspace &&
+    workspace.isRemoving !== true &&
+    !isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)
+  );
 }
 
 function openWorkspaceFromContext(
   workspaceContext: ReturnType<typeof useOptionalWorkspaceContext>,
   workspace: FrontendWorkspaceMetadata | undefined
 ): boolean {
-  if (!workspace || !workspaceContext) {
+  if (!workspace || !isExecutionWorkspaceOpenable(workspace) || !workspaceContext) {
     return false;
   }
 
@@ -205,68 +212,21 @@ function openWorkspaceFromContext(
   return true;
 }
 
-// Agent type badge
-const AgentTypeBadge: React.FC<{
-  type: string;
-  className?: string;
-  taskId?: string;
-  openWorkspaceId?: string;
-}> = ({ type, className, taskId, openWorkspaceId }) => {
-  const workspaceContext = useOptionalWorkspaceContext();
-  const targetTaskId = trimToNonEmptyString(taskId);
-  const workspace = targetTaskId
-    ? findWorkspaceForTaskTarget(workspaceContext?.workspaceMetadata, targetTaskId, openWorkspaceId)
-    : undefined;
-  const classNames = cn(
-    "inline-block shrink-0 rounded border px-1.5 py-0.5 text-[10px] font-medium whitespace-nowrap",
-    getAgentTypeStyle(type),
-    className
-  );
+// Agent badges identify execution kind only. Workspace navigation has one explicit action.
+const AgentTypeBadge: React.FC<{ type: string; className?: string }> = ({ type, className }) => (
+  <span
+    className={cn(
+      "inline-block shrink-0 rounded border px-1.5 py-0.5 text-[10px] font-medium whitespace-nowrap",
+      getAgentTypeStyle(type),
+      className
+    )}
+  >
+    {type}
+  </span>
+);
 
-  const openWorkspaceLabel = type === "workspace" ? "Open workspace" : `Open ${type} workspace`;
-
-  if (!workspace) {
-    return <span className={classNames}>{type}</span>;
-  }
-
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <button
-          type="button"
-          aria-label={openWorkspaceLabel}
-          className={cn(classNames, "hover:underline underline-offset-2")}
-          onClick={(event) => {
-            event.stopPropagation();
-            openWorkspaceFromContext(workspaceContext, workspace);
-          }}
-        >
-          {type}
-        </button>
-      </TooltipTrigger>
-      <TooltipContent>Open workspace</TooltipContent>
-    </Tooltip>
-  );
-};
-
-// Task ID display with open/copy affordance.
-// - If the task workspace exists locally, clicking opens it.
-// - Otherwise, clicking copies the ID (so the user can search / share it).
-const TaskId: React.FC<{ id: string; openWorkspaceId?: string; className?: string }> = ({
-  id,
-  openWorkspaceId,
-  className,
-}) => {
-  const workspaceContext = useOptionalWorkspaceContext();
+const TaskId: React.FC<{ id: string; className?: string }> = ({ id, className }) => {
   const { copied, copyToClipboard } = useCopyToClipboard();
-
-  const workspace = findWorkspaceForTaskTarget(
-    workspaceContext?.workspaceMetadata,
-    id,
-    openWorkspaceId
-  );
-
-  const canOpenWorkspace = Boolean(workspace && workspaceContext);
 
   return (
     <Tooltip>
@@ -278,20 +238,99 @@ const TaskId: React.FC<{ id: string; openWorkspaceId?: string; className?: strin
             className
           )}
           onClick={() => {
-            if (openWorkspaceFromContext(workspaceContext, workspace)) {
-              return;
-            }
-
             void copyToClipboard(id);
           }}
         >
           {id}
         </button>
       </TooltipTrigger>
-      <TooltipContent>
-        {canOpenWorkspace ? "Open workspace" : copied ? "Copied" : "Copy task ID"}
-      </TooltipContent>
+      <TooltipContent>{copied ? "Copied" : "Copy task ID"}</TooltipContent>
     </Tooltip>
+  );
+};
+
+const OpenWorkspaceButton: React.FC<{
+  taskId: string;
+  workspaceId?: string;
+  className?: string;
+}> = (props) => {
+  const workspaceContext = useOptionalWorkspaceContext();
+  const target = resolveExecutionWorkspaceTarget(
+    workspaceContext?.workspaceMetadata,
+    props.taskId,
+    props.workspaceId
+  );
+  if (!workspaceContext || !isExecutionWorkspaceOpenable(target.workspace)) {
+    return null;
+  }
+
+  return (
+    <button
+      type="button"
+      aria-label="Open workspace"
+      className={cn(
+        "text-link inline-flex shrink-0 items-center gap-1 text-[10px] font-medium underline-offset-2 hover:underline",
+        props.className
+      )}
+      onClick={(event) => {
+        event.stopPropagation();
+        openWorkspaceFromContext(workspaceContext, target.workspace);
+      }}
+    >
+      <ArrowUpRight aria-hidden="true" className="size-3" />
+      <span className="[@container(max-width:350px)]:hidden">Open workspace</span>
+    </button>
+  );
+};
+
+function formatExecutionProjectContext(workspace: FrontendWorkspaceMetadata): string {
+  const subProjectPath = trimToNonEmptyString(workspace.subProjectPath);
+  if (!subProjectPath) {
+    return workspace.projectName;
+  }
+
+  const projectPrefix = `${workspace.projectPath.replace(/[\\/]+$/, "")}/`;
+  const relativeSubProject = subProjectPath.startsWith(projectPrefix)
+    ? subProjectPath.slice(projectPrefix.length)
+    : subProjectPath.split(/[\\/]/).filter(Boolean).at(-1);
+  return relativeSubProject
+    ? `${workspace.projectName} / ${relativeSubProject}`
+    : workspace.projectName;
+}
+
+const ExecutionWorkspaceContext: React.FC<{
+  taskId: string;
+  workspaceId?: string;
+  executionTitle?: string;
+}> = (props) => {
+  const workspaceContext = useOptionalWorkspaceContext();
+  const target = resolveExecutionWorkspaceTarget(
+    workspaceContext?.workspaceMetadata,
+    props.taskId,
+    props.workspaceId
+  );
+  if (!target.workspace) {
+    return null;
+  }
+
+  const workspaceTitle = getTaskToolWorkspaceTitle(target.workspace);
+  const showWorkspaceTitle =
+    workspaceTitle != null &&
+    normalizeTaskTitle(workspaceTitle) !== normalizeTaskTitle(props.executionTitle);
+
+  return (
+    <div
+      data-execution-workspace-context
+      className="text-muted mt-0.5 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[10px]"
+    >
+      {showWorkspaceTitle && (
+        <span className="max-w-full min-w-0 truncate">workspace: {workspaceTitle}</span>
+      )}
+      <span className="max-w-full min-w-0 truncate">
+        {showWorkspaceTitle && <span aria-hidden="true">· </span>}
+        {formatExecutionProjectContext(target.workspace)}
+      </span>
+    </div>
   );
 };
 
@@ -302,7 +341,7 @@ interface TaskRowProps {
   title?: string;
   depth?: number;
   startedAtMs?: number;
-  openWorkspaceId?: string;
+  workspaceId?: string;
   className?: string;
   variant?: "default" | "await";
 }
@@ -350,25 +389,21 @@ const TaskRow: React.FC<TaskRowProps> = (props) => {
           {props.title ? (
             <div className="text-foreground truncate text-[11px] font-medium">{props.title}</div>
           ) : (
-            <TaskId
-              id={props.taskId}
-              openWorkspaceId={props.openWorkspaceId}
-              className="text-secondary opacity-100"
-            />
+            <TaskId id={props.taskId} className="text-secondary opacity-100" />
           )}
+          <ExecutionWorkspaceContext
+            taskId={props.taskId}
+            workspaceId={props.workspaceId}
+            executionTitle={props.title}
+          />
           <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5">
-            {props.title && <TaskId id={props.taskId} openWorkspaceId={props.openWorkspaceId} />}
-            {props.agentType && (
-              <AgentTypeBadge
-                type={props.agentType}
-                taskId={props.taskId}
-                openWorkspaceId={props.openWorkspaceId}
-              />
-            )}
+            {props.title && <TaskId id={props.taskId} />}
+            {props.agentType && <AgentTypeBadge type={props.agentType} />}
             {typeof props.depth === "number" && props.depth > 0 && (
               <span className="text-muted text-[10px]">depth {props.depth}</span>
             )}
             <TaskRowElapsed startedAtMs={props.startedAtMs} status={props.status} />
+            <OpenWorkspaceButton taskId={props.taskId} workspaceId={props.workspaceId} />
           </div>
         </div>
         <TaskStatusBadge status={props.status} />
@@ -377,25 +412,27 @@ const TaskRow: React.FC<TaskRowProps> = (props) => {
   }
 
   return (
-    <div
-      className={cn("bg-code-bg flex flex-wrap items-center gap-2 rounded-sm p-2", props.className)}
-    >
-      <TaskId id={props.taskId} openWorkspaceId={props.openWorkspaceId} />
-      <TaskStatusBadge status={props.status} />
-      {props.agentType && (
-        <AgentTypeBadge
-          type={props.agentType}
-          taskId={props.taskId}
-          openWorkspaceId={props.openWorkspaceId}
-        />
-      )}
-      {props.title && (
-        <span className="text-foreground max-w-[200px] truncate text-[11px]">{props.title}</span>
-      )}
-      {typeof props.depth === "number" && props.depth > 0 && (
-        <span className="text-muted text-[10px]">depth: {props.depth}</span>
-      )}
-      <TaskRowElapsed startedAtMs={props.startedAtMs} status={props.status} />
+    <div className={cn("bg-code-bg min-w-0 rounded-sm p-2", props.className)}>
+      <div className="flex min-w-0 flex-wrap items-center gap-2">
+        <TaskId id={props.taskId} />
+        <TaskStatusBadge status={props.status} />
+        {props.agentType && <AgentTypeBadge type={props.agentType} />}
+        {props.title && (
+          <span className="text-foreground max-w-[200px] min-w-0 truncate text-[11px]">
+            {props.title}
+          </span>
+        )}
+        {typeof props.depth === "number" && props.depth > 0 && (
+          <span className="text-muted text-[10px]">depth: {props.depth}</span>
+        )}
+        <TaskRowElapsed startedAtMs={props.startedAtMs} status={props.status} />
+        <OpenWorkspaceButton taskId={props.taskId} workspaceId={props.workspaceId} />
+      </div>
+      <ExecutionWorkspaceContext
+        taskId={props.taskId}
+        workspaceId={props.workspaceId}
+        executionTitle={props.title}
+      />
     </div>
   );
 };
@@ -464,10 +501,6 @@ function toTaskStatusFromBackgroundProcessStatus(
   }
 }
 
-function isWorkspaceTurnTaskHandleId(taskId: string): boolean {
-  return /^wst_[a-z0-9][a-z0-9_-]*$/.test(taskId);
-}
-
 function isWorkflowRunTaskHandleId(taskId: string): boolean {
   return taskId.startsWith("wfr_");
 }
@@ -503,12 +536,13 @@ interface TaskToolDisplayEntry {
   status: string;
   title?: string;
   reportMarkdown?: string;
-  openWorkspaceId?: string;
+  workspaceId?: string;
   groupKind?: TaskGroupKind;
   label?: string;
   modelString?: string;
   thinkingLevel?: ThinkingLevel;
   attachFiles?: readonly TaskAttachFileArtifact[];
+  error?: string;
 }
 
 interface TaskAiSettingsInfo {
@@ -581,6 +615,7 @@ function normalizeTaskId(value: unknown): string | null {
 
 interface TaskToolWorkspaceEntry {
   taskId: string;
+  workspaceId: string;
   index?: number;
   status?: string;
   title?: string;
@@ -608,16 +643,20 @@ function parseWorkspaceCreatedAtMs(createdAt: string | undefined): number | unde
 }
 
 function getTaskToolWorkspaceStatus(
-  taskStatus: FrontendWorkspaceMetadata["taskStatus"]
+  metadata: FrontendWorkspaceMetadata | null | undefined
 ): string | undefined {
-  switch (taskStatus) {
+  if (hasNonEmptyText(metadata?.taskLaunchError)) {
+    return "error";
+  }
+
+  switch (metadata?.taskStatus) {
     case "reported":
       return "completed";
     case "queued":
     case "running":
     case "awaiting_report":
     case "interrupted":
-      return taskStatus;
+      return metadata.taskStatus;
     default:
       return undefined;
   }
@@ -685,7 +724,7 @@ function recoverTaskGroupTaskIdsFromWorkspaceMetadata(params: {
       }
     }
 
-    const taskId = normalizeTaskId(metadata.id);
+    const taskId = normalizeTaskId(metadata.executionId);
     const metadataTitle = getTaskToolWorkspaceTitle(metadata);
     if (!taskId) {
       continue;
@@ -697,8 +736,9 @@ function recoverTaskGroupTaskIdsFromWorkspaceMetadata(params: {
     const candidates = groupedCandidates.get(metadata.bestOf.groupId) ?? [];
     candidates.push({
       taskId,
+      workspaceId: metadata.id,
       index: metadata.bestOf.index,
-      status: getTaskToolWorkspaceStatus(metadata.taskStatus),
+      status: getTaskToolWorkspaceStatus(metadata),
       title: metadataTitle,
       createdAtMs: parseWorkspaceCreatedAtMs(metadata.createdAt),
       groupKind: getTaskGroupKindFromMetadata(metadata.bestOf),
@@ -896,6 +936,9 @@ function getAggregateTaskStatus(
   if (displayEntries.length === 0) {
     return fallbackStatus;
   }
+  if (displayEntries.some((entry) => entry.status === "error" || entry.status === "failed")) {
+    return "error";
+  }
   if (displayEntries.every((entry) => entry.status === "completed")) {
     return "completed";
   }
@@ -925,9 +968,16 @@ const TaskToolCandidateCard: React.FC<{
   index: number;
   total: number;
   groupKind: TaskGroupKind;
-  onOpenTranscript: (taskId: string) => void;
-}> = ({ entry, index, total, groupKind, onOpenTranscript }) => {
-  const canViewTranscript = entry.status === "completed";
+  onOpenLegacyTranscript: (taskId: string) => void;
+}> = ({ entry, index, total, groupKind, onOpenLegacyTranscript }) => {
+  const workspaceContext = useOptionalWorkspaceContext();
+  const target = resolveExecutionWorkspaceTarget(
+    workspaceContext?.workspaceMetadata,
+    entry.taskId,
+    entry.workspaceId
+  );
+  const canViewLegacyTranscript =
+    entry.status === "completed" && !target.hasCanonicalWorkspaceId && !target.workspace;
   const hasReport = hasNonEmptyText(entry.reportMarkdown);
   const attachmentSummary = formatAttachFileArtifactSummary(entry.attachFiles);
   const memberLabel = formatTaskGroupMemberLabel({
@@ -938,31 +988,40 @@ const TaskToolCandidateCard: React.FC<{
 
   return (
     <div className="bg-code-bg rounded-sm p-2">
-      <div className={cn("flex flex-wrap items-center gap-2", hasReport && "mb-2")}>
+      <div className={cn("flex min-w-0 flex-wrap items-center gap-2", hasReport && "mb-2")}>
         {total > 1 && <span className="text-muted text-[10px]">{memberLabel}</span>}
-        <TaskId id={entry.taskId} openWorkspaceId={entry.openWorkspaceId} />
+        <TaskId id={entry.taskId} />
         <TaskStatusBadge status={entry.status} />
         {entry.title && (
-          <span className="text-foreground text-[11px] font-medium">{entry.title}</span>
+          <span className="text-foreground max-w-full min-w-0 truncate text-[11px] font-medium">
+            {entry.title}
+          </span>
         )}
         <TaskAiSettingsDisplay
           modelString={entry.modelString}
           thinkingLevel={entry.thinkingLevel}
           className="text-[10px]"
         />
-        {canViewTranscript && (
+        <OpenWorkspaceButton taskId={entry.taskId} workspaceId={entry.workspaceId} />
+        {canViewLegacyTranscript && (
           <button
             type="button"
             className="text-link text-[10px] font-medium underline-offset-2 hover:underline"
             onClick={() => {
-              onOpenTranscript(entry.taskId);
+              onOpenLegacyTranscript(entry.taskId);
             }}
           >
-            View transcript
+            View legacy transcript
           </button>
         )}
       </div>
+      <ExecutionWorkspaceContext
+        taskId={entry.taskId}
+        workspaceId={entry.workspaceId}
+        executionTitle={entry.title}
+      />
 
+      {entry.error && <div className="text-danger mb-1 text-[10px]">{entry.error}</div>}
       {attachmentSummary && <div className="text-muted mb-1 text-[10px]">{attachmentSummary}</div>}
       {hasReport && entry.reportMarkdown && <TaskReportMarkdown content={entry.reportMarkdown} />}
     </div>
@@ -1018,6 +1077,9 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
     toolStartedAt: startedAt ?? toolCallTimestamp,
     workspaceMetadata,
   });
+  for (const entry of recoveredWorkspaceEntries) {
+    workspaceIdByTaskId.set(entry.taskId, entry.workspaceId);
+  }
   if (recoveredWorkspaceEntries.length > 0) {
     recoveredTaskIdsRef.current = recoveredWorkspaceEntries.map((entry) => entry.taskId);
   }
@@ -1040,9 +1102,12 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
 
   const displayEntries: TaskToolDisplayEntry[] = taskIds.map((taskId, index) => {
     const ownReport = ownReportsByTaskId.get(taskId);
-    const linkedReport = taskReportLinking?.reportByTaskId.get(taskId);
-    const openWorkspaceId = workspaceIdByTaskId.get(taskId);
-    const metadata = findWorkspaceForTaskTarget(workspaceMetadata, taskId, openWorkspaceId);
+    const canonicalWorkspaceId = workspaceIdByTaskId.get(taskId);
+    const linkedReport = canonicalWorkspaceId
+      ? taskReportLinking?.reportByWorkspaceId.get(canonicalWorkspaceId)
+      : taskReportLinking?.reportByTaskId.get(taskId);
+    const target = resolveExecutionWorkspaceTarget(workspaceMetadata, taskId, canonicalWorkspaceId);
+    const metadata = target.workspace;
     const resultTaskGroup = taskGroupsByTaskId.get(taskId);
     const reportMarkdown = hasNonEmptyText(ownReport?.reportMarkdown)
       ? ownReport.reportMarkdown
@@ -1051,7 +1116,7 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
     const derivedStatus =
       (ownReport ?? linkedReport)
         ? "completed"
-        : (getTaskToolWorkspaceStatus(metadata?.taskStatus) ?? statusByTaskId.get(taskId));
+        : (getTaskToolWorkspaceStatus(metadata) ?? statusByTaskId.get(taskId));
 
     const resultAiSettings = aiSettingsByTaskId.get(taskId);
 
@@ -1059,9 +1124,9 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
       taskId,
       status:
         derivedStatus ?? (status === "executing" ? "running" : (successResult?.status ?? "queued")),
-      title: reportTitle ?? getTaskToolWorkspaceTitle(metadata) ?? title,
+      title: isTaskGroup ? (reportTitle ?? title) : title,
       reportMarkdown,
-      openWorkspaceId,
+      workspaceId: canonicalWorkspaceId,
       groupKind:
         ownReport?.groupKind ??
         resultTaskGroup?.groupKind ??
@@ -1082,6 +1147,7 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
         metadata?.taskThinkingLevel ??
         linkedReport?.thinkingLevel ??
         resultAiSettings?.thinkingLevel,
+      error: trimToNonEmptyString(metadata?.taskLaunchError) ?? undefined,
       attachFiles: ownReport?.attachFiles,
     };
   });
@@ -1106,18 +1172,23 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
   const effectiveStatus: ToolStatus =
     aggregateTaskStatus === "completed"
       ? "completed"
-      : aggregateTaskStatus === "interrupted"
-        ? "interrupted"
-        : status === "completed" &&
-            (aggregateTaskStatus === "queued" || aggregateTaskStatus === "running")
-          ? "backgrounded"
-          : status;
+      : aggregateTaskStatus === "error"
+        ? "failed"
+        : aggregateTaskStatus === "interrupted"
+          ? "interrupted"
+          : status === "completed" &&
+              (aggregateTaskStatus === "queued" || aggregateTaskStatus === "running")
+            ? "backgrounded"
+            : status;
 
   // Base state follows the sticky tools preference. Errors can arrive after mount, so
   // pass them as a live forceExpanded signal (latched) to open the row when one lands
   // instead of seeding once and hiding the failure behind the header.
   const { expanded, toggleExpanded } = useStickyExpand("tools", false, {
-    forceExpanded: !!errorResult || interruptionReport != null,
+    forceExpanded:
+      !!errorResult ||
+      interruptionReport != null ||
+      displayEntries.some((entry) => hasNonEmptyText(entry.error)),
   });
 
   const [transcriptTaskId, setTranscriptTaskId] = useState<string | null>(null);
@@ -1127,13 +1198,20 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
     (isTaskGroup ? formatTaskGroupHeader(taskGroupKind, totalTaskGroupCount, preview) : preview);
   const singleEntry = !isTaskGroup ? displayEntries[0] : undefined;
   const singleAttachmentSummary = formatAttachFileArtifactSummary(singleEntry?.attachFiles);
-  const kindBadge = (
-    <AgentTypeBadge
-      type={taskKindLabel}
-      taskId={singleEntry?.taskId}
-      openWorkspaceId={singleEntry?.openWorkspaceId}
-    />
+  const singleTarget = singleEntry
+    ? resolveExecutionWorkspaceTarget(
+        workspaceMetadata,
+        singleEntry.taskId,
+        singleEntry.workspaceId
+      )
+    : undefined;
+  const canViewSingleLegacyTranscript = Boolean(
+    singleEntry?.status === "completed" &&
+    singleTarget &&
+    !singleTarget.hasCanonicalWorkspaceId &&
+    !singleTarget.workspace
   );
+  const kindBadge = <AgentTypeBadge type={taskKindLabel} />;
   const createdTaskGroupCount = taskIds.length;
   const shouldShowCreationProgress =
     isTaskGroup &&
@@ -1148,6 +1226,9 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
         <TaskIcon toolName="task" />
         <ToolName>{headerLabel}</ToolName>
         {kindBadge}
+        {singleEntry && (
+          <OpenWorkspaceButton taskId={singleEntry.taskId} workspaceId={singleEntry.workspaceId} />
+        )}
         {isTaskGroup && (
           <span className="text-muted text-[10px]">
             {formatTaskGroupSummary(taskGroupKind, totalTaskGroupCount).toLowerCase()}
@@ -1188,9 +1269,7 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
                   {completedTaskGroupCount}/{totalTaskGroupCount} completed
                 </span>
               ) : (
-                singleEntry?.taskId && (
-                  <TaskId id={singleEntry.taskId} openWorkspaceId={singleEntry.openWorkspaceId} />
-                )
+                singleEntry?.taskId && <TaskId id={singleEntry.taskId} />
               )}
               {!isTaskGroup && singleEntry?.status && (
                 <TaskStatusBadge status={singleEntry.status} />
@@ -1202,7 +1281,7 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
                   className="text-[10px]"
                 />
               )}
-              {!isTaskGroup && singleEntry?.status === "completed" && (
+              {!isTaskGroup && canViewSingleLegacyTranscript && singleEntry && (
                 <button
                   type="button"
                   className="text-link text-[10px] font-medium underline-offset-2 hover:underline"
@@ -1210,8 +1289,17 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
                     setTranscriptTaskId(singleEntry.taskId);
                   }}
                 >
-                  View transcript
+                  View legacy transcript
                 </button>
+              )}
+              {!isTaskGroup && singleEntry && (
+                <div className="basis-full">
+                  <ExecutionWorkspaceContext
+                    taskId={singleEntry.taskId}
+                    workspaceId={singleEntry.workspaceId}
+                    executionTitle={singleEntry.title}
+                  />
+                </div>
               )}
             </div>
 
@@ -1231,6 +1319,10 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
               </div>
             </div>
 
+            {!isTaskGroup && singleEntry?.error && (
+              <ErrorBox className="mb-2">{singleEntry.error}</ErrorBox>
+            )}
+
             {isTaskGroup ? (
               <div className="task-divider border-t pt-2">
                 <div className="text-muted mb-2 text-[10px] tracking-wide uppercase">
@@ -1244,7 +1336,7 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
                       index={index}
                       total={totalTaskGroupCount}
                       groupKind={taskGroupKind}
-                      onOpenTranscript={setTranscriptTaskId}
+                      onOpenLegacyTranscript={setTranscriptTaskId}
                     />
                   ))}
                 </div>
@@ -1328,6 +1420,7 @@ export const TaskAwaitToolCall: React.FC<TaskAwaitToolCallProps> = ({
   const interruptionReport =
     interruption?.reason === "progress_report_received" ? interruption.report : undefined;
 
+  const suppressReportInAwaitWorkspaceIds = taskReportLinking?.suppressReportInAwaitWorkspaceIds;
   const suppressReportInAwaitTaskIds = taskReportLinking?.suppressReportInAwaitTaskIds;
 
   const showConfigInfo =
@@ -1365,34 +1458,28 @@ export const TaskAwaitToolCall: React.FC<TaskAwaitToolCallProps> = ({
         continue;
       }
 
-      const metadata = findWorkspaceForTaskTarget(workspaceMetadata, taskId);
-      const isWorkspaceTurn = isWorkspaceTurnTaskHandleId(taskId);
+      const target = resolveExecutionWorkspaceTarget(workspaceMetadata, taskId);
+      const metadata = target.workspace;
       if (!metadata) {
-        awaitedRows.push({
-          taskId,
-          status: "waiting",
-          agentType: isWorkspaceTurn ? "workspace" : undefined,
-        });
+        awaitedRows.push({ taskId, status: "waiting" });
         continue;
       }
 
-      const resolvedAgentType = isWorkspaceTurn
-        ? "workspace"
-        : resolvePersistedAgentId(metadata, "");
+      const resolvedAgentType = resolvePersistedAgentId(metadata, "");
       const agentType = resolvedAgentType.length > 0 ? resolvedAgentType : undefined;
-      const title = metadata.title?.trim().length ? metadata.title : metadata.name;
+      const executionTitle = taskReportLinking?.spawnTitleByTaskId.get(taskId);
 
       awaitedRows.push({
         taskId,
-        status: metadata.taskStatus ?? "waiting",
-        agentType: agentType && agentType.length > 0 ? agentType : undefined,
-        title,
+        status: getTaskToolWorkspaceStatus(metadata) ?? "waiting",
+        agentType,
+        title: executionTitle,
         depth:
           workspaceId && workspaceMetadata
             ? computeWorkspaceDepthFromRoot(workspaceId, metadata.id, workspaceMetadata)
             : undefined,
         startedAtMs: parseWorkspaceCreatedAtMs(metadata.createdAt),
-        openWorkspaceId: metadata.id,
+        workspaceId: metadata.id,
       });
     }
   }
@@ -1407,21 +1494,38 @@ export const TaskAwaitToolCall: React.FC<TaskAwaitToolCallProps> = ({
   for (const taskResult of results) {
     if (taskResult.status !== "completed") continue;
     const completedTaskId = taskResult.taskId;
+    const resultWorkspaceId = trimToNonEmptyString(taskResult.workspaceId) ?? undefined;
+    const target = resolveExecutionWorkspaceTarget(
+      workspaceMetadata,
+      completedTaskId,
+      resultWorkspaceId
+    );
     const bashSpawn = taskReportLinking?.bashSpawnByTaskId.get(completedTaskId);
+    const canonicalAgentType = resultWorkspaceId
+      ? (taskReportLinking?.spawnAgentTypeByWorkspaceId.get(resultWorkspaceId) ??
+        (target.workspace ? resolvePersistedAgentId(target.workspace, "") : undefined))
+      : undefined;
     const kind = fromBashTaskId(completedTaskId)
       ? "bash"
       : isWorkflowRunTaskHandleId(completedTaskId)
         ? "workflow"
-        : isWorkspaceTurnTaskHandleId(completedTaskId) || taskResult.handleKind === "workspace_turn"
+        : taskResult.handleKind === "workspace_turn"
           ? "workspace"
-          : taskReportLinking?.spawnAgentTypeByTaskId.get(completedTaskId);
-    // Spawn-side intent first (bash model_intent, task spawn title); the result's own
-    // title (report heading, bash display_name) is only a fallback.
+          : (trimToNonEmptyString(canonicalAgentType) ??
+            (resultWorkspaceId
+              ? undefined
+              : taskReportLinking?.spawnAgentTypeByTaskId.get(completedTaskId)));
+    // Spawn-side intent first (bash model_intent, task execution title); the report title is
+    // only a fallback. Canonical execution cards link by workspaceId, never opaque taskId.
     const description =
       (bashSpawn
         ? sanitizeDisplayableModelIntent(bashSpawn.modelIntent, bashSpawn.script)
         : undefined) ??
-      trimToNonEmptyString(taskReportLinking?.spawnTitleByTaskId.get(completedTaskId)) ??
+      trimToNonEmptyString(
+        resultWorkspaceId
+          ? taskReportLinking?.spawnTitleByWorkspaceId.get(resultWorkspaceId)
+          : taskReportLinking?.spawnTitleByTaskId.get(completedTaskId)
+      ) ??
       trimToNonEmptyString(taskResult.title);
     const detail = [kind, description].filter((part): part is string => part != null).join(" · ");
     if (detail.length > 0) completedTaskDetails.push(detail);
@@ -1597,23 +1701,27 @@ export const TaskAwaitToolCall: React.FC<TaskAwaitToolCallProps> = ({
                 {results.map((r, idx) => {
                   const taskId = typeof r.taskId === "string" ? r.taskId : null;
 
+                  const resultWorkspaceId =
+                    "workspaceId" in r
+                      ? (trimToNonEmptyString(r.workspaceId) ?? undefined)
+                      : undefined;
                   const spawnTitle = taskId
-                    ? taskReportLinking?.spawnTitleByTaskId.get(taskId)
+                    ? resultWorkspaceId
+                      ? taskReportLinking?.spawnTitleByWorkspaceId.get(resultWorkspaceId)
+                      : taskReportLinking?.spawnTitleByTaskId.get(taskId)
                     : undefined;
-                  const resultWorkspaceId = "workspaceId" in r ? r.workspaceId : undefined;
-                  const workspaceTitle = taskId
-                    ? getTaskToolWorkspaceTitle(
-                        findWorkspaceForTaskTarget(workspaceMetadata, taskId, resultWorkspaceId)
-                      )
-                    : undefined;
-                  const fallbackTitle = trimToNonEmptyString(spawnTitle) ?? workspaceTitle;
+                  const suppressReport = resultWorkspaceId
+                    ? suppressReportInAwaitWorkspaceIds?.has(resultWorkspaceId)
+                    : taskId
+                      ? suppressReportInAwaitTaskIds?.has(taskId)
+                      : false;
 
                   return (
                     <TaskAwaitResult
                       key={taskId ?? idx}
                       result={r}
-                      fallbackTitle={fallbackTitle}
-                      suppressReport={taskId ? suppressReportInAwaitTaskIds?.has(taskId) : false}
+                      fallbackTitle={trimToNonEmptyString(spawnTitle) ?? undefined}
+                      suppressReport={suppressReport}
                     />
                   );
                 })}
@@ -1653,7 +1761,7 @@ const TaskAwaitResult: React.FC<{
   const rawReportTitle = isCompleted ? result.title : undefined;
   const reportTitle = trimToNonEmptyString(rawReportTitle) ?? undefined;
 
-  const title = reportTitle ?? trimToNonEmptyString(fallbackTitle) ?? undefined;
+  const title = trimToNonEmptyString(fallbackTitle) ?? reportTitle ?? undefined;
 
   const output = "output" in result ? result.output : undefined;
   const note = "note" in result ? result.note : undefined;
@@ -1669,25 +1777,27 @@ const TaskAwaitResult: React.FC<{
       : null;
   const elapsedMs = "elapsed_ms" in result ? result.elapsed_ms : undefined;
 
-  const openWorkspaceId = "workspaceId" in result ? result.workspaceId : undefined;
+  const workspaceId = "workspaceId" in result ? result.workspaceId : undefined;
 
-  const showDetails = !suppressReport;
+  const showReport = !suppressReport;
 
   return (
     <div className="border-border-light/60 bg-surface-primary/40 rounded-md border px-2.5 py-2">
-      <div className={cn("grid grid-cols-[minmax(0,1fr)_auto] gap-2", showDetails && "mb-1")}>
+      <div className="mb-1 grid grid-cols-[minmax(0,1fr)_auto] gap-2">
         <div className="min-w-0">
           {title ? (
             <div className="text-foreground truncate text-[11px] font-medium">{title}</div>
           ) : (
-            <TaskId
-              id={result.taskId}
-              openWorkspaceId={openWorkspaceId}
-              className="text-secondary opacity-100"
-            />
+            <TaskId id={result.taskId} className="text-secondary opacity-100" />
           )}
+          <ExecutionWorkspaceContext
+            taskId={result.taskId}
+            workspaceId={workspaceId}
+            executionTitle={title}
+          />
           <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5">
-            {title && <TaskId id={result.taskId} openWorkspaceId={openWorkspaceId} />}
+            {title && <TaskId id={result.taskId} />}
+            <OpenWorkspaceButton taskId={result.taskId} workspaceId={workspaceId} />
             {exitCode !== undefined && (
               <span className="text-muted text-[10px]">exit {exitCode}</span>
             )}
@@ -1717,16 +1827,16 @@ const TaskAwaitResult: React.FC<{
         <TaskStatusBadge status={result.status} />
       </div>
 
-      {showDetails && patchSummary && <div className="text-muted text-[10px]">{patchSummary}</div>}
+      {patchSummary && <div className="text-muted text-[10px]">{patchSummary}</div>}
       {attachmentSummary && <div className="text-muted text-[10px]">{attachmentSummary}</div>}
 
-      {showDetails && !isCompleted && output && output.length > 0 && (
+      {!isCompleted && output && output.length > 0 && (
         <div className="text-foreground bg-code-bg max-h-[140px] overflow-y-auto rounded-sm p-2 text-[11px] break-words whitespace-pre-wrap">
           {output}
         </div>
       )}
 
-      {showDetails && reportMarkdown && (
+      {showReport && reportMarkdown && (
         <TaskReportMarkdown content={reportMarkdown} className="mt-2" />
       )}
 
@@ -1807,7 +1917,7 @@ const TaskListItem: React.FC<{
     agentType={task.handleKind === "workspace_turn" ? "workspace" : task.agentType}
     title={task.title}
     depth={task.depth}
-    openWorkspaceId={task.workspaceId}
+    workspaceId={task.workspaceId}
   />
 );
 
