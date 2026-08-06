@@ -1117,7 +1117,7 @@ describe("task tool", () => {
           subagent_type: "explore",
           prompt: "do it",
           title: "Child task",
-          run_in_background: false,
+          run_in_background: null,
         },
         mockToolCallOptions
       )
