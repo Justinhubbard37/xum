@@ -5063,6 +5063,44 @@ describe("WorkspaceService initialize", () => {
     expect(startStartupRecoverySpy).toHaveBeenCalledWith("live-ws");
   });
 
+  test("schedules Project Chat recovery when a trusted parent owns the sub-project", async () => {
+    const { config: realConfig, historyService, cleanup } = await createTestHistoryService();
+    const parentProjectPath = path.join(realConfig.rootDir, "repo");
+    const subProjectPath = path.join(parentProjectPath, "packages", "web");
+    await fsPromises.mkdir(subProjectPath, { recursive: true });
+    await realConfig.editConfig((cfg) => {
+      cfg.projects.set(parentProjectPath, { trusted: true, workspaces: [] });
+      cfg.projects.set(subProjectPath, {
+        parentProjectPath,
+        workspaces: [],
+      });
+      return cfg;
+    });
+    const projectChat = await realConfig.ensureProjectChat(subProjectPath);
+    const service = createWorkspaceServiceForTest({
+      config: realConfig,
+      historyService,
+      aiService: {
+        on: mock(() => undefined),
+        off: mock(() => undefined),
+      } as unknown as AIService,
+      initStateManager: mockInitStateManager as InitStateManager,
+    });
+    const startupAccess = service as unknown as {
+      startStartupRecovery: (workspaceId: string) => void;
+    };
+    const startStartupRecoverySpy = spyOn(startupAccess, "startStartupRecovery").mockImplementation(
+      () => undefined
+    );
+
+    try {
+      await service.initialize();
+      expect(startStartupRecoverySpy).toHaveBeenCalledWith(projectChat.sessionId);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("swallows startup metadata lookup failures", async () => {
     config.getAllWorkspaceMetadata = mock(() =>
       Promise.reject(new Error("config unavailable"))

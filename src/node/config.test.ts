@@ -97,6 +97,65 @@ describe("Config", () => {
       }
     });
 
+    it("regenerates duplicate imported Project Chat session IDs", async () => {
+      const firstProjectPath = path.join(tempDir, "first");
+      const secondProjectPath = path.join(tempDir, "second");
+      const duplicateSessionId = "project-session_aaaaaaaaaa";
+      fs.mkdirSync(firstProjectPath, { recursive: true });
+      fs.mkdirSync(secondProjectPath, { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            [
+              firstProjectPath,
+              {
+                workspaces: [],
+                projectChat: {
+                  version: 1,
+                  sessionId: duplicateSessionId,
+                  createdAt: "2026-08-06T00:00:00.000Z",
+                  agentId: "orchestrator",
+                },
+              },
+            ],
+            [
+              secondProjectPath,
+              {
+                workspaces: [],
+                projectChat: {
+                  version: 1,
+                  sessionId: duplicateSessionId,
+                  createdAt: "2026-08-06T00:01:00.000Z",
+                  agentId: "orchestrator",
+                },
+              },
+            ],
+          ],
+        })
+      );
+
+      const loaded = config.loadConfigOrDefault();
+      const firstSessionId = loaded.projects.get(firstProjectPath)?.projectChat?.sessionId;
+      const secondSessionId = loaded.projects.get(secondProjectPath)?.projectChat?.sessionId;
+      expect(firstSessionId).toBe(duplicateSessionId);
+      expect(secondSessionId).not.toBe(duplicateSessionId);
+      expect(secondSessionId != null && isProjectSessionId(secondSessionId)).toBe(true);
+      expect(config.findProjectChatBySessionId(duplicateSessionId)?.projectPath).toBe(
+        firstProjectPath
+      );
+      expect(config.findProjectChatBySessionId(secondSessionId ?? "")?.projectPath).toBe(
+        secondProjectPath
+      );
+
+      await flushConfigEdits();
+      const restarted = new Config(tempDir).loadConfigOrDefault();
+      expect(restarted.projects.get(firstProjectPath)?.projectChat?.sessionId).toBe(firstSessionId);
+      expect(restarted.projects.get(secondProjectPath)?.projectChat?.sessionId).toBe(
+        secondSessionId
+      );
+    });
+
     it("rejects malformed project-session IDs before resolving filesystem paths", async () => {
       const projectPath = path.join(tempDir, "repo");
       const maliciousSessionId = "project-session_aaaaaaaaaa/../../../outside";

@@ -69,6 +69,7 @@ import {
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { getProjects, isMultiProject } from "@/common/utils/multiProject";
 import { generateGitStatusScript, parseGitStatusScriptOutput } from "@/common/utils/git/gitStatus";
+import { isProjectTrusted } from "@/node/utils/projectTrust";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
 import { getPlanFilePath, getLegacyPlanFilePath } from "@/common/utils/planStorage";
@@ -2868,8 +2869,8 @@ export class WorkspaceService extends EventEmitter {
       // same AgentSession recovery path. Only schedule trusted configured chats; transcript display
       // remains available before trust without triggering model/tool execution at startup.
       const configSnapshot = this.config.loadConfigOrDefault();
-      for (const [projectPath, projectConfig] of configSnapshot.projects) {
-        if (projectConfig.trusted !== true) continue;
+      for (const [projectPath] of configSnapshot.projects) {
+        if (!isProjectTrusted(this.config, projectPath)) continue;
         const projectChat = this.config.findProjectChatByProjectPath(projectPath);
         if (projectChat == null) continue;
         this.startStartupRecovery(projectChat.sessionId);

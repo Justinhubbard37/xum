@@ -998,6 +998,38 @@ export class Config {
           configModified = true;
         }
 
+        // Imported/corrupted config can assign one valid session ID to multiple projects. Keep the
+        // first owner and give every duplicate a fresh ID before any chat lookup or recursive cleanup
+        // can mix project context/history or delete another project's session directory.
+        const claimedProjectChatSessionIds = new Set<string>();
+        for (const [projectPath, projectConfig] of projectsMap) {
+          const parsedProjectChat = ProjectChatConfigSchema.safeParse(projectConfig.projectChat);
+          if (!parsedProjectChat.success) {
+            continue;
+          }
+
+          let sessionId = parsedProjectChat.data.sessionId;
+          if (claimedProjectChatSessionIds.has(sessionId)) {
+            // Load migrations can be observed more than once before their queued write lands. Derive
+            // the replacement deterministically so every read resolves this project to one identity.
+            let collisionIndex = 0;
+            do {
+              const suffix = crypto
+                .createHash("sha256")
+                .update(`${sessionId}\0${projectPath}\0${collisionIndex}`)
+                .digest("hex")
+                .slice(0, 10);
+              sessionId = `${PROJECT_CHAT_SESSION_ID_PREFIX}${suffix}`;
+              collisionIndex += 1;
+            } while (claimedProjectChatSessionIds.has(sessionId));
+            projectConfig.projectChat = { ...parsedProjectChat.data, sessionId };
+            configModified = true;
+          } else {
+            projectConfig.projectChat = parsedProjectChat.data;
+          }
+          claimedProjectChatSessionIds.add(sessionId);
+        }
+
         const taskSettings = normalizeTaskSettings(parsed.taskSettings);
 
         const muxGatewayEnabled = parseOptionalBoolean(parsed.muxGatewayEnabled);
