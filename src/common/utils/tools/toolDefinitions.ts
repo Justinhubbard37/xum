@@ -62,7 +62,23 @@ import { zodToJsonSchema } from "zod-to-json-schema";
 import { extractToolFilePath } from "@/common/utils/tools/toolInputFilePath";
 import { TASK_VARIANT_PLACEHOLDER, TASK_GROUP_KIND_VALUES } from "@/common/utils/tools/taskGroups";
 import { WorkspaceTurnFinalMessageRefSchema } from "@/common/types/workspaceTurn";
-import { TaskAttachFileArtifactsSchema } from "@/common/types/taskArtifacts";
+import {
+  SubagentGitPatchArtifactSchema,
+  SubagentGitPatchArtifactStatusSchema,
+  SubagentGitProjectPatchArtifactSchema,
+  TaskAttachFileArtifactsSchema,
+  TaskResultArtifactsSchema,
+  type SubagentGitPatchArtifact,
+  type SubagentGitProjectPatchArtifact,
+} from "@/common/types/taskArtifacts";
+
+export {
+  SubagentGitPatchArtifactSchema,
+  SubagentGitPatchArtifactStatusSchema,
+  SubagentGitProjectPatchArtifactSchema,
+  type SubagentGitPatchArtifact,
+  type SubagentGitProjectPatchArtifact,
+};
 import { ForegroundWaitInterruptionSchema } from "@/common/types/foregroundWaitInterruption";
 
 import {
@@ -1009,53 +1025,6 @@ export const TaskAwaitToolArgsSchema = z
     }
   });
 
-export const SubagentGitPatchArtifactStatusSchema = z.enum([
-  "pending",
-  "ready",
-  "failed",
-  "skipped",
-]);
-
-export const SubagentGitProjectPatchArtifactSchema = z
-  .object({
-    projectPath: z.string(),
-    projectName: z.string(),
-    storageKey: z.string(),
-    status: SubagentGitPatchArtifactStatusSchema,
-    baseCommitSha: z.string().optional(),
-    headCommitSha: z.string().optional(),
-    commitCount: z.number().int().nonnegative().optional(),
-    mboxPath: z.string().optional(),
-    error: z.string().optional(),
-    appliedAtMs: z.number().int().nonnegative().optional(),
-  })
-  .strict();
-
-export const SubagentGitPatchArtifactSchema = z
-  .object({
-    childTaskId: z.string(),
-    parentWorkspaceId: z.string(),
-    createdAtMs: z.number().int().nonnegative(),
-    updatedAtMs: z.number().int().nonnegative().optional(),
-    status: SubagentGitPatchArtifactStatusSchema,
-    projectArtifacts: z.array(SubagentGitProjectPatchArtifactSchema),
-    readyProjectCount: z.number().int().nonnegative(),
-    failedProjectCount: z.number().int().nonnegative(),
-    skippedProjectCount: z.number().int().nonnegative(),
-    totalCommitCount: z.number().int().nonnegative(),
-  })
-  .strict();
-
-export type SubagentGitProjectPatchArtifact = z.infer<typeof SubagentGitProjectPatchArtifactSchema>;
-export type SubagentGitPatchArtifact = z.infer<typeof SubagentGitPatchArtifactSchema>;
-
-const TaskAwaitToolArtifactsSchema = z
-  .object({
-    gitFormatPatch: SubagentGitPatchArtifactSchema.optional(),
-    attachFiles: TaskAttachFileArtifactsSchema.optional(),
-  })
-  .strict();
-
 /**
  * Appended to completed task/workflow results so the model knows the report is durable
  * and can be re-fetched by ID after context compaction instead of re-running the work.
@@ -1080,7 +1049,7 @@ export const TaskAwaitToolCompletedResultSchema = z
     elapsed_ms: z.number().optional(),
     exitCode: z.number().optional(),
     note: z.string().optional(),
-    artifacts: TaskAwaitToolArtifactsSchema.optional(),
+    artifacts: TaskResultArtifactsSchema.optional(),
   })
   .strict();
 
