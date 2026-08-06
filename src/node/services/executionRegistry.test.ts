@@ -1,9 +1,10 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
+import type { ExecutionHandle } from "@/common/types/execution";
 import type { Workspace } from "@/common/types/project";
 import { Config } from "@/node/config";
 import { ExecutionRegistry } from "@/node/services/executionRegistry";
@@ -15,6 +16,25 @@ import { upsertSubagentReportArtifact } from "@/node/services/subagentReportArti
 
 const OWNER = "owner";
 const CREATED_AT = "2026-08-06T00:00:00.000Z";
+
+function canonicalHandle(overrides: Partial<ExecutionHandle> = {}): ExecutionHandle {
+  return {
+    version: 1,
+    executionId: "exe_canonical",
+    aliases: ["canonical-workspace"],
+    ownerSessionId: OWNER,
+    requesterWorkspaceId: OWNER,
+    target: { kind: "workspace", workspaceId: "canonical-workspace", origin: "created" },
+    launchPolicy: { kind: "agent_task", agentId: "exec", prompt: "Implement" },
+    completionPolicy: { kind: "final_assistant_message" },
+    retentionPolicy: { kind: "delete_workspace_on_completion" },
+    attentionPolicy: "blocking_until_terminal",
+    status: "starting",
+    createdAt: CREATED_AT,
+    updatedAt: CREATED_AT,
+    ...overrides,
+  };
+}
 
 async function addAgentTask(
   config: Config,
@@ -36,6 +56,142 @@ async function addAgentTask(
     ...(taskStatus === "reported" ? { reportedAt: "2026-08-06T00:00:05.000Z" } : {}),
   });
 }
+
+describe("ExecutionRegistry canonical lifecycle", () => {
+  let rootDir: string;
+  let config: Config;
+  let store: ExecutionStore;
+  let registry: ExecutionRegistry;
+
+  beforeEach(async () => {
+    rootDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-execution-registry-"));
+    config = new Config(rootDir);
+    store = new ExecutionStore(config);
+    registry = new ExecutionRegistry(config, { executionStore: store });
+  });
+
+  afterEach(async () => {
+    await fsPromises.rm(rootDir, { recursive: true, force: true });
+  });
+
+  test("snapshots active updates by alias and supports timeout and abort", async () => {
+    await registry.upsert(canonicalHandle());
+    const running = canonicalHandle({
+      status: "running",
+      phase: "awaiting_report",
+      startedAt: "2026-08-06T00:00:01.000Z",
+      updatedAt: "2026-08-06T00:00:01.000Z",
+    });
+    await registry.upsert(running);
+
+    expect(await registry.snapshot(OWNER, "canonical-workspace")).toEqual(running);
+    expect(await registry.waitForTerminal(OWNER, "canonical-workspace", { timeoutMs: 0 })).toEqual({
+      kind: "timeout",
+      snapshot: running,
+    });
+
+    const abortController = new AbortController();
+    abortController.abort();
+    expect(
+      await registry.waitForTerminal(OWNER, "exe_canonical", {
+        abortSignal: abortController.signal,
+      })
+    ).toEqual({ kind: "aborted", snapshot: running });
+    expect(await registry.waitForTerminal(OWNER, "exe_missing", { timeoutMs: 0 })).toEqual({
+      kind: "not_found",
+    });
+  });
+
+  test("persists terminal results before resolving all canonical waiters", async () => {
+    await registry.upsert(canonicalHandle({ status: "running", startedAt: CREATED_AT }));
+
+    let releaseWrite: (() => void) | undefined;
+    const writeGate = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    let terminalWriteStarted: (() => void) | undefined;
+    const terminalWriteStart = new Promise<void>((resolve) => {
+      terminalWriteStarted = resolve;
+    });
+    const originalUpsert = store.upsert.bind(store);
+    spyOn(store, "upsert").mockImplementation(async (handle) => {
+      if (handle.status === "completed") {
+        terminalWriteStarted?.();
+        await writeGate;
+      }
+      await originalUpsert(handle);
+    });
+
+    const waiterById = registry.waitForTerminal(OWNER, "exe_canonical");
+    const waiterByAlias = registry.waitForTerminal(OWNER, "canonical-workspace");
+    const settling = registry.settle(
+      OWNER,
+      "canonical-workspace",
+      { kind: "completed", reportMarkdown: "Done" },
+      { terminalAt: "2026-08-06T00:00:02.000Z" }
+    );
+    await terminalWriteStart;
+
+    let waiterResolved = false;
+    void waiterById.then(() => {
+      waiterResolved = true;
+    });
+    await Promise.resolve();
+    expect(waiterResolved).toBe(false);
+    expect(await new ExecutionStore(config).get(OWNER, "exe_canonical")).toMatchObject({
+      status: "running",
+    });
+
+    releaseWrite?.();
+    const [settled, byId, byAlias] = await Promise.all([settling, waiterById, waiterByAlias]);
+    if (settled == null) throw new Error("Expected canonical execution to settle");
+    expect(settled).toMatchObject({
+      status: "completed",
+      result: { kind: "completed", reportMarkdown: "Done" },
+      terminalAt: "2026-08-06T00:00:02.000Z",
+    });
+    expect(byId).toEqual({ kind: "terminal", handle: settled });
+    expect(byAlias).toEqual({ kind: "terminal", handle: settled });
+    expect(await new ExecutionStore(config).get(OWNER, "exe_canonical")).toEqual(settled);
+  });
+
+  test("keeps terminal settlement immutable and returns it after restart", async () => {
+    await registry.upsert(canonicalHandle({ status: "running", startedAt: CREATED_AT }));
+    const completed = await registry.settle(
+      OWNER,
+      "exe_canonical",
+      { kind: "completed", reportMarkdown: "First" },
+      { terminalAt: "2026-08-06T00:00:02.000Z" }
+    );
+    if (completed == null) throw new Error("Expected canonical execution to settle");
+
+    expect(
+      await registry.settle(
+        OWNER,
+        "canonical-workspace",
+        { kind: "error", error: "Late failure" },
+        { terminalAt: "2026-08-06T00:00:03.000Z" }
+      )
+    ).toEqual(completed);
+    expect(
+      await registry.upsert(
+        canonicalHandle({
+          status: "running",
+          updatedAt: "2026-08-06T00:00:04.000Z",
+          startedAt: CREATED_AT,
+        })
+      )
+    ).toEqual(completed);
+
+    const restarted = new ExecutionRegistry(config);
+    expect(await restarted.waitForTerminal(OWNER, "canonical-workspace", { timeoutMs: 0 })).toEqual(
+      {
+        kind: "terminal",
+        handle: completed,
+      }
+    );
+  });
+});
 
 describe("ExecutionRegistry legacy adapters", () => {
   let rootDir: string;
