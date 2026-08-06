@@ -9354,7 +9354,7 @@ describe("TaskService", () => {
 
     // Simulate a foreground await from the parent task workspace. This should allow the queued child
     // to start despite maxParallelAgentTasks=1, avoiding a scheduler deadlock.
-    const waiter = taskService.waitForAgentReport(childTask.data.taskId, {
+    const waiter = taskService.waitForAgentReport(childTask.data.workspaceId, {
       timeoutMs: 10_000,
       requestingWorkspaceId: parentTask.data.workspaceId,
     });

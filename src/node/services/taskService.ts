@@ -7635,10 +7635,10 @@ export class TaskService {
       }
     }
 
-    const canonicalEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
-    const canonicalExecution =
-      scopedCanonicalExecution ??
-      (await this.getCanonicalAgentExecutionForWorkspace(taskId, canonicalEntry));
+    // Keep workspace-ID callers on the legacy waiter path. This avoids introducing an async
+    // registry lookup before legacy foreground waiters register, while opaque execution IDs use
+    // the canonical result resolved above.
+    const canonicalExecution = scopedCanonicalExecution;
     if (canonicalExecution?.status === "completed") {
       return this.reportFromCanonicalExecution(canonicalExecution);
     }
