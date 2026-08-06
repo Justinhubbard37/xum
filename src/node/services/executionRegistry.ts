@@ -135,6 +135,22 @@ export class ExecutionRegistry {
   }
 
   /**
+   * Replace canonical state from a restart-durable compatibility shadow.
+   *
+   * Normal lifecycle writes remain first-terminal-wins through `upsert`/`settle`. Reconciliation
+   * is deliberately stronger because the workspace-turn shadow can prove that a stale terminal
+   * projection was revived or repaired after its child workspace self-healed.
+   */
+  async overwriteForReconciliation(handle: ExecutionHandle): Promise<ExecutionHandle> {
+    const key = this.executionKey(handle.ownerSessionId, handle.executionId);
+    return await this.settlementLocks.withLock(key, async () => {
+      await this.executionStore.upsert(handle);
+      if (isTerminalExecution(handle)) this.resolveTerminalWaiters(key, handle);
+      return handle;
+    });
+  }
+
+  /**
    * Atomically persist the first terminal result for a canonical execution. Later settlements are
    * idempotent and return the immutable persisted terminal handle.
    */

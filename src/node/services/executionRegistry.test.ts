@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
@@ -190,6 +191,44 @@ describe("ExecutionRegistry canonical lifecycle", () => {
         handle: completed,
       }
     );
+  });
+
+  test("reconciliation can replace a stale terminal projection without weakening normal settlement", async () => {
+    await registry.upsert(canonicalHandle({ status: "running", startedAt: CREATED_AT }));
+    const staleTerminal = await registry.settle(
+      OWNER,
+      "exe_canonical",
+      { kind: "interrupted", message: "Restart assumed the turn was stale" },
+      { terminalAt: "2026-08-06T00:00:02.000Z" }
+    );
+    assert(staleTerminal != null);
+
+    const revived = canonicalHandle({
+      status: "running",
+      startedAt: CREATED_AT,
+      updatedAt: "2026-08-06T00:00:03.000Z",
+    });
+    expect(await registry.overwriteForReconciliation(revived)).toEqual(revived);
+    expect(await registry.get(OWNER, "exe_canonical")).toEqual(revived);
+
+    const repaired = await registry.settle(
+      OWNER,
+      "exe_canonical",
+      { kind: "completed", reportMarkdown: "Recovered completion" },
+      { terminalAt: "2026-08-06T00:00:04.000Z" }
+    );
+    expect(repaired).toMatchObject({
+      status: "completed",
+      result: { kind: "completed", reportMarkdown: "Recovered completion" },
+    });
+    expect(
+      await registry.settle(
+        OWNER,
+        "exe_canonical",
+        { kind: "error", error: "Late failure" },
+        { terminalAt: "2026-08-06T00:00:05.000Z" }
+      )
+    ).toEqual(repaired);
   });
 });
 

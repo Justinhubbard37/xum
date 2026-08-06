@@ -6395,6 +6395,103 @@ describe("TaskService", () => {
     expect(snapshot?.terminalAttentionNotifiedAt).toBeDefined();
   });
 
+  test("initialize repairs canonical workspace-turn projections from execution-backed shadows", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const store = new TaskHandleStore(config);
+    await store.upsertWorkspaceTurn({
+      kind: "workspace_turn",
+      executionId: "exe_reconciled_turn",
+      handleId: "wst_reconciled_turn",
+      ownerWorkspaceId: parentId,
+      workspaceId: "childworkspace",
+      turnId: "turn-shadow",
+      status: "completed",
+      createdAt: "2026-06-19T00:00:00.000Z",
+      updatedAt: "2026-06-19T00:00:03.000Z",
+      createdWorkspace: true,
+      disposableWorkspace: false,
+      title: "Shadow title",
+      prompt: "Shadow prompt",
+      reportMarkdown: "Recovered canonical report",
+      finalMessageRef: { messageId: "message-recovered", partCount: 1 },
+      terminalAttentionNotifiedAt: "2026-06-19T00:00:04.000Z",
+    });
+    await store.upsertWorkspaceTurn({
+      kind: "workspace_turn",
+      handleId: "wst_legacy_unchanged",
+      ownerWorkspaceId: parentId,
+      workspaceId: "legacyworkspace",
+      turnId: "legacy-turn",
+      status: "completed",
+      createdAt: "2026-06-19T00:00:00.000Z",
+      updatedAt: "2026-06-19T00:00:01.000Z",
+      createdWorkspace: false,
+      disposableWorkspace: false,
+      reportMarkdown: "Legacy report",
+    });
+    await new ExecutionStore(config).upsert({
+      version: 1,
+      executionId: "exe_reconciled_turn",
+      aliases: ["custom-alias", "wst_reconciled_turn"],
+      ownerSessionId: parentId,
+      requesterWorkspaceId: "original-requester",
+      target: { kind: "workspace", workspaceId: "original-target", origin: "existing" },
+      launchPolicy: {
+        kind: "workspace_turn",
+        turnId: "canonical-turn",
+        title: "Canonical title",
+        prompt: "Canonical prompt",
+      },
+      completionPolicy: { kind: "final_assistant_message" },
+      retentionPolicy: { kind: "delete_workspace_on_completion" },
+      attentionPolicy: "notify_on_terminal",
+      status: "error",
+      result: { kind: "error", error: "Stale canonical result" },
+      createdAt: "2026-06-18T00:00:00.000Z",
+      updatedAt: "2026-06-18T00:00:01.000Z",
+      terminalAt: "2026-06-18T00:00:01.000Z",
+    });
+
+    const { taskService } = createTaskServiceHarness(config);
+    await taskService.initialize();
+
+    expect(await new ExecutionStore(config).get(parentId, "exe_reconciled_turn")).toEqual({
+      version: 1,
+      executionId: "exe_reconciled_turn",
+      aliases: ["custom-alias", "wst_reconciled_turn"],
+      ownerSessionId: parentId,
+      requesterWorkspaceId: "original-requester",
+      target: { kind: "workspace", workspaceId: "original-target", origin: "existing" },
+      launchPolicy: {
+        kind: "workspace_turn",
+        turnId: "canonical-turn",
+        title: "Canonical title",
+        prompt: "Canonical prompt",
+      },
+      completionPolicy: { kind: "final_assistant_message" },
+      retentionPolicy: { kind: "delete_workspace_on_completion" },
+      attentionPolicy: "notify_on_terminal",
+      status: "completed",
+      result: {
+        kind: "completed",
+        reportMarkdown: "Recovered canonical report",
+        finalMessageRef: { messageId: "message-recovered", partCount: 1 },
+      },
+      createdAt: "2026-06-18T00:00:00.000Z",
+      updatedAt: "2026-06-19T00:00:03.000Z",
+      terminalAt: "2026-06-19T00:00:03.000Z",
+      terminalAttentionNotifiedAt: "2026-06-19T00:00:04.000Z",
+    });
+    const legacyShadow = await store.getWorkspaceTurn(parentId, "wst_legacy_unchanged");
+    expect(legacyShadow).toMatchObject({
+      status: "completed",
+      reportMarkdown: "Legacy report",
+    });
+    expect(legacyShadow?.executionId).toBeUndefined();
+    expect(await new ExecutionStore(config).list(parentId)).toHaveLength(1);
+  });
+
   test("initialize defers terminal wake-up while blocking task-owned work is active", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
@@ -8586,6 +8683,63 @@ describe("TaskService", () => {
     expect(report.reportMarkdown).toBe("Done");
   });
 
+  test("workspace-turn mirror failures are repairable while terminal exposure stays durable", async () => {
+    const { config, parentId, taskService } = await startWorkspaceTurnForTest();
+    const shadow = await taskService.getWorkspaceTurnSnapshot(parentId, "wst_handle");
+    assert(shadow?.executionId, "workspace turn must have a canonical execution ID");
+    const internal = taskService as unknown as {
+      executionRegistry: ExecutionRegistry;
+      persistWorkspaceTurnRecord: (record: NonNullable<typeof shadow>) => Promise<void>;
+      settleWorkspaceTurn: (params: unknown) => Promise<void>;
+      settleWorkspaceTurnWaiters: (handleId: string, settlement: unknown) => boolean;
+    };
+    const canonicalBefore = await new ExecutionStore(config).get(parentId, shadow.executionId);
+    assert(canonicalBefore, "canonical execution must exist");
+
+    const mirror = spyOn(internal.executionRegistry, "overwriteForReconciliation");
+    mirror.mockRejectedValueOnce(new Error("active mirror unavailable"));
+    const activeUpdate = { ...shadow, updatedAt: "2026-06-19T00:00:01.000Z" };
+    await internal.persistWorkspaceTurnRecord(activeUpdate);
+    expect(await taskService.getWorkspaceTurnSnapshot(parentId, "wst_handle")).toMatchObject({
+      status: "running",
+      updatedAt: activeUpdate.updatedAt,
+    });
+    expect(await new ExecutionStore(config).get(parentId, shadow.executionId)).toEqual(
+      canonicalBefore
+    );
+
+    const waiterSettlement = spyOn(internal, "settleWorkspaceTurnWaiters");
+    mirror.mockRejectedValueOnce(new Error("terminal mirror unavailable"));
+    const terminal = {
+      ...activeUpdate,
+      status: "completed" as const,
+      updatedAt: "2026-06-19T00:00:02.000Z",
+      reportMarkdown: "Durable shadow result",
+    };
+    await expect(
+      internal.settleWorkspaceTurn({
+        record: activeUpdate,
+        next: terminal,
+        waiterSettlement: {
+          status: "completed",
+          result: {
+            taskId: terminal.handleId,
+            workspaceId: terminal.workspaceId,
+            reportMarkdown: terminal.reportMarkdown,
+          },
+        },
+      })
+    ).rejects.toThrow("terminal mirror unavailable");
+    expect(waiterSettlement).not.toHaveBeenCalled();
+    expect(await taskService.getWorkspaceTurnSnapshot(parentId, "wst_handle")).toMatchObject({
+      status: "completed",
+      reportMarkdown: "Durable shadow result",
+    });
+    expect(await new ExecutionStore(config).get(parentId, shadow.executionId)).toEqual(
+      canonicalBefore
+    );
+  });
+
   test("workspace-turn terminal settlements do not overwrite each other", async () => {
     const completed = await startWorkspaceTurnForTest();
     const staleRunningRecord = await completed.taskService.getWorkspaceTurnSnapshot(
@@ -8773,6 +8927,23 @@ describe("TaskService", () => {
     expect(await fsPromises.readFile(completedArtifact?.path ?? "")).toEqual(
       Buffer.from("%PDF-disposable")
     );
+    assert(completedSnapshot?.executionId, "completed shadow must retain canonical execution ID");
+    expect(
+      await new ExecutionStore(completed.config).get(
+        completed.parentId,
+        completedSnapshot.executionId
+      )
+    ).toMatchObject({
+      aliases: ["wst_handle"],
+      status: "completed",
+      terminalAt: completedSnapshot.updatedAt,
+      result: {
+        kind: "completed",
+        reportMarkdown: "Done",
+        finalMessageRef: { messageId: "msg_completed" },
+        artifacts: { attachFiles: [completedArtifact] },
+      },
+    });
 
     const errorRemove = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
     const failed = await startWorkspaceTurnForTest({ disposable: true, remove: errorRemove });
@@ -8788,6 +8959,17 @@ describe("TaskService", () => {
       errorType: "authentication",
     });
     expect(errorRemove).toHaveBeenCalledWith("childworkspace", true);
+    const failedShadow = await failed.taskService.getWorkspaceTurnSnapshot(
+      failed.parentId,
+      "wst_handle"
+    );
+    assert(failedShadow?.executionId, "error shadow must retain canonical execution ID");
+    expect(
+      await new ExecutionStore(failed.config).get(failed.parentId, failedShadow.executionId)
+    ).toMatchObject({
+      status: "error",
+      result: { kind: "error", error: "Provider failed" },
+    });
 
     const interruptedRemove = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
     const interrupted = await startWorkspaceTurnForTest({
@@ -8801,6 +8983,20 @@ describe("TaskService", () => {
     );
     expect(interruptResult.success).toBe(true);
     expect(interruptedRemove).toHaveBeenCalledWith("childworkspace", true);
+    const interruptedShadow = await interrupted.taskService.getWorkspaceTurnSnapshot(
+      interrupted.parentId,
+      "wst_handle"
+    );
+    assert(interruptedShadow?.executionId, "interrupted shadow must retain canonical execution ID");
+    expect(
+      await new ExecutionStore(interrupted.config).get(
+        interrupted.parentId,
+        interruptedShadow.executionId
+      )
+    ).toMatchObject({
+      status: "interrupted",
+      result: { kind: "interrupted" },
+    });
   });
 
   test("enforces maxTaskNestingDepth", async () => {
