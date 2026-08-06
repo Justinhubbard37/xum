@@ -350,6 +350,98 @@ export function buildTaskToolDescription(runtimeMode: RuntimeMode | undefined): 
   );
 }
 
+const ProjectChatRuntimeCoderConfigSchema = z
+  .object({
+    workspaceName: z.string().nullish(),
+    template: z.string().nullish(),
+    templateOrg: z.string().nullish(),
+    preset: z.string().nullish(),
+    existingWorkspace: z.boolean().nullish(),
+  })
+  .strict()
+  .transform((value) => ({
+    ...(value.workspaceName != null ? { workspaceName: value.workspaceName } : {}),
+    ...(value.template != null ? { template: value.template } : {}),
+    ...(value.templateOrg != null ? { templateOrg: value.templateOrg } : {}),
+    ...(value.preset != null ? { preset: value.preset } : {}),
+    ...(value.existingWorkspace != null ? { existingWorkspace: value.existingWorkspace } : {}),
+  }));
+
+// Tool inputs need nullish nested fields because strict-schema providers represent omitted object
+// properties as null. Normalize those nulls away before passing the shared RuntimeConfig to services.
+const ProjectChatRuntimeConfigSchema = z.union([
+  z
+    .object({
+      type: z.literal("local"),
+      srcBaseDir: z.string().nullish(),
+      bgOutputDir: z.string().nullish(),
+    })
+    .strict()
+    .transform((value) => ({
+      type: "local" as const,
+      ...(value.srcBaseDir != null ? { srcBaseDir: value.srcBaseDir } : {}),
+      ...(value.bgOutputDir != null ? { bgOutputDir: value.bgOutputDir } : {}),
+    })),
+  z
+    .object({
+      type: z.literal("worktree"),
+      srcBaseDir: z.string(),
+      bgOutputDir: z.string().nullish(),
+    })
+    .strict()
+    .transform((value) => ({
+      type: "worktree" as const,
+      srcBaseDir: value.srcBaseDir,
+      ...(value.bgOutputDir != null ? { bgOutputDir: value.bgOutputDir } : {}),
+    })),
+  z
+    .object({
+      type: z.literal("ssh"),
+      host: z.string(),
+      srcBaseDir: z.string(),
+      bgOutputDir: z.string().nullish(),
+      identityFile: z.string().nullish(),
+      port: z.number().nullish(),
+      coder: ProjectChatRuntimeCoderConfigSchema.nullish(),
+    })
+    .strict()
+    .transform((value) => ({
+      type: "ssh" as const,
+      host: value.host,
+      srcBaseDir: value.srcBaseDir,
+      ...(value.bgOutputDir != null ? { bgOutputDir: value.bgOutputDir } : {}),
+      ...(value.identityFile != null ? { identityFile: value.identityFile } : {}),
+      ...(value.port != null ? { port: value.port } : {}),
+      ...(value.coder != null ? { coder: value.coder } : {}),
+    })),
+  z
+    .object({
+      type: z.literal("docker"),
+      image: z.string(),
+      containerName: z.string().nullish(),
+      shareCredentials: z.boolean().nullish(),
+    })
+    .strict()
+    .transform((value) => ({
+      type: "docker" as const,
+      image: value.image,
+      ...(value.containerName != null ? { containerName: value.containerName } : {}),
+      ...(value.shareCredentials != null ? { shareCredentials: value.shareCredentials } : {}),
+    })),
+  z
+    .object({
+      type: z.literal("devcontainer"),
+      configPath: z.string(),
+      shareCredentials: z.boolean().nullish(),
+    })
+    .strict()
+    .transform((value) => ({
+      type: "devcontainer" as const,
+      configPath: value.configPath,
+      ...(value.shareCredentials != null ? { shareCredentials: value.shareCredentials } : {}),
+    })),
+]);
+
 const WorkspaceTaskKindSchema = z.enum(["subagent", "workspace"]);
 const WorkspaceTaskModeSchema = z.enum(["new", "fork", "existing"]);
 const WorkspaceTaskTargetSchema = z
@@ -366,7 +458,7 @@ const WorkspaceTaskTargetSchema = z
       .describe(
         "Workspace display title. For mode=new, sets the created workspace title; for mode=existing, updates the target workspace title. This is separate from the task handle title."
       ),
-    runtimeConfig: RuntimeConfigSchema.nullish().describe(
+    runtimeConfig: ProjectChatRuntimeConfigSchema.nullish().describe(
       "Creation runtime configuration for mode=new. Omit to use the effective project/global default. Existing workspace follow-ups cannot change runtime configuration."
     ),
     queueDispatchMode: z

@@ -227,6 +227,58 @@ describe("task tool", () => {
     });
   });
 
+  it("strips strict-provider nulls before forwarding Project Chat runtime overrides", async () => {
+    using tempDir = new TestTempDir("test-task-tool-project-chat-runtime-nulls");
+    const createWorkspaceTurn = mock((_args: Parameters<TaskService["createWorkspaceTurn"]>[0]) =>
+      Ok({
+        taskId: "wst_project-chat-runtime-nulls",
+        kind: "workspace_turn" as const,
+        status: "running" as const,
+        workspaceId: "child-workspace",
+      })
+    );
+    const taskService = { createWorkspaceTurn } as unknown as TaskService;
+    const tool = createTaskTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "project-session_aaaaaaaaaa" }),
+      projectChat: true,
+      taskService,
+    });
+
+    await Promise.resolve(
+      tool.execute!(
+        {
+          prompt: "implement",
+          title: "Task handle",
+          workspace: {
+            mode: "new",
+            runtimeConfig: {
+              type: "ssh",
+              host: "devbox",
+              srcBaseDir: "~/mux",
+              bgOutputDir: null,
+              identityFile: null,
+              port: null,
+              coder: null,
+            },
+          },
+        },
+        mockToolCallOptions
+      )
+    );
+
+    expect(createWorkspaceTurn.mock.calls[0]?.[0]).toMatchObject({
+      workspace: {
+        mode: "new",
+        runtimeConfig: { type: "ssh", host: "devbox", srcBaseDir: "~/mux" },
+      },
+    });
+    expect(createWorkspaceTurn.mock.calls[0]?.[0].workspace?.runtimeConfig).toEqual({
+      type: "ssh",
+      host: "devbox",
+      srcBaseDir: "~/mux",
+    });
+  });
+
   it("forwards grouped Project Chat AI overrides and returns resolved settings", async () => {
     using tempDir = new TestTempDir("test-task-tool-project-chat-ai");
     const createWorkspaceTurn = mock((_args: Parameters<TaskService["createWorkspaceTurn"]>[0]) =>

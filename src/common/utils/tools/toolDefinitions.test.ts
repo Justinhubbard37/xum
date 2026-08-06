@@ -219,6 +219,83 @@ describe("TOOL_DEFINITIONS", () => {
     }
   });
 
+  it("normalizes strict-provider nulls from nested Project Chat runtime fields", () => {
+    const cases = [
+      {
+        input: { type: "local", srcBaseDir: null, bgOutputDir: null },
+        expected: { type: "local" },
+      },
+      {
+        input: { type: "worktree", srcBaseDir: "/tmp/worktrees", bgOutputDir: null },
+        expected: { type: "worktree", srcBaseDir: "/tmp/worktrees" },
+      },
+      {
+        input: {
+          type: "ssh",
+          host: "devbox",
+          srcBaseDir: "~/mux",
+          bgOutputDir: null,
+          identityFile: null,
+          port: null,
+          coder: null,
+        },
+        expected: { type: "ssh", host: "devbox", srcBaseDir: "~/mux" },
+      },
+      {
+        input: {
+          type: "ssh",
+          host: "coder://",
+          srcBaseDir: "~/mux",
+          bgOutputDir: null,
+          identityFile: null,
+          port: null,
+          coder: {
+            workspaceName: null,
+            template: "ubuntu",
+            templateOrg: null,
+            preset: null,
+            existingWorkspace: false,
+          },
+        },
+        expected: {
+          type: "ssh",
+          host: "coder://",
+          srcBaseDir: "~/mux",
+          coder: { template: "ubuntu", existingWorkspace: false },
+        },
+      },
+      {
+        input: {
+          type: "docker",
+          image: "node:20",
+          containerName: null,
+          shareCredentials: null,
+        },
+        expected: { type: "docker", image: "node:20" },
+      },
+      {
+        input: {
+          type: "devcontainer",
+          configPath: ".devcontainer/devcontainer.json",
+          shareCredentials: null,
+        },
+        expected: { type: "devcontainer", configPath: ".devcontainer/devcontainer.json" },
+      },
+    ] as const;
+
+    for (const testCase of cases) {
+      const parsed = ProjectChatTaskToolArgsSchema.safeParse({
+        prompt: "Implement the change",
+        title: "Task handle",
+        workspace: { mode: "new", runtimeConfig: testCase.input },
+      });
+      expect(parsed.success).toBe(true);
+      if (parsed.success) {
+        expect(parsed.data.workspace?.runtimeConfig).toEqual(testCase.expected);
+      }
+    }
+  });
+
   it("rejects runtime configuration on existing Project Chat workspace turns", () => {
     const parsed = ProjectChatTaskToolArgsSchema.safeParse({
       prompt: "Continue the work",
