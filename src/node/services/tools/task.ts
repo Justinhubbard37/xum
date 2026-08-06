@@ -383,7 +383,10 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
   // enters LLM context.
   const runtimeMode = resolveRuntimeMode(config);
   const projectChat = config.projectChat === true;
-  const inputSchema: z.ZodType<z.infer<typeof TaskToolArgsSchema>> = projectChat
+  type ParsedTaskToolArgs = Omit<z.infer<typeof TaskToolArgsSchema>, "run_in_background"> & {
+    run_in_background: boolean | null;
+  };
+  const inputSchema: z.ZodType<ParsedTaskToolArgs> = projectChat
     ? ProjectChatTaskToolArgsSchema
     : buildTaskToolAgentArgsSchema({
         includeIsolation: runtimeModeSupportsSharedTaskWorkspace(runtimeMode),
@@ -428,6 +431,10 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
         workspace,
       } = validatedArgs;
 
+      // Strict providers represent omitted optional inputs as null. Project Chat stays
+      // non-blocking unless the caller explicitly requests foreground mode with false.
+      const runInBackground = projectChat ? (run_in_background ?? true) : run_in_background;
+
       // Explicit per-launch model/thinking overrides. Omitted by default so delegated work
       // inherits the parent's live settings unless the caller requests an override.
       const aiOverrides = parseTaskAiOverrides({ model, thinking });
@@ -453,7 +460,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
             : {}),
           ...(parentRuntimeAiSettings != null ? { parentRuntimeAiSettings } : {}),
           // Background launches are non-blocking with terminal wake-up; foreground/default block.
-          attentionPolicy: run_in_background ? "notify_on_terminal" : "blocking_until_terminal",
+          attentionPolicy: runInBackground ? "notify_on_terminal" : "blocking_until_terminal",
           workspace: {
             mode: workspace?.mode ?? "new",
             ...(workspace?.workspaceId != null ? { workspaceId: workspace.workspaceId } : {}),
@@ -476,7 +483,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
           handleKind: "workspace_turn" as const,
           note: buildBackgroundStartNote(1),
         };
-        if (run_in_background) {
+        if (runInBackground) {
           return parseToolResult(TaskToolResultSchema, pendingResult, "task");
         }
 
@@ -582,7 +589,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
           ...(sticky === true ? { sticky: true } : {}),
           ...(parentRuntimeAiSettings != null ? { parentRuntimeAiSettings } : {}),
           // Background launches are non-blocking with terminal wake-up; foreground/default block.
-          attentionPolicy: run_in_background ? "notify_on_terminal" : "blocking_until_terminal",
+          attentionPolicy: runInBackground ? "notify_on_terminal" : "blocking_until_terminal",
           bestOf:
             taskGroupId != null
               ? {
@@ -633,7 +640,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
         });
       }
 
-      if (run_in_background) {
+      if (runInBackground) {
         return parseToolResult(
           TaskToolResultSchema,
           buildPendingTaskResult({

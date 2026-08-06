@@ -156,7 +156,10 @@ describe("task tool", () => {
       schema.safeParse({ prompt: "implement", title: "Implementation", agentId: "exec" }).success
     ).toBe(false);
     const result: unknown = await Promise.resolve(
-      tool.execute!({ prompt: "implement", title: "Implementation" }, mockToolCallOptions)
+      tool.execute!(
+        { prompt: "implement", title: "Implementation", run_in_background: null },
+        mockToolCallOptions
+      )
     );
 
     expect(createWorkspaceTurn).toHaveBeenCalledTimes(1);

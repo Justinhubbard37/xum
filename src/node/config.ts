@@ -1000,10 +1000,20 @@ export class Config {
           configModified = true;
         }
 
-        // Imported/corrupted config can assign one valid session ID to multiple projects. Keep the
-        // first owner and give every duplicate a fresh ID before any chat lookup or recursive cleanup
-        // can mix project context/history or delete another project's session directory.
-        const claimedProjectChatSessionIds = new Set<string>();
+        // Imported/corrupted config can assign a Project Chat ID to an ordinary workspace or to
+        // multiple projects. Workspace IDs include parent-owned sub-project workspaces after the
+        // merge above; reserve all of them before repairing chats so history/store identities cannot
+        // alias and every generated replacement avoids an existing workspace.
+        const claimedSessionIds = new Set<string>();
+        for (const [projectPath, projectConfig] of projectsMap) {
+          for (const workspace of projectConfig.workspaces) {
+            const workspaceId =
+              typeof workspace.id === "string" && workspace.id.length > 0
+                ? workspace.id
+                : this.generateLegacyId(projectPath, workspace.path);
+            claimedSessionIds.add(workspaceId);
+          }
+        }
         for (const [projectPath, projectConfig] of projectsMap) {
           const parsedProjectChat = ProjectChatConfigSchema.safeParse(projectConfig.projectChat);
           if (!parsedProjectChat.success) {
@@ -1011,7 +1021,7 @@ export class Config {
           }
 
           let sessionId = parsedProjectChat.data.sessionId;
-          if (claimedProjectChatSessionIds.has(sessionId)) {
+          if (claimedSessionIds.has(sessionId)) {
             // Load migrations can be observed more than once before their queued write lands. Derive
             // the replacement deterministically so every read resolves this project to one identity.
             let collisionIndex = 0;
@@ -1023,13 +1033,13 @@ export class Config {
                 .slice(0, 10);
               sessionId = `${PROJECT_CHAT_SESSION_ID_PREFIX}${suffix}`;
               collisionIndex += 1;
-            } while (claimedProjectChatSessionIds.has(sessionId));
+            } while (claimedSessionIds.has(sessionId));
             projectConfig.projectChat = { ...parsedProjectChat.data, sessionId };
             configModified = true;
           } else {
             projectConfig.projectChat = parsedProjectChat.data;
           }
-          claimedProjectChatSessionIds.add(sessionId);
+          claimedSessionIds.add(sessionId);
         }
 
         const taskSettings = normalizeTaskSettings(parsed.taskSettings);

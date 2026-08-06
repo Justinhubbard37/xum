@@ -541,6 +541,7 @@ export const ProjectChatTaskToolArgsSchema = z
     title: z.string().min(1),
     run_in_background: z
       .boolean()
+      .nullish()
       .default(true)
       .describe(
         "Run in background by default so Project Chat remains available while the workspace turn continues. Set false only when the result is required before continuing."

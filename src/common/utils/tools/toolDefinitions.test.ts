@@ -131,6 +131,13 @@ describe("TOOL_DEFINITIONS", () => {
       expect(parsed.data.run_in_background).toBe(true);
     }
 
+    const strictProviderNull = schema.safeParse({
+      prompt: "Implement the change",
+      title: "Implementation",
+      run_in_background: null,
+    });
+    expect(strictProviderNull.success).toBe(true);
+
     for (const forbidden of [
       { agentId: "exec" },
       { subagent_type: "explore" },

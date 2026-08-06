@@ -1,3 +1,4 @@
+import * as crypto from "node:crypto";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -160,6 +161,99 @@ describe("Config", () => {
       expect(restarted.projects.get(firstProjectPath)?.projectChat?.sessionId).toBe(firstSessionId);
       expect(restarted.projects.get(secondProjectPath)?.projectChat?.sessionId).toBe(
         secondSessionId
+      );
+    });
+
+    it("regenerates Project Chat IDs that collide with parent-owned sub-project workspaces", async () => {
+      const parentProjectPath = path.join(tempDir, "project");
+      const subProjectPath = path.join(parentProjectPath, "packages", "web");
+      const collidingSessionId = "project-session_aaaaaaaaaa";
+      const legacyCollidingSessionId = "project-session_bbbbbbbbbb";
+      const firstReplacementId = `${PROJECT_CHAT_SESSION_ID_PREFIX}${crypto
+        .createHash("sha256")
+        .update([collidingSessionId, subProjectPath, "0"].join("\0"))
+        .digest("hex")
+        .slice(0, 10)}`;
+      fs.mkdirSync(subProjectPath, { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            [
+              parentProjectPath,
+              {
+                workspaces: [
+                  {
+                    path: path.join(parentProjectPath, "session_bbbbbbbbbb"),
+                  },
+                ],
+                projectChat: {
+                  version: 1,
+                  sessionId: legacyCollidingSessionId,
+                  createdAt: "2026-08-06T00:00:00.000Z",
+                  agentId: "orchestrator",
+                },
+              },
+            ],
+            [
+              subProjectPath,
+              {
+                parentProjectPath,
+                workspaces: [
+                  {
+                    id: collidingSessionId,
+                    path: path.join(parentProjectPath, "workspace-one"),
+                  },
+                  {
+                    id: firstReplacementId,
+                    path: path.join(parentProjectPath, "workspace-two"),
+                  },
+                ],
+                projectChat: {
+                  version: 1,
+                  sessionId: collidingSessionId,
+                  createdAt: "2026-08-06T00:00:00.000Z",
+                  agentId: "orchestrator",
+                },
+              },
+            ],
+          ],
+        })
+      );
+
+      const loaded = config.loadConfigOrDefault();
+      const parentProject = loaded.projects.get(parentProjectPath);
+      const explicitWorkspaceIds = new Set(
+        parentProject?.workspaces
+          .map((workspace) => workspace.id)
+          .filter((workspaceId): workspaceId is string => workspaceId != null)
+      );
+      const parentSessionId = parentProject?.projectChat?.sessionId;
+      const subProjectSessionId = loaded.projects.get(subProjectPath)?.projectChat?.sessionId;
+      const reservedWorkspaceIds = new Set([
+        legacyCollidingSessionId,
+        collidingSessionId,
+        firstReplacementId,
+      ]);
+      expect(explicitWorkspaceIds).toEqual(new Set([collidingSessionId, firstReplacementId]));
+      for (const repairedSessionId of [parentSessionId, subProjectSessionId]) {
+        expect(repairedSessionId != null && isProjectSessionId(repairedSessionId)).toBe(true);
+        expect(reservedWorkspaceIds.has(repairedSessionId ?? "")).toBe(false);
+        expect(config.getSessionDir(repairedSessionId ?? "")).toBe(
+          path.join(config.projectSessionsDir, repairedSessionId ?? "")
+        );
+      }
+      for (const workspaceId of reservedWorkspaceIds) {
+        expect(config.getSessionDir(workspaceId)).toBe(path.join(config.sessionsDir, workspaceId));
+      }
+
+      await flushConfigEdits();
+      const restarted = new Config(tempDir).loadConfigOrDefault();
+      expect(restarted.projects.get(parentProjectPath)?.projectChat?.sessionId).toBe(
+        parentSessionId
+      );
+      expect(restarted.projects.get(subProjectPath)?.projectChat?.sessionId).toBe(
+        subProjectSessionId
       );
     });
 
