@@ -340,11 +340,14 @@ function getProgressReportInterruption(part: unknown): ForegroundWaitInterruptio
 function applyAssistantProgressResponse(
   message: MuxMessage,
   awaitingResponse: Set<string>,
+  textResponseBlockedTaskIds: Set<string>,
   responded: Set<string>
 ): void {
   // Guidance in this turn must not make later prose look unambiguous for another sibling.
-  // Keep the candidates visible to text separate while still applying targeted guidance eagerly.
-  const textAttributionCandidates = new Set(awaitingResponse);
+  // Intervening user turns also make later prose ambiguous until a fresh child update arrives.
+  const textAttributionCandidates = new Set(
+    [...awaitingResponse].filter((taskId) => !textResponseBlockedTaskIds.has(taskId))
+  );
   for (const part of message.parts) {
     if (part.type === "text" && part.text.trim().length > 0) {
       if (textAttributionCandidates.size === 1) {
@@ -353,6 +356,7 @@ function applyAssistantProgressResponse(
           if (awaitingResponse.delete(taskId)) {
             responded.add(taskId);
           }
+          textResponseBlockedTaskIds.delete(taskId);
           textAttributionCandidates.delete(taskId);
         }
       }
@@ -361,6 +365,7 @@ function applyAssistantProgressResponse(
     const progressInterruption = getProgressReportInterruption(part);
     if (progressInterruption?.reason === "progress_report_received") {
       awaitingResponse.add(progressInterruption.sourceTaskId);
+      textResponseBlockedTaskIds.delete(progressInterruption.sourceTaskId);
       textAttributionCandidates.add(progressInterruption.sourceTaskId);
       responded.delete(progressInterruption.sourceTaskId);
       continue;
@@ -377,6 +382,7 @@ function applyAssistantProgressResponse(
       output.data.taskId === input.data.task_id &&
       awaitingResponse.delete(input.data.task_id)
     ) {
+      textResponseBlockedTaskIds.delete(input.data.task_id);
       responded.add(input.data.task_id);
     }
   }
@@ -5434,6 +5440,7 @@ export class TaskService {
 
     const visibleCompletedReports = new Set<string>();
     const awaitingResponse = new Set<string>();
+    const textResponseBlockedTaskIds = new Set<string>();
     const responded = new Set<string>();
     // The duplicate-ending decision only depends on the active context epoch. If compaction already
     // summarized an older progress turn, retain the terminal wake rather than scanning lifetime history.
@@ -5464,13 +5471,28 @@ export class TaskService {
           // terminal notifications happen to be in this drain. Otherwise the same plain-text turn
           // could be misattributed independently to several children as they finish.
           awaitingResponse.add(report.taskId);
+          textResponseBlockedTaskIds.delete(report.taskId);
           responded.delete(report.taskId);
+        }
+        if (report != null) continue;
+      }
+
+      if (message.role === "user") {
+        // The next assistant prose answers this user turn, not an earlier child update. Keep the
+        // obligation for explicit same-child guidance, but do not infer acknowledgement from text.
+        for (const taskId of awaitingResponse) {
+          textResponseBlockedTaskIds.add(taskId);
         }
         continue;
       }
 
       if (message.role === "assistant" && message.metadata?.partial !== true) {
-        applyAssistantProgressResponse(message, awaitingResponse, responded);
+        applyAssistantProgressResponse(
+          message,
+          awaitingResponse,
+          textResponseBlockedTaskIds,
+          responded
+        );
       }
     }
     return new Set([...responded].filter((taskId) => visibleCompletedReports.has(taskId)));

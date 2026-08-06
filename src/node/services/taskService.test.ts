@@ -2857,6 +2857,108 @@ describe("TaskService", () => {
     }
   });
 
+  test("intervening user turns block text attribution but preserve explicit guidance", async () => {
+    const config = await createTestConfig(rootDir);
+    const { historyService, taskService } = createTaskServiceHarness(config);
+    const internal = taskService as unknown as {
+      findProgressRespondedTaskIds: (
+        ownerWorkspaceId: string,
+        candidateTaskIds: ReadonlySet<string>
+      ) => Promise<Set<string>>;
+    };
+    const childId = "intervening-user-progress-child";
+    const interruption = {
+      reason: "progress_report_received" as const,
+      sourceTaskId: childId,
+      report: {
+        agentType: "explore",
+        title: "Progress",
+        reportMarkdown: "Found the relevant code path.",
+      },
+    };
+
+    for (const scenario of [
+      { name: "user-answer-text", guidance: false, expected: false },
+      { name: "user-answer-guidance", guidance: true, expected: true },
+    ]) {
+      const parentId = `parent-${scenario.name}`;
+      await historyService.appendToHistory(
+        parentId,
+        createMuxMessage(`${scenario.name}-progress`, "assistant", "", { timestamp: Date.now() }, [
+          {
+            type: "dynamic-tool",
+            toolCallId: `${scenario.name}-task`,
+            toolName: "task",
+            state: "output-available",
+            input: {
+              subagent_type: "explore",
+              prompt: "Trace the path.",
+              title: "Trace",
+              run_in_background: false,
+            },
+            output: {
+              status: "running",
+              taskId: childId,
+              interruption,
+              note: "Foreground wait paused because a queued message needs attention.",
+            },
+          },
+        ])
+      );
+      await historyService.appendToHistory(
+        parentId,
+        createMuxMessage(
+          `${scenario.name}-user`,
+          "user",
+          "Also check the unrelated build failure.",
+          {
+            timestamp: Date.now(),
+          }
+        )
+      );
+      const responseParts: MuxMessage["parts"] = scenario.guidance
+        ? [
+            {
+              type: "dynamic-tool",
+              toolCallId: `${scenario.name}-guidance`,
+              toolName: "task_send_message",
+              state: "output-available",
+              input: { task_id: childId, message: "Good finding; continue." },
+              output: { status: "accepted", taskId: childId },
+            },
+          ]
+        : [];
+      await historyService.appendToHistory(
+        parentId,
+        createMuxMessage(
+          `${scenario.name}-response`,
+          "assistant",
+          "I addressed the build question.",
+          { timestamp: Date.now() },
+          responseParts
+        )
+      );
+      await historyService.appendToHistory(
+        parentId,
+        createMuxMessage(
+          `${scenario.name}-completed`,
+          "user",
+          formatSubagentReportEnvelope({
+            taskId: childId,
+            agentType: "explore",
+            status: "completed",
+            title: "Final report",
+            reportMarkdown: "Investigation complete.",
+          }),
+          { timestamp: Date.now(), synthetic: true, uiVisible: true }
+        )
+      );
+
+      const responded = await internal.findProgressRespondedTaskIds(parentId, new Set([childId]));
+      expect(responded.has(childId), scenario.name).toBe(scenario.expected);
+    }
+  });
+
   test("plain text remains ambiguous when a non-candidate sibling also awaits a response", async () => {
     const config = await createTestConfig(rootDir);
     const { historyService, taskService } = createTaskServiceHarness(config);
