@@ -3453,11 +3453,18 @@ export class TaskService {
     if (parentEntry?.workspace.kind === "scratch") {
       return Err("Task.createWorkspaceTurn: scratch workspace turns are not supported yet");
     }
-    const taskProjectConfig = cfg.projects.get(stripTrailingSlashes(parentMeta.projectPath));
+    // Sub-project workspaces and trust live in the top-level parent's storage bucket. Resolve the
+    // same creation scope used by WorkspaceService instead of treating the Project Chat path as the
+    // trust owner (sub-project configs normally leave `trusted` unset).
+    const projectChatWorkspaceScope = projectChatOwner
+      ? this.resolveProjectChatWorkspaceScope(ownerWorkspaceId, cfg)
+      : null;
+    const taskProjectConfig =
+      projectChatWorkspaceScope?.project ??
+      cfg.projects.get(stripTrailingSlashes(parentMeta.projectPath));
     if (
       projectChatOwner != null &&
-      (parentMeta.projectPath === SCRATCH_PROJECT_CONFIG_KEY ||
-        taskProjectConfig?.projectKind === "system")
+      (parentMeta.projectPath === SCRATCH_PROJECT_CONFIG_KEY || projectChatWorkspaceScope == null)
     ) {
       return Err("Task.createWorkspaceTurn: hidden/system Project Chat owners are not supported");
     }

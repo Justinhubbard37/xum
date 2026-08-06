@@ -1362,7 +1362,6 @@ describe("TaskService", () => {
           subProjectPath,
           {
             parentProjectPath,
-            trusted: true,
             workspaces: [
               projectWorkspace(parentProjectPath, "subproject", "subprojectworkspace", {
                 runtimeConfig: { type: "local" },
@@ -1374,16 +1373,43 @@ describe("TaskService", () => {
       { taskSettings: testTaskSettings() }
     );
     const projectChat = await config.ensureProjectChat(subProjectPath);
-    stubStableIds(config, ["existinghandle", "existingturn"]);
+    stubStableIds(config, ["newhandle", "newturn", "existinghandle", "existingturn"]);
+    const createWorkspace = mock(
+      (...args: unknown[]): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
+        expect(args[0]).toBe(subProjectPath);
+        return Promise.resolve(
+          Ok({
+            metadata: {
+              ...createWorkspaceTurnMetadata(parentProjectPath),
+              id: "createdsubproject",
+              name: "created-subproject",
+              subProjectPath,
+            },
+          })
+        );
+      }
+    );
     const sendMessage = mock(async (...args: unknown[]): Promise<Result<void>> => {
       const internal = args[3] as { onAccepted?: () => Promise<void> | void } | undefined;
       await internal?.onAccepted?.();
       return Ok(undefined);
     });
     const { taskService } = createTaskServiceHarness(config, {
-      workspaceService: createWorkspaceServiceMocks({ sendMessage }).workspaceService,
+      workspaceService: createWorkspaceServiceMocks({ create: createWorkspace, sendMessage })
+        .workspaceService,
     });
 
+    expect(
+      await taskService.createWorkspaceTurn({
+        ownerWorkspaceId: projectChat.sessionId,
+        prompt: "Create sub-project workspace",
+        title: "Sub-project implementation",
+        workspace: { mode: "new" },
+      })
+    ).toMatchObject({
+      success: true,
+      data: { workspaceId: "createdsubproject", status: "running" },
+    });
     expect(
       await taskService.createWorkspaceTurn({
         ownerWorkspaceId: projectChat.sessionId,
@@ -1403,7 +1429,10 @@ describe("TaskService", () => {
         workspace: { mode: "existing", workspaceId: "parentworkspace" },
       })
     ).toEqual(Err("Task.createWorkspaceTurn: invalid_scope for existing workspace"));
-    expect(sendMessage.mock.calls[0]?.[0]).toBe("subprojectworkspace");
+    expect(sendMessage.mock.calls.map((call) => call[0])).toEqual([
+      "createdsubproject",
+      "subprojectworkspace",
+    ]);
 
     const listed = await taskService.listProjectWorkspaces(projectChat.sessionId);
     expect(listed.success).toBe(true);
