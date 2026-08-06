@@ -3683,8 +3683,23 @@ export class WorkspaceService extends EventEmitter {
           sessionId: normalizedSessionId,
           error: interrupted.error,
         });
+        const fallbackStop = await this.aiService.stopStream(normalizedSessionId, {
+          abandonPartial: true,
+          abortReason: "user",
+        });
+        if (!fallbackStop.success) {
+          throw new Error(`Failed to stop Project Chat stream: ${fallbackStop.error}`);
+        }
       }
+
+      // interruptStream() only requests the abort. Wait until AgentSession has processed the
+      // forwarded stream-abort/stream-end event and finished its awaited history cleanup.
+      await session.waitForIdle();
     }
+    // Timing listeners run independently from AgentSession's async event handler and can otherwise
+    // recreate the directory after deletion even though the session itself is idle.
+    await this.sessionTimingService?.waitForIdle(normalizedSessionId);
+
     // Dispose before removing disk state so no retained session can recreate sidecars afterward.
     this.disposeSession(normalizedSessionId);
     await fsPromises.rm(this.config.getSessionDir(normalizedSessionId), {

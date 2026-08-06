@@ -390,7 +390,7 @@ describe("WorkspaceService Project Chat", () => {
     }
   });
 
-  test("interrupts and disposes the session before deleting Project Chat sidecars", async () => {
+  test("waits for Project Chat stream cleanup before disposing and deleting sidecars", async () => {
     const { config, historyService, cleanup } = await createTestHistoryService();
     const projectPath = path.join(config.rootDir, "project-chat-cleanup");
     await fsPromises.mkdir(projectPath, { recursive: true });
@@ -402,10 +402,30 @@ describe("WorkspaceService Project Chat", () => {
       const projectChat = await config.ensureProjectChat(projectPath);
       const sessionDir = config.getSessionDir(projectChat.sessionId);
       await fsPromises.writeFile(path.join(sessionDir, "sidecar.json"), "{}", "utf-8");
+
+      let releaseSessionIdle: (() => void) | undefined;
+      let signalSessionIdleWaitStarted: (() => void) | undefined;
+      const sessionIdleWaitStarted = new Promise<void>((resolve) => {
+        signalSessionIdleWaitStarted = resolve;
+      });
       const interruptStream = mock(() => Promise.resolve(Ok(undefined)));
+      const waitForIdle = mock(
+        () =>
+          new Promise<void>((resolve) => {
+            releaseSessionIdle = resolve;
+            signalSessionIdleWaitStarted?.();
+          })
+      );
       const dispose = mock(() => undefined);
-      const fakeSession = { interruptStream, dispose } as unknown as AgentSession;
-      const workspaceService = createWorkspaceServiceForTest({ config, historyService });
+      const timingWaitForIdle = mock(() => Promise.resolve());
+      const fakeSession = { interruptStream, waitForIdle, dispose } as unknown as AgentSession;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        sessionTimingService: {
+          waitForIdle: timingWaitForIdle,
+        } as unknown as WorkspaceServiceArgs[10],
+      });
       const sessions = (
         workspaceService as unknown as {
           sessions: Map<string, AgentSession>;
@@ -413,9 +433,18 @@ describe("WorkspaceService Project Chat", () => {
       ).sessions;
       sessions.set(projectChat.sessionId, fakeSession);
 
-      await workspaceService.cleanupProjectChatSession(projectChat.sessionId);
+      const cleanupPromise = workspaceService.cleanupProjectChatSession(projectChat.sessionId);
+      await sessionIdleWaitStarted;
 
       expect(interruptStream).toHaveBeenCalledWith({ abandonPartial: true });
+      expect(dispose).not.toHaveBeenCalled();
+      expect(timingWaitForIdle).not.toHaveBeenCalled();
+      await fsPromises.access(sessionDir);
+
+      releaseSessionIdle?.();
+      await cleanupPromise;
+
+      expect(timingWaitForIdle).toHaveBeenCalledWith(projectChat.sessionId);
       expect(dispose).toHaveBeenCalledTimes(1);
       expect(sessions.has(projectChat.sessionId)).toBe(false);
       expect(fsPromises.access(sessionDir)).rejects.toMatchObject({ code: "ENOENT" });

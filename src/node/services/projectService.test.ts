@@ -1928,13 +1928,20 @@ exit 1
       const sessionDir = config.getSessionDir(projectChat.sessionId);
       service.setWorkspaceService({
         remove: () => Promise.resolve(Ok(undefined)),
-        cleanupProjectChatSession: () => Promise.reject(new Error("interrupt failed")),
+        cleanupProjectChatSession: (sessionId) => {
+          expect(config.findProjectChatBySessionId(sessionId)).toBeNull();
+          expect(config.getSessionDir(sessionId)).toBe(sessionDir);
+          return Promise.reject(new Error("interrupt failed"));
+        },
       });
 
       const result = await service.remove(projectPath);
 
       expect(result.success).toBe(true);
       expect(config.loadConfigOrDefault().projects.has(projectPath)).toBe(false);
+      expect(config.getSessionDir(projectChat.sessionId)).toBe(
+        path.join(config.sessionsDir, projectChat.sessionId)
+      );
       expect(fs.access(sessionDir)).rejects.toMatchObject({ code: "ENOENT" });
     });
 

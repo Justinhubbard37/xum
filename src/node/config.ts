@@ -754,6 +754,8 @@ export class Config {
   private readonly providersFile: string;
   private readonly secretsFile: string;
   private readonly emitter = new EventEmitter();
+  /** Keeps captured Project Chat ownership routable while project config is being removed. */
+  private readonly retainedProjectSessionRoutes = new Map<string, number>();
   /** Serializes editConfig calls; see editConfig for why. */
   private editConfigQueue: Promise<void> = Promise.resolve();
   /** One-shot guard for the queued load-time migration persist; see loadConfigOrDefault. */
@@ -1136,8 +1138,11 @@ export class Config {
                   continue;
                 }
 
+                // Entries enumerated from sessionsDir are ordinary workspace sessions, even when a
+                // legacy workspace ID happens to resemble a Project Chat ID.
                 const usagePath = path.join(
-                  this.getSessionDir(sessionEntry.name),
+                  this.sessionsDir,
+                  sessionEntry.name,
                   "session-usage.json"
                 );
                 if (fs.existsSync(usagePath)) {
@@ -1816,19 +1821,53 @@ export class Config {
    * paths from getWorkspacePath() or getWorkspacePaths() instead.
    */
 
+  retainProjectSessionRouting(sessionId: string): { [Symbol.dispose](): void } {
+    if (!isProjectSessionId(sessionId)) {
+      throw new Error("Invalid Project Chat session ID");
+    }
+
+    this.retainedProjectSessionRoutes.set(
+      sessionId,
+      (this.retainedProjectSessionRoutes.get(sessionId) ?? 0) + 1
+    );
+    let disposed = false;
+    return {
+      [Symbol.dispose]: () => {
+        if (disposed) return;
+        disposed = true;
+        const nextCount = (this.retainedProjectSessionRoutes.get(sessionId) ?? 1) - 1;
+        if (nextCount === 0) {
+          this.retainedProjectSessionRoutes.delete(sessionId);
+        } else {
+          this.retainedProjectSessionRoutes.set(sessionId, nextCount);
+        }
+      },
+    };
+  }
+
   /**
    * Get the session directory for a workspace or Project Chat session.
    *
-   * The explicit prefix keeps project sessions backend-owned and lets all existing history,
-   * replay, queue, interrupt, and attention stores reuse this seam without relocating ordinary
-   * workspace data from ~/.mux/sessions.
+   * Project Chat ownership comes from persisted project metadata, not its ID prefix: legacy
+   * workspace IDs can also begin with `project-session_`. The strict path-segment check keeps a
+   * corrupt identifier from escaping either session root without reserving that prefix globally.
    */
   getSessionDir(sessionId: string): string {
-    if (sessionId.startsWith(PROJECT_CHAT_SESSION_ID_PREFIX) && !isProjectSessionId(sessionId)) {
-      throw new Error("Invalid Project Chat session ID");
+    if (
+      sessionId.length === 0 ||
+      sessionId === "." ||
+      sessionId === ".." ||
+      path.basename(sessionId) !== sessionId ||
+      sessionId.includes("\0")
+    ) {
+      throw new Error("Invalid session ID");
     }
+
+    const isConfiguredProjectSession =
+      this.retainedProjectSessionRoutes.has(sessionId) ||
+      (isProjectSessionId(sessionId) && this.findProjectChatBySessionId(sessionId) != null);
     return path.join(
-      isProjectSessionId(sessionId) ? this.projectSessionsDir : this.sessionsDir,
+      isConfiguredProjectSession ? this.projectSessionsDir : this.sessionsDir,
       sessionId
     );
   }

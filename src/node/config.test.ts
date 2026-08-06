@@ -71,6 +71,13 @@ describe("Config", () => {
       expect(config.getSessionDir("ordinary-workspace")).toBe(
         path.join(tempDir, "sessions", "ordinary-workspace")
       );
+      // Legacy IDs came from project/workspace basenames, so both prefix-shaped and fully
+      // Project-Chat-shaped values must remain ordinary unless project metadata claims them.
+      for (const legacyWorkspaceId of ["project-session_feature", "project-session_aaaaaaaaaa"]) {
+        expect(config.getSessionDir(legacyWorkspaceId)).toBe(
+          path.join(tempDir, "sessions", legacyWorkspaceId)
+        );
+      }
 
       const historyService = new HistoryService(config);
       const append = await historyService.appendToHistory(
@@ -163,9 +170,7 @@ describe("Config", () => {
 
       expect(isProjectSessionId("project-session_0123456789")).toBe(true);
       expect(isProjectSessionId(maliciousSessionId)).toBe(false);
-      expect(() => config.getSessionDir(maliciousSessionId)).toThrow(
-        "Invalid Project Chat session ID"
-      );
+      expect(() => config.getSessionDir(maliciousSessionId)).toThrow("Invalid session ID");
 
       await config.editConfig((cfg) => {
         cfg.projects.set(projectPath, {

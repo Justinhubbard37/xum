@@ -1081,6 +1081,9 @@ export class ProjectService {
   private async cleanupProjectChatSessions(sessionIds: readonly string[]): Promise<void> {
     // Never pass corrupt persisted IDs to recursive deletion: session IDs are directory names.
     for (const sessionId of new Set(sessionIds.filter(isProjectSessionId))) {
+      // The config entry is removed before cleanup, but in-flight AgentSession/history writes must
+      // keep resolving this captured ID to project-sessions until cleanup finishes.
+      using _projectSessionRoute = this.config.retainProjectSessionRouting(sessionId);
       try {
         if (this.workspaceService?.cleanupProjectChatSession) {
           await this.workspaceService.cleanupProjectChatSession(sessionId);
