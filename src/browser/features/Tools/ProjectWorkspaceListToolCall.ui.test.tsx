@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, setSystemTime, test } from "bun:test";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 import { useEffect, type ReactElement } from "react";
@@ -44,12 +44,14 @@ function renderWithProviders(
 
 describe("ProjectWorkspaceListToolCall", () => {
   beforeEach(() => {
+    setSystemTime(new Date("2026-08-06T04:00:00.000Z"));
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
   });
 
   afterEach(() => {
     cleanup();
+    setSystemTime();
     globalThis.window = undefined as unknown as Window & typeof globalThis;
     globalThis.document = undefined as unknown as Document;
   });
@@ -92,10 +94,18 @@ describe("ProjectWorkspaceListToolCall", () => {
               name: "feature-a",
               title: "Implement orchestration",
               archived: false,
+              updatedAt: "2026-08-06T03:00:00.000Z",
+              runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" },
+              execAiSettings: {
+                model: "openai:gpt-5.6-sol",
+                thinkingLevel: "high",
+                reasoningMode: "pro",
+              },
               workspaceTurn: {
                 taskId: "wst_active",
                 status: "running",
-                updatedAt: "2026-08-06T03:00:00.000Z",
+                prompt: "Continue the active implementation",
+                updatedAt: "2026-08-06T02:00:00.000Z",
               },
             },
             {
@@ -117,6 +127,10 @@ describe("ProjectWorkspaceListToolCall", () => {
 
     expect(view.getByText("Implement orchestration")).toBeTruthy();
     expect(view.getByText("Running")).toBeTruthy();
+    expect(view.getByText("worktree")).toBeTruthy();
+    expect(view.getByText("Exec: openai:gpt-5.6-sol · high · pro")).toBeTruthy();
+    expect(view.getByText("Continue the active implementation")).toBeTruthy();
+    expect(view.getByText("Updated 1 hour ago")).toBeTruthy();
     expect(view.getByText("Archived")).toBeTruthy();
     expect(view.getByText("Transcript only")).toBeTruthy();
 

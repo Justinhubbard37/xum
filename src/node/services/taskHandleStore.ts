@@ -6,7 +6,11 @@ import { z } from "zod";
 
 import type { Config } from "@/node/config";
 import type { CompletedMessagePart, StreamEndEvent } from "@/common/types/stream";
-import type { ParsedThinkingInput, ThinkingLevel } from "@/common/types/thinking";
+import type {
+  OpenAIReasoningMode,
+  ParsedThinkingInput,
+  ThinkingLevel,
+} from "@/common/types/thinking";
 import {
   BackgroundWorkAttentionPolicySchema,
   type BackgroundWorkAttentionPolicy,
@@ -46,6 +50,7 @@ export interface WorkspaceTurnTaskHandleRecord {
   prompt?: string;
   modelString?: string;
   thinkingLevel?: ParsedThinkingInput | ThinkingLevel;
+  reasoningMode?: OpenAIReasoningMode;
   messageId?: string;
   reportMarkdown?: string;
   finalMessageRef?: WorkspaceTurnFinalMessageRef;
@@ -85,6 +90,7 @@ const WorkspaceTurnTaskHandleRecordSchema = z
     prompt: z.string().optional(),
     modelString: z.string().optional(),
     thinkingLevel: z.unknown().optional(),
+    reasoningMode: z.enum(["standard", "pro"]).optional(),
     messageId: z.string().optional(),
     reportMarkdown: z.string().optional(),
     finalMessageRef: WorkspaceTurnFinalMessageRefSchema.optional(),

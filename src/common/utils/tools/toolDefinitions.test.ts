@@ -209,6 +209,39 @@ describe("TOOL_DEFINITIONS", () => {
     expect(parsed.success).toBe(false);
   });
 
+  it("accepts Project Chat AI overrides, strict-provider nulls, and rejects duplicates", () => {
+    const schema = ProjectChatTaskToolArgsSchema;
+    expect(
+      schema.safeParse({
+        prompt: "Implement the change",
+        title: "Implementation",
+        ai: {
+          model: "openai:gpt-5.6-sol",
+          thinking: "high",
+          reasoningMode: "pro",
+        },
+      }).success
+    ).toBe(true);
+    expect(
+      schema.safeParse({
+        prompt: "Implement the change",
+        title: "Implementation",
+        ai: { model: null, thinking: null, reasoningMode: null },
+        model: null,
+        thinking: null,
+        reasoningMode: null,
+      }).success
+    ).toBe(true);
+    expect(
+      schema.safeParse({
+        prompt: "Implement the change",
+        title: "Implementation",
+        model: "openai:gpt-5.6-sol",
+        ai: { model: "openai:gpt-5.6-sol" },
+      }).success
+    ).toBe(false);
+  });
+
   it("accepts strict-provider null for the ordinary task background default", () => {
     const parsed = TaskToolArgsSchema.safeParse({
       subagent_type: "explore",

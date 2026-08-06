@@ -225,6 +225,51 @@ describe("task tool", () => {
     });
   });
 
+  it("forwards grouped Project Chat AI overrides and returns resolved settings", async () => {
+    using tempDir = new TestTempDir("test-task-tool-project-chat-ai");
+    const createWorkspaceTurn = mock((_args: Parameters<TaskService["createWorkspaceTurn"]>[0]) =>
+      Ok({
+        taskId: "wst_project-chat-ai",
+        kind: "workspace_turn" as const,
+        status: "running" as const,
+        workspaceId: "child-workspace",
+        modelString: "openai:gpt-5.6-sol",
+        thinkingLevel: "high" as const,
+        reasoningMode: "pro" as const,
+      })
+    );
+    const taskService = { createWorkspaceTurn } as unknown as TaskService;
+    const taskTool = createTaskTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "project-session_aaaaaaaaaa" }),
+      projectChat: true,
+      taskService,
+    });
+
+    const result = await taskTool.execute!(
+      {
+        prompt: "implement",
+        title: "Implementation",
+        ai: {
+          model: "openai:gpt-5.6-sol",
+          thinking: "high",
+          reasoningMode: "pro",
+        },
+      },
+      mockToolCallOptions
+    );
+
+    expect(createWorkspaceTurn.mock.calls[0]?.[0]).toMatchObject({
+      modelString: "openai:gpt-5.6-sol",
+      thinkingLevel: "high",
+      reasoningMode: "pro",
+    });
+    expect(result).toMatchObject({
+      modelString: "openai:gpt-5.6-sol",
+      thinkingLevel: "high",
+      reasoningMode: "pro",
+    });
+  });
+
   it("backgrounds an explicit Project Chat foreground wait when new parent input arrives", async () => {
     using tempDir = new TestTempDir("test-task-tool-project-chat-foreground");
     const createWorkspaceTurn = mock((_args: Parameters<TaskService["createWorkspaceTurn"]>[0]) =>

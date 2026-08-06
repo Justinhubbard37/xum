@@ -1,6 +1,7 @@
 import { ChevronRight } from "lucide-react";
 
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
+import { formatRelativeTime } from "@/browser/utils/ui/dateTime";
 import { cn } from "@/common/lib/utils";
 import type {
   ProjectWorkspaceListToolArgs,
@@ -47,6 +48,21 @@ function formatTurnStatus(status: WorkspaceTurnStatus): string {
   return status === "starting" ? "Starting" : `${status.charAt(0).toUpperCase()}${status.slice(1)}`;
 }
 
+function formatRuntime(workspace: ProjectWorkspaceSummary): string | undefined {
+  const runtimeConfig = workspace.runtimeConfig;
+  if (runtimeConfig == null) return undefined;
+  if (runtimeConfig.type === "local" && "srcBaseDir" in runtimeConfig) return "worktree";
+  return runtimeConfig.type;
+}
+
+function formatExecAiSettings(workspace: ProjectWorkspaceSummary): string | undefined {
+  const settings = workspace.execAiSettings;
+  if (settings == null) return undefined;
+  return [settings.model, settings.thinkingLevel, settings.reasoningMode]
+    .filter((value): value is string => value != null)
+    .join(" · ");
+}
+
 export function toProjectWorkspaceListView(result: unknown): ProjectWorkspaceListView {
   const unwrapped = unwrapResult(result);
   if (isToolErrorResult(unwrapped)) {
@@ -80,6 +96,8 @@ function ProjectWorkspaceRow(props: { workspace: ProjectWorkspaceSummary }) {
   const workspaceStore = useWorkspaceStoreRaw();
   const displayName = props.workspace.title ?? props.workspace.name;
   const canOpen = !props.workspace.archived;
+  const runtime = formatRuntime(props.workspace);
+  const execAiSettings = formatExecAiSettings(props.workspace);
   const content = (
     <>
       <div className="min-w-0">
@@ -88,12 +106,26 @@ function ProjectWorkspaceRow(props: { workspace: ProjectWorkspaceSummary }) {
           <span className="counter-nums-mono text-muted truncate text-[10px]">
             {props.workspace.workspaceId}
           </span>
+          {runtime && <span className="text-muted text-[10px]">{runtime}</span>}
           {props.workspace.workspaceTurn && (
             <span className="counter-nums-mono text-muted truncate text-[10px]">
               {props.workspace.workspaceTurn.taskId}
             </span>
           )}
         </div>
+        {execAiSettings && (
+          <div className="text-muted mt-1 truncate text-[10px]">Exec: {execAiSettings}</div>
+        )}
+        {props.workspace.workspaceTurn?.prompt && (
+          <div className="text-secondary mt-1 line-clamp-2 text-[10px]">
+            {props.workspace.workspaceTurn.prompt}
+          </div>
+        )}
+        {props.workspace.updatedAt && (
+          <div className="counter-nums text-muted mt-1 truncate text-[10px]">
+            Updated {formatRelativeTime(new Date(props.workspace.updatedAt).getTime())}
+          </div>
+        )}
       </div>
       <div className="flex max-w-full flex-wrap items-center justify-start gap-1.5 @sm:justify-end">
         {props.workspace.archived && (

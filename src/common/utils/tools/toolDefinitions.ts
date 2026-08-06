@@ -36,6 +36,7 @@ import {
   WorkflowRunRecordSchema,
   WorkflowRunStatusSchema,
   WorkflowStepStatusSchema,
+  WorkspaceAISettingsSchema,
   WorkspaceHeartbeatSettingsSchema,
 } from "@/common/orpc/schemas";
 import {
@@ -55,7 +56,7 @@ import {
   ConfigOperationsSchema,
 } from "@/common/config/schemas/configOperations";
 import { TOOL_EDIT_WARNING } from "@/common/types/tools";
-import { THINKING_LEVELS } from "@/common/types/thinking";
+import { OpenAIReasoningModeSchema, THINKING_LEVELS } from "@/common/types/thinking";
 
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { extractToolFilePath } from "@/common/utils/tools/toolInputFilePath";
@@ -557,6 +558,14 @@ export function buildTaskToolAgentArgsSchema(options: {
   return options.includeIsolation ? TaskToolArgsSchema : TaskToolArgsSchemaWithoutIsolation;
 }
 
+const ProjectChatTaskAiSchema = z
+  .object({
+    model: TaskToolModelSchema.nullish(),
+    thinking: TaskToolThinkingSchema.nullish(),
+    reasoningMode: OpenAIReasoningModeSchema.nullish(),
+  })
+  .strict();
+
 export const ProjectChatTaskToolArgsSchema = z
   .object({
     kind: z
@@ -574,23 +583,41 @@ export const ProjectChatTaskToolArgsSchema = z
         "Run in background by default so Project Chat remains available while the workspace turn continues. Set false only when the result is required before continuing."
       ),
     workspace: WorkspaceTaskTargetSchema.nullish().describe(
-      'Workspace target. Omit for a new ordinary project workspace; use mode="existing" with a canonical workspaceId from project_workspace_list for a same-project follow-up.'
+      'Workspace target. Omit for a fresh ordinary project workspace. Reuse only when project_workspace_list provides positive relevance evidence, and then pass mode="existing" with its canonical workspaceId.'
+    ),
+    ai: ProjectChatTaskAiSchema.nullish().describe(
+      "Optional grouped AI overrides for this workspace turn. Do not duplicate model, thinking, or reasoningMode at the top level."
     ),
     model: TaskToolModelSchema.nullish().describe(
-      "Optional model override for this workspace turn. Omit to use the target/default Exec settings."
+      "Backward-compatible model override for this workspace turn. Omit to use the target/default Exec settings."
     ),
     thinking: TaskToolThinkingSchema.nullish().describe(
-      "Optional thinking-level override for this workspace turn. Omit to use the target/default Exec settings."
+      "Backward-compatible thinking-level override for this workspace turn. Omit to use the target/default Exec settings."
+    ),
+    reasoningMode: OpenAIReasoningModeSchema.nullish().describe(
+      'Optional typed OpenAI reasoning-mode override ("standard" or "pro"). Omit to use the target workspace default.'
     ),
   })
   .strict()
-  .superRefine((args, ctx) => refineTaskToolAgentArgs(args, ctx));
+  .superRefine((args, ctx) => {
+    refineTaskToolAgentArgs(args, ctx);
+    for (const field of ["model", "thinking", "reasoningMode"] as const) {
+      if (args[field] != null && args.ai?.[field] != null) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `${field} must not be specified both at the top level and in ai`,
+          path: ["ai", field],
+        });
+      }
+    }
+  });
 
 export function buildProjectChatTaskToolDescription(): string {
   return (
     'Start or continue an ordinary same-project workspace turn. Project Chat may only use kind="workspace"; sub-agent fields are not accepted. ' +
     "Prefer the default background mode so this chat remains available while the child workspace runs. " +
-    "Use project_workspace_list for canonical existing workspace IDs. New and interrupted workspaces persist unless workspace.disposable is explicitly true; archive is the safe default cleanup action."
+    "Create a fresh workspace by default. Reuse only when project_workspace_list provides positive relevance evidence for a specific canonical workspace ID, and pass that ID explicitly. " +
+    "New and interrupted workspaces persist unless workspace.disposable is explicitly true; archive is the safe default cleanup action."
   );
 }
 
@@ -609,6 +636,8 @@ const ProjectWorkspaceTurnSummarySchema = z
     taskId: z.string().min(1),
     status: z.enum(["queued", "starting", "running", "completed", "interrupted", "error"]),
     title: z.string().optional(),
+    prompt: z.string().optional(),
+    createdAt: z.string().optional(),
     updatedAt: z.string().min(1),
   })
   .strict();
@@ -620,6 +649,11 @@ export const ProjectWorkspaceSummarySchema = z
     title: z.string().optional(),
     archived: z.boolean(),
     transcriptOnly: z.boolean().optional(),
+    createdAt: z.string().optional(),
+    lastActivityAt: z.string().optional(),
+    updatedAt: z.string().optional(),
+    runtimeConfig: RuntimeConfigSchema.optional(),
+    execAiSettings: WorkspaceAISettingsSchema.optional(),
     workspaceTurn: ProjectWorkspaceTurnSummarySchema.optional(),
   })
   .strict();
@@ -677,6 +711,7 @@ export const TaskToolQueuedResultSchema = z
     reports: z.array(TaskToolCompletedReportSchema).min(1).optional(),
     modelString: z.string().optional(),
     thinkingLevel: TaskThinkingLevelSchema.optional(),
+    reasoningMode: OpenAIReasoningModeSchema.optional(),
     interruption: ForegroundWaitInterruptionSchema.optional(),
     note: z.string().min(1).describe("Additional guidance for the caller."),
   })
@@ -713,6 +748,7 @@ export const TaskToolCompletedResultSchema = z
     reports: z.array(TaskToolCompletedReportSchema).min(1).optional(),
     modelString: z.string().optional(),
     thinkingLevel: TaskThinkingLevelSchema.optional(),
+    reasoningMode: OpenAIReasoningModeSchema.optional(),
   })
   .strict()
   .superRefine((value, ctx) => {
@@ -2247,8 +2283,8 @@ export const TOOL_DEFINITIONS = {
   project_workspace_list: {
     description:
       "List canonical ordinary workspaces in the current Project Chat's project in one bulk call. " +
-      "Returns active/archived summaries and the latest durable workspace-turn handle/status for each workspace when available. " +
-      "Use the returned workspaceId for task workspace.mode=existing and lifecycle calls; never synthesize IDs.",
+      "Returns runtime, fixed Exec workspace-turn AI settings, canonical activity recency, and latest durable task context when available. " +
+      "Create a fresh workspace by default; reuse only when this context provides positive relevance evidence for a specific workspaceId. Never synthesize IDs.",
     schema: ProjectWorkspaceListToolArgsSchema,
   },
   task: {

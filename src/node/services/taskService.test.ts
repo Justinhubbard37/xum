@@ -35,7 +35,11 @@ import { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import { IdleDispatcher } from "@/node/services/idleDispatcher";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import { TaskHandleStore } from "@/node/services/taskHandleStore";
-import { TaskService, ForegroundWaitBackgroundedError } from "@/node/services/taskService";
+import {
+  TaskService,
+  ForegroundWaitBackgroundedError,
+  type WorkspaceTurnCreateArgs,
+} from "@/node/services/taskService";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { log } from "@/node/services/log";
 import { recordAgentWorkflowRunReference } from "@/node/services/agentWorkflowRunReferences";
@@ -59,7 +63,7 @@ import { defaultModel } from "@/common/utils/ai/models";
 import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 import type { RuntimeConfig } from "@/common/types/runtime";
-import type { ThinkingLevel } from "@/common/types/thinking";
+import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import type { SendMessageError } from "@/common/types/errors";
 import type { ErrorEvent, StreamAbortEvent, StreamEndEvent } from "@/common/types/stream";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
@@ -68,7 +72,7 @@ import {
   buildWorkflowRunCardMessage,
   WORKFLOW_RUN_CARD_DISPLAY_METADATA_TYPE,
 } from "@/common/utils/workflowRunMessages";
-import type { WorkspaceMetadata } from "@/common/types/workspace";
+import type { WorkspaceActivitySnapshot, WorkspaceMetadata } from "@/common/types/workspace";
 import type { ProvidersConfigMap, WorkspaceChatMessage } from "@/common/orpc/types";
 import type { AIService } from "@/node/services/aiService";
 import type { WorkspaceService } from "@/node/services/workspaceService";
@@ -409,10 +413,12 @@ function createWorkspaceServiceMocks(
     isWorkflowInvocationCurrent: ReturnType<typeof mock>;
     interruptWorkspaceTurnStream: ReturnType<typeof mock>;
     updateTitle: ReturnType<typeof mock>;
+    getActivityList: ReturnType<typeof mock>;
     create: ReturnType<typeof mock>;
   }>
 ): {
   interruptWorkspaceTurnStream: ReturnType<typeof mock>;
+  getActivityList: ReturnType<typeof mock>;
   workspaceService: WorkspaceService;
   sendMessage: ReturnType<typeof mock>;
   resumeStream: ReturnType<typeof mock>;
@@ -489,6 +495,10 @@ function createWorkspaceServiceMocks(
   const isWorkflowInvocationCurrent =
     overrides?.isWorkflowInvocationCurrent ?? mock(() => Promise.resolve(true));
 
+  const getActivityList =
+    overrides?.getActivityList ??
+    mock((): Promise<Record<string, WorkspaceActivitySnapshot>> => Promise.resolve({}));
+
   const interruptWorkspaceTurnStream =
     overrides?.interruptWorkspaceTurnStream ??
     mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
@@ -507,6 +517,7 @@ function createWorkspaceServiceMocks(
     workspaceService: {
       interruptWorkspaceTurnStream,
       updateTitle,
+      getActivityList,
       create,
       sendMessage,
       resumeStream,
@@ -537,6 +548,7 @@ function createWorkspaceServiceMocks(
     } as unknown as WorkspaceService,
     interruptWorkspaceTurnStream,
     updateTitle,
+    getActivityList,
     create,
     sendMessage,
     resumeStream,
@@ -2107,9 +2119,29 @@ describe("TaskService", () => {
       [
         projectWorkspace(projectPath, "active", "activeworkspace", {
           title: "Active workspace",
+          createdAt: "2026-08-01T00:00:00.000Z",
           runtimeConfig: { type: "local" },
+          agentId: "researcher",
+          aiSettingsByAgent: {
+            exec: {
+              model: "openai:gpt-5.6-sol",
+              thinkingLevel: "high",
+              reasoningMode: "pro",
+            },
+            researcher: {
+              model: "anthropic:claude-opus-4-6",
+              thinkingLevel: "low",
+            },
+          },
+        }),
+        projectWorkspace(projectPath, "fallback", "fallbackworkspace", {
+          createdAt: "2026-08-06T02:00:00.000Z",
+          runtimeConfig: { type: "local" },
+          archivedAt: "2026-08-06T02:15:00.000Z",
+          unarchivedAt: "2026-08-06T02:30:00.000Z",
         }),
         projectWorkspace(projectPath, "archived", "archivedworkspace", {
+          createdAt: "2026-08-05T00:00:00.000Z",
           runtimeConfig: { type: "local" },
           archivedAt: "2026-08-05T00:00:00.000Z",
         }),
@@ -2149,54 +2181,70 @@ describe("TaskService", () => {
       createdWorkspace: false,
       disposableWorkspace: false,
       title: "Active turn",
+      prompt: "Continue the active implementation",
     });
-    const { taskService } = createTaskServiceHarness(config);
+    const getActivityList = mock(() =>
+      Promise.resolve({
+        activeworkspace: {
+          recency: Date.parse("2026-08-06T03:00:00.000Z"),
+          streaming: false,
+          lastModel: "openai:gpt-5.6-sol",
+          lastThinkingLevel: "high" as const,
+        },
+      })
+    );
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: createWorkspaceServiceMocks({ getActivityList }).workspaceService,
+    });
 
-    expect(await taskService.listProjectWorkspaces(projectChat.sessionId)).toEqual(
-      Ok({
-        projectPath,
-        workspaces: [
-          {
-            workspaceId: "activeworkspace",
-            name: "active",
-            title: "Active workspace",
-            archived: false,
-            workspaceTurn: {
-              taskId: "wst_active",
-              status: "completed",
-              title: "Active turn",
-              updatedAt: "2026-08-06T00:01:00.000Z",
-            },
-          },
-          {
-            workspaceId: "archivedworkspace",
-            name: "archived",
-            archived: true,
-          },
-        ],
-      })
-    );
-    expect(
-      await taskService.listProjectWorkspaces(projectChat.sessionId, { includeArchived: false })
-    ).toEqual(
-      Ok({
-        projectPath,
-        workspaces: [
-          {
-            workspaceId: "activeworkspace",
-            name: "active",
-            title: "Active workspace",
-            archived: false,
-            workspaceTurn: {
-              taskId: "wst_active",
-              status: "completed",
-              title: "Active turn",
-              updatedAt: "2026-08-06T00:01:00.000Z",
-            },
-          },
-        ],
-      })
-    );
+    const listed = await taskService.listProjectWorkspaces(projectChat.sessionId);
+    expect(listed.success).toBe(true);
+    if (!listed.success) throw new Error(listed.error);
+    expect(getActivityList).toHaveBeenCalledTimes(1);
+    expect(listed.data.projectPath).toBe(projectPath);
+    expect(listed.data.workspaces.map((workspace) => workspace.workspaceId)).toEqual([
+      "activeworkspace",
+      "fallbackworkspace",
+      "archivedworkspace",
+    ]);
+    expect(listed.data.workspaces[0]).toMatchObject({
+      workspaceId: "activeworkspace",
+      name: "active",
+      title: "Active workspace",
+      archived: false,
+      createdAt: "2026-08-01T00:00:00.000Z",
+      lastActivityAt: "2026-08-06T03:00:00.000Z",
+      updatedAt: "2026-08-06T03:00:00.000Z",
+      runtimeConfig: { type: "local" },
+      execAiSettings: {
+        model: "openai:gpt-5.6-sol",
+        thinkingLevel: "high",
+        reasoningMode: "pro",
+      },
+      workspaceTurn: {
+        taskId: "wst_active",
+        status: "completed",
+        title: "Active turn",
+        prompt: "Continue the active implementation",
+        createdAt: "2026-08-06T00:00:00.000Z",
+        updatedAt: "2026-08-06T00:01:00.000Z",
+      },
+    });
+    expect(listed.data.workspaces[1]).toMatchObject({
+      workspaceId: "fallbackworkspace",
+      lastActivityAt: "2026-08-06T02:30:00.000Z",
+      updatedAt: "2026-08-06T02:30:00.000Z",
+    });
+
+    const activeOnly = await taskService.listProjectWorkspaces(projectChat.sessionId, {
+      includeArchived: false,
+    });
+    expect(activeOnly.success).toBe(true);
+    if (!activeOnly.success) throw new Error(activeOnly.error);
+    expect(activeOnly.data.workspaces.map((workspace) => workspace.workspaceId)).toEqual([
+      "activeworkspace",
+      "fallbackworkspace",
+    ]);
   });
 
   test("Project Chat rejects invalid existing workspace scopes", async () => {
@@ -2603,6 +2651,128 @@ describe("TaskService", () => {
     });
   });
 
+  test("createWorkspaceTurn persists explicit existing-workspace overrides as subsequent defaults", async () => {
+    const config = await createTestConfig(rootDir);
+    const { projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    const projectChat = await config.ensureProjectChat(projectPath);
+    stubStableIds(config, [
+      "firsthandle",
+      "firstturn",
+      "secondhandle",
+      "secondturn",
+      "thirdhandle",
+      "thirdturn",
+      "fourthhandle",
+      "fourthturn",
+    ]);
+    await config.editConfig((cfg) => {
+      cfg.taskSettings = testTaskSettings(10);
+      const project = cfg.projects.get(projectPath);
+      assert(project, "test project must exist");
+      project.workspaces.push({
+        path: path.join(projectPath, "existing"),
+        id: "existingworkspace",
+        name: "existing",
+        createdAt: "2026-08-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+        aiSettingsByAgent: {
+          exec: {
+            model: "anthropic:claude-sonnet-4-5",
+            thinkingLevel: "low",
+            reasoningMode: "standard",
+          },
+        },
+      });
+      return cfg;
+    });
+
+    const sentSettings: Array<{
+      model: string;
+      thinkingLevel: ThinkingLevel;
+      reasoningMode?: OpenAIReasoningMode;
+    }> = [];
+    const sendMessage = mock(async (...args: unknown[]): Promise<Result<void>> => {
+      const workspaceId = args[0] as string;
+      const options = args[2] as {
+        model: string;
+        thinkingLevel: ThinkingLevel;
+        reasoningMode?: OpenAIReasoningMode;
+      };
+      sentSettings.push({
+        model: options.model,
+        thinkingLevel: options.thinkingLevel,
+        ...(options.reasoningMode != null ? { reasoningMode: options.reasoningMode } : {}),
+      });
+      // Faithfully model WorkspaceService.sendMessage's accepted-send persistence path so the next
+      // Project Chat turn resolves from the target workspace, not from test-only manual mutation.
+      await config.editConfig((cfg) => {
+        const project = cfg.projects.get(projectPath);
+        const workspace = project?.workspaces.find((entry) => entry.id === workspaceId);
+        assert(workspace, "target workspace must exist");
+        workspace.aiSettingsByAgent = {
+          ...(workspace.aiSettingsByAgent ?? {}),
+          exec: {
+            model: options.model,
+            thinkingLevel: options.thinkingLevel,
+            ...(options.reasoningMode != null ? { reasoningMode: options.reasoningMode } : {}),
+          },
+        };
+        return cfg;
+      });
+      const internal = args[3] as { onAccepted?: () => Promise<void> | void } | undefined;
+      await internal?.onAccepted?.();
+      return Ok(undefined);
+    });
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: createWorkspaceServiceMocks({ sendMessage }).workspaceService,
+    });
+
+    const launch = (prompt: string, overrides: Partial<WorkspaceTurnCreateArgs> = {}) =>
+      taskService.createWorkspaceTurn({
+        ownerWorkspaceId: projectChat.sessionId,
+        prompt,
+        title: prompt,
+        workspace: { mode: "existing", workspaceId: "existingworkspace" },
+        ...overrides,
+      });
+
+    await launch("Override A", {
+      modelString: "openai:gpt-5.6-sol",
+      thinkingLevel: "high",
+      reasoningMode: "pro",
+    });
+    await launch("Inherit A");
+    await launch("Override B", {
+      modelString: "anthropic:claude-opus-4-6",
+      thinkingLevel: "medium",
+      reasoningMode: "standard",
+    });
+    await launch("Inherit B");
+
+    expect(sentSettings).toEqual([
+      {
+        model: "openai:gpt-5.6-sol",
+        thinkingLevel: "high",
+        reasoningMode: "pro",
+      },
+      {
+        model: "openai:gpt-5.6-sol",
+        thinkingLevel: "high",
+        reasoningMode: "pro",
+      },
+      {
+        model: "anthropic:claude-opus-4-6",
+        thinkingLevel: "medium",
+        reasoningMode: "standard",
+      },
+      {
+        model: "anthropic:claude-opus-4-6",
+        thinkingLevel: "medium",
+        reasoningMode: "standard",
+      },
+    ]);
+  });
+
   test("createWorkspaceTurn follow-ups do not re-inject the owner's pro mode over the target's own settings", async () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["firsthandle", "firstturn", "secondhandle", "secondturn"]);
@@ -2687,7 +2857,7 @@ describe("TaskService", () => {
     });
     expect(second.success).toBe(true);
     const secondSend = sendMessage.mock.calls[1];
-    expect(secondSend[2]).not.toHaveProperty("reasoningMode");
+    expect(secondSend[2]).toMatchObject({ reasoningMode: "standard" });
   });
 
   test("createWorkspaceTurn rejects multi-project owners instead of dropping secondary repos", async () => {

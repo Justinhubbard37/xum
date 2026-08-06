@@ -33,6 +33,7 @@ import { getErrorMessage } from "@/common/utils/errors";
 import {
   coerceThinkingLevel,
   parseThinkingInput,
+  type OpenAIReasoningMode,
   type ParsedThinkingInput,
   type ThinkingLevel,
 } from "@/common/types/thinking";
@@ -119,11 +120,20 @@ function buildParentRuntimeAiSettings(
  * against the sub-agent's chosen model in `resolveTaskAISettings`. Throws a
  * descriptive error on invalid input so the model can correct the call.
  */
-function parseTaskAiOverrides(args: { model?: string | null; thinking?: string | null }): {
+function parseTaskAiOverrides(args: {
+  model?: string | null;
+  thinking?: string | null;
+  reasoningMode?: OpenAIReasoningMode | null;
+}): {
   modelString?: string;
   thinkingLevel?: ParsedThinkingInput;
+  reasoningMode?: OpenAIReasoningMode;
 } {
-  const overrides: { modelString?: string; thinkingLevel?: ParsedThinkingInput } = {};
+  const overrides: {
+    modelString?: string;
+    thinkingLevel?: ParsedThinkingInput;
+    reasoningMode?: OpenAIReasoningMode;
+  } = {};
 
   if (args.model != null) {
     const normalized = normalizeModelInput(args.model);
@@ -143,6 +153,10 @@ function parseTaskAiOverrides(args: { model?: string | null; thinking?: string |
       );
     }
     overrides.thinkingLevel = parsed;
+  }
+
+  if (args.reasoningMode != null) {
+    overrides.reasoningMode = args.reasoningMode;
   }
 
   return overrides;
@@ -430,6 +444,21 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
         isolation,
         workspace,
       } = validatedArgs;
+      const projectChatAi =
+        projectChat && "ai" in validatedArgs
+          ? (validatedArgs.ai as
+              | {
+                  model?: string | null;
+                  thinking?: string | null;
+                  reasoningMode?: OpenAIReasoningMode | null;
+                }
+              | null
+              | undefined)
+          : undefined;
+      const reasoningMode =
+        projectChat && "reasoningMode" in validatedArgs
+          ? (validatedArgs.reasoningMode as OpenAIReasoningMode | null | undefined)
+          : undefined;
 
       const taskKind = projectChat ? (kind ?? "workspace") : kind;
       // Strict providers represent omitted optional inputs as null. Project Chat stays
@@ -440,7 +469,11 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
 
       // Explicit per-launch model/thinking overrides. Omitted by default so delegated work
       // inherits the parent's live settings unless the caller requests an override.
-      const aiOverrides = parseTaskAiOverrides({ model, thinking });
+      const aiOverrides = parseTaskAiOverrides({
+        model: projectChatAi?.model ?? model,
+        thinking: projectChatAi?.thinking ?? thinking,
+        reasoningMode: projectChatAi?.reasoningMode ?? reasoningMode,
+      });
 
       const workspaceId = requireWorkspaceId(config, "task");
       const taskService = requireTaskService(config, "task");
@@ -460,6 +493,9 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
           ...(aiOverrides.modelString != null ? { modelString: aiOverrides.modelString } : {}),
           ...(aiOverrides.thinkingLevel != null
             ? { thinkingLevel: aiOverrides.thinkingLevel }
+            : {}),
+          ...(aiOverrides.reasoningMode != null
+            ? { reasoningMode: aiOverrides.reasoningMode }
             : {}),
           ...(parentRuntimeAiSettings != null ? { parentRuntimeAiSettings } : {}),
           // Background launches are non-blocking with terminal wake-up; foreground/default block.
@@ -486,6 +522,9 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
           taskId: created.data.taskId,
           workspaceId: created.data.workspaceId,
           handleKind: "workspace_turn" as const,
+          modelString: created.data.modelString,
+          thinkingLevel: created.data.thinkingLevel,
+          reasoningMode: created.data.reasoningMode,
           note: buildBackgroundStartNote(1),
         };
         if (runInBackground) {
@@ -509,6 +548,9 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
               title: report.title,
               messageId: report.messageId,
               finalMessageRef: report.finalMessageRef,
+              modelString: created.data.modelString,
+              thinkingLevel: created.data.thinkingLevel,
+              reasoningMode: created.data.reasoningMode,
             },
             "task"
           );

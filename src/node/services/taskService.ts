@@ -241,6 +241,8 @@ export interface ProjectWorkspaceTurnSummary {
   taskId: string;
   status: WorkspaceTurnTaskStatus;
   title?: string;
+  prompt?: string;
+  createdAt?: string;
   updatedAt: string;
 }
 
@@ -250,6 +252,11 @@ export interface ProjectWorkspaceSummary {
   title?: string;
   archived: boolean;
   transcriptOnly?: boolean;
+  createdAt?: string;
+  lastActivityAt?: string;
+  updatedAt?: string;
+  runtimeConfig?: RuntimeConfig;
+  execAiSettings?: ResolvedWorkspaceAiSettings;
   workspaceTurn?: ProjectWorkspaceTurnSummary;
 }
 
@@ -616,6 +623,7 @@ export interface WorkspaceTurnCreateArgs {
   title: string;
   modelString?: string;
   thinkingLevel?: ParsedThinkingInput;
+  reasoningMode?: OpenAIReasoningMode;
   parentRuntimeAiSettings?: { modelString?: string; thinkingLevel?: ThinkingLevel };
   workspace?: {
     mode?: "new" | "fork" | "existing";
@@ -643,6 +651,9 @@ export interface WorkspaceTurnCreateResult {
   kind: "workspace_turn";
   status: "queued" | "starting" | "running";
   workspaceId: string;
+  modelString: string;
+  thinkingLevel: ThinkingLevel;
+  reasoningMode: OpenAIReasoningMode;
 }
 
 export interface WorkspaceTurnWaitResult {
@@ -3680,28 +3691,34 @@ export class TaskService {
     // creating one by hand) → owner's live runtime settings → owner's
     // persisted settings → app default.
     const workspaceTurnAgentDefault = cfg.agentAiDefaults?.[workspaceTurnAgentId];
-    const model =
+    const model = normalizeToCanonical(
       coerceNonEmptyString(args.modelString) ??
-      coerceNonEmptyString(targetAiSettings?.model) ??
-      coerceNonEmptyString(workspaceTurnAgentDefault?.modelString) ??
-      coerceNonEmptyString(args.parentRuntimeAiSettings?.modelString) ??
-      coerceNonEmptyString(parentMeta.aiSettingsByAgent?.[workspaceTurnAgentId]?.model) ??
-      coerceNonEmptyString(parentMeta.aiSettings?.model) ??
-      defaultModel;
-    const thinkingLevel =
-      args.thinkingLevel != null
+        coerceNonEmptyString(targetAiSettings?.model) ??
+        coerceNonEmptyString(workspaceTurnAgentDefault?.modelString) ??
+        coerceNonEmptyString(args.parentRuntimeAiSettings?.modelString) ??
+        coerceNonEmptyString(parentMeta.aiSettingsByAgent?.[workspaceTurnAgentId]?.model) ??
+        coerceNonEmptyString(parentMeta.aiSettings?.model) ??
+        defaultModel
+    ).trim();
+    const providersConfig = this.aiService.getProvidersConfig();
+    const requestedThinkingLevel =
+      (args.thinkingLevel != null
         ? // Providers config keeps mapped aliases on their target's ladder
           // (see resolveTaskAISettings).
-          resolveThinkingInput(
-            args.thinkingLevel,
-            normalizeToCanonical(model),
-            this.aiService.getProvidersConfig()
-          )
-        : (targetAiSettings?.thinkingLevel ??
-          workspaceTurnAgentDefault?.thinkingLevel ??
-          args.parentRuntimeAiSettings?.thinkingLevel ??
-          parentMeta.aiSettingsByAgent?.[workspaceTurnAgentId]?.thinkingLevel ??
-          parentMeta.aiSettings?.thinkingLevel);
+          resolveThinkingInput(args.thinkingLevel, model, providersConfig)
+        : undefined) ??
+      targetAiSettings?.thinkingLevel ??
+      workspaceTurnAgentDefault?.thinkingLevel ??
+      args.parentRuntimeAiSettings?.thinkingLevel ??
+      parentMeta.aiSettingsByAgent?.[workspaceTurnAgentId]?.thinkingLevel ??
+      parentMeta.aiSettings?.thinkingLevel ??
+      "off";
+    const thinkingLevel = enforceThinkingPolicy(
+      model,
+      requestedThinkingLevel,
+      undefined,
+      providersConfig
+    );
     // Per-workspace pro mode inherits alongside model/thinking; the send path
     // re-gates per model/route so this is inert for non-GPT-5.6 models.
     // The user toggles pro on the parent's ACTIVE agent, so after the exec
@@ -3716,13 +3733,15 @@ export class TaskService {
       parentMeta,
       normalizeAgentId(parentMeta.agentId)
     );
-    const reasoningMode = coerceOpenAIReasoningMode(
-      targetAiSettings != null
-        ? targetAiSettings.reasoningMode
-        : (parentMeta.aiSettingsByAgent?.[workspaceTurnAgentId]?.reasoningMode ??
-            activeParentAiSettings?.reasoningMode ??
-            parentMeta.aiSettings?.reasoningMode)
-    );
+    const reasoningMode =
+      coerceOpenAIReasoningMode(
+        args.reasoningMode ??
+          (targetAiSettings != null
+            ? targetAiSettings.reasoningMode
+            : (parentMeta.aiSettingsByAgent?.[workspaceTurnAgentId]?.reasoningMode ??
+              activeParentAiSettings?.reasoningMode ??
+              parentMeta.aiSettings?.reasoningMode))
+      ) ?? "standard";
 
     const record: WorkspaceTurnTaskHandleRecord = {
       kind: "workspace_turn",
@@ -3738,7 +3757,8 @@ export class TaskService {
       title,
       prompt,
       modelString: model,
-      ...(thinkingLevel != null ? { thinkingLevel } : {}),
+      thinkingLevel,
+      reasoningMode,
       ...(args.attentionPolicy != null ? { attentionPolicy: args.attentionPolicy } : {}),
     };
     await this.taskHandleStore.upsertWorkspaceTurn(record);
@@ -3781,8 +3801,8 @@ export class TaskService {
       {
         model,
         agentId: workspaceTurnAgentId,
-        ...(thinkingLevel != null ? { thinkingLevel } : {}),
-        ...(reasoningMode != null ? { reasoningMode } : {}),
+        thinkingLevel,
+        reasoningMode,
         muxMetadata: this.buildWorkspaceTurnMuxMetadata(record),
         experiments: args.experiments,
         ...(mode === "existing" ? { queueDispatchMode } : {}),
@@ -3863,6 +3883,9 @@ export class TaskService {
       kind: "workspace_turn",
       status: acceptedStatus === "queued" ? "queued" : "running",
       workspaceId: targetWorkspaceId,
+      modelString: model,
+      thinkingLevel,
+      reasoningMode,
     });
   }
 
@@ -7534,9 +7557,10 @@ export class TaskService {
     try {
       // One metadata load + one owner handle load keeps this bulk tool independent of frontend RPC
       // loops while preserving backend-canonical IDs for legacy entries.
-      const [allMetadata, turns] = await Promise.all([
+      const [allMetadata, turns, activityByWorkspaceId] = await Promise.all([
         this.config.getAllWorkspaceMetadata(),
         this.listWorkspaceTurnTasks(ownerWorkspaceId),
+        this.workspaceService.getActivityList(),
       ]);
       const cfg = this.config.loadConfigOrDefault();
       const latestTurnByWorkspace = new Map<string, WorkspaceTurnTaskHandleRecord>();
@@ -7566,18 +7590,52 @@ export class TaskService {
         if (archived && !includeArchived) continue;
 
         const turn = latestTurnByWorkspace.get(metadata.id);
+        // Workspace turns are fixed to Exec, so expose that exact persisted bucket rather than the
+        // currently selected UI agent's settings. Legacy workspace-wide settings remain the fallback.
+        const execAiSettings = this.resolveWorkspaceAISettings(metadata, "exec");
+        const createdAt = metadata.createdAt;
+        const activityRecency = activityByWorkspaceId[metadata.id]?.recency;
+        const recencyCandidates = [
+          typeof activityRecency === "number" && Number.isFinite(activityRecency)
+            ? activityRecency
+            : undefined,
+          metadata.unarchivedAt != null ? Date.parse(metadata.unarchivedAt) : undefined,
+          createdAt != null ? Date.parse(createdAt) : undefined,
+        ].filter((value): value is number => value != null && Number.isFinite(value) && value > 0);
+        const lastActivityAt =
+          recencyCandidates.length > 0
+            ? new Date(Math.max(...recencyCandidates)).toISOString()
+            : undefined;
+        const updatedAt = lastActivityAt;
         workspaces.push({
           workspaceId: metadata.id,
           name: metadata.name,
           ...(metadata.title != null ? { title: metadata.title } : {}),
           archived,
           ...(metadata.transcriptOnly === true ? { transcriptOnly: true } : {}),
+          ...(createdAt != null ? { createdAt } : {}),
+          ...(lastActivityAt != null ? { lastActivityAt } : {}),
+          ...(updatedAt != null ? { updatedAt } : {}),
+          runtimeConfig: metadata.runtimeConfig,
+          ...(execAiSettings != null
+            ? {
+                execAiSettings: {
+                  model: execAiSettings.model,
+                  thinkingLevel: execAiSettings.thinkingLevel ?? "off",
+                  ...(coerceOpenAIReasoningMode(execAiSettings.reasoningMode) != null
+                    ? { reasoningMode: coerceOpenAIReasoningMode(execAiSettings.reasoningMode) }
+                    : {}),
+                },
+              }
+            : {}),
           ...(turn != null
             ? {
                 workspaceTurn: {
                   taskId: turn.handleId,
                   status: turn.status,
                   ...(turn.title != null ? { title: turn.title } : {}),
+                  ...(turn.prompt != null ? { prompt: turn.prompt } : {}),
+                  createdAt: turn.createdAt,
                   updatedAt: turn.updatedAt,
                 },
               }
@@ -7588,6 +7646,7 @@ export class TaskService {
       workspaces.sort(
         (left, right) =>
           Number(left.archived) - Number(right.archived) ||
+          (right.updatedAt ?? "").localeCompare(left.updatedAt ?? "") ||
           left.name.localeCompare(right.name) ||
           left.workspaceId.localeCompare(right.workspaceId)
       );
