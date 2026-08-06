@@ -177,6 +177,7 @@ function AppInner() {
     currentWorkspaceId,
     currentSettingsSection,
     isAnalyticsOpen,
+    navigateToProject,
     navigateToAnalytics,
     navigateFromAnalytics,
   } = useRouter();
@@ -1461,6 +1462,7 @@ function AppInner() {
               <ProjectPage
                 projectPath={creationProjectPath}
                 projectName={
+                  userProjects.get(creationProjectPath)?.displayName ??
                   creationProjectPath.split("/").pop() ??
                   creationProjectPath.split("\\").pop() ??
                   "Project"
@@ -1502,7 +1504,9 @@ function AppInner() {
               (prev) => [...(Array.isArray(prev) ? prev : []), normalizedPath],
               []
             );
-            beginWorkspaceCreation(normalizedPath);
+            // New projects now open their persistent control-plane chat; manual workspace creation
+            // remains available from the dedicated plus action and Ctrl/Cmd+N.
+            navigateToProject(normalizedPath);
           }}
         />
         {multiProjectWorkspacesEnabled && (

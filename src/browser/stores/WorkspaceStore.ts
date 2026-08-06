@@ -4270,6 +4270,7 @@ export class WorkspaceStore {
     this.consumersStore.clear();
     this.aggregators.clear();
     this.chatTransientState.clear();
+    this.auxiliaryChatIds.clear();
     this.workspaceMetadata.clear();
     this.workspaceActivity.clear();
     this.activeGoalCount = 0;
