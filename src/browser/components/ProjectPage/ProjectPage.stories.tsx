@@ -75,7 +75,8 @@ async function openFirstProjectCreationView(storyRoot: HTMLElement): Promise<voi
 
 /** Helper to create a project config for a path with no workspaces */
 function projectWithNoWorkspaces(path: string): [string, ProjectConfig] {
-  return [path, { workspaces: [] }];
+  // Most ProjectPage stories exercise creation/project navigation rather than the trust gate.
+  return [path, { workspaces: [], trusted: true }];
 }
 
 const PROJECT_CHAT_MESSAGES = [
