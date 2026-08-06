@@ -1881,7 +1881,7 @@ exit 1
       expect(result.success).toBe(true);
       expect(cleaned).toEqual([projectChat.sessionId]);
       expect(config.loadConfigOrDefault().projects.has(projectPath)).toBe(false);
-      await expect(fs.access(sessionDir)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(fs.access(sessionDir)).rejects.toMatchObject({ code: "ENOENT" });
     });
 
     it("keeps Project Chat cleanup best-effort after config removal", async () => {
@@ -1901,7 +1901,7 @@ exit 1
 
       expect(result.success).toBe(true);
       expect(config.loadConfigOrDefault().projects.has(projectPath)).toBe(false);
-      await expect(fs.access(sessionDir)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(fs.access(sessionDir)).rejects.toMatchObject({ code: "ENOENT" });
     });
 
     it("does not clean Project Chat while ordinary workspaces block removal", async () => {

@@ -418,7 +418,7 @@ describe("WorkspaceService Project Chat", () => {
       expect(interruptStream).toHaveBeenCalledWith({ abandonPartial: true });
       expect(dispose).toHaveBeenCalledTimes(1);
       expect(sessions.has(projectChat.sessionId)).toBe(false);
-      await expect(fsPromises.access(sessionDir)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(fsPromises.access(sessionDir)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       await cleanup();
     }

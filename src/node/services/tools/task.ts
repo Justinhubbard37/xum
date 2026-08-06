@@ -6,12 +6,12 @@ import type { z } from "zod";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import {
   ProjectChatTaskToolArgsSchema,
-  TaskToolArgsSchema,
   TaskToolResultSchema,
   buildProjectChatTaskToolDescription,
   buildTaskToolAgentArgsSchema,
   buildTaskToolDescription,
 } from "@/common/utils/tools/toolDefinitions";
+import type { TaskToolArgsSchema } from "@/common/utils/tools/toolDefinitions";
 import {
   RUNTIME_MODE,
   runtimeModeSupportsSharedTaskWorkspace,

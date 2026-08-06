@@ -35,7 +35,9 @@ describe("project_workspace_list tool", () => {
       taskService,
     });
 
-    const result = await listTool.execute!({ include_archived: true }, mockToolCallOptions);
+    const result: unknown = await Promise.resolve(
+      listTool.execute!({ include_archived: true }, mockToolCallOptions)
+    );
 
     expect(listProjectWorkspaces).toHaveBeenCalledWith(workspaceId, { includeArchived: true });
     expect(result).toEqual({
@@ -57,13 +59,16 @@ describe("project_workspace_list tool", () => {
 
   it("rejects non-Project-Chat callers", async () => {
     using tempDir = new TestTempDir("project-workspace-list-scope");
-    const listTool = createProjectWorkspaceListTool({
-      ...createTestToolConfig(tempDir.path),
-      taskService: {} as TaskService,
-    });
+    const listTool = createProjectWorkspaceListTool(createTestToolConfig(tempDir.path));
 
-    expect(listTool.execute!({}, mockToolCallOptions)).rejects.toThrow(
-      "project_workspace_list is only available in Project Chat"
-    );
+    try {
+      await listTool.execute!({}, mockToolCallOptions);
+      throw new Error("Expected project_workspace_list to reject a non-Project-Chat caller");
+    } catch (error) {
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toBe(
+        "project_workspace_list is only available in Project Chat"
+      );
+    }
   });
 });

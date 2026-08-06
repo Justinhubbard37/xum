@@ -155,9 +155,8 @@ describe("task tool", () => {
     expect(
       schema.safeParse({ prompt: "implement", title: "Implementation", agentId: "exec" }).success
     ).toBe(false);
-    const result = await tool.execute!(
-      { prompt: "implement", title: "Implementation" },
-      mockToolCallOptions
+    const result: unknown = await Promise.resolve(
+      tool.execute!({ prompt: "implement", title: "Implementation" }, mockToolCallOptions)
     );
 
     expect(createWorkspaceTurn).toHaveBeenCalledTimes(1);
@@ -192,14 +191,16 @@ describe("task tool", () => {
       taskService,
     });
 
-    const result = await taskTool.execute!(
-      {
-        kind: "workspace",
-        prompt: "implement",
-        title: "Implementation",
-        run_in_background: false,
-      },
-      mockToolCallOptions
+    const result: unknown = await Promise.resolve(
+      taskTool.execute!(
+        {
+          kind: "workspace",
+          prompt: "implement",
+          title: "Implementation",
+          run_in_background: false,
+        },
+        mockToolCallOptions
+      )
     );
 
     expect(waitForWorkspaceTurn).toHaveBeenCalledWith(

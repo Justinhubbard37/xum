@@ -205,7 +205,7 @@ export async function resolveAgentForStream(
   if (fixedBuiltInAgentId != null && !fixedBuiltInAgentId.success) {
     return Err({
       type: "unknown",
-      raw: `Invalid fixed built-in agent ID: ${rawFixedBuiltInAgentId}`,
+      raw: `Invalid fixed built-in agent ID: ${String(rawFixedBuiltInAgentId)}`,
     });
   }
   const fixedAgentId = fixedBuiltInAgentId?.data;
