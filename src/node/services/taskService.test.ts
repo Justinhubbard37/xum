@@ -8716,8 +8716,9 @@ describe("TaskService", () => {
       updatedAt: "2026-06-19T00:00:02.000Z",
       reportMarkdown: "Durable shadow result",
     };
-    await expect(
-      internal.settleWorkspaceTurn({
+    let terminalMirrorError: unknown;
+    try {
+      await internal.settleWorkspaceTurn({
         record: activeUpdate,
         next: terminal,
         waiterSettlement: {
@@ -8728,8 +8729,12 @@ describe("TaskService", () => {
             reportMarkdown: terminal.reportMarkdown,
           },
         },
-      })
-    ).rejects.toThrow("terminal mirror unavailable");
+      });
+    } catch (error) {
+      terminalMirrorError = error;
+    }
+    assert(terminalMirrorError instanceof Error, "terminal mirror must fail");
+    expect(terminalMirrorError.message).toContain("terminal mirror unavailable");
     expect(waiterSettlement).not.toHaveBeenCalled();
     expect(await taskService.getWorkspaceTurnSnapshot(parentId, "wst_handle")).toMatchObject({
       status: "completed",
