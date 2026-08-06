@@ -1811,7 +1811,8 @@ export class Config {
         projectPath,
         createdAt: projectChat.createdAt,
         aiSettingsByAgent: projectChat.aiSettingsByAgent,
-        runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+        // Project Chat executes directly in the trusted project root; it is not a worktree.
+        runtimeConfig: { type: "local" },
         agentId: PROJECT_CHAT_AGENT_ID,
         namedWorkspacePath: projectPath,
       },

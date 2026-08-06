@@ -562,6 +562,56 @@ describe("resolveMuxProjectRootForHostFs", () => {
   });
 });
 
+describe("AIService Project Chat execution gate", () => {
+  afterEach(() => {
+    mock.restore();
+  });
+
+  it("loads virtual metadata but rejects untrusted execution before model creation", async () => {
+    using muxHome = new DisposableTempDir("ai-service-project-chat-trust");
+    const projectPath = path.join(muxHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const { config, service } = createBasicAIService(muxHome.path);
+    await config.editConfig((cfg) => {
+      cfg.projects.set(projectPath, { trusted: false, workspaces: [] });
+      return cfg;
+    });
+    const projectChat = await config.ensureProjectChat(projectPath);
+
+    const metadata = await service.getWorkspaceMetadata(projectChat.sessionId);
+    expect(metadata.success).toBe(true);
+    if (metadata.success) {
+      expect(metadata.data).toMatchObject({
+        id: projectChat.sessionId,
+        projectPath,
+        runtimeConfig: { type: "local" },
+        agentId: "orchestrator",
+      });
+    }
+
+    const providerModelFactory = Reflect.get(
+      service,
+      "providerModelFactory"
+    ) as ProviderModelFactory;
+    const createModelSpy = spyOn(providerModelFactory, "resolveAndCreateModel");
+    const result = await service.streamMessage({
+      messages: [createMuxMessage("user-message", "user", "coordinate work")],
+      workspaceId: projectChat.sessionId,
+      modelString: "openai:gpt-5.2",
+      agentId: "exec",
+    });
+
+    expect(result).toEqual({
+      success: false,
+      error: {
+        type: "policy_denied",
+        message: "Trust this project before running Project Chat.",
+      },
+    });
+    expect(createModelSpy).not.toHaveBeenCalled();
+  });
+});
+
 describe("AIService.setupStreamEventForwarding", () => {
   interface ForwardingInternals {
     streamManager: StreamManager;

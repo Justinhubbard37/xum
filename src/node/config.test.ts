@@ -64,6 +64,7 @@ describe("Config", () => {
         namedWorkspacePath: projectPath,
         agentId: "orchestrator",
       });
+      expect(first.metadata.runtimeConfig).toEqual({ type: "local" });
       expect(config.getSessionDir(first.sessionId)).toBe(
         path.join(tempDir, "project-sessions", first.sessionId)
       );
