@@ -12,7 +12,7 @@ import { ATTACH_FILE_ARTIFACT_GUIDANCE } from "@/common/utils/tools/toolDefiniti
 
 function expectQueuedOrRunningTaskToolResult(
   result: unknown,
-  expected: { status: "queued" | "running"; taskId: string }
+  expected: { status: "queued" | "running"; taskId: string; workspaceId?: string }
 ): void {
   expect(result).toBeTruthy();
   expect(typeof result).toBe("object");
@@ -20,6 +20,7 @@ function expectQueuedOrRunningTaskToolResult(
 
   const obj = result as Record<string, unknown>;
   expect(obj.status).toBe(expected.status);
+  if (expected.workspaceId != null) expect(obj.workspaceId).toBe(expected.workspaceId);
   expect(obj.taskId).toBe(expected.taskId);
   expect(typeof obj.note).toBe("string");
 }
@@ -617,12 +618,17 @@ describe("task tool", () => {
     expect(create.mock.calls[0]?.[0]?.sticky).toBe(true);
   });
 
-  it("should return immediately when run_in_background is true", async () => {
+  it("should return opaque task and explicit workspace ids in background", async () => {
     using tempDir = new TestTempDir("test-task-tool");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
 
     const create = mock(() =>
-      Ok({ taskId: "child-task", kind: "agent" as const, status: "queued" as const })
+      Ok({
+        taskId: "exe_child",
+        workspaceId: "child-workspace",
+        kind: "agent" as const,
+        status: "queued" as const,
+      })
     );
     const waitForAgentReport = mock(() => Promise.resolve({ reportMarkdown: "ignored" }));
     const taskService = { create, waitForAgentReport } as unknown as TaskService;
@@ -642,7 +648,11 @@ describe("task tool", () => {
 
     expect(create).toHaveBeenCalled();
     expect(waitForAgentReport).not.toHaveBeenCalled();
-    expectQueuedOrRunningTaskToolResult(result, { status: "queued", taskId: "child-task" });
+    expectQueuedOrRunningTaskToolResult(result, {
+      status: "queued",
+      taskId: "exe_child",
+      workspaceId: "child-workspace",
+    });
   });
 
   it("passes parent MUX_MODEL_STRING/MUX_THINKING_LEVEL as a runtime fallback hint", async () => {
@@ -1290,7 +1300,12 @@ describe("task tool", () => {
     let didEmitTaskCreated = false;
 
     const create = mock(() =>
-      Ok({ taskId: "child-task", kind: "agent" as const, status: "running" as const })
+      Ok({
+        taskId: "exe_child",
+        workspaceId: "child-workspace",
+        kind: "agent" as const,
+        status: "running" as const,
+      })
     );
     const waitForAgentReport = mock(() => {
       // The main thing we care about: emit the UI-only taskId before we block waiting for the report.
@@ -1326,7 +1341,7 @@ describe("task tool", () => {
     );
 
     expect(create).toHaveBeenCalled();
-    expect(waitForAgentReport).toHaveBeenCalledWith("child-task", expect.any(Object));
+    expect(waitForAgentReport).toHaveBeenCalledWith("exe_child", expect.any(Object));
 
     expect(events).toHaveLength(1);
     const taskCreated = events[0];
@@ -1342,11 +1357,13 @@ describe("task tool", () => {
     }
     expect(taskCreated.workspaceId).toBe(parentWorkspaceId);
     expect(taskCreated.toolCallId).toBe(mockToolCallOptions.toolCallId);
-    expect(taskCreated.taskId).toBe("child-task");
+    expect(taskCreated.taskId).toBe("exe_child");
+    expect(taskCreated.taskWorkspaceId).toBe("child-workspace");
     expect(typeof taskCreated.timestamp).toBe("number");
     expect(result).toEqual({
       status: "completed",
-      taskId: "child-task",
+      taskId: "exe_child",
+      workspaceId: "child-workspace",
       reportMarkdown: "Hello from child",
       title: "Result",
       agentId: "explore",

@@ -174,6 +174,10 @@ export const WorkspaceMetadataSchema = z.object({
     description:
       "Per-workspace overrides for goal creation defaults (budget, turn cap, explicit-budget). Layered on top of the global `goalDefaults` from app config.",
   }),
+  executionId: z.string().optional().meta({
+    description:
+      "Opaque execution handle for agent-task workspaces. Kept as a lightweight back-reference; lifecycle ownership lives in the execution registry.",
+  }),
   parentWorkspaceId: z.string().optional().meta({
     description:
       "If set, this workspace is a child workspace spawned from the parent workspaceId (enables nesting in UI and backend orchestration).",

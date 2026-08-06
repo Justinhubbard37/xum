@@ -110,6 +110,10 @@ export const WorkspaceConfigSchema = z.object({
     description:
       "Per-workspace overrides for goal creation defaults. Sparse; each null field follows the global `goalDefaults`.",
   }),
+  executionId: z.string().optional().meta({
+    description:
+      "Opaque execution handle for agent-task workspaces. Kept as a lightweight back-reference; lifecycle ownership lives in the execution registry.",
+  }),
   parentWorkspaceId: z.string().optional().meta({
     description:
       "If set, this workspace is a child workspace spawned from the parent workspaceId (enables nesting in UI and backend orchestration).",

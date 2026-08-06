@@ -4560,13 +4560,14 @@ export const router = (authToken?: string) => {
             // If a grandchild task has already been cleaned up, its transcript is archived into the
             // immediate parent workspace's session dir. Until that parent workspace is cleaned up and
             // its artifacts are rolled up, the requesting workspace won't have the transcript index.
-            const descendants = context.taskService.listDescendantAgentTasks(ancestorWorkspaceId);
+            const descendants =
+              await context.taskService.listDescendantAgentTasks(ancestorWorkspaceId);
 
             // Prefer shallower tasks first so we find the owning parent quickly.
             descendants.sort((a, b) => a.depth - b.depth);
 
             for (const descendant of descendants) {
-              const loaded = await tryLoadFromWorkspace(descendant.taskId);
+              const loaded = await tryLoadFromWorkspace(descendant.workspaceId);
               if (loaded) return loaded;
             }
 

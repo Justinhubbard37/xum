@@ -34,6 +34,8 @@ import { SessionUsageService } from "@/node/services/sessionUsageService";
 import { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import { IdleDispatcher } from "@/node/services/idleDispatcher";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
+import { ExecutionRegistry } from "@/node/services/executionRegistry";
+import { ExecutionStore } from "@/node/services/executionStore";
 import { TaskHandleStore } from "@/node/services/taskHandleStore";
 import {
   TaskService,
@@ -603,6 +605,8 @@ function createTaskServiceHarness(
     overrides?.workspaceService ?? createWorkspaceServiceMocks().workspaceService;
   const initStateManager = overrides?.initStateManager ?? createMockInitStateManager();
 
+  const executionStore = new ExecutionStore(config);
+  const executionRegistry = new ExecutionRegistry(config, { executionStore });
   const taskService = new TaskService(
     config,
     historyService,
@@ -611,7 +615,8 @@ function createTaskServiceHarness(
     initStateManager,
     undefined,
     overrides?.sessionUsageService,
-    overrides?.workspaceGoalService
+    overrides?.workspaceGoalService,
+    { executionStore, executionRegistry }
   );
 
   return {
@@ -677,15 +682,16 @@ describe("TaskService", () => {
 
     const result = await createAgentTask(taskService, parentId, "Inspect the scratch files");
 
-    expect(result).toEqual(
+    expect(result).toMatchObject(
       Ok({
-        taskId: childId,
+        workspaceId: childId,
         kind: "agent",
         status: "running",
         modelString: "anthropic:claude-opus-4-6",
         thinkingLevel: "high",
       })
     );
+    expect(result.success && result.data.taskId).not.toBe(childId);
     const scratchProject = config.loadConfigOrDefault().projects.get(SCRATCH_PROJECT_CONFIG_KEY);
     const child = scratchProject?.workspaces.find((workspace) => workspace.id === childId);
     expect(child?.kind).toBe("scratch");
@@ -699,6 +705,99 @@ describe("TaskService", () => {
       expect.any(Object),
       { agentInitiated: true }
     );
+  });
+
+  test("opaque execution ids retain nested scope and legacy workspace aliases", async () => {
+    const config = await createTestConfig(rootDir);
+    const parentId = "1111111111";
+    const firstWorkspaceId = "2222222222";
+    const nestedWorkspaceId = "3333333333";
+    const scratchPath = path.join(config.rootDir, "scratch", parentId);
+    await fsPromises.mkdir(scratchPath, { recursive: true });
+    await saveTestConfig(
+      config,
+      [
+        [
+          SCRATCH_PROJECT_CONFIG_KEY,
+          {
+            projectKind: "system",
+            trusted: true,
+            workspaces: [
+              {
+                kind: "scratch",
+                path: scratchPath,
+                id: parentId,
+                name: `scratch-${parentId}`,
+                createdAt: new Date().toISOString(),
+                runtimeConfig: { type: "local" },
+                aiSettings: { model: "anthropic:claude-opus-4-6", thinkingLevel: "high" },
+              },
+            ],
+          },
+        ],
+      ],
+      { taskSettings: { maxParallelAgentTasks: 3, maxTaskNestingDepth: 3 } }
+    );
+    stubStableIds(config, [firstWorkspaceId, nestedWorkspaceId]);
+
+    const workspaceMocks = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+    const first = await createAgentTask(taskService, parentId, "Inspect first");
+    assert(first.success, "first task should be created");
+    const nested = await createAgentTask(taskService, first.data.workspaceId, "Inspect nested");
+    assert(nested.success, "nested task should be created");
+
+    expect(first.data.taskId).not.toBe(first.data.workspaceId);
+    expect(nested.data.taskId).not.toBe(nested.data.workspaceId);
+    const registry = new ExecutionRegistry(config);
+    const firstHandle = await registry.get(parentId, first.data.taskId);
+    const nestedHandle = await registry.get(parentId, nested.data.taskId);
+    expect(firstHandle).toMatchObject({
+      executionId: first.data.taskId,
+      ownerSessionId: parentId,
+      requesterWorkspaceId: parentId,
+      target: { workspaceId: firstWorkspaceId },
+    });
+    expect(nestedHandle).toMatchObject({
+      executionId: nested.data.taskId,
+      parentExecutionId: first.data.taskId,
+      ownerSessionId: parentId,
+      requesterWorkspaceId: firstWorkspaceId,
+      target: { workspaceId: nestedWorkspaceId },
+    });
+
+    expect(
+      (await taskService.listDescendantAgentTasks(parentId)).map((task) => ({
+        taskId: task.taskId,
+        workspaceId: task.workspaceId,
+      }))
+    ).toEqual([
+      { taskId: first.data.taskId, workspaceId: firstWorkspaceId },
+      { taskId: nested.data.taskId, workspaceId: nestedWorkspaceId },
+    ]);
+    expect(
+      (await taskService.listDescendantAgentTasks(firstWorkspaceId)).map((task) => task.taskId)
+    ).toEqual([nested.data.taskId]);
+
+    const opaqueSend = await taskService.sendMessageToDescendantAgentTask(
+      parentId,
+      first.data.taskId,
+      "Use canonical ids",
+      "tool-end"
+    );
+    expect(opaqueSend.success).toBe(true);
+    const aliasSend = await taskService.sendMessageToDescendantAgentTask(
+      parentId,
+      first.data.workspaceId,
+      "Legacy alias still works",
+      "tool-end"
+    );
+    expect(aliasSend.success).toBe(true);
+
+    const terminated = await taskService.terminateDescendantAgentTask(parentId, first.data.taskId);
+    expect(terminated).toEqual(Ok({ terminatedTaskIds: [nested.data.taskId, first.data.taskId] }));
   });
 
   test("create persists sticky retention only when requested", async () => {
@@ -5286,6 +5385,7 @@ describe("TaskService", () => {
       ownerWorkspaceId: parentId,
       sourceKind: "agent_task",
       sourceId: "task_done",
+      title: "Fallback audit",
       outputDelivery: "already_injected",
       terminalOutcome: "completed",
     });
@@ -8500,11 +8600,15 @@ describe("TaskService", () => {
     expect(first.success).toBe(true);
     if (!first.success) return;
 
-    const second = await createAgentTask(taskService, first.data.taskId, "nested explore");
+    const second = await createAgentTask(taskService, first.data.workspaceId, "nested explore");
     expect(second.success).toBe(true);
     if (!second.success) return;
 
-    const third = await createAgentTask(taskService, second.data.taskId, "nested explore again");
+    const third = await createAgentTask(
+      taskService,
+      second.data.workspaceId,
+      "nested explore again"
+    );
     expect(third.success).toBe(false);
     if (!third.success) {
       expect(third.error).toContain("maxTaskNestingDepth");
@@ -8588,6 +8692,12 @@ describe("TaskService", () => {
     expect(result.success).toBe(true);
     if (!result.success) return;
     expect(result.data.map((task) => task.status)).toEqual(["starting", "starting", "queued"]);
+
+    const executionStore = new ExecutionStore(config);
+    const executionStatuses = await Promise.all(
+      result.data.map(async (task) => (await executionStore.get(parentId, task.taskId))?.status)
+    );
+    expect(executionStatuses).toEqual(["starting", "starting", "queued"]);
 
     const tasks = Array.from(config.loadConfigOrDefault().projects.values())
       .flatMap((project) => project.workspaces)
@@ -8712,7 +8822,12 @@ describe("TaskService", () => {
     expect(result.success).toBe(true);
     if (!result.success) return;
     const taskId = result.data[0]?.taskId;
+    const workspaceId = result.data[0]?.workspaceId;
     assert(typeof taskId === "string" && taskId.length > 0, "created task id is required");
+    assert(
+      typeof workspaceId === "string" && workspaceId.length > 0,
+      "created workspace id is required"
+    );
 
     let launchError: unknown;
     try {
@@ -8728,7 +8843,11 @@ describe("TaskService", () => {
 
     const taskEntry = Array.from(config.loadConfigOrDefault().projects.values())
       .flatMap((project) => project.workspaces)
-      .find((workspace) => workspace.id === taskId);
+      .find((workspace) => workspace.id === workspaceId);
+    expect(await new ExecutionStore(config).get(parentId, taskId)).toMatchObject({
+      status: "error",
+      result: { kind: "error", error: "Forbidden" },
+    });
     expect(taskEntry?.taskStatus).toBe("interrupted");
     expect(taskEntry?.taskLaunchError).toBe("Forbidden");
   });
@@ -8801,11 +8920,11 @@ describe("TaskService", () => {
     // task that only has agentType so dequeue preserves Explore instead of falling back to Exec.
     await config.editConfig((cfg) => {
       for (const [_project, project] of cfg.projects) {
-        const ws = project.workspaces.find((w) => w.id === running.data.taskId);
+        const ws = project.workspaces.find((w) => w.id === running.data.workspaceId);
         if (ws) {
           ws.taskStatus = "reported";
         }
-        const queuedWs = project.workspaces.find((w) => w.id === queued.data.taskId);
+        const queuedWs = project.workspaces.find((w) => w.id === queued.data.workspaceId);
         if (queuedWs) {
           queuedWs.agentId = "";
         }
@@ -8820,7 +8939,7 @@ describe("TaskService", () => {
       await taskService.initialize();
 
       expect(sendMessage).toHaveBeenCalledWith(
-        queued.data.taskId,
+        queued.data.workspaceId,
         "task 2",
         expect.objectContaining({ agentId: "explore" }),
         expect.objectContaining({ allowQueuedAgentTask: true })
@@ -8828,7 +8947,7 @@ describe("TaskService", () => {
       expect(runBackgroundInitSpy).toHaveBeenCalledWith(
         expect.anything(),
         expect.objectContaining({ skipInitHook: true }),
-        queued.data.taskId
+        queued.data.workspaceId
       );
     } finally {
       runBackgroundInitSpy.mockRestore();
@@ -8837,7 +8956,7 @@ describe("TaskService", () => {
     const cfg = config.loadConfigOrDefault();
     const started = Array.from(cfg.projects.values())
       .flatMap((p) => p.workspaces)
-      .find((w) => w.id === queued.data.taskId);
+      .find((w) => w.id === queued.data.workspaceId);
     expect(started?.taskStatus).toBe("running");
   }, 20_000);
 
@@ -8997,10 +9116,10 @@ describe("TaskService", () => {
     const parentTask = await createAgentTask(taskService, rootWorkspaceId, "parent task");
     expect(parentTask.success).toBe(true);
     if (!parentTask.success) return;
-    streamingWorkspaceId = parentTask.data.taskId;
+    streamingWorkspaceId = parentTask.data.workspaceId;
 
     // With maxParallelAgentTasks=1, nested tasks will be created as queued.
-    const childTask = await createAgentTask(taskService, parentTask.data.taskId, "child task");
+    const childTask = await createAgentTask(taskService, parentTask.data.workspaceId, "child task");
     expect(childTask.success).toBe(true);
     if (!childTask.success) return;
     expect(childTask.data.status).toBe("queued");
@@ -9009,7 +9128,7 @@ describe("TaskService", () => {
     // to start despite maxParallelAgentTasks=1, avoiding a scheduler deadlock.
     const waiter = taskService.waitForAgentReport(childTask.data.taskId, {
       timeoutMs: 10_000,
-      requestingWorkspaceId: parentTask.data.taskId,
+      requestingWorkspaceId: parentTask.data.workspaceId,
     });
 
     const internal = taskService as unknown as {
@@ -9020,7 +9139,7 @@ describe("TaskService", () => {
     await internal.maybeStartQueuedTasks();
 
     expect(sendMessage).toHaveBeenCalledWith(
-      childTask.data.taskId,
+      childTask.data.workspaceId,
       "child task",
       expect.anything(),
       expect.objectContaining({ allowQueuedAgentTask: true })
@@ -9029,10 +9148,10 @@ describe("TaskService", () => {
     const cfgAfterStart = config.loadConfigOrDefault();
     const startedEntry = Array.from(cfgAfterStart.projects.values())
       .flatMap((p) => p.workspaces)
-      .find((w) => w.id === childTask.data.taskId);
+      .find((w) => w.id === childTask.data.workspaceId);
     expect(startedEntry?.taskStatus).toBe("running");
 
-    internal.resolveWaiters(childTask.data.taskId, { reportMarkdown: "ok" });
+    internal.resolveWaiters(childTask.data.workspaceId, { reportMarkdown: "ok" });
     const report = await waiter;
     expect(report.reportMarkdown).toBe("ok");
   }, 20_000);
@@ -9107,7 +9226,7 @@ describe("TaskService", () => {
 
       await config.editConfig((cfg) => {
         for (const [_project, project] of cfg.projects) {
-          const ws = project.workspaces.find((w) => w.id === running.data.taskId);
+          const ws = project.workspaces.find((w) => w.id === running.data.workspaceId);
           if (ws) {
             ws.taskStatus = "reported";
           }
@@ -9120,7 +9239,7 @@ describe("TaskService", () => {
       const postCfg = config.loadConfigOrDefault();
       const workspaces = Array.from(postCfg.projects.values()).flatMap((p) => p.workspaces);
       const parentEntry = workspaces.find((w) => w.id === parentId);
-      const childEntry = workspaces.find((w) => w.id === queued.data.taskId);
+      const childEntry = workspaces.find((w) => w.id === queued.data.workspaceId);
       expect(parentEntry?.runtimeConfig).toMatchObject({
         type: "worktree",
         srcBaseDir: sourceSrcBaseDir,
@@ -9339,7 +9458,8 @@ describe("TaskService", () => {
       expect(result.success).toBe(true);
       assert(result.success, "Expected shared-workspace task to be created");
       expect(result.data.status).toBe("running");
-      expect(result.data.taskId).toBe(childTaskId);
+      expect(result.data.workspaceId).toBe(childTaskId);
+      expect(result.data.taskId).not.toBe(childTaskId);
 
       // No fork and no init: the sub-agent reuses the parent's live checkout.
       expect(forkSpy).not.toHaveBeenCalled();
@@ -9822,7 +9942,7 @@ describe("TaskService", () => {
     if (!running.success) return;
 
     // Wait for running task init (fire-and-forget) so the init-status file exists.
-    await initStateManager.waitForInit(running.data.taskId);
+    await initStateManager.waitForInit(running.data.workspaceId);
 
     const queued = await createAgentTask(taskService, parentId, "task 2");
     expect(queued.success).toBe(true);
@@ -9833,7 +9953,7 @@ describe("TaskService", () => {
     const cfgBeforeStart = config.loadConfigOrDefault();
     const queuedEntryBeforeStart = Array.from(cfgBeforeStart.projects.values())
       .flatMap((p) => p.workspaces)
-      .find((w) => w.id === queued.data.taskId);
+      .find((w) => w.id === queued.data.workspaceId);
     expect(queuedEntryBeforeStart).toBeTruthy();
     await fsPromises.stat(queuedEntryBeforeStart!.path).then(
       () => {
@@ -9843,7 +9963,7 @@ describe("TaskService", () => {
     );
 
     const queuedInitStatusPath = path.join(
-      config.getSessionDir(queued.data.taskId),
+      config.getSessionDir(queued.data.workspaceId),
       "init-status.json"
     );
     await fsPromises.stat(queuedInitStatusPath).then(
@@ -9856,7 +9976,7 @@ describe("TaskService", () => {
     // Free slot and start queued tasks.
     await config.editConfig((cfg) => {
       for (const [_project, project] of cfg.projects) {
-        const ws = project.workspaces.find((w) => w.id === running.data.taskId);
+        const ws = project.workspaces.find((w) => w.id === running.data.workspaceId);
         if (ws) {
           ws.taskStatus = "reported";
         }
@@ -9867,20 +9987,20 @@ describe("TaskService", () => {
     await taskService.initialize();
 
     expect(sendMessage).toHaveBeenCalledWith(
-      queued.data.taskId,
+      queued.data.workspaceId,
       "task 2",
       expect.anything(),
       expect.objectContaining({ allowQueuedAgentTask: true })
     );
 
     // Init should start only once the task is dequeued.
-    await initStateManager.waitForInit(queued.data.taskId);
+    await initStateManager.waitForInit(queued.data.workspaceId);
     expect(await fsPromises.stat(queuedInitStatusPath)).toBeTruthy();
 
     const cfgAfterStart = config.loadConfigOrDefault();
     const queuedEntryAfterStart = Array.from(cfgAfterStart.projects.values())
       .flatMap((p) => p.workspaces)
-      .find((w) => w.id === queued.data.taskId);
+      .find((w) => w.id === queued.data.workspaceId);
     expect(queuedEntryAfterStart).toBeTruthy();
     expect(await fsPromises.stat(queuedEntryAfterStart!.path)).toBeTruthy();
   }, 20_000);
@@ -10021,7 +10141,7 @@ describe("TaskService", () => {
     const postCfg = config.loadConfigOrDefault();
     const childEntry = Array.from(postCfg.projects.values())
       .flatMap((p) => p.workspaces)
-      .find((w) => w.id === created.data.taskId);
+      .find((w) => w.id === created.data.workspaceId);
     expect(childEntry).toBeTruthy();
     expect(childEntry?.path).toBe(projectPath);
     expect(childEntry?.runtimeConfig?.type).toBe("local");
@@ -10064,7 +10184,7 @@ describe("TaskService", () => {
     if (!created.success) return;
 
     expect(sendMessage).toHaveBeenCalledWith(
-      created.data.taskId,
+      created.data.workspaceId,
       "run task with inherited model",
       {
         model: "openai:gpt-5.3-codex",
@@ -10078,7 +10198,7 @@ describe("TaskService", () => {
     const postCfg = config.loadConfigOrDefault();
     const childEntry = Array.from(postCfg.projects.values())
       .flatMap((p) => p.workspaces)
-      .find((w) => w.id === created.data.taskId);
+      .find((w) => w.id === created.data.workspaceId);
     expect(childEntry).toBeTruthy();
     expect(childEntry?.aiSettings).toEqual({
       model: "openai:gpt-5.3-codex",
@@ -10123,7 +10243,7 @@ describe("TaskService", () => {
     if (!created.success) return;
 
     expect(sendMessage).toHaveBeenCalledWith(
-      created.data.taskId,
+      created.data.workspaceId,
       "run task inheriting parent settings",
       {
         model: "openai:gpt-5.3-codex",
@@ -10137,7 +10257,7 @@ describe("TaskService", () => {
     const postCfg = config.loadConfigOrDefault();
     const childEntry = Array.from(postCfg.projects.values())
       .flatMap((p) => p.workspaces)
-      .find((w) => w.id === created.data.taskId);
+      .find((w) => w.id === created.data.workspaceId);
     expect(childEntry).toBeTruthy();
     expect(childEntry?.taskModelString).toBe("openai:gpt-5.3-codex");
     expect(childEntry?.taskThinkingLevel).toBe("xhigh");
@@ -10176,7 +10296,7 @@ describe("TaskService", () => {
     // The child's kickoff send must carry the parent's pro mode (the send path
     // re-gates per model, so this is safe even for non-GPT-5.6 task models).
     expect(sendMessage).toHaveBeenCalledWith(
-      created.data.taskId,
+      created.data.workspaceId,
       "run task inheriting pro mode",
       {
         model: "openai:gpt-5.6-sol",
@@ -10193,7 +10313,7 @@ describe("TaskService", () => {
     const postCfg = config.loadConfigOrDefault();
     const childEntry = Array.from(postCfg.projects.values())
       .flatMap((p) => p.workspaces)
-      .find((w) => w.id === created.data.taskId);
+      .find((w) => w.id === created.data.workspaceId);
     expect(childEntry?.aiSettings).toEqual({
       model: "openai:gpt-5.6-sol",
       thinkingLevel: "high",
@@ -10242,7 +10362,7 @@ describe("TaskService", () => {
     if (!created.success) return;
 
     expect(sendMessage).toHaveBeenCalledWith(
-      created.data.taskId,
+      created.data.workspaceId,
       "run explore with parent pro mode",
       expect.objectContaining({ agentId: "explore", reasoningMode: "pro" }),
       { agentInitiated: true }
@@ -10297,7 +10417,7 @@ describe("TaskService", () => {
     if (!created.success) return;
 
     expect(sendMessage).toHaveBeenCalledWith(
-      created.data.taskId,
+      created.data.workspaceId,
       "run with mapped alias max",
       expect.objectContaining({ model: "openai:team-sol", thinkingLevel: "max" }),
       { agentInitiated: true }
@@ -10338,7 +10458,7 @@ describe("TaskService", () => {
     if (!created.success) return;
 
     expect(sendMessage).toHaveBeenCalledWith(
-      created.data.taskId,
+      created.data.workspaceId,
       "run with numeric thinking",
       {
         model: "anthropic:claude-opus-4-6",
@@ -10352,7 +10472,7 @@ describe("TaskService", () => {
     const postCfg = config.loadConfigOrDefault();
     const childEntry = Array.from(postCfg.projects.values())
       .flatMap((p) => p.workspaces)
-      .find((w) => w.id === created.data.taskId);
+      .find((w) => w.id === created.data.workspaceId);
     expect(childEntry?.taskModelString).toBe("anthropic:claude-opus-4-6");
     expect(childEntry?.taskThinkingLevel).toBe("xhigh");
   }, 20_000);
@@ -10400,7 +10520,7 @@ describe("TaskService", () => {
     if (!created.success) return;
 
     expect(sendMessage).toHaveBeenCalledWith(
-      created.data.taskId,
+      created.data.workspaceId,
       "run task with same-agent conflicts",
       {
         model: "anthropic:claude-haiku-4-5",
@@ -10414,7 +10534,7 @@ describe("TaskService", () => {
     const postCfg = config.loadConfigOrDefault();
     const childEntry = Array.from(postCfg.projects.values())
       .flatMap((p) => p.workspaces)
-      .find((w) => w.id === created.data.taskId);
+      .find((w) => w.id === created.data.workspaceId);
     expect(childEntry).toBeTruthy();
     expect(childEntry?.aiSettings).toEqual({
       model: "anthropic:claude-haiku-4-5",
@@ -10473,7 +10593,7 @@ describe("TaskService", () => {
     if (!created.success) return;
 
     expect(sendMessage).toHaveBeenCalledWith(
-      created.data.taskId,
+      created.data.workspaceId,
       "run task with custom agent",
       {
         model: "openai:gpt-5.3-codex",
@@ -10487,7 +10607,7 @@ describe("TaskService", () => {
     const postCfg = config.loadConfigOrDefault();
     const childEntry = Array.from(postCfg.projects.values())
       .flatMap((p) => p.workspaces)
-      .find((w) => w.id === created.data.taskId);
+      .find((w) => w.id === created.data.workspaceId);
     expect(childEntry).toBeTruthy();
     expect(childEntry?.aiSettings).toEqual({
       model: "openai:gpt-5.3-codex",
@@ -10546,7 +10666,7 @@ describe("TaskService", () => {
     if (!created.success) return;
 
     expect(sendMessage).toHaveBeenCalledWith(
-      created.data.taskId,
+      created.data.workspaceId,
       "run task with custom agent",
       {
         model: "openai:gpt-4o-mini",
@@ -10593,7 +10713,7 @@ describe("TaskService", () => {
 
     expect(created.success).toBe(true);
     assert(created.success);
-    expect(await workspaceGoalFileExists(config, created.data.taskId)).toBe(false);
+    expect(await workspaceGoalFileExists(config, created.data.workspaceId)).toBe(false);
   }, 20_000);
 
   test("parent runtime AI settings outrank persisted parent workspace settings", async () => {
@@ -10619,7 +10739,7 @@ describe("TaskService", () => {
     if (!created.success) return;
 
     expect(sendMessage).toHaveBeenCalledWith(
-      created.data.taskId,
+      created.data.workspaceId,
       "run exec task with parent runtime fallback",
       {
         model: "openai:gpt-5.3-codex",
@@ -10629,7 +10749,7 @@ describe("TaskService", () => {
       },
       { agentInitiated: true }
     );
-    const childEntry = findWorkspaceInConfig(config, created.data.taskId);
+    const childEntry = findWorkspaceInConfig(config, created.data.workspaceId);
     expect(childEntry?.taskModelString).toBe("openai:gpt-5.3-codex");
     expect(childEntry?.taskThinkingLevel).toBe("medium");
   }, 20_000);
@@ -10659,7 +10779,7 @@ describe("TaskService", () => {
     if (!created.success) return;
 
     expect(sendMessage).toHaveBeenCalledWith(
-      created.data.taskId,
+      created.data.workspaceId,
       "run exec task with configured default",
       {
         model: "anthropic:claude-haiku-4-5",
@@ -10669,7 +10789,7 @@ describe("TaskService", () => {
       },
       { agentInitiated: true }
     );
-    const childEntry = findWorkspaceInConfig(config, created.data.taskId);
+    const childEntry = findWorkspaceInConfig(config, created.data.workspaceId);
     expect(childEntry?.taskModelString).toBe("anthropic:claude-haiku-4-5");
     expect(childEntry?.taskThinkingLevel).toBe("off");
   }, 20_000);
@@ -10701,7 +10821,7 @@ describe("TaskService", () => {
     if (!created.success) return;
 
     expect(sendMessage).toHaveBeenCalledWith(
-      created.data.taskId,
+      created.data.workspaceId,
       "run exec task with parent runtime thinking fallback",
       {
         model: resolvedModel,
@@ -10711,7 +10831,7 @@ describe("TaskService", () => {
       },
       { agentInitiated: true }
     );
-    const childEntry = findWorkspaceInConfig(config, created.data.taskId);
+    const childEntry = findWorkspaceInConfig(config, created.data.workspaceId);
     expect(childEntry?.taskModelString).toBe(resolvedModel);
     expect(childEntry?.taskThinkingLevel).toBe(expectedThinkingLevel);
   }, 20_000);
@@ -10743,7 +10863,7 @@ describe("TaskService", () => {
     if (!created.success) return;
 
     expect(sendMessage).toHaveBeenCalledWith(
-      created.data.taskId,
+      created.data.workspaceId,
       "run exec task with subagent defaults",
       {
         model: "openai:gpt-5.3-codex",
@@ -10753,7 +10873,7 @@ describe("TaskService", () => {
       },
       { agentInitiated: true }
     );
-    const childEntry = findWorkspaceInConfig(config, created.data.taskId);
+    const childEntry = findWorkspaceInConfig(config, created.data.workspaceId);
     expect(childEntry?.taskModelString).toBe("openai:gpt-5.3-codex");
     expect(childEntry?.taskThinkingLevel).toBe("xhigh");
   }, 20_000);
@@ -10784,7 +10904,7 @@ describe("TaskService", () => {
     if (!created.success) return;
 
     expect(sendMessage).toHaveBeenCalledWith(
-      created.data.taskId,
+      created.data.workspaceId,
       "run exec task with explicit args",
       {
         model: "openai:gpt-5.2",
@@ -10794,7 +10914,7 @@ describe("TaskService", () => {
       },
       { agentInitiated: true }
     );
-    const childEntry = findWorkspaceInConfig(config, created.data.taskId);
+    const childEntry = findWorkspaceInConfig(config, created.data.workspaceId);
     expect(childEntry?.taskModelString).toBe("openai:gpt-5.2");
     expect(childEntry?.taskThinkingLevel).toBe("medium");
   }, 20_000);
@@ -10823,7 +10943,7 @@ describe("TaskService", () => {
     if (!created.success) return;
 
     expect(sendMessage).toHaveBeenCalledWith(
-      created.data.taskId,
+      created.data.workspaceId,
       "run exec task with agent defaults",
       {
         model: "openai:gpt-5.3-codex",
@@ -10862,7 +10982,7 @@ describe("TaskService", () => {
     if (!created.success) return;
 
     expect(sendMessage).toHaveBeenCalledWith(
-      created.data.taskId,
+      created.data.workspaceId,
       "run exec task with partial defaults",
       {
         model: "openai:gpt-5.3-codex",
@@ -10904,7 +11024,7 @@ describe("TaskService", () => {
     if (!created.success) return;
 
     expect(sendMessage).toHaveBeenCalledWith(
-      created.data.taskId,
+      created.data.workspaceId,
       "run exec task with clamped default thinking",
       {
         model: resolvedModel,
@@ -10914,7 +11034,7 @@ describe("TaskService", () => {
       },
       { agentInitiated: true }
     );
-    const childEntry = findWorkspaceInConfig(config, created.data.taskId);
+    const childEntry = findWorkspaceInConfig(config, created.data.workspaceId);
     expect(childEntry?.taskModelString).toBe(resolvedModel);
     expect(childEntry?.taskThinkingLevel).toBe(expectedThinkingLevel);
   }, 20_000);
@@ -10944,7 +11064,7 @@ describe("TaskService", () => {
     if (!created.success) return;
 
     expect(sendMessage).toHaveBeenCalledWith(
-      created.data.taskId,
+      created.data.workspaceId,
       "run exec task with clamped thinking",
       {
         model: "google:gemini-3-pro",
@@ -11083,7 +11203,7 @@ describe("TaskService", () => {
       },
     }));
 
-    const childEntry = findWorkspaceInConfig(config, created.data.taskId);
+    const childEntry = findWorkspaceInConfig(config, created.data.workspaceId);
     expect(childEntry?.aiSettings).toEqual({
       model: "openai:gpt-5.3-codex",
       thinkingLevel: "xhigh",
@@ -14392,14 +14512,16 @@ describe("TaskService", () => {
     const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
 
     expect(
-      new Set(taskService.listDescendantAgentTasks(rootWorkspaceId).map((task) => task.taskId))
+      new Set(
+        (await taskService.listDescendantAgentTasks(rootWorkspaceId)).map((task) => task.taskId)
+      )
     ).toEqual(new Set([regularTaskId, workflowChildTaskId, workflowTaskId]));
     expect(
-      taskService
-        .listDescendantAgentTasks(rootWorkspaceId, {
+      (
+        await taskService.listDescendantAgentTasks(rootWorkspaceId, {
           excludeWorkflowTasks: true,
         })
-        .map((task) => task.taskId)
+      ).map((task) => task.taskId)
     ).toEqual([regularTaskId]);
     expect(
       await taskService.isWorkflowOwnedDescendantAgentTask(rootWorkspaceId, workflowTaskId)
@@ -23656,7 +23778,7 @@ describe("TaskService", () => {
     const postCfg = config.loadConfigOrDefault();
     const childEntry = Array.from(postCfg.projects.values())
       .flatMap((p) => p.workspaces)
-      .find((w) => w.id === created.data.taskId);
+      .find((w) => w.id === created.data.workspaceId);
     expect(childEntry).toBeTruthy();
     expect(childEntry?.runtimeConfig?.type).toBe("worktree");
   }, 20_000);

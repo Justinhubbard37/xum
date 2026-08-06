@@ -170,16 +170,30 @@ export class ExecutionRegistry {
   }
 
   private getLegacyAgentWorkspaces(ownerSessionId: string): Map<string, Workspace> {
-    const byId = new Map<string, Workspace>();
+    const allById = new Map<string, Workspace>();
     const config = this.config.loadConfigOrDefault();
     for (const project of config.projects.values()) {
       for (const workspace of project.workspaces) {
-        if (workspace.parentWorkspaceId === ownerSessionId && workspace.id != null) {
-          byId.set(workspace.id, workspace);
-        }
+        if (workspace.id != null) allById.set(workspace.id, workspace);
       }
     }
-    return byId;
+
+    const descendants = new Map<string, Workspace>();
+    for (const [workspaceId, workspace] of allById) {
+      let current = workspace;
+      const visited = new Set<string>();
+      while (current.parentWorkspaceId != null && !visited.has(current.parentWorkspaceId)) {
+        if (current.parentWorkspaceId === ownerSessionId) {
+          descendants.set(workspaceId, workspace);
+          break;
+        }
+        visited.add(current.parentWorkspaceId);
+        const parent = allById.get(current.parentWorkspaceId);
+        if (parent == null) break;
+        current = parent;
+      }
+    }
+    return descendants;
   }
 
   private async listLegacyAgentTasks(ownerSessionId: string): Promise<ExecutionHandle[]> {
@@ -281,7 +295,10 @@ export class ExecutionRegistry {
       executionId: legacyExecutionId("agent_task", taskId),
       aliases: [taskId],
       ownerSessionId,
-      requesterWorkspaceId: ownerSessionId,
+      requesterWorkspaceId: workspace?.parentWorkspaceId ?? ownerSessionId,
+      ...(workspace?.parentWorkspaceId != null && workspace.parentWorkspaceId !== ownerSessionId
+        ? { parentExecutionId: legacyExecutionId("agent_task", workspace.parentWorkspaceId) }
+        : {}),
       target: { kind: "workspace", workspaceId: taskId, origin: "created" },
       launchPolicy: {
         kind: "agent_task",

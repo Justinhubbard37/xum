@@ -170,7 +170,9 @@ export const createTaskTerminateTool: ToolFactory = (config: ToolConfiguration) 
               if (!terminateResult.success) {
                 const msg = terminateResult.error;
                 const activeDescendantIds =
-                  taskService.listActiveDescendantAgentTaskIds(workspaceId);
+                  taskService.listActiveDescendantAgentExecutionIds != null
+                    ? await taskService.listActiveDescendantAgentExecutionIds(workspaceId)
+                    : taskService.listActiveDescendantAgentTaskIds(workspaceId);
                 const activeTaskIds =
                   activeDescendantIds.length > 0 ? activeDescendantIds : undefined;
                 // Exact-match the canonical scope errors: aggregated cleanup failures

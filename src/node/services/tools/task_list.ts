@@ -171,13 +171,13 @@ function createWorkspaceArchiveLookup(
 }
 
 function shouldHideArchivedAgentTask(
-  task: { taskId: string; status: AgentTaskStatus },
+  task: { taskId: string; workspaceId?: string; status: AgentTaskStatus },
   archiveLookup: WorkspaceArchiveLookup | null
 ): boolean {
   return (
     archiveLookup != null &&
     !ACTIONABLE_AGENT_TASK_STATUSES.has(task.status) &&
-    archiveLookup.isArchivedInScope(task.taskId)
+    archiveLookup.isArchivedInScope(task.workspaceId ?? task.taskId)
   );
 }
 
@@ -221,7 +221,7 @@ export const createTaskListTool: ToolFactory = (config: ToolConfiguration) => {
 
       const allAgentTasks =
         agentStatuses.length > 0
-          ? taskService.listDescendantAgentTasks(workspaceId, {
+          ? await taskService.listDescendantAgentTasks(workspaceId, {
               statuses: agentStatuses,
               excludeWorkflowTasks: true,
             })

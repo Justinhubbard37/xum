@@ -70,6 +70,12 @@ import {
 import { inspectInsideGitRepository, stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { Ok, Err, type Result } from "@/common/types/result";
 import {
+  EXECUTION_HANDLE_VERSION,
+  isExecutionId,
+  type ExecutionHandle,
+  type ExecutionStatus,
+} from "@/common/types/execution";
+import {
   DEFAULT_TASK_SETTINGS,
   normalizeTaskSettings,
   type TaskSettings,
@@ -168,6 +174,8 @@ import type { StreamErrorType } from "@/common/types/errors";
 import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
+import { ExecutionRegistry } from "@/node/services/executionRegistry";
+import { ExecutionStore } from "@/node/services/executionStore";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import {
   TaskHandleStore,
@@ -709,7 +717,10 @@ interface WorkspaceTurnWaiter extends BackgroundableForegroundWaiter {
 }
 
 export interface TaskCreateResult {
+  /** Opaque execution ID returned to tool callers. */
   taskId: string;
+  /** Concrete child workspace ID used for navigation and workspace operations. */
+  workspaceId: string;
   kind: TaskKind;
   status: "queued" | "starting" | "running";
   /** Resolved (post-precedence) AI settings the child was created with. */
@@ -720,7 +731,9 @@ export interface TaskCreateResult {
 type TaskLaunchStart = { kind: "sendMessage"; prompt: string } | { kind: "resumeStream" };
 
 interface TaskLaunchPlan {
+  /** Legacy internal task key: the concrete child workspace ID. */
   taskId: string;
+  executionId: `exe_${string}`;
   parentWorkspaceId: string;
   parentMeta: WorkspaceMetadata;
   agentId: string;
@@ -780,6 +793,7 @@ export interface TerminateAgentTaskResult {
 
 export interface DescendantAgentTaskInfo {
   taskId: string;
+  workspaceId: string;
   status: AgentTaskStatus;
   parentWorkspaceId: string;
   agentType?: string;
@@ -1359,6 +1373,16 @@ function buildWorkflowTimeoutFinalizationPrompt(
   return `${base}\n\nAdditional workflow-specific finalization instructions:\n${finalInstructions}`;
 }
 
+type ScopedAgentExecutionResolution =
+  | { kind: "ok"; handle: ExecutionHandle; workspaceId: string }
+  | { kind: "not_found" }
+  | { kind: "invalid_scope" };
+
+interface TaskServiceExecutionDependencies {
+  executionStore?: ExecutionStore;
+  executionRegistry?: ExecutionRegistry;
+}
+
 export class TaskService {
   // Serialize stream-end processing per workspace to avoid races when
   // finalizing reported tasks and cleanup state transitions.
@@ -1404,6 +1428,8 @@ export class TaskService {
     string,
     { handleId: string; ownerWorkspaceId: string }
   >();
+  private readonly executionStore: ExecutionStore;
+  private readonly executionRegistry: ExecutionRegistry;
   private readonly taskHandleStore: TaskHandleStore;
   private readonly terminalAttentionStore: TerminalAttentionStore;
   private readonly userBackgroundedTaskIds = new Set<string>();
@@ -1830,8 +1856,13 @@ export class TaskService {
     private readonly initStateManager: InitStateManager,
     private readonly opResolver?: ExternalSecretResolver,
     private readonly sessionUsageService?: SessionUsageService,
-    private readonly workspaceGoalService?: WorkspaceGoalService
+    private readonly workspaceGoalService?: WorkspaceGoalService,
+    executionDependencies: TaskServiceExecutionDependencies = {}
   ) {
+    this.executionStore = executionDependencies.executionStore ?? new ExecutionStore(config);
+    this.executionRegistry =
+      executionDependencies.executionRegistry ??
+      new ExecutionRegistry(config, { executionStore: this.executionStore });
     this.taskHandleStore = new TaskHandleStore(config);
     this.terminalAttentionStore = new TerminalAttentionStore(config);
     this.gitPatchArtifactService = new GitPatchArtifactService(config);
@@ -1875,6 +1906,198 @@ export class TaskService {
 
   isProjectChatOwner(sessionId: string): boolean {
     return this.config.findProjectChatBySessionId(sessionId) != null;
+  }
+
+  private generateExecutionId(): `exe_${string}` {
+    return `exe_${randomUUID().replaceAll("-", "")}`;
+  }
+
+  private resolveExecutionOwnerSessionId(
+    requesterWorkspaceId: string,
+    cfg: ProjectsConfig
+  ): string {
+    let currentWorkspaceId = requesterWorkspaceId;
+    const visited = new Set<string>();
+    for (let depth = 0; depth < 32; depth += 1) {
+      if (visited.has(currentWorkspaceId)) {
+        throw new Error(
+          `resolveExecutionOwnerSessionId: possible parentWorkspaceId cycle at ${currentWorkspaceId}`
+        );
+      }
+      visited.add(currentWorkspaceId);
+      const entry = findWorkspaceEntry(cfg, currentWorkspaceId)?.workspace;
+      if (entry?.executionId == null || entry.parentWorkspaceId == null) {
+        return currentWorkspaceId;
+      }
+      currentWorkspaceId = entry.parentWorkspaceId;
+    }
+    throw new Error("resolveExecutionOwnerSessionId: parentWorkspaceId depth exceeded");
+  }
+
+  private buildAgentExecutionHandle(params: {
+    executionId: `exe_${string}`;
+    workspaceId: string;
+    requesterWorkspaceId: string;
+    cfg: ProjectsConfig;
+    agentId: string;
+    title?: string;
+    prompt: string;
+    status: "queued" | "starting" | "running";
+    sticky?: boolean;
+    attentionPolicy?: BackgroundWorkAttentionPolicy;
+    createdAt: string;
+  }): ExecutionHandle {
+    const parentExecutionId = findWorkspaceEntry(params.cfg, params.requesterWorkspaceId)?.workspace
+      .executionId;
+    return {
+      version: EXECUTION_HANDLE_VERSION,
+      executionId: params.executionId,
+      aliases: [params.workspaceId],
+      ...(parentExecutionId != null ? { parentExecutionId } : {}),
+      ownerSessionId: this.resolveExecutionOwnerSessionId(params.requesterWorkspaceId, params.cfg),
+      requesterWorkspaceId: params.requesterWorkspaceId,
+      target: { kind: "workspace", workspaceId: params.workspaceId, origin: "created" },
+      launchPolicy: {
+        kind: "agent_task",
+        agentId: params.agentId,
+        ...(params.title != null ? { title: params.title } : {}),
+        prompt: params.prompt,
+      },
+      completionPolicy: { kind: "final_assistant_message" },
+      retentionPolicy: {
+        kind: params.sticky === true ? "retain_workspace" : "delete_workspace_on_completion",
+      },
+      attentionPolicy: resolveBackgroundWorkAttentionPolicy(params.attentionPolicy),
+      status: params.status,
+      createdAt: params.createdAt,
+      updatedAt: params.createdAt,
+      ...(params.status === "running" ? { startedAt: params.createdAt } : {}),
+    };
+  }
+
+  private async updateExecutionHandleStatus(
+    handle: ExecutionHandle,
+    status: ExecutionStatus,
+    error?: string,
+    phase?: "awaiting_report"
+  ): Promise<void> {
+    const updatedAt = getIsoNow();
+    await this.executionStore.upsert({
+      ...handle,
+      status,
+      phase: status === "running" ? phase : undefined,
+      updatedAt,
+      ...(status === "running" && handle.startedAt == null ? { startedAt: updatedAt } : {}),
+      ...(status === "error"
+        ? { result: { kind: "error", error: error ?? "Agent task failed" }, terminalAt: updatedAt }
+        : status === "interrupted"
+          ? {
+              result: {
+                kind: "interrupted" as const,
+                ...(error != null ? { message: error } : {}),
+              },
+              terminalAt: updatedAt,
+            }
+          : {}),
+    });
+  }
+
+  private async updateExecutionStatusForWorkspace(
+    workspaceId: string,
+    status: ExecutionStatus,
+    error?: string
+  ): Promise<void> {
+    const cfg = this.config.loadConfigOrDefault();
+    const workspace = findWorkspaceEntry(cfg, workspaceId)?.workspace;
+    if (workspace?.executionId == null) return;
+    const ownerSessionId = this.resolveExecutionOwnerSessionId(workspaceId, cfg);
+    const handle = await this.executionStore.get(ownerSessionId, workspace.executionId);
+    if (handle != null) {
+      await this.updateExecutionHandleStatus(
+        handle,
+        status,
+        error,
+        workspace.taskStatus === "awaiting_report" ? "awaiting_report" : undefined
+      );
+    }
+  }
+
+  private async isExecutionHandleInScope(
+    ancestorWorkspaceId: string,
+    handle: ExecutionHandle,
+    ownerSessionId: string,
+    cfg: ProjectsConfig
+  ): Promise<boolean> {
+    if (handle.ownerSessionId !== ownerSessionId) return false;
+    if (ancestorWorkspaceId === ownerSessionId) return true;
+
+    const ancestorExecutionId = findWorkspaceEntry(cfg, ancestorWorkspaceId)?.workspace.executionId;
+    if (ancestorExecutionId == null) return false;
+
+    let parentExecutionId = handle.parentExecutionId;
+    const visited = new Set<string>();
+    for (let depth = 0; parentExecutionId != null && depth < 32; depth += 1) {
+      if (parentExecutionId === ancestorExecutionId) return true;
+      if (visited.has(parentExecutionId)) return false;
+      visited.add(parentExecutionId);
+      const parent = await this.executionRegistry.get(ownerSessionId, parentExecutionId);
+      parentExecutionId = parent?.parentExecutionId;
+    }
+    return false;
+  }
+
+  private resolveLegacyWorkspaceAliasInScope(
+    ancestorWorkspaceId: string,
+    taskId: string,
+    cfg: ProjectsConfig
+  ): string | null {
+    const entry = findWorkspaceEntry(cfg, taskId)?.workspace;
+    if (entry?.parentWorkspaceId == null) return null;
+    const parentById = this.buildAgentTaskIndex(cfg).parentById;
+    return this.isDescendantAgentTaskUsingParentById(parentById, ancestorWorkspaceId, taskId)
+      ? taskId
+      : null;
+  }
+
+  /** Canonical scope gate shared by task list/send/terminate/status resolution. */
+  private async resolveScopedAgentExecution(
+    ancestorWorkspaceId: string,
+    executionIdOrAlias: string
+  ): Promise<ScopedAgentExecutionResolution> {
+    const cfg = this.config.loadConfigOrDefault();
+    const ownerSessionId = this.resolveExecutionOwnerSessionId(ancestorWorkspaceId, cfg);
+    const handle = await this.executionRegistry.get(ownerSessionId, executionIdOrAlias);
+    if (handle?.launchPolicy.kind === "agent_task") {
+      return (await this.isExecutionHandleInScope(ancestorWorkspaceId, handle, ownerSessionId, cfg))
+        ? { kind: "ok", handle, workspaceId: handle.target.workspaceId }
+        : { kind: "invalid_scope" };
+    }
+
+    if (ancestorWorkspaceId !== ownerSessionId) {
+      const legacyScoped = await this.executionRegistry.get(
+        ancestorWorkspaceId,
+        executionIdOrAlias
+      );
+      if (legacyScoped?.launchPolicy.kind === "agent_task") {
+        return {
+          kind: "ok",
+          handle: legacyScoped,
+          workspaceId: legacyScoped.target.workspaceId,
+        };
+      }
+    }
+
+    const workspace = this.listAgentTaskWorkspaces(cfg).find(
+      (candidate) =>
+        candidate.id === executionIdOrAlias || candidate.executionId === executionIdOrAlias
+    );
+    if (workspace == null) return { kind: "not_found" };
+    const workspaceId = workspace.id;
+    assert(workspaceId != null, "resolveScopedAgentExecution requires workspace id");
+    if (this.resolveExecutionOwnerSessionId(workspaceId, cfg) !== ownerSessionId) {
+      return { kind: "invalid_scope" };
+    }
+    return { kind: "not_found" };
   }
 
   setTimelineRecorder(recorder: TimelineRecorder): void {
@@ -2727,6 +2950,7 @@ export class TaskService {
       }
 
       const taskId = this.config.generateStableId();
+      const executionId = this.generateExecutionId();
       const workspaceName = buildAgentWorkspaceName(agentId, taskId);
       const nameValidation = validateWorkspaceName(workspaceName);
       if (!nameValidation.valid) {
@@ -2855,6 +3079,7 @@ export class TaskService {
       const createdAt = getIsoNow();
       plans.push({
         taskId,
+        executionId,
         parentWorkspaceId,
         parentMeta,
         agentId,
@@ -2889,13 +3114,34 @@ export class TaskService {
           : {}),
       });
       results.push({
-        taskId,
+        taskId: executionId,
+        workspaceId: taskId,
         kind: "agent",
         status,
         modelString: taskModelString,
         thinkingLevel: effectiveThinkingLevel,
       });
     }
+
+    await Promise.all(
+      plans.map((plan) =>
+        this.executionStore.upsert(
+          this.buildAgentExecutionHandle({
+            executionId: plan.executionId,
+            workspaceId: plan.taskId,
+            requesterWorkspaceId: plan.parentWorkspaceId,
+            cfg,
+            agentId: plan.agentId,
+            title: plan.title,
+            prompt: plan.start.kind === "sendMessage" ? plan.start.prompt : "Resume agent task",
+            status: plan.status,
+            sticky: plan.sticky,
+            attentionPolicy: plan.attentionPolicy,
+            createdAt: plan.createdAt,
+          })
+        )
+      )
+    );
 
     for (const [index, result] of results.entries()) {
       // Workflow callers durably checkpoint returned task IDs before task records are persisted.
@@ -2929,6 +3175,7 @@ export class TaskService {
           kind: plan.workspaceKind,
           path: workspacePath,
           id: plan.taskId,
+          executionId: plan.executionId,
           name: plan.workspaceName,
           title: plan.title,
           createdAt: plan.createdAt,
@@ -2965,7 +3212,7 @@ export class TaskService {
     });
 
     for (const result of results) {
-      await this.emitWorkspaceMetadata(result.taskId);
+      await this.emitWorkspaceMetadata(result.workspaceId);
     }
     for (const plan of plans) {
       if (plan.status === "starting") {
@@ -3178,6 +3425,7 @@ export class TaskService {
       },
       { allowMissing: true }
     );
+    await this.updateExecutionStatusForWorkspace(taskId, "error", message);
     if (transitionedToInterrupted) {
       this.recordTaskInterrupted(taskId, parentWorkspaceId);
     }
@@ -4081,6 +4329,7 @@ export class TaskService {
     const shouldQueue = activeCount >= taskSettings.maxParallelAgentTasks;
 
     const taskId = this.config.generateStableId();
+    const executionId = this.generateExecutionId();
     const workspaceName = buildAgentWorkspaceName(agentId, taskId);
 
     const nameValidation = validateWorkspaceName(workspaceName);
@@ -4242,11 +4491,27 @@ export class TaskService {
       thinkingLevel: effectiveThinkingLevel,
     });
 
+    const executionHandle = this.buildAgentExecutionHandle({
+      executionId,
+      workspaceId: taskId,
+      requesterWorkspaceId: parentWorkspaceId,
+      cfg,
+      agentId,
+      title: args.title,
+      prompt,
+      status: shouldQueue ? "queued" : "starting",
+      sticky: args.sticky,
+      attentionPolicy: args.attentionPolicy,
+      createdAt,
+    });
+
     if (shouldQueue) {
       const trunkBranch = parentBranchName;
       if (!trunkBranch) {
         return Err("Task.create: parent workspace name missing (cannot queue task)");
       }
+
+      await this.executionStore.upsert(executionHandle);
 
       // NOTE: Queued tasks are persisted immediately, but their workspace is created later
       // when a parallel slot is available. This ensures queued tasks don't create worktrees
@@ -4276,6 +4541,7 @@ export class TaskService {
           kind: parentIsScratch ? "scratch" : undefined,
           path: workspacePath,
           id: taskId,
+          executionId,
           name: workspaceName,
           title: args.title,
           createdAt,
@@ -4320,13 +4586,16 @@ export class TaskService {
       void this.maybeStartQueuedTasks();
       taskQueueDebug("TaskService.create queued scheduled maybeStartQueuedTasks", { taskId });
       return Ok({
-        taskId,
+        taskId: executionId,
+        workspaceId: taskId,
         kind: "agent",
         status: "queued",
         modelString: taskModelString,
         thinkingLevel: effectiveThinkingLevel,
       });
     }
+
+    await this.executionStore.upsert(executionHandle);
 
     const initLogger = this.startWorkspaceInit(taskId, parentMeta.projectPath);
 
@@ -4399,6 +4668,13 @@ export class TaskService {
       }
 
       if (!forkResult.success) {
+        await this.updateExecutionHandleStatus(
+          executionHandle,
+          "error",
+          `Task fork failed: ${forkResult.error}`
+        );
+      }
+      if (!forkResult.success) {
         initLogger.logComplete(-1);
         return Err(`Task fork failed: ${forkResult.error}`);
       }
@@ -4446,6 +4722,7 @@ export class TaskService {
         kind: parentIsScratch ? "scratch" : undefined,
         path: workspacePath,
         id: taskId,
+        executionId,
         name: workspaceName,
         title: args.title,
         createdAt,
@@ -4522,6 +4799,7 @@ export class TaskService {
         typeof sendResult.error === "string"
           ? sendResult.error
           : formatSendMessageError(sendResult.error).message;
+      await this.updateExecutionHandleStatus(executionHandle, "error", message);
       await this.rollbackFailedTaskCreate(
         runtimeForTaskWorkspace,
         parentMeta.projectPath,
@@ -4532,8 +4810,11 @@ export class TaskService {
       return Err(message);
     }
 
+    await this.updateExecutionHandleStatus(executionHandle, "running");
+
     return Ok({
-      taskId,
+      taskId: executionId,
+      workspaceId: taskId,
       kind: "agent",
       status: "running",
       modelString: taskModelString,
@@ -4557,6 +4838,11 @@ export class TaskService {
       trimmedMessage.length > 0,
       "sendMessageToDescendantAgentTask: message must be non-empty"
     );
+
+    const scopedExecution = await this.resolveScopedAgentExecution(ancestorWorkspaceId, taskId);
+    if (scopedExecution.kind === "not_found") return Err({ code: "not_found" });
+    if (scopedExecution.kind === "invalid_scope") return Err({ code: "invalid_scope" });
+    taskId = scopedExecution.workspaceId;
 
     const queuedUpdateResult = await (async (): Promise<
       Result<SendAgentTaskMessageResult | null, SendAgentTaskMessageError>
@@ -4734,6 +5020,13 @@ export class TaskService {
     );
     assert(taskId.length > 0, "terminateDescendantAgentTask: taskId must be non-empty");
 
+    const scopedExecution = await this.resolveScopedAgentExecution(ancestorWorkspaceId, taskId);
+    if (scopedExecution.kind === "not_found") return Err("Task not found");
+    if (scopedExecution.kind === "invalid_scope") {
+      return Err("Task is not a descendant of this workspace");
+    }
+    taskId = scopedExecution.workspaceId;
+
     const terminatedTaskIds: string[] = [];
     const terminationErrors: string[] = [];
 
@@ -4756,6 +5049,13 @@ export class TaskService {
       // Terminate the entire subtree to avoid orphaned descendant tasks.
       const descendants = this.listDescendantAgentTaskIdsFromIndex(index, taskId);
       const toTerminate = Array.from(new Set([taskId, ...descendants]));
+
+      const publicTaskIdByWorkspaceId = new Map(
+        toTerminate.map((workspaceId) => [
+          workspaceId,
+          index.byId.get(workspaceId)?.executionId ?? workspaceId,
+        ])
+      );
 
       // Delete leaves first to avoid leaving children with missing parents.
       const parentById = index.parentById;
@@ -4866,7 +5166,8 @@ export class TaskService {
           continue;
         }
 
-        terminatedTaskIds.push(id);
+        await this.updateExecutionStatusForWorkspace(id, "interrupted", "Task terminated");
+        terminatedTaskIds.push(publicTaskIdByWorkspaceId.get(id) ?? id);
       }
     }
 
@@ -7030,6 +7331,23 @@ export class TaskService {
   }> {
     assert(taskId.length > 0, "waitForAgentReport: taskId must be non-empty");
 
+    const requestingWorkspaceId = coerceNonEmptyString(options?.requestingWorkspaceId);
+    if (requestingWorkspaceId != null) {
+      const directWorkspaceId = this.resolveLegacyWorkspaceAliasInScope(
+        requestingWorkspaceId,
+        taskId,
+        this.config.loadConfigOrDefault()
+      );
+      if (directWorkspaceId != null) {
+        taskId = directWorkspaceId;
+      } else {
+        const resolved = await this.resolveScopedAgentExecution(requestingWorkspaceId, taskId);
+        if (resolved.kind === "invalid_scope") throw new Error("Task is not a descendant");
+        if (resolved.kind === "not_found") throw new Error("Task not found");
+        taskId = resolved.workspaceId;
+      }
+    }
+
     // Report monotonicity invariant: check the in-memory cache before any status-based
     // interruption handling so a finalized report stays awaitable once observed.
     const cached = this.completedReportsByTaskId.get(taskId);
@@ -7047,7 +7365,6 @@ export class TaskService {
     const timeoutMs = options?.timeoutMs ?? 10 * 60 * 1000; // 10 minutes
     assert(Number.isFinite(timeoutMs) && timeoutMs > 0, "waitForAgentReport: timeoutMs invalid");
 
-    const requestingWorkspaceId = coerceNonEmptyString(options?.requestingWorkspaceId);
     if (requestingWorkspaceId) {
       // A renewed foreground wait means this task is blocking again unless re-backgrounded later.
       this.markTaskForegroundRelevant(taskId);
@@ -7398,8 +7715,10 @@ export class TaskService {
     assert(taskId.length > 0, "getAgentTaskStatus: taskId must be non-empty");
 
     const cfg = this.config.loadConfigOrDefault();
-    const entry = findWorkspaceEntry(cfg, taskId);
-    const status = entry?.workspace.taskStatus;
+    const task = this.listAgentTaskWorkspaces(cfg).find(
+      (candidate) => candidate.id === taskId || candidate.executionId === taskId
+    );
+    const status = task?.taskStatus;
     return status ?? null;
   }
 
@@ -7407,14 +7726,14 @@ export class TaskService {
     assert(taskId.length > 0, "getAgentTaskTimestamps: taskId must be non-empty");
 
     const cfg = this.config.loadConfigOrDefault();
-    const entry = findWorkspaceEntry(cfg, taskId);
-    if (!entry) {
-      return null;
-    }
+    const task = this.listAgentTaskWorkspaces(cfg).find(
+      (candidate) => candidate.id === taskId || candidate.executionId === taskId
+    );
+    if (!task) return null;
 
     return {
-      createdAt: entry.workspace.createdAt,
-      reportedAt: entry.workspace.reportedAt,
+      createdAt: task.createdAt,
+      reportedAt: task.reportedAt,
     };
   }
 
@@ -7428,13 +7747,16 @@ export class TaskService {
     }
 
     const cfg = this.config.loadConfigOrDefault();
+    const tasks = this.listAgentTaskWorkspaces(cfg);
     const statuses = new Map<string, AgentTaskStatusLookup>();
 
     for (const taskId of taskIds) {
-      const entry = findWorkspaceEntry(cfg, taskId);
+      const task = tasks.find(
+        (candidate) => candidate.id === taskId || candidate.executionId === taskId
+      );
       statuses.set(taskId, {
-        exists: entry != null,
-        taskStatus: entry?.workspace.taskStatus ?? null,
+        exists: task != null,
+        taskStatus: task?.taskStatus ?? null,
       });
     }
 
@@ -7544,6 +7866,18 @@ export class TaskService {
       }
     }
     return result;
+  }
+
+  async listActiveDescendantAgentExecutionIds(
+    workspaceId: string,
+    options: { excludeWorkflowTasks?: boolean } = {}
+  ): Promise<string[]> {
+    return (
+      await this.listDescendantAgentTasks(workspaceId, {
+        statuses: ["queued", "starting", "running", "awaiting_report"],
+        excludeWorkflowTasks: options.excludeWorkflowTasks,
+      })
+    ).map((task) => task.taskId);
   }
 
   private async normalizeWorkspaceTurnRecord(
@@ -8507,62 +8841,73 @@ export class TaskService {
     return null;
   }
 
-  listDescendantAgentTasks(
+  async listDescendantAgentTasks(
     workspaceId: string,
     options?: { statuses?: AgentTaskStatus[]; excludeWorkflowTasks?: boolean }
-  ): DescendantAgentTaskInfo[] {
+  ): Promise<DescendantAgentTaskInfo[]> {
     assert(workspaceId.length > 0, "listDescendantAgentTasks: workspaceId must be non-empty");
 
-    const statuses = options?.statuses;
-    const statusFilter = statuses && statuses.length > 0 ? new Set(statuses) : null;
-
+    const statusFilter =
+      options?.statuses != null && options.statuses.length > 0 ? new Set(options.statuses) : null;
     const cfg = this.config.loadConfigOrDefault();
+    const ownerSessionId = this.resolveExecutionOwnerSessionId(workspaceId, cfg);
     const index = this.buildAgentTaskIndex(cfg);
-
+    const handles = await this.executionRegistry.list(ownerSessionId);
     const result: DescendantAgentTaskInfo[] = [];
 
-    const stack: Array<{ taskId: string; depth: number; workflowOwned: boolean }> = [];
-    for (const childTaskId of index.childrenByParent.get(workspaceId) ?? []) {
-      stack.push({ taskId: childTaskId, depth: 1, workflowOwned: false });
-    }
-
-    while (stack.length > 0) {
-      const next = stack.pop()!;
-      const entry = index.byId.get(next.taskId);
-      if (!entry) continue;
-
-      assert(
-        entry.parentWorkspaceId,
-        `listDescendantAgentTasks: task ${next.taskId} is missing parentWorkspaceId`
-      );
-
-      const workflowOwned = next.workflowOwned || entry.workflowTask != null;
-      const status: AgentTaskStatus = entry.taskStatus ?? "running";
+    for (const handle of handles) {
       if (
-        (!statusFilter || statusFilter.has(status)) &&
-        !(options?.excludeWorkflowTasks === true && workflowOwned)
+        handle.launchPolicy.kind !== "agent_task" ||
+        !(await this.isExecutionHandleInScope(workspaceId, handle, ownerSessionId, cfg))
       ) {
-        result.push({
-          taskId: next.taskId,
-          status,
-          parentWorkspaceId: entry.parentWorkspaceId,
-          agentType: entry.agentType,
-          workspaceName: entry.name,
-          title: entry.title,
-          createdAt: entry.createdAt,
-          modelString: entry.aiSettings?.model,
-          thinkingLevel: entry.aiSettings?.thinkingLevel,
-          sticky: entry.taskSticky === true ? true : undefined,
-          depth: next.depth,
-        });
+        continue;
       }
 
-      for (const childTaskId of index.childrenByParent.get(next.taskId) ?? []) {
-        stack.push({ taskId: childTaskId, depth: next.depth + 1, workflowOwned });
+      const entry = index.byId.get(handle.target.workspaceId);
+      const workflowOwned =
+        entry != null && this.isWorkflowOwnedTaskUsingIndex(index, handle.target.workspaceId);
+      if (options?.excludeWorkflowTasks === true && workflowOwned) continue;
+
+      const status: AgentTaskStatus =
+        entry?.taskStatus ??
+        (handle.status === "completed"
+          ? "reported"
+          : handle.status === "interrupted" || handle.status === "error"
+            ? "interrupted"
+            : handle.phase === "awaiting_report"
+              ? "awaiting_report"
+              : handle.status);
+      if (statusFilter != null && !statusFilter.has(status)) continue;
+
+      let depth = 1;
+      let parentExecutionId = handle.parentExecutionId;
+      const ancestorExecutionId = findWorkspaceEntry(cfg, workspaceId)?.workspace.executionId;
+      while (parentExecutionId != null && parentExecutionId !== ancestorExecutionId) {
+        const parent = await this.executionRegistry.get(ownerSessionId, parentExecutionId);
+        if (parent == null) break;
+        depth += 1;
+        parentExecutionId = parent.parentExecutionId;
       }
+
+      const canonicalWorkspace = entry?.executionId === handle.executionId;
+      result.push({
+        taskId: canonicalWorkspace
+          ? handle.executionId
+          : (handle.aliases?.[0] ?? handle.executionId),
+        workspaceId: handle.target.workspaceId,
+        status,
+        parentWorkspaceId: handle.requesterWorkspaceId,
+        agentType: entry?.agentType ?? handle.launchPolicy.agentId,
+        workspaceName: entry?.name,
+        title: entry?.title ?? handle.launchPolicy.title,
+        createdAt: entry?.createdAt ?? handle.createdAt,
+        modelString: entry?.aiSettings?.model,
+        thinkingLevel: entry?.aiSettings?.thinkingLevel,
+        sticky: entry?.taskSticky === true ? true : undefined,
+        depth,
+      });
     }
 
-    // Stable ordering: oldest first, then depth (ties by taskId for determinism).
     result.sort((a, b) => {
       const aTime = a.createdAt ? Date.parse(a.createdAt) : 0;
       const bTime = b.createdAt ? Date.parse(b.createdAt) : 0;
@@ -8570,7 +8915,6 @@ export class TaskService {
       if (a.depth !== b.depth) return a.depth - b.depth;
       return a.taskId.localeCompare(b.taskId);
     });
-
     return result;
   }
 
@@ -8584,52 +8928,13 @@ export class TaskService {
     );
     assert(Array.isArray(taskIds), "filterDescendantAgentTaskIds: taskIds must be an array");
 
-    const cfg = this.config.loadConfigOrDefault();
-    const parentById = this.buildAgentTaskIndex(cfg).parentById;
-
     const result: string[] = [];
-    const maybePersisted: string[] = [];
-
     for (const taskId of taskIds) {
       if (typeof taskId !== "string" || taskId.length === 0) continue;
-
-      if (this.isDescendantAgentTaskUsingParentById(parentById, ancestorWorkspaceId, taskId)) {
-        result.push(taskId);
-        continue;
-      }
-
-      const cached = this.completedReportsByTaskId.get(taskId);
-      if (hasAncestorWorkspaceId(cached, ancestorWorkspaceId)) {
-        result.push(taskId);
-        continue;
-      }
-
-      maybePersisted.push(taskId);
-    }
-
-    if (maybePersisted.length === 0) {
-      return result;
-    }
-
-    // Terminal failures persist in a separate artifacts file (a failure must
-    // never masquerade as a completed report), so scope checks must consult
-    // BOTH: a background-failed child that was cleaned up or lost to a restart
-    // must stay in scope for task_await so waitForAgentReport can surface the
-    // persisted typed failure instead of degrading to invalid_scope/not_found.
-    const sessionDir = this.config.getSessionDir(ancestorWorkspaceId);
-    const [reports, failures] = await Promise.all([
-      readSubagentReportArtifactsFile(sessionDir),
-      readSubagentFailureArtifactsFile(sessionDir),
-    ]);
-    for (const taskId of maybePersisted) {
-      if (
-        hasAncestorWorkspaceId(reports.artifactsByChildTaskId[taskId], ancestorWorkspaceId) ||
-        hasAncestorWorkspaceId(failures.failuresByChildTaskId[taskId], ancestorWorkspaceId)
-      ) {
+      if ((await this.resolveScopedAgentExecution(ancestorWorkspaceId, taskId)).kind === "ok") {
         result.push(taskId);
       }
     }
-
     return result;
   }
 
@@ -8759,30 +9064,7 @@ export class TaskService {
   async isDescendantAgentTask(ancestorWorkspaceId: string, taskId: string): Promise<boolean> {
     assert(ancestorWorkspaceId.length > 0, "isDescendantAgentTask: ancestorWorkspaceId required");
     assert(taskId.length > 0, "isDescendantAgentTask: taskId required");
-
-    const cfg = this.config.loadConfigOrDefault();
-    const parentById = this.buildAgentTaskIndex(cfg).parentById;
-    if (this.isDescendantAgentTaskUsingParentById(parentById, ancestorWorkspaceId, taskId)) {
-      return true;
-    }
-
-    // The task workspace may have been removed after it settled (cleanup/restart). Preserve scope
-    // checks by consulting persisted report AND failure artifacts in the ancestor session dir —
-    // a terminally-failed child must stay awaitable so its typed failure can be surfaced.
-    const cached = this.completedReportsByTaskId.get(taskId);
-    if (hasAncestorWorkspaceId(cached, ancestorWorkspaceId)) {
-      return true;
-    }
-
-    const sessionDir = this.config.getSessionDir(ancestorWorkspaceId);
-    const [reports, failures] = await Promise.all([
-      readSubagentReportArtifactsFile(sessionDir),
-      readSubagentFailureArtifactsFile(sessionDir),
-    ]);
-    return (
-      hasAncestorWorkspaceId(reports.artifactsByChildTaskId[taskId], ancestorWorkspaceId) ||
-      hasAncestorWorkspaceId(failures.failuresByChildTaskId[taskId], ancestorWorkspaceId)
-    );
+    return (await this.resolveScopedAgentExecution(ancestorWorkspaceId, taskId)).kind === "ok";
   }
 
   private isDescendantAgentTaskUsingParentById(
@@ -9583,10 +9865,14 @@ export class TaskService {
         await this.editWorkspaceEntry(taskId, (workspace) => {
           workspace.taskStatus = "starting";
         });
+        await this.updateExecutionStatusForWorkspace(taskId, "starting");
         reservedSlots += 1;
 
         plans.push({
           taskId,
+          executionId: isExecutionId(task.executionId)
+            ? task.executionId
+            : this.generateExecutionId(),
           parentWorkspaceId,
           parentMeta,
           agentId,
@@ -9640,6 +9926,12 @@ export class TaskService {
         ws.taskPrompt = undefined;
       }
     });
+
+    if (status === "queued" || status === "starting" || status === "running") {
+      await this.updateExecutionStatusForWorkspace(workspaceId, status);
+    } else if (status === "awaiting_report") {
+      await this.updateExecutionStatusForWorkspace(workspaceId, "running");
+    }
 
     await this.emitWorkspaceMetadata(workspaceId);
 

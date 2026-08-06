@@ -165,6 +165,7 @@ function parseTaskAiOverrides(args: {
 
 interface SpawnedTaskInfo {
   taskId: string;
+  workspaceId: string;
   status: "queued" | "starting" | "running";
   groupKind?: TaskGroupKind;
   label?: string;
@@ -174,6 +175,7 @@ interface SpawnedTaskInfo {
 
 interface PendingTaskInfo {
   taskId: string;
+  workspaceId: string;
   status: "queued" | "starting" | "running" | "completed" | "interrupted";
   groupKind?: TaskGroupKind;
   label?: string;
@@ -183,6 +185,7 @@ interface PendingTaskInfo {
 
 interface CompletedTaskInfo {
   taskId: string;
+  workspaceId: string;
   reportMarkdown: string;
   structuredOutput?: unknown;
   title?: string;
@@ -211,6 +214,7 @@ function emitTaskCreatedEvent(params: {
   workspaceId: string;
   toolCallId: string | undefined;
   taskId: string;
+  taskWorkspaceId: string;
 }): void {
   if (!params.config.emitChatEvent || !params.config.workspaceId || !params.toolCallId) {
     return;
@@ -223,6 +227,7 @@ function emitTaskCreatedEvent(params: {
       workspaceId: params.workspaceId,
       toolCallId: params.toolCallId,
       taskId: params.taskId,
+      taskWorkspaceId: params.taskWorkspaceId,
       timestamp: Date.now(),
     } satisfies TaskCreatedEvent,
     "task"
@@ -240,6 +245,7 @@ function toAggregatePendingStatus(
 function serializeCompletedReport(report: CompletedTaskInfo) {
   return {
     taskId: report.taskId,
+    workspaceId: report.workspaceId,
     reportMarkdown: report.reportMarkdown,
     structuredOutput: report.structuredOutput,
     title: report.title,
@@ -299,6 +305,7 @@ function buildPendingTaskResult(params: {
   if (params.tasks.length === 1 && !params.forceGrouped) {
     const task = params.tasks[0];
     return {
+      workspaceId: task.workspaceId,
       status,
       taskId: task.taskId,
       modelString: task.modelString,
@@ -312,6 +319,7 @@ function buildPendingTaskResult(params: {
     status,
     taskIds: params.tasks.map((task) => task.taskId),
     tasks: params.tasks.map((task) => ({
+      workspaceId: task.workspaceId,
       taskId: task.taskId,
       status: task.status,
       groupKind: task.groupKind,
@@ -332,6 +340,7 @@ function buildCompletedTaskResult(params: {
   if (serializedReports.length === 1) {
     const report = serializedReports[0];
     return {
+      workspaceId: report.workspaceId,
       status: "completed",
       taskId: report.taskId,
       reportMarkdown: report.reportMarkdown,
@@ -363,6 +372,7 @@ function normalizePendingTaskStatuses(params: {
     const completedReport = completedReportsByTaskId.get(createdTask.taskId);
     if (completedReport) {
       return {
+        workspaceId: createdTask.workspaceId,
         taskId: createdTask.taskId,
         status: "completed",
         groupKind: createdTask.groupKind,
@@ -375,6 +385,7 @@ function normalizePendingTaskStatuses(params: {
     const currentStatus =
       params.taskService.getAgentTaskStatus(createdTask.taskId) ?? createdTask.status;
     return {
+      workspaceId: createdTask.workspaceId,
       taskId: createdTask.taskId,
       status:
         currentStatus === "queued"
@@ -681,6 +692,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
 
         const task = {
           taskId: created.data.taskId,
+          workspaceId: created.data.workspaceId,
           status: created.data.status,
           modelString: created.data.modelString,
           thinkingLevel: created.data.thinkingLevel,
@@ -695,6 +707,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
           config,
           workspaceId,
           toolCallId,
+          taskWorkspaceId: task.workspaceId,
           taskId: task.taskId,
         });
       }
@@ -723,6 +736,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
             return {
               kind: "completed",
               report: {
+                workspaceId: createdTask.workspaceId,
                 taskId: createdTask.taskId,
                 reportMarkdown: report.reportMarkdown,
                 structuredOutput: report.structuredOutput,
