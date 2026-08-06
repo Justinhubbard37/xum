@@ -132,11 +132,16 @@ describe("TOOL_DEFINITIONS", () => {
     }
 
     const strictProviderNull = schema.safeParse({
+      kind: null,
       prompt: "Implement the change",
       title: "Implementation",
       run_in_background: null,
     });
     expect(strictProviderNull.success).toBe(true);
+
+    if (strictProviderNull.success) {
+      expect(strictProviderNull.data.kind).toBe("workspace");
+    }
 
     for (const forbidden of [
       { agentId: "exec" },
@@ -154,6 +159,17 @@ describe("TOOL_DEFINITIONS", () => {
         }).success
       ).toBe(false);
     }
+  });
+
+  it("accepts strict-provider null for the ordinary task background default", () => {
+    const parsed = TaskToolArgsSchema.safeParse({
+      subagent_type: "explore",
+      prompt: "Inspect the repository",
+      title: "Repository inspection",
+      run_in_background: null,
+    });
+
+    expect(parsed.success).toBe(true);
   });
 
   it("accepts workspace task args without an agent id", () => {

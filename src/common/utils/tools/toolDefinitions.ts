@@ -482,7 +482,7 @@ const taskToolBaseShape = {
   subagent_type: SubagentTypeSchema.nullish(),
   prompt: z.string().min(1),
   title: z.string().min(1),
-  run_in_background: z.boolean().default(false),
+  run_in_background: z.boolean().nullish().default(false),
   sticky: z
     .boolean()
     .nullish()
@@ -536,7 +536,11 @@ export function buildTaskToolAgentArgsSchema(options: {
 
 export const ProjectChatTaskToolArgsSchema = z
   .object({
-    kind: z.literal("workspace").default("workspace"),
+    kind: z
+      .literal("workspace")
+      .nullish()
+      .transform((value) => value ?? "workspace")
+      .default("workspace"),
     prompt: z.string().min(1),
     title: z.string().min(1),
     run_in_background: z

@@ -1007,11 +1007,18 @@ export class Config {
         const claimedSessionIds = new Set<string>();
         for (const [projectPath, projectConfig] of projectsMap) {
           for (const workspace of projectConfig.workspaces) {
-            const workspaceId =
-              typeof workspace.id === "string" && workspace.id.length > 0
-                ? workspace.id
-                : this.generateLegacyId(projectPath, workspace.path);
-            claimedSessionIds.add(workspaceId);
+            if (typeof workspace.id === "string" && workspace.id.length > 0) {
+              claimedSessionIds.add(workspace.id);
+              continue;
+            }
+
+            // Unmigrated workspaces support both historical lookup forms: metadata/session state
+            // may be keyed by the workspace basename or by the generated project-workspace ID.
+            const workspaceBasename = PlatformPaths.basename(workspace.path);
+            if (workspaceBasename.length > 0) {
+              claimedSessionIds.add(workspaceBasename);
+            }
+            claimedSessionIds.add(this.generateLegacyId(projectPath, workspace.path));
           }
         }
         for (const [projectPath, projectConfig] of projectsMap) {

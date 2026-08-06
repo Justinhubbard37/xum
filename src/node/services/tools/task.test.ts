@@ -157,7 +157,7 @@ describe("task tool", () => {
     ).toBe(false);
     const result: unknown = await Promise.resolve(
       tool.execute!(
-        { prompt: "implement", title: "Implementation", run_in_background: null },
+        { kind: null, prompt: "implement", title: "Implementation", run_in_background: null },
         mockToolCallOptions
       )
     );
@@ -1080,7 +1080,7 @@ describe("task tool", () => {
     expectQueuedOrRunningTaskToolResult(result, { status: "queued", taskId: "grandchild-task" });
   });
 
-  it("should block and return report when run_in_background is false", async () => {
+  it("uses foreground mode when a strict provider normalizes run_in_background to null", async () => {
     using tempDir = new TestTempDir("test-task-tool");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
 

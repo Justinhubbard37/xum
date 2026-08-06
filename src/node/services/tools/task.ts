@@ -431,9 +431,12 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
         workspace,
       } = validatedArgs;
 
+      const taskKind = projectChat ? (kind ?? "workspace") : kind;
       // Strict providers represent omitted optional inputs as null. Project Chat stays
       // non-blocking unless the caller explicitly requests foreground mode with false.
-      const runInBackground = projectChat ? (run_in_background ?? true) : run_in_background;
+      const runInBackground = projectChat
+        ? (run_in_background ?? true)
+        : (run_in_background ?? false);
 
       // Explicit per-launch model/thinking overrides. Omitted by default so delegated work
       // inherits the parent's live settings unless the caller requests an override.
@@ -444,11 +447,11 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
 
       const parentRuntimeAiSettings = buildParentRuntimeAiSettings(config);
 
-      if (config.planFileOnly && kind === "workspace") {
+      if (config.planFileOnly && taskKind === "workspace") {
         throw new Error(PLAN_AGENT_EXPLORE_ONLY_ERROR);
       }
 
-      if (kind === "workspace") {
+      if (taskKind === "workspace") {
         const created = await taskService.createWorkspaceTurn({
           ownerWorkspaceId: workspaceId,
           prompt,

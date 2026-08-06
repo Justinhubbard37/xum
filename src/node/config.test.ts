@@ -175,6 +175,12 @@ describe("Config", () => {
         .digest("hex")
         .slice(0, 10)}`;
       fs.mkdirSync(subProjectPath, { recursive: true });
+      const basenameSessionDir = path.join(config.sessionsDir, legacyCollidingSessionId);
+      fs.mkdirSync(basenameSessionDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(basenameSessionDir, "metadata.json"),
+        JSON.stringify({ id: legacyCollidingSessionId })
+      );
       fs.writeFileSync(
         path.join(tempDir, "config.json"),
         JSON.stringify({
@@ -184,7 +190,7 @@ describe("Config", () => {
               {
                 workspaces: [
                   {
-                    path: path.join(parentProjectPath, "session_bbbbbbbbbb"),
+                    path: path.join(parentProjectPath, legacyCollidingSessionId),
                   },
                 ],
                 projectChat: {
@@ -243,6 +249,9 @@ describe("Config", () => {
           path.join(config.projectSessionsDir, repairedSessionId ?? "")
         );
       }
+      expect(config.findWorkspace(legacyCollidingSessionId)?.workspacePath).toBe(
+        path.join(parentProjectPath, legacyCollidingSessionId)
+      );
       for (const workspaceId of reservedWorkspaceIds) {
         expect(config.getSessionDir(workspaceId)).toBe(path.join(config.sessionsDir, workspaceId));
       }
