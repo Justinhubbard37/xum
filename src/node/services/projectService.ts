@@ -1155,11 +1155,6 @@ export class ProjectService {
 
       if (projectConfig.parentProjectPath) {
         let projectChatSessionId: string | undefined;
-        try {
-          await this.config.updateProjectSecrets(normalizedPath, []);
-        } catch (error) {
-          log.error(`Failed to clean up secrets for sub-project ${normalizedPath}:`, error);
-        }
         // Mutate inside the serialized editConfig transform, re-resolving the sub-project
         // and its parent from FRESH config: persisting the pre-read snapshot would clobber
         // concurrent config edits (e.g. resurrect concurrently removed workspaces).
@@ -1187,6 +1182,13 @@ export class ProjectService {
         }
         if (projectChatSessionId) {
           await this.cleanupProjectChatSessions([projectChatSessionId]);
+        }
+        try {
+          // Delete secrets only after the project removal is durably verified. A failed config write
+          // must leave every part of the still-configured project intact for a safe retry.
+          await this.config.updateProjectSecrets(normalizedPath, []);
+        } catch (error) {
+          log.error(`Failed to clean up secrets for sub-project ${normalizedPath}:`, error);
         }
         return Ok(undefined);
       }

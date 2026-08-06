@@ -525,6 +525,23 @@ describe("WorkspaceService Project Chat", () => {
     }
   });
 
+  test("workspace-turn interruption delegates to AgentSession so pending retries are canceled", async () => {
+    const interruptStream = mock(() => Promise.resolve(Ok(undefined)));
+    const fakeSession = { interruptStream } as unknown as AgentSession;
+    const workspaceService = createWorkspaceServiceForTest({ config: {} });
+    const sessions = (
+      workspaceService as unknown as {
+        sessions: Map<string, AgentSession>;
+      }
+    ).sessions;
+    sessions.set("workspace-turn", fakeSession);
+
+    expect(await workspaceService.interruptWorkspaceTurnStream("workspace-turn")).toEqual(
+      Ok(undefined)
+    );
+    expect(interruptStream).toHaveBeenCalledWith({ abandonPartial: false });
+  });
+
   test("keeps Project Chat out of workspace info and activity snapshots", async () => {
     const { config, historyService, cleanup } = await createTestHistoryService();
     const projectPath = path.join(config.rootDir, "project-chat-hidden");

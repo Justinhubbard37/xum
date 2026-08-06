@@ -1896,6 +1896,7 @@ exit 1
         });
         return cfg;
       });
+      await config.updateProjectSecrets(subProjectPath, [{ key: "TOKEN", value: "preserve" }]);
       const projectChat = await config.ensureProjectChat(subProjectPath);
       const sessionDir = config.getSessionDir(projectChat.sessionId);
       const transcriptPath = path.join(sessionDir, "chat.jsonl");
@@ -1926,6 +1927,9 @@ exit 1
       expect(config.findProjectChatBySessionId(projectChat.sessionId)?.projectPath).toBe(
         subProjectPath
       );
+      expect(config.getProjectSecrets(subProjectPath)).toEqual([
+        { key: "TOKEN", value: "preserve" },
+      ]);
       expect(await fs.readFile(transcriptPath, "utf-8")).toBe("preserve me\n");
     });
 
@@ -1941,6 +1945,7 @@ exit 1
         });
         return cfg;
       });
+      await config.updateProjectSecrets(subProjectPath, [{ key: "TOKEN", value: "preserve" }]);
       const projectChat = await config.ensureProjectChat(subProjectPath);
       const transcriptPath = path.join(config.getSessionDir(projectChat.sessionId), "chat.jsonl");
       await fs.writeFile(transcriptPath, "preserve me\n", "utf-8");
@@ -1976,6 +1981,9 @@ exit 1
       if (result.error.type !== "unknown") throw new Error("Expected unknown removal error");
       expect(result.error.message).toContain("verification config read failed");
       expect(cleanupProjectChatSession).not.toHaveBeenCalled();
+      expect(config.getProjectSecrets(subProjectPath)).toEqual([
+        { key: "TOKEN", value: "preserve" },
+      ]);
       expect(await fs.readFile(transcriptPath, "utf-8")).toBe("preserve me\n");
     });
 
@@ -2002,6 +2010,7 @@ exit 1
         });
         return cfg;
       });
+      await config.updateProjectSecrets(subProjectPath, [{ key: "TOKEN", value: "remove" }]);
       const projectChat = await config.ensureProjectChat(subProjectPath);
       const cleanupProjectChatSession = mock(() => Promise.resolve());
       service.setWorkspaceService({
@@ -2019,10 +2028,11 @@ exit 1
         path: workspacePath,
       });
       expect(retainedWorkspace?.subProjectPath).toBeUndefined();
+      expect(config.getProjectSecrets(subProjectPath)).toEqual([]);
       expect(cleanupProjectChatSession).toHaveBeenCalledWith(projectChat.sessionId);
     });
 
-    it("cleans a sub-project chat created while removal waits on secret cleanup", async () => {
+    it("cleans a sub-project chat created while serialized removal is queued", async () => {
       const parentPath = path.join(tempDir, "parent-racing-chat");
       const subProjectPath = path.join(parentPath, "packages", "web");
       await fs.mkdir(subProjectPath, { recursive: true });
@@ -2035,21 +2045,31 @@ exit 1
         return cfg;
       });
 
-      let createdSessionId: string | undefined;
-      const originalUpdateProjectSecrets = config.updateProjectSecrets.bind(config);
-      config.updateProjectSecrets = async (projectPath, secrets) => {
-        createdSessionId = (await config.ensureProjectChat(subProjectPath)).sessionId;
-        await originalUpdateProjectSecrets(projectPath, secrets);
-      };
+      const createdSessionId = "project-session_aaaaaaaaaa";
+      // Queue the first-chat write without awaiting it. remove() takes its synchronous snapshot before
+      // this edit runs, then its serialized delete must capture the newly-created ID from fresh config.
+      const createProjectChat = config.editConfig((freshConfig) => {
+        const subProject = freshConfig.projects.get(subProjectPath);
+        if (subProject) {
+          subProject.projectChat = {
+            version: 1,
+            sessionId: createdSessionId,
+            createdAt: "2026-08-06T00:00:00.000Z",
+            agentId: "orchestrator",
+          };
+        }
+        return freshConfig;
+      });
       const cleanupProjectChatSession = mock(() => Promise.resolve());
       service.setWorkspaceService({
         remove: () => Promise.resolve(Ok(undefined)),
         cleanupProjectChatSession,
       });
 
-      expect((await service.remove(subProjectPath)).success).toBe(true);
+      const removeResult = service.remove(subProjectPath);
+      await createProjectChat;
+      expect((await removeResult).success).toBe(true);
 
-      expect(createdSessionId).toBeDefined();
       expect(cleanupProjectChatSession).toHaveBeenCalledWith(createdSessionId);
       expect(config.loadConfigOrDefault().projects.has(subProjectPath)).toBe(false);
     });

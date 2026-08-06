@@ -404,9 +404,11 @@ function createWorkspaceServiceMocks(
     isExperimentEnabled: ReturnType<typeof mock>;
     emitChatEvent: ReturnType<typeof mock>;
     isWorkflowInvocationCurrent: ReturnType<typeof mock>;
+    interruptWorkspaceTurnStream: ReturnType<typeof mock>;
     create: ReturnType<typeof mock>;
   }>
 ): {
+  interruptWorkspaceTurnStream: ReturnType<typeof mock>;
   workspaceService: WorkspaceService;
   sendMessage: ReturnType<typeof mock>;
   resumeStream: ReturnType<typeof mock>;
@@ -482,6 +484,10 @@ function createWorkspaceServiceMocks(
   const isWorkflowInvocationCurrent =
     overrides?.isWorkflowInvocationCurrent ?? mock(() => Promise.resolve(true));
 
+  const interruptWorkspaceTurnStream =
+    overrides?.interruptWorkspaceTurnStream ??
+    mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+
   const create =
     overrides?.create ??
     mock(
@@ -491,6 +497,7 @@ function createWorkspaceServiceMocks(
 
   return {
     workspaceService: {
+      interruptWorkspaceTurnStream,
       create,
       sendMessage,
       resumeStream,
@@ -519,6 +526,7 @@ function createWorkspaceServiceMocks(
       emitChatEvent,
       isWorkflowInvocationCurrent,
     } as unknown as WorkspaceService,
+    interruptWorkspaceTurnStream,
     create,
     sendMessage,
     resumeStream,
@@ -1381,12 +1389,35 @@ describe("TaskService", () => {
       "foreignworkspace",
     ]);
     const isStreaming = mock((workspaceId: string) => streamingWorkspaceIds.has(workspaceId));
-    const stopStream = mock((workspaceId: string): Promise<Result<void>> => {
+    const interruptWorkspaceTurnStream = mock((workspaceId: string): Promise<Result<void>> => {
       streamingWorkspaceIds.delete(workspaceId);
       return Promise.resolve(Ok(undefined));
     });
-    const aiMocks = createAIServiceMocks(config, { isStreaming, stopStream });
-    const { taskService } = createTaskServiceHarness(config, { aiService: aiMocks.aiService });
+    const operations: string[] = [];
+    const hasQueuedWorkspaceTurn = mock(
+      (_workspaceId: string, handleId: string) => handleId === "wst_queued"
+    );
+    const removeQueuedWorkspaceTurn = mock(
+      (_workspaceId: string, handleId: string): Result<boolean> => {
+        operations.push(`cancel:${handleId}`);
+        return Ok(true);
+      }
+    );
+    const waitForIdleAndNoQueuedMessages = mock((workspaceId: string): Promise<void> => {
+      operations.push(`idle:${workspaceId}`);
+      return Promise.resolve();
+    });
+    const workspaceMocks = createWorkspaceServiceMocks({
+      interruptWorkspaceTurnStream,
+      hasQueuedWorkspaceTurn,
+      removeQueuedWorkspaceTurn,
+      waitForIdleAndNoQueuedMessages,
+    });
+    const aiMocks = createAIServiceMocks(config, { isStreaming });
+    const { taskService } = createTaskServiceHarness(config, {
+      aiService: aiMocks.aiService,
+      workspaceService: workspaceMocks.workspaceService,
+    });
     const store = new TaskHandleStore(config);
     const baseRecord = {
       kind: "workspace_turn" as const,
@@ -1402,6 +1433,14 @@ describe("TaskService", () => {
       handleId: "wst_active",
       workspaceId: "activeworkspace",
       status: "running",
+    });
+    await store.upsertWorkspaceTurn({
+      ...baseRecord,
+      handleId: "wst_queued",
+      workspaceId: "activeworkspace",
+      status: "queued",
+      createdAt: "2026-08-06T00:00:01.000Z",
+      updatedAt: "2026-08-06T00:00:01.000Z",
     });
     await store.upsertWorkspaceTurn({
       ...baseRecord,
@@ -1441,6 +1480,7 @@ describe("TaskService", () => {
       )
     ).toEqual({
       wst_active: "interrupted",
+      wst_queued: "interrupted",
       wst_starting: "interrupted",
       wst_completed: "completed",
     });
@@ -1448,12 +1488,12 @@ describe("TaskService", () => {
       status: "running",
       workspaceId: "foreignworkspace",
     });
-    expect(aiMocks.stopStream).toHaveBeenCalledWith("activeworkspace", {
-      abandonPartial: false,
-    });
-    expect(aiMocks.stopStream).toHaveBeenCalledWith("startingworkspace", {
-      abandonPartial: false,
-    });
+    expect(operations.indexOf("cancel:wst_queued")).toBeLessThan(
+      operations.indexOf("idle:activeworkspace")
+    );
+    expect(waitForIdleAndNoQueuedMessages).toHaveBeenCalledTimes(2);
+    expect(interruptWorkspaceTurnStream).toHaveBeenCalledWith("activeworkspace");
+    expect(interruptWorkspaceTurnStream).toHaveBeenCalledWith("startingworkspace");
     expect(
       fsPromises.access(path.join(config.sessionsDir, projectChat.sessionId))
     ).rejects.toMatchObject({ code: "ENOENT" });
@@ -1467,10 +1507,12 @@ describe("TaskService", () => {
     await saveWorkspaces(config, projectPath, [], testTaskSettings());
     const projectChat = await config.ensureProjectChat(projectPath);
     const waitForIdleAndNoQueuedMessages = mock(() => Promise.resolve());
-    const workspaceMocks = createWorkspaceServiceMocks({ waitForIdleAndNoQueuedMessages });
+    const workspaceMocks = createWorkspaceServiceMocks({
+      waitForIdleAndNoQueuedMessages,
+      interruptWorkspaceTurnStream: mock(() => Promise.resolve(Err("stream stop failed"))),
+    });
     const aiMocks = createAIServiceMocks(config, {
       isStreaming: mock(() => true),
-      stopStream: mock(() => Promise.resolve(Err("stream stop failed"))),
     });
     const { taskService } = createTaskServiceHarness(config, {
       aiService: aiMocks.aiService,
@@ -1492,7 +1534,7 @@ describe("TaskService", () => {
 
     const result = await taskService.interruptAllWorkspaceTurnsForOwner(projectChat.sessionId);
 
-    expect(result).toEqual(Err("Workspace turn wst_busy is still active after interruption"));
+    expect(result).toEqual(Err("Owned workspace busyworkspace is still active after interruption"));
     expect(waitForIdleAndNoQueuedMessages).toHaveBeenCalledWith("busyworkspace");
     expect(await store.getWorkspaceTurn(projectChat.sessionId, "wst_busy")).toMatchObject({
       status: "interrupted",

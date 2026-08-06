@@ -9246,6 +9246,32 @@ export class WorkspaceService extends EventEmitter {
     }
   }
 
+  /**
+   * Stop one delegated workspace turn without invoking TaskService's descendant-cascade path.
+   * TaskService may call this while holding its launch mutex; delegating to AgentSession still
+   * cancels pending auto-retry before stopping the provider stream.
+   */
+  async interruptWorkspaceTurnStream(workspaceId: string): Promise<Result<void>> {
+    const normalizedWorkspaceId = workspaceId.trim();
+    assert(normalizedWorkspaceId.length > 0, "interruptWorkspaceTurnStream requires workspaceId");
+    try {
+      const session =
+        this.sessions.get(normalizedWorkspaceId) ??
+        this.transientStartupRecoverySessions.get(normalizedWorkspaceId);
+      if (session != null) {
+        return await session.interruptStream({ abandonPartial: false });
+      }
+      // No session means there is no RetryManager to cancel in this process, but a provider stream
+      // may still need a best-effort stop (for example a partially registered startup).
+      return await this.aiService.stopStream(normalizedWorkspaceId, {
+        abandonPartial: false,
+        abortReason: "user",
+      });
+    } catch (error) {
+      return Err(`Failed to interrupt workspace turn stream: ${getErrorMessage(error)}`);
+    }
+  }
+
   async interruptStream(
     workspaceId: string,
     options?: { soft?: boolean; abandonPartial?: boolean; sendQueuedImmediately?: boolean }

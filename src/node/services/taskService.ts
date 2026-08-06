@@ -7532,62 +7532,75 @@ export class TaskService {
     const activeRecords = await this.listWorkspaceTurnTasks(normalizedOwnerWorkspaceId, {
       statuses: ["queued", "starting", "running"],
     });
-    for (const record of activeRecords) {
+    const orderedRecords = activeRecords.toSorted(
+      (left, right) => Number(left.status !== "queued") - Number(right.status !== "queued")
+    );
+    const workspaceIds = new Set<string>();
+    const interruptFailures: Array<{
+      record: WorkspaceTurnTaskHandleRecord;
+      error: string;
+    }> = [];
+
+    // First make every durable handle terminal and cancel all queued follow-ups. Waiting before this
+    // phase completes can deadlock on a same-workspace queued turn that has not been removed yet.
+    for (const record of orderedRecords) {
+      workspaceIds.add(record.workspaceId);
       const interruptResult = await this.interruptWorkspaceTurn(
         normalizedOwnerWorkspaceId,
         record.handleId
       );
+      if (!interruptResult.success) {
+        interruptFailures.push({ record, error: interruptResult.error });
+      }
+    }
 
-      if (record.status !== "queued") {
-        // interruptWorkspaceTurn makes the durable handle terminal before requesting stream stop.
-        // Owner cleanup must also wait for AgentSession to observe that stop; stopStream failures are
-        // otherwise swallowed by the generic lifecycle path and could leave an unsupervised stream.
-        const idlePromise = this.workspaceService.waitForIdleAndNoQueuedMessages(
-          record.workspaceId
-        );
+    // Then wait once per owned workspace, in parallel, after every queued/running handle has been
+    // interrupted. This bounds owner cleanup to one stop timeout rather than one timeout per handle.
+    const quiescenceResults = await Promise.all(
+      Array.from(workspaceIds, async (workspaceId): Promise<Result<void, string>> => {
+        const idlePromise = this.workspaceService.waitForIdleAndNoQueuedMessages(workspaceId);
         try {
           const idleOutcome = await raceWithAbortAndTimeout(idlePromise, {
             timeoutMs: TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
           });
           if (idleOutcome.kind !== "ok") {
             void idlePromise.catch((error: unknown) => {
-              log.debug("Owned workspace turn idle wait later threw", {
-                handleId: record.handleId,
-                workspaceId: record.workspaceId,
-                error,
-              });
+              log.debug("Owned workspace idle wait later threw", { workspaceId, error });
             });
-            return Err(`Timed out stopping workspace turn ${record.handleId}`);
+            return Err(`Timed out stopping owned workspace ${workspaceId}`);
           }
         } catch (error) {
           return Err(
-            `Failed waiting for workspace turn ${record.handleId} to stop: ${getErrorMessage(error)}`
+            `Failed waiting for owned workspace ${workspaceId}: ${getErrorMessage(error)}`
           );
         }
-      }
 
-      if (
-        this.aiService.isStreaming(record.workspaceId) ||
-        this.workspaceService.hasPendingAutoRetry(record.workspaceId) ||
-        this.workspaceService.hasPendingQueuedOrPreparingTurn(record.workspaceId)
-      ) {
-        return Err(`Workspace turn ${record.handleId} is still active after interruption`);
-      }
+        if (
+          this.aiService.isStreaming(workspaceId) ||
+          this.workspaceService.hasPendingAutoRetry(workspaceId) ||
+          this.workspaceService.hasPendingQueuedOrPreparingTurn(workspaceId)
+        ) {
+          return Err(`Owned workspace ${workspaceId} is still active after interruption`);
+        }
+        return Ok(undefined);
+      })
+    );
+    const quiescenceFailure = quiescenceResults.find((result) => !result.success);
+    if (quiescenceFailure != null && !quiescenceFailure.success) {
+      return quiescenceFailure;
+    }
 
-      if (interruptResult.success) {
-        continue;
-      }
-
+    for (const failure of interruptFailures) {
       // A natural settlement can win the per-handle lock after the active snapshot. That is safe;
       // only a handle that remains live after the failed interrupt must block owner cleanup.
       const latest = await this.getWorkspaceTurnSnapshot(
         normalizedOwnerWorkspaceId,
-        record.handleId
+        failure.record.handleId
       );
       if (latest == null || !this.isActiveWorkspaceTurn(latest)) {
         continue;
       }
-      return Err(`Failed to interrupt workspace turn ${record.handleId}: ${interruptResult.error}`);
+      return Err(`Failed to interrupt workspace turn ${failure.record.handleId}: ${failure.error}`);
     }
 
     const remainingActive = await this.listWorkspaceTurnTasks(normalizedOwnerWorkspaceId, {
@@ -7665,10 +7678,9 @@ export class TaskService {
       }
     }
     if (shouldStopStream && workspaceId != null) {
-      try {
-        await this.aiService.stopStream(workspaceId, { abandonPartial: false });
-      } catch (error: unknown) {
-        log.debug("interruptWorkspaceTurn: stopStream threw", { handleId, error });
+      const stopResult = await this.workspaceService.interruptWorkspaceTurnStream(workspaceId);
+      if (!stopResult.success) {
+        return Err(`Failed to stop workspace turn stream: ${stopResult.error}`);
       }
     }
     if (interruptedRecord != null) {
