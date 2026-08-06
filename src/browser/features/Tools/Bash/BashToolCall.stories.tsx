@@ -7,7 +7,7 @@ import { BashBackgroundTerminateToolCall } from "@/browser/features/Tools/BashBa
 import { BashOutputToolCall } from "@/browser/features/Tools/BashOutputToolCall";
 import { BashToolCall } from "@/browser/features/Tools/BashToolCall";
 import { lightweightMeta } from "@/browser/stories/meta.js";
-import { STABLE_TIMESTAMP } from "@/browser/stories/storyTime";
+import { NOW } from "@/browser/stories/storyTime";
 
 const meta = {
   ...lightweightMeta,
@@ -145,7 +145,7 @@ export const IntentExecutingSummary: Story = {
           display_name: "Dev server readiness",
         }}
         status="executing"
-        startedAt={STABLE_TIMESTAMP - 1_000}
+        startedAt={NOW - 1_000}
       />
     </ToolStoryShell>
   ),
