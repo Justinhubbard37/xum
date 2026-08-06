@@ -1340,15 +1340,52 @@ describe("TaskService", () => {
     ]);
   });
 
+  test("Project Chat rejects unsupported automatic workspace runtime defaults", async () => {
+    const unsupportedDefaults = ["ssh", "coder", "docker", "devcontainer"] as const;
+
+    for (const defaultRuntime of unsupportedDefaults) {
+      const config = await createTestConfig(path.join(rootDir, defaultRuntime));
+      const projectPath = await createTestProject(config.rootDir, `repo-${defaultRuntime}`);
+      await saveWorkspaces(config, projectPath, [], {
+        taskSettings: testTaskSettings(),
+        defaultRuntime,
+      });
+      const projectChat = await config.ensureProjectChat(projectPath);
+      const workspaceMocks = createWorkspaceServiceMocks();
+      const { taskService } = createTaskServiceHarness(config, {
+        workspaceService: workspaceMocks.workspaceService,
+      });
+
+      const result = await taskService.createWorkspaceTurn({
+        ownerWorkspaceId: projectChat.sessionId,
+        prompt: "Create workspace",
+        title: "Unsupported runtime",
+        workspace: { mode: "new" },
+      });
+
+      expect(result.success).toBe(false);
+      if (result.success) throw new Error("Expected unsupported runtime rejection");
+      expect(result.error).toContain(defaultRuntime);
+      expect(workspaceMocks.create).not.toHaveBeenCalled();
+    }
+  });
+
   test("Project Chat cleanup interrupts every active owned workspace turn before deleting handles", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = await createTestProject(rootDir, "cleanup-owner", { initGit: false });
     await saveWorkspaces(config, projectPath, [], testTaskSettings());
     const projectChat = await config.ensureProjectChat(projectPath);
-    const isStreaming = mock((workspaceId: string) =>
-      ["activeworkspace", "startingworkspace", "foreignworkspace"].includes(workspaceId)
-    );
-    const aiMocks = createAIServiceMocks(config, { isStreaming });
+    const streamingWorkspaceIds = new Set([
+      "activeworkspace",
+      "startingworkspace",
+      "foreignworkspace",
+    ]);
+    const isStreaming = mock((workspaceId: string) => streamingWorkspaceIds.has(workspaceId));
+    const stopStream = mock((workspaceId: string): Promise<Result<void>> => {
+      streamingWorkspaceIds.delete(workspaceId);
+      return Promise.resolve(Ok(undefined));
+    });
+    const aiMocks = createAIServiceMocks(config, { isStreaming, stopStream });
     const { taskService } = createTaskServiceHarness(config, { aiService: aiMocks.aiService });
     const store = new TaskHandleStore(config);
     const baseRecord = {
@@ -1420,6 +1457,46 @@ describe("TaskService", () => {
     expect(
       fsPromises.access(path.join(config.sessionsDir, projectChat.sessionId))
     ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("Project Chat owner cleanup fails when an owned workspace does not become idle", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = await createTestProject(rootDir, "cleanup-busy-owner", {
+      initGit: false,
+    });
+    await saveWorkspaces(config, projectPath, [], testTaskSettings());
+    const projectChat = await config.ensureProjectChat(projectPath);
+    const waitForIdleAndNoQueuedMessages = mock(() => Promise.resolve());
+    const workspaceMocks = createWorkspaceServiceMocks({ waitForIdleAndNoQueuedMessages });
+    const aiMocks = createAIServiceMocks(config, {
+      isStreaming: mock(() => true),
+      stopStream: mock(() => Promise.resolve(Err("stream stop failed"))),
+    });
+    const { taskService } = createTaskServiceHarness(config, {
+      aiService: aiMocks.aiService,
+      workspaceService: workspaceMocks.workspaceService,
+    });
+    const store = new TaskHandleStore(config);
+    await store.upsertWorkspaceTurn({
+      kind: "workspace_turn",
+      handleId: "wst_busy",
+      ownerWorkspaceId: projectChat.sessionId,
+      workspaceId: "busyworkspace",
+      turnId: "turn",
+      status: "running",
+      createdAt: "2026-08-06T00:00:00.000Z",
+      updatedAt: "2026-08-06T00:00:00.000Z",
+      createdWorkspace: true,
+      disposableWorkspace: false,
+    });
+
+    const result = await taskService.interruptAllWorkspaceTurnsForOwner(projectChat.sessionId);
+
+    expect(result).toEqual(Err("Workspace turn wst_busy is still active after interruption"));
+    expect(waitForIdleAndNoQueuedMessages).toHaveBeenCalledWith("busyworkspace");
+    expect(await store.getWorkspaceTurn(projectChat.sessionId, "wst_busy")).toMatchObject({
+      status: "interrupted",
+    });
   });
 
   test("sub-project Project Chat reuses and lists workspaces from the parent storage bucket", async () => {

@@ -3561,6 +3561,15 @@ export class TaskService {
         // with backend trunk detection. Non-git projects self-heal to local because worktrees are invalid.
         const branches = await listLocalBranches(parentMeta.projectPath).catch(() => []);
         const effectiveDefaultRuntime = taskProjectConfig.defaultRuntime ?? cfg.defaultRuntime;
+        if (
+          effectiveDefaultRuntime != null &&
+          effectiveDefaultRuntime !== "local" &&
+          effectiveDefaultRuntime !== "worktree"
+        ) {
+          return Err(
+            `Task.createWorkspaceTurn: Project Chat cannot automatically create ${effectiveDefaultRuntime} workspaces; create one manually, then continue it with workspace.mode="existing".`
+          );
+        }
         const useLocalRuntime = effectiveDefaultRuntime === "local" || branches.length === 0;
         creationRuntimeConfig = useLocalRuntime ? { type: "local" } : undefined;
         creationTrunkBranch = useLocalRuntime
@@ -7528,6 +7537,43 @@ export class TaskService {
         normalizedOwnerWorkspaceId,
         record.handleId
       );
+
+      if (record.status !== "queued") {
+        // interruptWorkspaceTurn makes the durable handle terminal before requesting stream stop.
+        // Owner cleanup must also wait for AgentSession to observe that stop; stopStream failures are
+        // otherwise swallowed by the generic lifecycle path and could leave an unsupervised stream.
+        const idlePromise = this.workspaceService.waitForIdleAndNoQueuedMessages(
+          record.workspaceId
+        );
+        try {
+          const idleOutcome = await raceWithAbortAndTimeout(idlePromise, {
+            timeoutMs: TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
+          });
+          if (idleOutcome.kind !== "ok") {
+            void idlePromise.catch((error: unknown) => {
+              log.debug("Owned workspace turn idle wait later threw", {
+                handleId: record.handleId,
+                workspaceId: record.workspaceId,
+                error,
+              });
+            });
+            return Err(`Timed out stopping workspace turn ${record.handleId}`);
+          }
+        } catch (error) {
+          return Err(
+            `Failed waiting for workspace turn ${record.handleId} to stop: ${getErrorMessage(error)}`
+          );
+        }
+      }
+
+      if (
+        this.aiService.isStreaming(record.workspaceId) ||
+        this.workspaceService.hasPendingAutoRetry(record.workspaceId) ||
+        this.workspaceService.hasPendingQueuedOrPreparingTurn(record.workspaceId)
+      ) {
+        return Err(`Workspace turn ${record.handleId} is still active after interruption`);
+      }
+
       if (interruptResult.success) {
         continue;
       }

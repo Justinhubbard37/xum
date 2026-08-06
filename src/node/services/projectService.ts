@@ -1078,11 +1078,18 @@ export class ProjectService {
     return Err("Clone did not return a completion event");
   }
 
+  private isProjectChatSessionConfigured(sessionId: string): boolean {
+    const persisted = this.config.loadConfigOrDefault({ throwOnError: true });
+    return Array.from(persisted.projects.values()).some(
+      (project) => project.projectChat?.sessionId === sessionId
+    );
+  }
+
   private verifyProjectRemovalPersisted(
     projectPaths: readonly string[],
     projectChatSessionIds: readonly string[]
   ): Result<void, ProjectRemoveError> {
-    const persisted = this.config.loadConfigOrDefault();
+    const persisted = this.config.loadConfigOrDefault({ throwOnError: true });
     const remainingProjectPath = projectPaths.find((projectPath) =>
       persisted.projects.has(projectPath)
     );
@@ -1106,11 +1113,8 @@ export class ProjectService {
     for (const sessionId of new Set(sessionIds.filter(isProjectSessionId))) {
       // Never delete a session that a fresh disk-backed config still owns. Config writes are
       // deliberately startup-safe/log-and-swallow, so callers must verify destructive follow-up.
-      if (this.config.findProjectChatBySessionId(sessionId) != null) {
-        log.error(
-          `Skipping Project Chat cleanup because session is still configured: ${sessionId}`
-        );
-        continue;
+      if (this.isProjectChatSessionConfigured(sessionId)) {
+        throw new Error(`Project Chat session is still configured: ${sessionId}`);
       }
       // The config entry is removed before cleanup, but in-flight AgentSession/history writes must
       // keep resolving this captured ID to project-sessions until cleanup finishes.

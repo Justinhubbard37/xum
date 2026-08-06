@@ -1929,6 +1929,56 @@ exit 1
       expect(await fs.readFile(transcriptPath, "utf-8")).toBe("preserve me\n");
     });
 
+    it("fails closed when persisted-removal verification cannot read config", async () => {
+      const parentPath = path.join(tempDir, "parent-config-read-failure");
+      const subProjectPath = path.join(parentPath, "packages", "web");
+      await fs.mkdir(subProjectPath, { recursive: true });
+      await config.editConfig((cfg) => {
+        cfg.projects.set(parentPath, { trusted: true, workspaces: [] });
+        cfg.projects.set(subProjectPath, {
+          parentProjectPath: parentPath,
+          workspaces: [],
+        });
+        return cfg;
+      });
+      const projectChat = await config.ensureProjectChat(subProjectPath);
+      const transcriptPath = path.join(config.getSessionDir(projectChat.sessionId), "chat.jsonl");
+      await fs.writeFile(transcriptPath, "preserve me\n", "utf-8");
+      const cleanupProjectChatSession = mock(() => Promise.resolve());
+      service.setWorkspaceService({
+        remove: () => Promise.resolve(Ok(undefined)),
+        cleanupProjectChatSession,
+      });
+      (
+        config as unknown as {
+          saveConfig: (configSnapshot: unknown) => Promise<void>;
+        }
+      ).saveConfig = mock(() => Promise.resolve());
+      const originalLoadConfig = config.loadConfigOrDefault.bind(config);
+      (
+        config as unknown as {
+          loadConfigOrDefault: (options?: {
+            throwOnError?: boolean;
+          }) => ReturnType<Config["loadConfigOrDefault"]>;
+        }
+      ).loadConfigOrDefault = (options) => {
+        if (options?.throwOnError === true) {
+          throw new Error("verification config read failed");
+        }
+        return originalLoadConfig(options);
+      };
+
+      const result = await service.remove(subProjectPath);
+
+      expect(result.success).toBe(false);
+      if (result.success) throw new Error("Expected verification read failure");
+      expect(result.error.type).toBe("unknown");
+      if (result.error.type !== "unknown") throw new Error("Expected unknown removal error");
+      expect(result.error.message).toContain("verification config read failed");
+      expect(cleanupProjectChatSession).not.toHaveBeenCalled();
+      expect(await fs.readFile(transcriptPath, "utf-8")).toBe("preserve me\n");
+    });
+
     it("retains a sub-project workspace while cleaning its Project Chat owner", async () => {
       const parentPath = path.join(tempDir, "parent-project");
       const subProjectPath = path.join(parentPath, "packages", "web");
