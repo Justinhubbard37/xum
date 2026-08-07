@@ -2483,6 +2483,7 @@ export class TaskService {
       timeoutMs?: number;
       abortSignal?: AbortSignal;
       backgroundOnMessageQueued?: boolean;
+      onExecutionStarted?: () => void | Promise<void>;
     } = {}
   ): Promise<ScopedExecutionWaitResult> {
     const resolved = await this.getScopedExecutionSnapshot(ancestorWorkspaceId, executionIdOrAlias);
@@ -2508,12 +2509,18 @@ export class TaskService {
     }
 
     let stopBlockingRequester: (() => void) | null = this.startForegroundAwait(ancestorWorkspaceId);
+    let startWaiter: PendingTaskStartWaiter | null = null;
     let rejectBackground!: (error: Error) => void;
     const backgrounded = new Promise<never>((_resolve, reject) => {
       rejectBackground = reject;
     });
     let cleanedUp = false;
     const shouldBackgroundOnQueuedMessage = options.backgroundOnMessageQueued ?? true;
+    const cleanupStartWaiter = () => {
+      if (startWaiter == null) return;
+      startWaiter.cleanup();
+      startWaiter = null;
+    };
     const waiter: BackgroundableForegroundWaiter = {
       // Agent task persistence is keyed by workspace; workspace turns use their canonical public ID
       // and resolve back to the wst shadow only inside compatibility helpers.
@@ -2530,6 +2537,7 @@ export class TaskService {
       cleanup: () => {
         if (cleanedUp) return;
         cleanedUp = true;
+        cleanupStartWaiter();
         if (shouldBackgroundOnQueuedMessage) {
           this.unregisterBackgroundableForegroundWaiter(ancestorWorkspaceId, waiter);
         }
@@ -2546,18 +2554,91 @@ export class TaskService {
     }
     this.backgroundForegroundWaitIfQueued(shouldBackgroundOnQueuedMessage, ancestorWorkspaceId);
 
-    try {
-      return await Promise.race([
-        this.executionRegistry.waitForTerminal(
-          resolved.handle.ownerSessionId,
-          resolved.handle.executionId,
-          {
-            ...(options.timeoutMs != null ? { timeoutMs: options.timeoutMs } : {}),
-            abortSignal: waitController.signal,
+    const notifyExecutionStarted = () => {
+      void Promise.resolve(options.onExecutionStarted?.()).catch((error: unknown) => {
+        log.error("waitForScopedExecutionTerminal execution-start callback failed", {
+          executionId: resolved.handle.executionId,
+          error,
+        });
+      });
+    };
+    const waitForTerminal = async (): Promise<ExecutionWaitResult> =>
+      await this.executionRegistry.waitForTerminal(
+        resolved.handle.ownerSessionId,
+        resolved.handle.executionId,
+        {
+          ...(options.timeoutMs != null ? { timeoutMs: options.timeoutMs } : {}),
+          abortSignal: waitController.signal,
+        }
+      );
+    const waitForExecution = async (): Promise<ExecutionWaitResult> => {
+      if (
+        options.onExecutionStarted == null ||
+        (resolved.handle.status !== "queued" && resolved.handle.status !== "starting")
+      ) {
+        notifyExecutionStarted();
+        return await waitForTerminal();
+      }
+
+      // Match legacy workflow timeout semantics: queued time is not execution time. Race terminal
+      // settlement while waiting for running so launch failures still resolve without starting a timer.
+      let resolveStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        resolveStarted = resolve;
+      });
+      const startWaiterEntry: PendingTaskStartWaiter = {
+        start: resolveStarted,
+        cleanup: () => {
+          const current = this.pendingStartWaitersByTaskId.get(resolved.workspaceId);
+          if (current == null) return;
+          const next = current.filter((candidate) => candidate !== startWaiterEntry);
+          if (next.length === 0) {
+            this.pendingStartWaitersByTaskId.delete(resolved.workspaceId);
+          } else {
+            this.pendingStartWaitersByTaskId.set(resolved.workspaceId, next);
           }
-        ),
-        backgrounded,
+        },
+      };
+      startWaiter = startWaiterEntry;
+      const current = this.pendingStartWaitersByTaskId.get(resolved.workspaceId) ?? [];
+      current.push(startWaiterEntry);
+      this.pendingStartWaitersByTaskId.set(resolved.workspaceId, current);
+
+      const preStartController = new AbortController();
+      const forwardPreStartAbort = () => preStartController.abort();
+      waitController.signal.addEventListener("abort", forwardPreStartAbort, { once: true });
+      const terminalBeforeStart = this.executionRegistry.waitForTerminal(
+        resolved.handle.ownerSessionId,
+        resolved.handle.executionId,
+        { abortSignal: preStartController.signal }
+      );
+
+      const latest = await this.executionRegistry.get(
+        resolved.handle.ownerSessionId,
+        resolved.handle.executionId
+      );
+      if (latest != null && latest.status !== "queued" && latest.status !== "starting") {
+        resolveStarted();
+      }
+
+      const preStart = await Promise.race([
+        started.then(() => ({ kind: "started" as const })),
+        terminalBeforeStart.then((result) => ({ kind: "terminal" as const, result })),
       ]);
+      cleanupStartWaiter();
+      waitController.signal.removeEventListener("abort", forwardPreStartAbort);
+      if (preStart.kind === "terminal") {
+        return preStart.result;
+      }
+
+      preStartController.abort();
+      await terminalBeforeStart;
+      notifyExecutionStarted();
+      return await waitForTerminal();
+    };
+
+    try {
+      return await Promise.race([waitForExecution(), backgrounded]);
     } finally {
       waiter.cleanup();
     }

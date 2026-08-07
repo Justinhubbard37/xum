@@ -7,6 +7,7 @@ import type {
   WorkflowStepRecord,
 } from "@/common/types/workflow";
 import { parseThinkingInput, type ParsedThinkingInput } from "@/common/types/thinking";
+import { isExecutionId } from "@/common/types/execution";
 import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -25,6 +26,13 @@ export class WorkflowRunBackgroundedError extends Error {
   constructor(runId: string) {
     super(`Workflow run backgrounded: ${runId}`);
     this.name = "WorkflowRunBackgroundedError";
+  }
+}
+
+export class WorkflowAgentWaitTimeoutError extends Error {
+  constructor() {
+    super("Timed out waiting for workflow agent execution");
+    this.name = "WorkflowAgentWaitTimeoutError";
   }
 }
 
@@ -283,8 +291,11 @@ function parseParallelAgentsOptions(raw: unknown): { maxParallel?: number } {
   return parseWorkflowParallelOptions(raw, "parallel");
 }
 
-function isAgentReportWaitTimeoutError(error: unknown): boolean {
-  return isErrorWithName(error, "AgentReportWaitTimeoutError");
+function isWorkflowAgentWaitTimeoutError(error: unknown): boolean {
+  return (
+    isErrorWithName(error, "WorkflowAgentWaitTimeoutError") ||
+    isErrorWithName(error, "AgentReportWaitTimeoutError")
+  );
 }
 
 function buildWorkflowAgentTimeoutFinalizationToken(
@@ -1999,7 +2010,7 @@ export class WorkflowRunner {
         });
         return result;
       } catch (error) {
-        if (!isAgentReportWaitTimeoutError(error)) {
+        if (!isWorkflowAgentWaitTimeoutError(error)) {
           throw error;
         }
       }
@@ -2007,6 +2018,14 @@ export class WorkflowRunner {
     };
 
     if (existingTimeout?.softTimedOutAt != null) {
+      // Canonical executions complete from their final assistant message, so a soft timeout only
+      // starts the grace window; reprompting for agent_report is a legacy compatibility behavior.
+      if (isExecutionId(step.taskId)) {
+        return await waitDuringGrace(
+          remainingMsUntil(existingTimeout.hardDeadlineAt, timeout.graceMs)
+        );
+      }
+
       assert(
         this.taskAdapter.requestAgentFinalReportForTimeout != null,
         "WorkflowRunner timeout wait requires requestAgentFinalReportForTimeout"
@@ -2046,7 +2065,7 @@ export class WorkflowRunner {
     try {
       return await waitForReport(remainingMsUntil(existingTimeout?.softDeadlineAt, timeout.softMs));
     } catch (error) {
-      if (!isAgentReportWaitTimeoutError(error)) {
+      if (!isWorkflowAgentWaitTimeoutError(error)) {
         throw error;
       }
     }
@@ -2097,6 +2116,10 @@ export class WorkflowRunner {
       title: step.spec.title,
       status: "finalizing",
     });
+
+    if (isExecutionId(step.taskId)) {
+      return await waitDuringGrace(remainingMsUntil(hardDeadlineAt, timeout.graceMs));
+    }
 
     const finalizationResult = await this.taskAdapter.requestAgentFinalReportForTimeout(
       step.taskId,

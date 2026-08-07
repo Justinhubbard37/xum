@@ -2,16 +2,22 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import type { SubagentGitPatchArtifact } from "@/common/utils/tools/toolDefinitions";
+import { isExecutionId } from "@/common/types/execution";
 import type { ParsedThinkingInput } from "@/common/types/thinking";
 import assert from "@/common/utils/assert";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
-import type { TaskCreateResult } from "@/node/services/taskService";
 import type {
-  WorkflowAgentResult,
-  WorkflowAgentSpec,
-  WorkflowAgentWaitOptions,
-  WorkflowApplyPatchSpec,
-  WorkflowTaskAdapter,
+  ScopedExecutionSnapshot,
+  ScopedExecutionWaitResult,
+  TaskCreateResult,
+} from "@/node/services/taskService";
+import {
+  WorkflowAgentWaitTimeoutError,
+  type WorkflowAgentResult,
+  type WorkflowAgentSpec,
+  type WorkflowAgentWaitOptions,
+  type WorkflowApplyPatchSpec,
+  type WorkflowTaskAdapter,
 } from "./WorkflowRunner";
 import { isPathInsideDir } from "@/node/utils/pathUtils";
 import {
@@ -70,6 +76,15 @@ interface WorkflowTaskServiceLike {
       onTaskReserved?: (index: number, result: TaskCreateResult) => Promise<void> | void;
     }
   ): Promise<{ success: true; data: TaskCreateResult[] } | { success: false; error: string }>;
+  waitForScopedExecutionTerminal?(
+    ancestorWorkspaceId: string,
+    executionIdOrAlias: string,
+    options?: WorkflowAgentWaitOptions
+  ): Promise<ScopedExecutionWaitResult>;
+  getScopedExecutionSnapshot?(
+    ancestorWorkspaceId: string,
+    executionIdOrAlias: string
+  ): Promise<ScopedExecutionSnapshot>;
   waitForAgentReport(
     taskId: string,
     options: WorkflowAgentWaitOptions & {
@@ -494,7 +509,29 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
       this.taskService.failAgentTaskForHardTimeout != null,
       "WorkflowTaskServiceAdapter requires TaskService hard timeout support"
     );
-    await this.taskService.failAgentTaskForHardTimeout(taskId, options);
+
+    let targetWorkspaceId = taskId;
+    if (isExecutionId(taskId)) {
+      assert(
+        this.taskService.getScopedExecutionSnapshot != null,
+        "WorkflowTaskServiceAdapter requires canonical execution lookup support"
+      );
+      const resolved = await this.taskService.getScopedExecutionSnapshot(
+        this.parentWorkspaceId,
+        taskId
+      );
+      if (resolved.kind === "invalid_scope") {
+        throw new Error("Task is not a descendant");
+      }
+      if (resolved.kind === "not_found") {
+        throw new Error("Task not found");
+      }
+      targetWorkspaceId = resolved.workspaceId;
+    }
+
+    // Hard-timeout termination still operates on the child workspace while workflow state stores
+    // the canonical execution ID, so resolve the execution target before using the legacy terminator.
+    await this.taskService.failAgentTaskForHardTimeout(targetWorkspaceId, options);
   }
 
   async waitForAgentTask(
@@ -502,7 +539,61 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
     _spec: WorkflowAgentSpec,
     waitOptions?: WorkflowAgentWaitOptions
   ): Promise<WorkflowAgentResult> {
-    const report = await this.taskService.waitForAgentReport(taskId, {
+    if (!isExecutionId(taskId)) {
+      return await this.waitForLegacyAgentTask(taskId, waitOptions);
+    }
+
+    assert(
+      this.taskService.waitForScopedExecutionTerminal != null,
+      "WorkflowTaskServiceAdapter requires canonical execution wait support"
+    );
+    const outcome = await this.taskService.waitForScopedExecutionTerminal(
+      this.parentWorkspaceId,
+      taskId,
+      waitOptions
+    );
+    switch (outcome.kind) {
+      case "terminal": {
+        const result = outcome.handle.result;
+        assert(result != null, "Canonical terminal execution must include a result");
+        if (result.kind === "error") {
+          throw new Error(result.error);
+        }
+        if (result.kind === "interrupted") {
+          throw new Error(result.message ?? "Task interrupted");
+        }
+        return {
+          taskId,
+          reportMarkdown: result.reportMarkdown,
+          ...(outcome.handle.launchPolicy.title != null
+            ? { title: outcome.handle.launchPolicy.title }
+            : {}),
+          ...(result.structuredOutput !== undefined
+            ? { structuredOutput: result.structuredOutput }
+            : {}),
+        };
+      }
+      case "legacy":
+        return await this.waitForLegacyAgentTask(outcome.workspaceId, waitOptions, taskId);
+      case "timeout":
+        throw new WorkflowAgentWaitTimeoutError();
+      case "aborted": {
+        const abortReason = waitOptions?.abortSignal?.reason;
+        throw abortReason instanceof Error ? abortReason : new Error("Task interrupted");
+      }
+      case "invalid_scope":
+        throw new Error("Task is not a descendant");
+      case "not_found":
+        throw new Error("Task not found");
+    }
+  }
+
+  private async waitForLegacyAgentTask(
+    legacyTaskId: string,
+    waitOptions?: WorkflowAgentWaitOptions,
+    resultTaskId = legacyTaskId
+  ): Promise<WorkflowAgentResult> {
+    const report = await this.taskService.waitForAgentReport(legacyTaskId, {
       ...(waitOptions?.abortSignal != null ? { abortSignal: waitOptions.abortSignal } : {}),
       ...(waitOptions?.timeoutMs != null ? { timeoutMs: waitOptions.timeoutMs } : {}),
       ...(waitOptions?.onExecutionStarted != null
@@ -513,7 +604,7 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
     });
 
     return {
-      taskId,
+      taskId: resultTaskId,
       reportMarkdown: report.reportMarkdown,
       ...(report.title != null ? { title: report.title } : {}),
       ...(report.planFilePath !== undefined ? { planFilePath: report.planFilePath } : {}),

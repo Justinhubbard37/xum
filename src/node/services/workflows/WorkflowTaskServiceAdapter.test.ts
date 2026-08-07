@@ -4,6 +4,7 @@ import * as path from "node:path";
 import assert from "node:assert/strict";
 import { describe, expect, mock, test } from "bun:test";
 import { Ok } from "@/common/types/result";
+import type { ExecutionHandle, ExecutionResult } from "@/common/types/execution";
 import type { TaskApplyGitPatchConfiguration } from "@/node/services/tools/task_apply_git_patch";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import type { TaskCreateResult } from "@/node/services/taskService";
@@ -17,6 +18,35 @@ function taskResult(
   status: TaskCreateResult["status"] = "running"
 ): TaskCreateResult {
   return { taskId, workspaceId: taskId, kind: "agent", status };
+}
+
+function terminalExecutionHandle(
+  result: ExecutionResult,
+  options: { title?: string; workspaceId?: string } = {}
+): ExecutionHandle {
+  return {
+    version: 1,
+    executionId: "exe_workflow_child",
+    ownerSessionId: "parent_1",
+    requesterWorkspaceId: "parent_1",
+    target: {
+      kind: "workspace",
+      workspaceId: options.workspaceId ?? "child_workspace",
+      origin: "created",
+    },
+    launchPolicy: {
+      kind: "agent_task",
+      ...(options.title != null ? { title: options.title } : {}),
+    },
+    completionPolicy: { kind: "final_assistant_message" },
+    retentionPolicy: { kind: "retain_workspace" },
+    attentionPolicy: "notify_on_terminal",
+    status: result.kind,
+    result,
+    createdAt: "2026-08-07T00:00:00.000Z",
+    updatedAt: "2026-08-07T00:01:00.000Z",
+    terminalAt: "2026-08-07T00:01:00.000Z",
+  };
 }
 
 describe("WorkflowTaskServiceAdapter", () => {
@@ -64,6 +94,184 @@ describe("WorkflowTaskServiceAdapter", () => {
       planFilePath: "/tmp/mux/plans/repo/task_1.md",
       structuredOutput: { claims: ["durable"] },
     });
+  });
+
+  test("waits on canonical executions and preserves completed title and structured output", async () => {
+    const waitForAgentReport = mock(async () => ({ reportMarkdown: "legacy should not run" }));
+    const waitForScopedExecutionTerminal = mock(async () => ({
+      kind: "terminal" as const,
+      handle: terminalExecutionHandle(
+        {
+          kind: "completed",
+          reportMarkdown: "canonical report",
+          structuredOutput: { claims: ["durable"] },
+        },
+        { title: "Canonical child" }
+      ),
+    }));
+    const adapter = new WorkflowTaskServiceAdapter({
+      taskService: {
+        create: mock(async () => Ok(taskResult("unused"))),
+        waitForAgentReport,
+        waitForScopedExecutionTerminal,
+      },
+      parentWorkspaceId: "parent_1",
+      workflowRunId: "wfr_123",
+      defaultAgentId: "exec",
+    });
+    const abortController = new AbortController();
+
+    const result = await adapter.waitForAgentTask(
+      "exe_workflow_child",
+      { id: "claims", prompt: "Extract claims" },
+      {
+        abortSignal: abortController.signal,
+        timeoutMs: 1_234,
+        backgroundOnMessageQueued: false,
+      }
+    );
+
+    expect(waitForScopedExecutionTerminal).toHaveBeenCalledWith("parent_1", "exe_workflow_child", {
+      abortSignal: abortController.signal,
+      timeoutMs: 1_234,
+      backgroundOnMessageQueued: false,
+    });
+    expect(waitForAgentReport).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      taskId: "exe_workflow_child",
+      reportMarkdown: "canonical report",
+      title: "Canonical child",
+      structuredOutput: { claims: ["durable"] },
+    });
+  });
+
+  test("rejects canonical error and interrupted execution results", async () => {
+    const outcomes = [
+      {
+        kind: "terminal" as const,
+        handle: terminalExecutionHandle({ kind: "error", error: "model refusal" }),
+      },
+      {
+        kind: "terminal" as const,
+        handle: terminalExecutionHandle({ kind: "interrupted", message: "user stopped task" }),
+      },
+    ];
+    const adapter = new WorkflowTaskServiceAdapter({
+      taskService: {
+        create: mock(async () => Ok(taskResult("unused"))),
+        waitForAgentReport: mock(async () => ({ reportMarkdown: "legacy should not run" })),
+        waitForScopedExecutionTerminal: mock(async () => {
+          const outcome = outcomes.shift();
+          assert(outcome != null);
+          return outcome;
+        }),
+      },
+      parentWorkspaceId: "parent_1",
+      workflowRunId: "wfr_123",
+      defaultAgentId: "exec",
+    });
+
+    await expect(
+      adapter.waitForAgentTask("exe_workflow_child", { id: "error", prompt: "Fail" })
+    ).rejects.toThrow("model refusal");
+    await expect(
+      adapter.waitForAgentTask("exe_workflow_child", { id: "stop", prompt: "Stop" })
+    ).rejects.toThrow("user stopped task");
+  });
+
+  test("uses a workflow-specific timeout error for canonical execution waits", async () => {
+    const adapter = new WorkflowTaskServiceAdapter({
+      taskService: {
+        create: mock(async () => Ok(taskResult("unused"))),
+        waitForAgentReport: mock(async () => ({ reportMarkdown: "legacy should not run" })),
+        waitForScopedExecutionTerminal: mock(async () => ({
+          kind: "timeout" as const,
+          snapshot: {
+            ...terminalExecutionHandle({ kind: "completed", reportMarkdown: "unused" }),
+            status: "running" as const,
+            result: undefined,
+            terminalAt: undefined,
+          },
+        })),
+      },
+      parentWorkspaceId: "parent_1",
+      workflowRunId: "wfr_123",
+      defaultAgentId: "exec",
+    });
+
+    const error = await adapter
+      .waitForAgentTask("exe_workflow_child", { id: "slow", prompt: "Keep working" })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).name).toBe("WorkflowAgentWaitTimeoutError");
+    expect((error as Error).message).not.toContain("agent_report");
+  });
+
+  test("falls back to the legacy report waiter for legacy task IDs", async () => {
+    const waitForAgentReport = mock(async () => ({
+      reportMarkdown: "legacy report",
+      title: "Legacy child",
+    }));
+    const waitForScopedExecutionTerminal = mock(async () => ({ kind: "not_found" as const }));
+    const adapter = new WorkflowTaskServiceAdapter({
+      taskService: {
+        create: mock(async () => Ok(taskResult("unused"))),
+        waitForAgentReport,
+        waitForScopedExecutionTerminal,
+      },
+      parentWorkspaceId: "parent_1",
+      workflowRunId: "wfr_123",
+      defaultAgentId: "exec",
+    });
+
+    await expect(
+      adapter.waitForAgentTask("legacy_workspace", { id: "legacy", prompt: "Legacy" })
+    ).resolves.toEqual({
+      taskId: "legacy_workspace",
+      reportMarkdown: "legacy report",
+      title: "Legacy child",
+    });
+    expect(waitForAgentReport).toHaveBeenCalledWith("legacy_workspace", {
+      requestingWorkspaceId: "parent_1",
+      backgroundOnMessageQueued: true,
+    });
+    expect(waitForScopedExecutionTerminal).not.toHaveBeenCalled();
+  });
+
+  test("resolves a canonical execution target before hard-timeout termination", async () => {
+    const failAgentTaskForHardTimeout = mock(async () => undefined);
+    const getScopedExecutionSnapshot = mock(async () => ({
+      kind: "ok" as const,
+      source: "canonical" as const,
+      workspaceId: "child_workspace",
+      handle: terminalExecutionHandle(
+        { kind: "completed", reportMarkdown: "unused" },
+        { workspaceId: "child_workspace" }
+      ),
+    }));
+    const adapter = new WorkflowTaskServiceAdapter({
+      taskService: {
+        create: mock(async () => Ok(taskResult("unused"))),
+        waitForAgentReport: mock(async () => ({ reportMarkdown: "unused" })),
+        getScopedExecutionSnapshot,
+        failAgentTaskForHardTimeout,
+      },
+      parentWorkspaceId: "parent_1",
+      workflowRunId: "wfr_123",
+      defaultAgentId: "exec",
+    });
+    const options = {
+      workflowRunId: "wfr_123",
+      stepId: "slow",
+      inputHash: "hash",
+      reason: "hard timeout",
+    };
+
+    await adapter.failAgentTaskForHardTimeout("exe_workflow_child", options);
+
+    expect(getScopedExecutionSnapshot).toHaveBeenCalledWith("parent_1", "exe_workflow_child");
+    expect(failAgentTaskForHardTimeout).toHaveBeenCalledWith("child_workspace", options);
   });
 
   test("propagates terminal task failures (model refusal) instead of hanging", async () => {

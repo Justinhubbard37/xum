@@ -1309,7 +1309,7 @@ describe("WorkflowRunner", () => {
     ).toBeUndefined();
   });
 
-  test("fails and hard-times-out an agent that does not report during grace", async () => {
+  test("hard-times-out a canonical agent without requesting an agent_report during grace", async () => {
     using tmp = new DisposableTempDir("workflow-runner-agent-timeout-hard");
     const store = new WorkflowRunStore({
       sessionDir: tmp.path,
@@ -1327,22 +1327,22 @@ describe("WorkflowRunner", () => {
       now: "2026-05-29T00:00:00.000Z",
     });
     const timeoutError = new Error("wait expired");
-    timeoutError.name = "AgentReportWaitTimeoutError";
+    timeoutError.name = "WorkflowAgentWaitTimeoutError";
     const hardTimeouts: unknown[] = [];
     const runner = createRunner(store, {
       async runAgent() {
         throw new Error("timeout steps should use createAgentTasks so the runner controls waits");
       },
       async createAgentTasks(_specs, lifecycle) {
-        await lifecycle?.onTaskCreated?.(0, "task_slow");
-        return [{ taskId: "task_slow", status: "running" }];
+        await lifecycle?.onTaskCreated?.(0, "exe_slow");
+        return [{ taskId: "exe_slow", status: "running" }];
       },
       async waitForAgentTask(_taskId, _spec, waitOptions) {
         await waitOptions?.onExecutionStarted?.();
         throw timeoutError;
       },
       async requestAgentFinalReportForTimeout() {
-        return "prompted";
+        throw new Error("canonical timeout must not request agent_report");
       },
       async failAgentTaskForHardTimeout(taskId, request) {
         hardTimeouts.push({ taskId, request });
