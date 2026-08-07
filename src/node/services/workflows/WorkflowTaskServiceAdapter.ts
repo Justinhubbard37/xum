@@ -578,7 +578,7 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
       case "timeout":
         throw new WorkflowAgentWaitTimeoutError();
       case "aborted": {
-        const abortReason = waitOptions?.abortSignal?.reason;
+        const abortReason: unknown = waitOptions?.abortSignal?.reason;
         throw abortReason instanceof Error ? abortReason : new Error("Task interrupted");
       }
       case "invalid_scope":
