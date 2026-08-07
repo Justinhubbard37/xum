@@ -33,6 +33,7 @@ import { useBackgroundProcesses } from "@/browser/stores/BackgroundBashStore";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { TaskAttachFileArtifact } from "@/common/types/taskArtifacts";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import { isCanonicalExecutionWorkspace } from "@/common/utils/workspaceClassification";
 import type {
   TaskToolArgs,
   TaskToolResult,
@@ -193,11 +194,13 @@ function resolveExecutionWorkspaceTarget(
 }
 
 function isExecutionWorkspaceOpenable(workspace: FrontendWorkspaceMetadata | undefined): boolean {
-  return Boolean(
-    workspace &&
-    workspace.isRemoving !== true &&
-    !isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)
-  );
+  if (!workspace || workspace.isRemoving === true) {
+    return false;
+  }
+  if (!isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) {
+    return true;
+  }
+  return workspace.transcriptOnly === true && isCanonicalExecutionWorkspace(workspace);
 }
 
 function openWorkspaceFromContext(

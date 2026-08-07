@@ -134,6 +134,7 @@ import { getProjectDisplayName, getSubProjectsForParent } from "@/common/utils/s
 import { getErrorMessage } from "@/common/utils/errors";
 import { isMultiProject } from "@/common/utils/multiProject";
 import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
+import { isLegacyAgentWorkspace } from "@/common/utils/workspaceClassification";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_SIDEBAR_SECTION_ID } from "@/common/constants/scratch";
 import { MULTI_PROJECT_SIDEBAR_SECTION_ID } from "@/common/constants/multiProject";
 import { getProjectWorkspaceCounts } from "@/common/utils/projectRemoval";
@@ -2945,7 +2946,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                   }
                                   rowNodes.push({
                                     id: workspace.id,
-                                    parentId: workspace.parentWorkspaceId,
+                                    parentId: isLegacyAgentWorkspace(workspace)
+                                      ? workspace.parentWorkspaceId
+                                      : undefined,
                                     depth: baseRowMeta.depth,
                                     isRunning: isRunningOrStartingTaskStatus(workspace.taskStatus),
                                     baseMeta: baseRowMeta,

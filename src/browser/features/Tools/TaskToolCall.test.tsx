@@ -300,11 +300,47 @@ describe("TaskToolCall", () => {
     expect(view.getByTestId("legacy-transcript").textContent).toContain("legacy-task");
   });
 
+  test("opens an archived canonical transcript-only task target", () => {
+    const workspace = createWorkspaceMetadata({
+      id: "archived-transcript",
+      executionId: "exe_archived_transcript",
+      transcriptOnly: true,
+      archivedAt: "2026-08-05T00:00:00.000Z",
+    });
+    const setSelectedWorkspace = mock((selection: unknown) => {
+      void selection;
+    });
+    workspaceContextMock = {
+      workspaceMetadata: new Map([[workspace.id, workspace]]),
+      setSelectedWorkspace,
+    };
+
+    const view = render(
+      <TooltipProvider>
+        <TaskToolCall
+          args={workspaceTaskArgs}
+          result={{
+            status: "completed",
+            taskId: "exe_archived_transcript",
+            workspaceId: workspace.id,
+            handleKind: "workspace_turn",
+            reportMarkdown: "Finished.",
+          }}
+          status="completed"
+        />
+      </TooltipProvider>
+    );
+
+    fireEvent.click(view.getByRole("button", { name: "Open workspace" }));
+    expect(setSelectedWorkspace.mock.calls[0][0]).toEqual(workspace);
+  });
+
   for (const unavailable of ["archived", "removing", "missing"] as const) {
     test(`hides canonical workspace navigation when the target is ${unavailable}`, () => {
       const workspaceId = `workspace-${unavailable}`;
       const workspace = createWorkspaceMetadata({
         id: workspaceId,
+        executionId: `exe_${unavailable}`,
         archivedAt: unavailable === "archived" ? "2026-08-05T00:00:00.000Z" : undefined,
         isRemoving: unavailable === "removing" ? true : undefined,
       });
