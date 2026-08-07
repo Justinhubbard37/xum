@@ -225,6 +225,13 @@ export function installDom(): () => void {
       previous.IntersectionObserver;
     (globalThis as unknown as { ResizeObserver?: unknown }).ResizeObserver =
       previous.ResizeObserver;
+
+    // Self-heal: snapshots taken after a `document = undefined` teardown would
+    // restore that poisoned state here, breaking modules that detect DOM
+    // support at eval time (e.g. @react-dnd/asap). Keep a baseline DOM alive.
+    if (typeof globalThis.document === "undefined" || typeof globalThis.window === "undefined") {
+      installDom();
+    }
   };
 }
 
@@ -243,3 +250,9 @@ export function installDom(): () => void {
 if (typeof globalThis.document === "undefined") {
   installDom();
 }
+
+// Require (not statically import) react-dnd after the DOM bootstrap because
+// @react-dnd/asap reads `document` while constructing its scheduler during
+// module evaluation.
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+require("react-dnd");

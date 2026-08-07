@@ -7,6 +7,10 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { createContext, type ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
+import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
+import * as RealAPIModule from "@/browser/contexts/API";
+import * as RealExperimentsModule from "@/browser/hooks/useExperiments";
+import * as RealDialogModule from "@/browser/components/Dialog/Dialog";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type {
   MemoryConsolidationRecordPayload,
@@ -172,6 +176,12 @@ function createFakeMemoryApi(initialFiles: MemoryFileInfo[], options: FakeMemory
 }
 
 let fake: ReturnType<typeof createFakeMemoryApi> | null = null;
+
+restoreModulesAfterSuite([
+  ["@/browser/contexts/API", { ...RealAPIModule }],
+  ["@/browser/hooks/useExperiments", { ...RealExperimentsModule }],
+  ["@/browser/components/Dialog/Dialog", { ...RealDialogModule }],
+]);
 
 void mock.module("@/browser/contexts/API", () => ({
   APIContext: createContext(null),
