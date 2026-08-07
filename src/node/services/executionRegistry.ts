@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import {
   EXECUTION_HANDLE_VERSION,
+  isExecutionId,
   type ExecutionHandle,
   type ExecutionResult,
   type ExecutionStatus,
@@ -243,6 +244,85 @@ export class ExecutionRegistry {
     );
   }
 
+  /** List agent-task executions from canonical storage plus the legacy workspace adapter. */
+  async listAgentExecutions(
+    ownerSessionId: string,
+    options: { statuses?: readonly ExecutionStatus[] } = {}
+  ): Promise<ExecutionHandle[]> {
+    const statuses = options.statuses != null ? new Set(options.statuses) : null;
+    return (await this.list(ownerSessionId)).filter(
+      (handle) =>
+        handle.launchPolicy.kind === "agent_task" &&
+        (statuses == null || statuses.has(handle.status))
+    );
+  }
+
+  /** Queued, starting, and running executions are active; transcript-only legacy tasks are terminal. */
+  async listActiveAgentExecutions(ownerSessionId: string): Promise<ExecutionHandle[]> {
+    return await this.listAgentExecutions(ownerSessionId, {
+      statuses: ["queued", "starting", "running"],
+    });
+  }
+
+  /** Return one-based task depth, following canonical parentExecutionId edges. */
+  async getAgentExecutionDepth(
+    ownerSessionId: string,
+    executionIdOrAlias: string
+  ): Promise<number | null> {
+    const handles = await this.listAgentExecutions(ownerSessionId);
+    const byId = new Map(handles.map((handle) => [handle.executionId, handle]));
+    const handle = this.resolveListedExecution(handles, executionIdOrAlias);
+    if (handle == null) return null;
+
+    let depth = 1;
+    let parentExecutionId = handle.parentExecutionId;
+    const visited = new Set([handle.executionId]);
+    while (parentExecutionId != null && !visited.has(parentExecutionId)) {
+      visited.add(parentExecutionId);
+      const parent = byId.get(parentExecutionId);
+      if (parent == null) break;
+      depth += 1;
+      parentExecutionId = parent.parentExecutionId;
+    }
+    return depth;
+  }
+
+  /** List all agent-task descendants of an execution, or all tasks when rooted at the owner. */
+  async listDescendantAgentExecutions(
+    ownerSessionId: string,
+    ancestorExecutionIdOrOwner: string = ownerSessionId
+  ): Promise<ExecutionHandle[]> {
+    const handles = await this.listAgentExecutions(ownerSessionId);
+    if (ancestorExecutionIdOrOwner === ownerSessionId) return handles;
+
+    const ancestor = this.resolveListedExecution(handles, ancestorExecutionIdOrOwner);
+    if (ancestor == null) return [];
+    const byId = new Map(handles.map((handle) => [handle.executionId, handle]));
+
+    return handles.filter((handle) => {
+      let parentExecutionId = handle.parentExecutionId;
+      const visited = new Set<string>();
+      while (parentExecutionId != null && !visited.has(parentExecutionId)) {
+        if (parentExecutionId === ancestor.executionId) return true;
+        visited.add(parentExecutionId);
+        parentExecutionId = byId.get(parentExecutionId)?.parentExecutionId;
+      }
+      return false;
+    });
+  }
+
+  private resolveListedExecution(
+    handles: readonly ExecutionHandle[],
+    executionIdOrAlias: string
+  ): ExecutionHandle | null {
+    return (
+      handles.find(
+        (handle) =>
+          handle.executionId === executionIdOrAlias || handle.aliases?.includes(executionIdOrAlias)
+      ) ?? null
+    );
+  }
+
   private async getCanonical(
     ownerSessionId: string,
     executionIdOrAlias: string
@@ -332,12 +412,20 @@ export class ExecutionRegistry {
     };
   }
 
-  private getLegacyAgentWorkspaces(ownerSessionId: string): Map<string, Workspace> {
+  private getLegacyAgentWorkspaceContext(ownerSessionId: string): {
+    descendants: Map<string, Workspace>;
+    canonicalExecutionByWorkspaceId: Map<string, string>;
+  } {
     const allById = new Map<string, Workspace>();
+    const canonicalExecutionByWorkspaceId = new Map<string, string>();
     const config = this.config.loadConfigOrDefault();
     for (const project of config.projects.values()) {
       for (const workspace of project.workspaces) {
-        if (workspace.id != null) allById.set(workspace.id, workspace);
+        if (workspace.id == null) continue;
+        allById.set(workspace.id, workspace);
+        if (isExecutionId(workspace.executionId)) {
+          canonicalExecutionByWorkspaceId.set(workspace.id, workspace.executionId);
+        }
       }
     }
 
@@ -356,7 +444,8 @@ export class ExecutionRegistry {
         current = parent;
       }
     }
-    return descendants;
+    // Parent workspaces may be canonical even when only their legacy descendants are adapted.
+    return { descendants, canonicalExecutionByWorkspaceId };
   }
 
   private async listLegacyAgentTasks(ownerSessionId: string): Promise<ExecutionHandle[]> {
@@ -365,14 +454,14 @@ export class ExecutionRegistry {
       readSubagentReportArtifactsFile(sessionDir),
       readSubagentFailureArtifactsFile(sessionDir),
     ]);
-    const workspaces = this.getLegacyAgentWorkspaces(ownerSessionId);
+    const context = this.getLegacyAgentWorkspaceContext(ownerSessionId);
     const taskIds = new Set([
-      ...workspaces.keys(),
+      ...context.descendants.keys(),
       ...Object.keys(reports.artifactsByChildTaskId),
       ...Object.keys(failures.failuresByChildTaskId),
     ]);
     const records = await Promise.all(
-      [...taskIds].map((taskId) => this.readLegacyAgentTask(ownerSessionId, taskId, workspaces))
+      [...taskIds].map((taskId) => this.readLegacyAgentTask(ownerSessionId, taskId, context))
     );
     return records.filter((record): record is ExecutionHandle => record != null);
   }
@@ -380,10 +469,10 @@ export class ExecutionRegistry {
   private async readLegacyAgentTask(
     ownerSessionId: string,
     taskId: string,
-    knownWorkspaces = this.getLegacyAgentWorkspaces(ownerSessionId)
+    context = this.getLegacyAgentWorkspaceContext(ownerSessionId)
   ): Promise<ExecutionHandle | null> {
     const sessionDir = this.config.getSessionDir(ownerSessionId);
-    const workspace = knownWorkspaces.get(taskId);
+    const workspace = context.descendants.get(taskId);
     const [report, failure] = await Promise.all([
       readSubagentReportArtifact(sessionDir, taskId),
       readSubagentFailureArtifact(sessionDir, taskId),
@@ -391,12 +480,22 @@ export class ExecutionRegistry {
     if (
       workspace == null &&
       report?.parentWorkspaceId !== ownerSessionId &&
-      failure?.parentWorkspaceId !== ownerSessionId
+      !report?.ancestorWorkspaceIds.includes(ownerSessionId) &&
+      failure?.parentWorkspaceId !== ownerSessionId &&
+      !failure?.ancestorWorkspaceIds.includes(ownerSessionId)
     ) {
       return null;
     }
     const patch = await readSubagentGitPatchArtifact(sessionDir, taskId);
-    return this.adaptAgentTask(ownerSessionId, taskId, workspace, report, failure, patch);
+    return this.adaptAgentTask(
+      ownerSessionId,
+      taskId,
+      workspace,
+      report,
+      failure,
+      patch,
+      context.canonicalExecutionByWorkspaceId
+    );
   }
 
   private adaptAgentTask(
@@ -405,7 +504,8 @@ export class ExecutionRegistry {
     workspace: Workspace | undefined,
     report: SubagentReportArtifact | null,
     failure: SubagentFailureArtifact | null,
-    patch: Awaited<ReturnType<typeof readSubagentGitPatchArtifact>>
+    patch: Awaited<ReturnType<typeof readSubagentGitPatchArtifact>>,
+    canonicalExecutionByWorkspaceId: ReadonlyMap<string, string>
   ): ExecutionHandle {
     let status: ExecutionStatus;
     let phase: "awaiting_report" | undefined;
@@ -430,7 +530,7 @@ export class ExecutionRegistry {
     } else if (workspace?.taskStatus === "reported") {
       status = "completed";
       result = { kind: "completed", reportMarkdown: "" };
-    } else if (workspace?.taskStatus === "interrupted") {
+    } else if (workspace?.taskStatus === "interrupted" || workspace?.transcriptOnly === true) {
       status = "interrupted";
       result = { kind: "interrupted" };
     } else if (workspace?.taskStatus === "queued" || workspace?.taskStatus === "starting") {
@@ -453,15 +553,21 @@ export class ExecutionRegistry {
     const title = workspace?.title ?? report?.title;
     const agentId = workspace?.agentId ?? workspace?.agentType;
 
+    const parentWorkspaceId =
+      workspace?.parentWorkspaceId ?? report?.parentWorkspaceId ?? failure?.parentWorkspaceId;
+    const parentExecutionId =
+      parentWorkspaceId != null && parentWorkspaceId !== ownerSessionId
+        ? (canonicalExecutionByWorkspaceId.get(parentWorkspaceId) ??
+          legacyExecutionId("agent_task", parentWorkspaceId))
+        : undefined;
+
     return {
       version: EXECUTION_HANDLE_VERSION,
       executionId: legacyExecutionId("agent_task", taskId),
       aliases: [taskId],
       ownerSessionId,
-      requesterWorkspaceId: workspace?.parentWorkspaceId ?? ownerSessionId,
-      ...(workspace?.parentWorkspaceId != null && workspace.parentWorkspaceId !== ownerSessionId
-        ? { parentExecutionId: legacyExecutionId("agent_task", workspace.parentWorkspaceId) }
-        : {}),
+      requesterWorkspaceId: parentWorkspaceId ?? ownerSessionId,
+      ...(parentExecutionId != null ? { parentExecutionId } : {}),
       target: { kind: "workspace", workspaceId: taskId, origin: "created" },
       launchPolicy: {
         kind: "agent_task",

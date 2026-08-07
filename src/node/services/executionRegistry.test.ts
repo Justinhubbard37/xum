@@ -40,7 +40,8 @@ function canonicalHandle(overrides: Partial<ExecutionHandle> = {}): ExecutionHan
 async function addAgentTask(
   config: Config,
   taskId: string,
-  taskStatus: Workspace["taskStatus"]
+  taskStatus: Workspace["taskStatus"],
+  overrides: Partial<Workspace> = {}
 ): Promise<void> {
   await config.addWorkspace("/repo", {
     id: taskId,
@@ -55,7 +56,17 @@ async function addAgentTask(
     taskStatus,
     taskPrompt: `${taskId} prompt`,
     ...(taskStatus === "reported" ? { reportedAt: "2026-08-06T00:00:05.000Z" } : {}),
+    ...overrides,
   });
+  if (overrides.executionId != null) {
+    await config.editConfig((projectsConfig) => {
+      for (const project of projectsConfig.projects.values()) {
+        const workspace = project.workspaces.find((candidate) => candidate.id === taskId);
+        if (workspace != null) workspace.executionId = overrides.executionId;
+      }
+      return projectsConfig;
+    });
+  }
 }
 
 describe("ExecutionRegistry canonical lifecycle", () => {
@@ -229,6 +240,68 @@ describe("ExecutionRegistry canonical lifecycle", () => {
         { terminalAt: "2026-08-06T00:00:05.000Z" }
       )
     ).toEqual(repaired);
+  });
+
+  test("queries canonical agent execution depth, descendants, owner root, and active statuses", async () => {
+    const root = canonicalHandle({
+      executionId: "exe_root",
+      aliases: ["root-workspace"],
+      target: { kind: "workspace", workspaceId: "root-workspace", origin: "created" },
+      status: "running",
+      startedAt: CREATED_AT,
+    });
+    const child = canonicalHandle({
+      executionId: "exe_child",
+      aliases: ["child-workspace"],
+      parentExecutionId: root.executionId,
+      requesterWorkspaceId: "root-workspace",
+      target: { kind: "workspace", workspaceId: "child-workspace", origin: "created" },
+      status: "starting",
+      createdAt: "2026-08-06T00:00:01.000Z",
+      updatedAt: "2026-08-06T00:00:01.000Z",
+    });
+    const grandchild = canonicalHandle({
+      executionId: "exe_grandchild",
+      aliases: ["grandchild-workspace"],
+      parentExecutionId: child.executionId,
+      requesterWorkspaceId: "child-workspace",
+      target: { kind: "workspace", workspaceId: "grandchild-workspace", origin: "created" },
+      status: "completed",
+      result: { kind: "completed", reportMarkdown: "Done" },
+      createdAt: "2026-08-06T00:00:02.000Z",
+      updatedAt: "2026-08-06T00:00:03.000Z",
+      terminalAt: "2026-08-06T00:00:03.000Z",
+    });
+    await Promise.all([registry.upsert(root), registry.upsert(child), registry.upsert(grandchild)]);
+
+    expect((await registry.listAgentExecutions(OWNER)).map((handle) => handle.executionId)).toEqual(
+      [root.executionId, child.executionId, grandchild.executionId]
+    );
+    expect(
+      (await registry.listAgentExecutions(OWNER, { statuses: ["completed"] })).map(
+        (handle) => handle.executionId
+      )
+    ).toEqual([grandchild.executionId]);
+    expect(
+      (await registry.listActiveAgentExecutions(OWNER)).map((handle) => handle.executionId)
+    ).toEqual([root.executionId, child.executionId]);
+    expect(await registry.getAgentExecutionDepth(OWNER, "root-workspace")).toBe(1);
+    expect(await registry.getAgentExecutionDepth(OWNER, child.executionId)).toBe(2);
+    expect(await registry.getAgentExecutionDepth(OWNER, "grandchild-workspace")).toBe(3);
+    expect(await registry.getAgentExecutionDepth(OWNER, "missing")).toBeNull();
+    expect(
+      (await registry.listDescendantAgentExecutions(OWNER, "root-workspace")).map(
+        (handle) => handle.executionId
+      )
+    ).toEqual([child.executionId, grandchild.executionId]);
+    expect(
+      (await registry.listDescendantAgentExecutions(OWNER, child.executionId)).map(
+        (handle) => handle.executionId
+      )
+    ).toEqual([grandchild.executionId]);
+    expect(
+      (await registry.listDescendantAgentExecutions(OWNER)).map((handle) => handle.executionId)
+    ).toEqual([root.executionId, child.executionId, grandchild.executionId]);
   });
 });
 
@@ -419,6 +492,79 @@ describe("ExecutionRegistry legacy adapters", () => {
     });
   });
 
+  test("queries legacy chains and excludes transcript-only terminal workspaces from active results", async () => {
+    await addAgentTask(config, "legacy-root", "running");
+    await addAgentTask(config, "legacy-child", "starting", {
+      parentWorkspaceId: "legacy-root",
+      createdAt: "2026-08-06T00:00:01.000Z",
+    });
+    await addAgentTask(config, "legacy-terminal", "running", {
+      parentWorkspaceId: "legacy-child",
+      transcriptOnly: true,
+      createdAt: "2026-08-06T00:00:02.000Z",
+    });
+
+    const handles = await registry.listAgentExecutions(OWNER);
+    const root = handles.find((handle) => handle.aliases?.includes("legacy-root"));
+    const child = handles.find((handle) => handle.aliases?.includes("legacy-child"));
+    const terminal = handles.find((handle) => handle.aliases?.includes("legacy-terminal"));
+    assert(root != null);
+    assert(child != null);
+    assert(terminal != null);
+
+    expect(child.parentExecutionId).toBe(root.executionId);
+    expect(terminal.parentExecutionId).toBe(child.executionId);
+    expect(terminal).toMatchObject({
+      status: "interrupted",
+      result: { kind: "interrupted" },
+    });
+    expect(await registry.getAgentExecutionDepth(OWNER, "legacy-root")).toBe(1);
+    expect(await registry.getAgentExecutionDepth(OWNER, "legacy-child")).toBe(2);
+    expect(await registry.getAgentExecutionDepth(OWNER, "legacy-terminal")).toBe(3);
+    expect(
+      (await registry.listDescendantAgentExecutions(OWNER, root.executionId)).map(
+        (handle) => handle.aliases?.[0]
+      )
+    ).toEqual(["legacy-child", "legacy-terminal"]);
+    expect(
+      (await registry.listActiveAgentExecutions(OWNER)).map((handle) => handle.aliases?.[0])
+    ).toEqual(["legacy-root", "legacy-child"]);
+  });
+
+  test("maps a legacy child's parent to the canonical parent workspace execution", async () => {
+    await addAgentTask(config, "canonical-parent-workspace", "running", {
+      executionId: "exe_canonical_parent",
+    });
+    await addAgentTask(config, "legacy-child", "running", {
+      parentWorkspaceId: "canonical-parent-workspace",
+      createdAt: "2026-08-06T00:00:01.000Z",
+    });
+    const canonicalParent = canonicalHandle({
+      executionId: "exe_canonical_parent",
+      aliases: ["canonical-parent-workspace"],
+      target: {
+        kind: "workspace",
+        workspaceId: "canonical-parent-workspace",
+        origin: "created",
+      },
+      status: "running",
+      startedAt: CREATED_AT,
+    });
+    await new ExecutionStore(config).upsert(canonicalParent);
+
+    const child = await registry.get(OWNER, "legacy-child");
+    expect(child).toMatchObject({
+      requesterWorkspaceId: "canonical-parent-workspace",
+      parentExecutionId: canonicalParent.executionId,
+    });
+    expect(await registry.getAgentExecutionDepth(OWNER, "legacy-child")).toBe(2);
+    expect(
+      (await registry.listDescendantAgentExecutions(OWNER, canonicalParent.executionId)).map(
+        (handle) => handle.aliases?.[0]
+      )
+    ).toEqual(["legacy-child"]);
+  });
+
   test("canonical records win over legacy aliases without rewriting legacy state", async () => {
     await addAgentTask(config, "running-task", "running");
     const canonical = {
@@ -444,7 +590,9 @@ describe("ExecutionRegistry legacy adapters", () => {
 
     expect(await registry.get(OWNER, "running-task")).toEqual(canonical);
     expect(
-      (await registry.list(OWNER)).filter((item) => item.aliases?.includes("running-task"))
+      (await registry.listAgentExecutions(OWNER)).filter((item) =>
+        item.aliases?.includes("running-task")
+      )
     ).toEqual([canonical]);
   });
 });
