@@ -29,12 +29,25 @@ export const MCPTransportSchema = z.enum(["stdio", "http", "sse", "auto"]);
 export const MCPHeaderValueSchema = z.union([z.string(), z.object({ secret: z.string() })]);
 export const MCPHeadersSchema = z.record(z.string(), MCPHeaderValueSchema);
 
+/** UI-safe Agent Plugin provenance (agent-plugins experiment; read-only entries). */
+export const MCPServerPluginProvenanceSchema = z.object({
+  pluginName: z.string(),
+  serverName: z.string(),
+  sourceScope: z.enum(["project", "global"]),
+  /** Installation location discriminator, e.g. ".mux/plugins/demo" (same-name plugins can sit in sibling containers). */
+  sourceLocation: z.string(),
+});
+
 export const MCPServerInfoSchema = z.discriminatedUnion("transport", [
   z.object({
     transport: z.literal("stdio"),
     command: z.string(),
+    args: z.array(z.string()).optional(),
+    env: z.record(z.string(), z.string()).optional(),
+    cwd: z.string().optional(),
     disabled: z.boolean(),
     toolAllowlist: z.array(z.string()).optional(),
+    plugin: MCPServerPluginProvenanceSchema.optional(),
   }),
   z.object({
     transport: z.literal("http"),
@@ -42,6 +55,7 @@ export const MCPServerInfoSchema = z.discriminatedUnion("transport", [
     headers: MCPHeadersSchema.optional(),
     disabled: z.boolean(),
     toolAllowlist: z.array(z.string()).optional(),
+    plugin: MCPServerPluginProvenanceSchema.optional(),
   }),
   z.object({
     transport: z.literal("sse"),
@@ -49,6 +63,7 @@ export const MCPServerInfoSchema = z.discriminatedUnion("transport", [
     headers: MCPHeadersSchema.optional(),
     disabled: z.boolean(),
     toolAllowlist: z.array(z.string()).optional(),
+    plugin: MCPServerPluginProvenanceSchema.optional(),
   }),
   z.object({
     transport: z.literal("auto"),
@@ -56,6 +71,7 @@ export const MCPServerInfoSchema = z.discriminatedUnion("transport", [
     headers: MCPHeadersSchema.optional(),
     disabled: z.boolean(),
     toolAllowlist: z.array(z.string()).optional(),
+    plugin: MCPServerPluginProvenanceSchema.optional(),
   }),
 ]);
 
@@ -63,6 +79,14 @@ export const MCPServerMapSchema = z.record(z.string(), MCPServerInfoSchema);
 
 export const MCPListParamsSchema = z.object({
   projectPath: z.string().optional(),
+  /**
+   * Workspace whose Agent Plugins MCP context should apply (agent-plugins
+   * experiment): plugin servers are discovered from that workspace's active
+   * checkout, and omitted entirely for off-host workspaces. Without a
+   * workspaceId, plugin discovery scans under projectPath (project-level
+   * flows like Settings).
+   */
+  workspaceId: z.string().optional(),
 });
 
 const MCPAddParamsBaseSchema = z.object({
@@ -153,6 +177,8 @@ const MCPTestParamsBaseSchema = z.object({
   command: z.string().optional(),
   url: z.string().optional(),
   headers: MCPHeadersSchema.optional(),
+  /** Workspace whose Agent Plugins MCP context should apply; see MCPListParamsSchema. */
+  workspaceId: z.string().optional(),
 });
 
 type MCPTestParamsLike = z.infer<typeof MCPTestParamsBaseSchema>;

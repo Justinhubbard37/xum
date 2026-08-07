@@ -48,6 +48,10 @@ import {
   createRuntimeForWorkspace,
   resolveWorkspaceRootPath,
 } from "@/node/runtime/runtimeHelpers";
+import {
+  resolveAgentPluginsMcpContext,
+  type AgentPluginsMcpContext,
+} from "@/node/services/agentPlugins/mcpConfig";
 import { readPlanFile } from "@/node/utils/runtime/helpers";
 import {
   parseMemoryPath,
@@ -281,6 +285,56 @@ async function resolveAgentDiscoveryContext(
     { projectPath: input.projectPath! }
   );
   return { runtime, discoveryPath: input.projectPath! };
+}
+
+/**
+ * Agent Plugins MCP context for an optional workspaceId input (agent-plugins
+ * experiment). Returns undefined (project-level default: scan under
+ * projectPath) when no workspace is given or its metadata cannot be resolved;
+ * otherwise the workspace's own context — worktree-scanning for host
+ * workspaces, null for off-host workspaces so plugin servers match what the
+ * engine actually offers there.
+ *
+ * SECURITY: the workspace must belong to the request's project. The caller's
+ * `trusted` flag is derived from `projectPath`, so honoring a workspaceId from
+ * a DIFFERENT (untrusted) project would scan that project's checkout under
+ * another project's trust and let mcp.test execute its repo-local stdio
+ * plugins. Mismatches fall back to the projectPath-scoped default, whose
+ * trust and scan root describe the same project.
+ */
+async function resolveWorkspaceAgentPluginsMcpContext(
+  context: ORPCContext,
+  workspaceId: string | null | undefined,
+  projectPath: string | null | undefined
+): Promise<AgentPluginsMcpContext | null | undefined> {
+  const trimmed = workspaceId?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  try {
+    const metadataResult = await context.aiService.getWorkspaceMetadata(trimmed);
+    if (!metadataResult.success) {
+      return undefined;
+    }
+    const metadata = metadataResult.data;
+    if (metadata.projectPath !== projectPath?.trim()) {
+      log.debug("Ignoring Agent Plugins workspace context for mismatched project", {
+        workspaceId: trimmed,
+        requestedProjectPath: projectPath,
+        workspaceProjectPath: metadata.projectPath,
+      });
+      return undefined;
+    }
+    const runtime = createRuntimeForWorkspace(metadata);
+    const workspacePath = resolveWorkspaceRootPath(metadata, runtime);
+    return resolveAgentPluginsMcpContext(metadata, workspacePath);
+  } catch (error) {
+    log.debug("Failed to resolve Agent Plugins MCP context for workspace", {
+      workspaceId: trimmed,
+      error,
+    });
+    return undefined;
+  }
 }
 
 function isTrustedProjectPath(context: ORPCContext, projectPath?: string | null): boolean {
@@ -1852,6 +1906,10 @@ export const router = (authToken?: string) => {
             includeClaudeSkills: context.experimentsService.isExperimentEnabled(
               EXPERIMENT_IDS.CLAUDE_SKILLS_COMPAT
             ),
+            // agent-plugins experiment: surface read-only plugin skills alongside other skills.
+            includeAgentPlugins: context.experimentsService.isExperimentEnabled(
+              EXPERIMENT_IDS.AGENT_PLUGINS
+            ),
           });
         }),
       listDiagnostics: t
@@ -1866,6 +1924,10 @@ export const router = (authToken?: string) => {
           const diagnostics = await discoverAgentSkillsDiagnostics(runtime, discoveryPath, {
             includeClaudeSkills: context.experimentsService.isExperimentEnabled(
               EXPERIMENT_IDS.CLAUDE_SKILLS_COMPAT
+            ),
+            // agent-plugins experiment: surface read-only plugin skills alongside other skills.
+            includeAgentPlugins: context.experimentsService.isExperimentEnabled(
+              EXPERIMENT_IDS.AGENT_PLUGINS
             ),
           });
           return diagnostics;
@@ -1882,6 +1944,10 @@ export const router = (authToken?: string) => {
           const result = await readAgentSkill(runtime, discoveryPath, input.skillName, {
             includeClaudeSkills: context.experimentsService.isExperimentEnabled(
               EXPERIMENT_IDS.CLAUDE_SKILLS_COMPAT
+            ),
+            // agent-plugins experiment: surface read-only plugin skills alongside other skills.
+            includeAgentPlugins: context.experimentsService.isExperimentEnabled(
+              EXPERIMENT_IDS.AGENT_PLUGINS
             ),
           });
           return result.package;
@@ -2762,7 +2828,14 @@ export const router = (authToken?: string) => {
         .handler(async ({ context, input }) => {
           const servers = await context.mcpConfigService.listServers(
             input.projectPath,
-            isTrustedProjectPath(context, input.projectPath)
+            isTrustedProjectPath(context, input.projectPath),
+            {
+              agentPlugins: await resolveWorkspaceAgentPluginsMcpContext(
+                context,
+                input.workspaceId,
+                input.projectPath
+              ),
+            }
           );
 
           if (!context.policyService.isEnforced()) {
@@ -2903,11 +2976,17 @@ export const router = (authToken?: string) => {
             opResolver
           );
 
+          const agentPlugins = await resolveWorkspaceAgentPluginsMcpContext(
+            context,
+            input.workspaceId,
+            projectPathProvided ? resolvedProjectPath : undefined
+          );
           const configuredTransport = input.name
             ? (
                 await context.mcpConfigService.listServers(
                   projectPathProvided ? resolvedProjectPath : undefined,
-                  trusted
+                  trusted,
+                  { agentPlugins }
                 )
               )[input.name]?.transport
             : undefined;
@@ -2930,6 +3009,7 @@ export const router = (authToken?: string) => {
             url: input.url,
             headers: input.headers,
             projectSecrets: secrets,
+            agentPlugins,
           });
 
           const durationMs = Date.now() - start;

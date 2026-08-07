@@ -40,7 +40,7 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
   const [error, setError] = useState<string | null>(null);
 
   // Use shared cache for tool test results
-  const { getTools, setResult, reload: reloadCache } = useMCPTestCache(projectPath);
+  const { getTools, setResult, reload: reloadCache } = useMCPTestCache(projectPath, workspaceId);
 
   // Ref so the effect can call reloadCache without depending on its identity.
   // We only want to re-fire the effect when the modal opens (open/api/ids change),
@@ -60,7 +60,9 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
       setError(null);
       try {
         const [projectServers, workspaceOverrides] = await Promise.all([
-          api.mcp.list({ projectPath }),
+          // workspaceId scopes Agent Plugins servers to this workspace's active
+          // checkout (and hides them entirely for off-host workspaces).
+          api.mcp.list({ projectPath, workspaceId }),
           api.workspace.mcp.get({ workspaceId }),
         ]);
         setServers(projectServers ?? {});
@@ -81,7 +83,7 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
       if (!api) return;
       setLoadingTools((prev) => ({ ...prev, [serverName]: true }));
       try {
-        const result = await api.mcp.test({ projectPath, name: serverName });
+        const result = await api.mcp.test({ projectPath, name: serverName, workspaceId });
         setResult(serverName, result);
         if (!result.success) {
           setError(`Failed to fetch tools for ${serverName}: ${result.error}`);
@@ -92,7 +94,7 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
         setLoadingTools((prev) => ({ ...prev, [serverName]: false }));
       }
     },
-    [api, projectPath, setResult]
+    [api, projectPath, workspaceId, setResult]
   );
 
   /**
@@ -319,6 +321,11 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                 const tools = getTools(name);
                 const isLoadingTools = loadingTools[name];
                 const allowedTools = overrides.toolAllowlist?.[name] ?? tools ?? [];
+                // Agent Plugin servers keep the instance key as the override
+                // name but display readable provenance (plugin/server).
+                const displayName = info.plugin
+                  ? `${info.plugin.pluginName}/${info.plugin.serverName}`
+                  : name;
 
                 return (
                   <div
@@ -328,19 +335,33 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                       !effectivelyEnabled && "opacity-50"
                     )}
                   >
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-3">
+                    <div className="flex items-center justify-between gap-2">
+                      {/* min-w-0 chain: repo-controlled plugin/server names can be
+                          long unbroken tokens; without it they push the Fetch
+                          Tools button past the dialog edge at narrow widths. */}
+                      <div className="flex min-w-0 items-center gap-3">
                         <Switch
                           checked={effectivelyEnabled}
                           onCheckedChange={(checked) =>
                             toggleServerEnabled(name, checked, projectDisabled)
                           }
-                          aria-label={`Toggle ${name} MCP server`}
+                          aria-label={`Toggle ${displayName} MCP server`}
                         />
-                        <div>
-                          <div className="font-medium">{name}</div>
-                          {projectDisabled && (
-                            <div className="text-muted text-xs">(disabled at project level)</div>
+                        <div className="min-w-0">
+                          {/* wrap-anywhere (not truncate/break-words): repo-controlled
+                              names must stay fully readable, and only overflow-wrap:
+                              anywhere shrinks intrinsic min-content so the dialog's
+                              grid track cannot be inflated by an unbroken token. */}
+                          <div className="font-medium wrap-anywhere">{displayName}</div>
+                          {info.plugin ? (
+                            <div className="text-muted text-xs wrap-anywhere">
+                              Agent Plugin ({info.plugin.sourceScope} · {info.plugin.sourceLocation}
+                              ) — disabled by default
+                            </div>
+                          ) : (
+                            projectDisabled && (
+                              <div className="text-muted text-xs">(disabled at project level)</div>
+                            )
                           )}
                         </div>
                       </div>

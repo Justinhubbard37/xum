@@ -35,11 +35,14 @@ import {
 import { getGoalToolAvailability } from "@/common/utils/tools/toolAvailability";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
+import { resolveAgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
 import {
   createRuntimeContextForWorkspace,
   createRuntimeForWorkspace,
   resolveWorkspaceExecutionPath,
+  resolveWorkspaceRootPath,
 } from "@/node/runtime/runtimeHelpers";
+import type { Runtime } from "@/node/runtime/Runtime";
 import { getWorkspacePathHintForProject } from "@/node/services/workspaceProjectRepos";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
 import { getMuxEnv, getRuntimeType } from "@/node/runtime/initHook";
@@ -375,7 +378,9 @@ export function resolveMuxProjectRootForHostFs(
 function resolveMuxToolScope(
   config: Config,
   metadata: WorkspaceMetadata,
-  workspacePath: string
+  workspacePath: string,
+  /** Host checkout root when known (subProjectPath workspaces execute in a subdirectory). */
+  checkoutRoot?: string | null
 ): MuxToolScope {
   const projectConfig = config.loadConfigOrDefault().projects.get(metadata.projectPath);
   if (
@@ -398,6 +403,7 @@ function resolveMuxToolScope(
     projectRoot: resolveMuxProjectRootForHostFs(metadata, workspacePath),
     projectStorageAuthority:
       runtimeType === "ssh" || runtimeType === "docker" ? "runtime" : "host-local",
+    ...(checkoutRoot != null ? { checkoutRoot } : {}),
   };
 }
 
@@ -1037,6 +1043,39 @@ export class AIService extends EventEmitter {
     );
   }
 
+  /**
+   * Host-evaluated gate for the agent-plugins experiment: when enabled, skill
+   * discovery/read paths also scan Agent Plugins containers (.mux/plugins,
+   * .agents/plugins, ~/.mux/plugins, ~/.agents/plugins; read-only, lowest
+   * precedence). Public for the same reason as isClaudeSkillsCompatEnabled.
+   */
+  isAgentPluginsEnabled(): boolean {
+    return this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS) === true;
+  }
+
+  /**
+   * Resolve the MuxToolScope a workspace's tools receive, including the host
+   * checkout root that anchors Agent Plugins containers (agent-plugins
+   * experiment). Public so AgentSession's slash-skill snapshot materialization
+   * resolves skills with the same roots/containment as the skill read tool:
+   * for subProjectPath workspaces the execution path is a subdirectory of the
+   * checkout, and default discovery there misses checkout-level plugin
+   * containers. Mirrors streamMessage's hostCheckoutRoot gating.
+   */
+  resolveMuxToolScopeForWorkspace(
+    metadata: WorkspaceMetadata,
+    runtime: Runtime,
+    workspacePath: string
+  ): MuxToolScope {
+    const hostCheckoutRoot =
+      !isMultiProject(metadata) &&
+      metadata.runtimeConfig.type !== "ssh" &&
+      metadata.runtimeConfig.type !== "docker"
+        ? resolveWorkspaceRootPath(metadata, runtime)
+        : null;
+    return resolveMuxToolScope(this.config, metadata, workspacePath, hostCheckoutRoot);
+  }
+
   /** Stream a message conversation to the AI model. */
   async streamMessage(opts: StreamMessageOptions): Promise<Result<void, SendMessageError>> {
     const {
@@ -1448,6 +1487,7 @@ export class AIService extends EventEmitter {
       // claude-skills-compat is host-evaluated (like memory-hot-set): sub-agents share the
       // host ExperimentsService, so it is not inherited through SendMessageOptions.experiments.
       const claudeSkillsCompatExperimentEnabled = this.isClaudeSkillsCompatEnabled();
+      const agentPluginsExperimentEnabled = this.isAgentPluginsEnabled();
       // Once final tool policy keeps the memory tool, upgrade the index-only
       // memory context (resolved pre-policy with includeHotMemories: false) to
       // the token-budgeted hot block for the model that will actually stream.
@@ -1539,13 +1579,32 @@ export class AIService extends EventEmitter {
       }
       recordStartupPhaseTiming("loadWorkspaceMcpOverridesMs", loadWorkspaceMcpOverridesStartedAt);
 
+      // Host checkout root for single-project host workspaces. This differs
+      // from `workspacePath` for subProjectPath workspaces, whose execution
+      // path is a subdirectory of the checkout; Agent Plugins containers (MCP
+      // and skills) anchor at the checkout root, matching the oRPC listing
+      // paths (resolveWorkspaceRootPath).
+      const hostCheckoutRoot =
+        singleProjectContext &&
+        metadata.runtimeConfig.type !== "ssh" &&
+        metadata.runtimeConfig.type !== "docker"
+          ? resolveWorkspaceRootPath(metadataWithPath, runtime)
+          : null;
+
+      // Agent Plugins: discovery follows the active checkout and is disabled
+      // for workspaces that exec off-host (SSH/Docker/devcontainer).
+      const agentPluginsMcpContext = hostCheckoutRoot
+        ? resolveAgentPluginsMcpContext(metadata, hostCheckoutRoot)
+        : null;
+
       // Fetch MCP server config for system prompt (before building message).
       const listMcpServersStartedAt = Date.now();
       const mcpServers = this.mcpServerManager
         ? await this.mcpServerManager.listServers(
             metadata.projectPath,
             mcpOverrides,
-            projectTrusted
+            projectTrusted,
+            agentPluginsMcpContext
           )
         : undefined;
       recordStartupPhaseTiming("listMcpServersMs", listMcpServersStartedAt);
@@ -1601,7 +1660,7 @@ export class AIService extends EventEmitter {
         });
       recordStartupPhaseTiming("buildPlanInstructionsMs", buildPlanInstructionsStartedAt);
 
-      const muxScope = resolveMuxToolScope(this.config, metadata, workspacePath);
+      const muxScope = resolveMuxToolScope(this.config, metadata, workspacePath, hostCheckoutRoot);
 
       const desktopSessionManager = this.desktopSessionManager;
       let desktopCapabilityPromise: ReturnType<DesktopSessionManager["getCapability"]> | undefined;
@@ -1648,6 +1707,7 @@ export class AIService extends EventEmitter {
           memoryToolAvailable: toolset.memoryToolAvailable,
           hotMemoriesBlock: contextForModel?.hotMemoriesBlock ?? undefined,
           claudeSkillsCompatEnabled: claudeSkillsCompatExperimentEnabled,
+          agentPluginsEnabled: agentPluginsExperimentEnabled,
         });
 
       // Build provisional agent context before tool policy finalizes the toolset.
@@ -1691,6 +1751,7 @@ export class AIService extends EventEmitter {
             trusted: projectTrusted,
             overrides: mcpOverrides,
             projectSecrets: await secretsToRecord(projectSecrets, this.opResolver),
+            agentPlugins: agentPluginsMcpContext,
           });
 
           mcpTools = result.tools;
@@ -2206,6 +2267,7 @@ export class AIService extends EventEmitter {
           workspaceHeartbeats: workspaceHeartbeatsExperimentEnabled,
           toolSearch: toolSearchExperimentEnabled,
           claudeSkillsCompat: claudeSkillsCompatExperimentEnabled,
+          agentPlugins: agentPluginsExperimentEnabled,
         },
         // Dynamic context for tool descriptions (moved from system prompt for better model attention)
         availableSubagents: agentDefinitions,

@@ -1,15 +1,21 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { createServer } from "http";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 
 import * as mcpSdk from "@ai-sdk/mcp";
 import {
   MCPServerManager,
   isClosedClientError,
+  prepareStdioLaunch,
   runMCPToolWithDeadline,
   wrapMCPTools,
 } from "./mcpServerManager";
 import type { MCPConfigService } from "./mcpConfigService";
 import type { Runtime } from "@/node/runtime/Runtime";
+import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
+import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
+import { DisposableTempDir } from "@/node/services/tempDir";
 import type { Tool } from "ai";
 
 interface MCPServerManagerTestAccess {
@@ -619,7 +625,7 @@ describe("MCPServerManager", () => {
 
     access.workspaceServers.set(workspaceId, {
       configSignature: JSON.stringify({
-        slow: { transport: "stdio", command: "cmd-slow" },
+        slow: { transport: "stdio", command: "cmd-slow", args: null, env: null, cwd: null },
       }),
       instances: new Map(),
       stats: cachedStats(),
@@ -703,7 +709,7 @@ describe("MCPServerManager", () => {
 
     const staleEntry = {
       configSignature: JSON.stringify({
-        slow: { transport: "stdio", command: "cmd-1" },
+        slow: { transport: "stdio", command: "cmd-1", args: null, env: null, cwd: null },
       }),
       instances: new Map(),
       stats: cachedStats(),
@@ -979,8 +985,12 @@ describe("MCPServerManager", () => {
       workspaceRequest("ws-trusted-mcp", { trusted: true })
     );
 
-    expect(configService.listServers).toHaveBeenNthCalledWith(1, PROJECT_PATH, false);
-    expect(configService.listServers).toHaveBeenNthCalledWith(2, PROJECT_PATH, true);
+    expect(configService.listServers).toHaveBeenNthCalledWith(1, PROJECT_PATH, false, {
+      agentPlugins: undefined,
+    });
+    expect(configService.listServers).toHaveBeenNthCalledWith(2, PROJECT_PATH, true, {
+      agentPlugins: undefined,
+    });
     expect(Object.keys(untrustedResult.tools)).toEqual(["global_tool"]);
     expect(Object.keys(trustedResult.tools).sort()).toEqual(["global_tool", "repo_tool"]);
 
@@ -1163,6 +1173,258 @@ describe("MCPServerManager", () => {
 
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     expect(startServersMock).toHaveBeenCalledTimes(2);
+  });
+
+  // --- Agent Plugins (agent-plugins experiment) ---
+
+  const PLUGIN_KEY = "plugin:abcdef0123456789:everything";
+
+  function pluginStdioConfig(overrides: Record<string, unknown> = {}) {
+    return {
+      [PLUGIN_KEY]: {
+        transport: "stdio" as const,
+        command: "bunx",
+        args: ["-y", "some-server"],
+        env: { PLUGIN_ROOT: "/plugins/demo", PLUGIN_DATA: "/tmp/mux-test-plugin-data" },
+        cwd: "/plugins/demo",
+        disabled: true,
+        plugin: {
+          pluginName: "demo",
+          serverName: "everything",
+          sourceScope: "global" as const,
+          sourceLocation: ".mux/plugins/demo",
+        },
+        ...overrides,
+      },
+    };
+  }
+
+  test("default-disabled plugin servers start only with a workspace enabledServers override", async () => {
+    configService.listServers = mock(() => Promise.resolve(pluginStdioConfig()));
+    const startServersMock = spyOn(access, "startServers").mockImplementation(
+      (...args: unknown[]) => {
+        const servers = args[0] as Record<string, unknown>;
+        return Promise.resolve(startResult(Object.keys(servers).map((name) => [name, undefined])));
+      }
+    );
+
+    const withoutOverride = await manager.getToolsForWorkspace(workspaceRequest("ws-plugin-off"));
+    expect(withoutOverride.stats.enabledServerCount).toBe(0);
+
+    const withOverride = await manager.getToolsForWorkspace(
+      workspaceRequest("ws-plugin-on", { overrides: { enabledServers: [PLUGIN_KEY] } })
+    );
+    expect(withOverride.stats.enabledServerCount).toBe(1);
+    const startedServers = startServersMock.mock.calls.at(-1)?.[0] as Record<string, unknown>;
+    expect(Object.keys(startedServers)).toEqual([PLUGIN_KEY]);
+  });
+
+  test("plugin servers are excluded on off-host runtimes (remote and devcontainer)", async () => {
+    configService.listServers = mock(() => Promise.resolve(pluginStdioConfig()));
+    spyOn(access, "startServers").mockImplementation(() => Promise.resolve(startResult([])));
+
+    // Runtime identity is all the gate needs; both classes exec off-host.
+    // DevcontainerRuntime extends LocalBaseRuntime but execs inside the container.
+    const offHostRuntimes: Array<[string, Runtime]> = [
+      ["ws-plugin-remote", Object.create(RemoteRuntime.prototype) as Runtime],
+      ["ws-plugin-devcontainer", Object.create(DevcontainerRuntime.prototype) as Runtime],
+    ];
+    for (const [workspaceId, runtime] of offHostRuntimes) {
+      const result = await manager.getToolsForWorkspace(
+        workspaceRequest(workspaceId, {
+          runtime,
+          overrides: { enabledServers: [PLUGIN_KEY] },
+        })
+      );
+
+      expect(result.stats.enabledServerCount).toBe(0);
+    }
+  });
+
+  test("threads the agentPlugins context through to config listing", async () => {
+    configService.listServers = mock(() => Promise.resolve({}));
+    spyOn(access, "startServers").mockImplementation(() => Promise.resolve(startResult([])));
+
+    const context = { projectRoot: "/worktrees/ws-1", projectKey: PROJECT_PATH };
+    await manager.getToolsForWorkspace(
+      workspaceRequest("ws-plugin-ctx", { agentPlugins: context })
+    );
+    expect(configService.listServers).toHaveBeenLastCalledWith(PROJECT_PATH, false, {
+      agentPlugins: context,
+    });
+
+    await manager.listServers(PROJECT_PATH, undefined, true, null);
+    expect(configService.listServers).toHaveBeenLastCalledWith(PROJECT_PATH, true, {
+      agentPlugins: null,
+    });
+  });
+
+  test("stdio config signature includes args/env/cwd so plugin mcp.json edits recycle servers", async () => {
+    const startServersMock = spyOn(access, "startServers").mockImplementation(() =>
+      Promise.resolve(startResult([[PLUGIN_KEY, undefined]]))
+    );
+    const overrides = { enabledServers: [PLUGIN_KEY] };
+
+    configService.listServers = mock(() => Promise.resolve(pluginStdioConfig()));
+    await manager.getToolsForWorkspace(workspaceRequest("ws-plugin-sig", { overrides }));
+    expect(startServersMock).toHaveBeenCalledTimes(1);
+
+    // Same command, changed args: signature must change and servers restart.
+    configService.listServers = mock(() =>
+      Promise.resolve(pluginStdioConfig({ args: ["-y", "some-server", "--changed"] }))
+    );
+    await manager.getToolsForWorkspace(workspaceRequest("ws-plugin-sig", { overrides }));
+    expect(startServersMock).toHaveBeenCalledTimes(2);
+
+    // Unchanged config: cached instances are reused.
+    await manager.getToolsForWorkspace(workspaceRequest("ws-plugin-sig", { overrides }));
+    expect(startServersMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("prepareStdioLaunch", () => {
+  test("keeps legacy raw shell-string behavior when args is unset", async () => {
+    const launch = await prepareStdioLaunch({
+      transport: "stdio",
+      command: "bunx -y some-server",
+      disabled: false,
+    });
+    expect(launch).toEqual({ command: "bunx -y some-server" });
+  });
+
+  test("argv mode quotes command and each arg against shell injection", async () => {
+    const launch = await prepareStdioLaunch({
+      transport: "stdio",
+      command: "/plugins/my plugin/bin/tool",
+      args: ["a b", "$(rm -rf /)", "`tick`", "it's", ""],
+      disabled: false,
+    });
+    expect(launch.command).toBe(
+      "'/plugins/my plugin/bin/tool' 'a b' '$(rm -rf /)' '`tick`' 'it'\"'\"'s' ''"
+    );
+  });
+
+  test("creates the PLUGIN_DATA directory for plugin servers before launch", async () => {
+    using tmp = new DisposableTempDir("mcp-plugin-data");
+    const dataPath = path.join(tmp.path, "plugin-data", "abc123");
+
+    const launch = await prepareStdioLaunch({
+      transport: "stdio",
+      command: "bunx",
+      args: [],
+      env: { PLUGIN_ROOT: tmp.path, PLUGIN_DATA: dataPath },
+      cwd: tmp.path,
+      disabled: false,
+      plugin: {
+        pluginName: "demo",
+        serverName: "srv",
+        sourceScope: "global",
+        sourceLocation: ".mux/plugins/demo",
+      },
+    });
+
+    expect((await fs.stat(dataPath)).isDirectory()).toBe(true);
+    expect(launch.cwd).toBe(tmp.path);
+    expect(launch.env?.PLUGIN_DATA).toBe(dataPath);
+    // Plugin-root cwd is shipped plugin content: never created by launch.
+    expect(await fs.readdir(tmp.path)).toEqual(["plugin-data"]);
+  });
+
+  test("creates a nested PLUGIN_DATA cwd recursively before launch", async () => {
+    using tmp = new DisposableTempDir("mcp-plugin-data-nested");
+    const dataPath = path.join(tmp.path, "plugin-data", "abc123");
+    const nestedCwd = path.join(dataPath, "nested", "deep");
+
+    const launch = await prepareStdioLaunch({
+      transport: "stdio",
+      command: "bunx",
+      args: [],
+      env: { PLUGIN_ROOT: tmp.path, PLUGIN_DATA: dataPath },
+      cwd: nestedCwd,
+      disabled: false,
+      plugin: {
+        pluginName: "demo",
+        serverName: "srv",
+        sourceScope: "global",
+        sourceLocation: ".mux/plugins/demo",
+      },
+    });
+
+    // exec() requires an existing cwd; data-dir cwds are client-managed state.
+    expect((await fs.stat(nestedCwd)).isDirectory()).toBe(true);
+    expect(launch.cwd).toBe(nestedCwd);
+  });
+
+  test("quarantines a stray file occupying the PLUGIN_DATA path and still launches", async () => {
+    using tmp = new DisposableTempDir("mcp-plugin-data-corrupt");
+    // Corrupt state: plugin-data (the PARENT of every instance dir) is a file.
+    const dataRoot = path.join(tmp.path, "plugin-data");
+    await fs.writeFile(dataRoot, "not a directory", "utf8");
+    const dataPath = path.join(dataRoot, "abc123");
+
+    const launch = await prepareStdioLaunch({
+      transport: "stdio",
+      command: "bunx",
+      args: [],
+      env: { PLUGIN_ROOT: tmp.path, PLUGIN_DATA: dataPath },
+      disabled: false,
+      plugin: {
+        pluginName: "demo",
+        serverName: "srv",
+        sourceScope: "global",
+        sourceLocation: ".mux/plugins/demo",
+      },
+    });
+
+    expect((await fs.stat(dataPath)).isDirectory()).toBe(true);
+    expect(launch.env?.PLUGIN_DATA).toBe(dataPath);
+    // The stray file is quarantined (renamed), not deleted.
+    const quarantined = (await fs.readdir(tmp.path)).find((name) =>
+      name.startsWith("plugin-data.corrupt-")
+    );
+    expect(quarantined).toBeDefined();
+    expect(await fs.readFile(path.join(tmp.path, quarantined!), "utf8")).toBe("not a directory");
+  });
+
+  test("quarantines a file occupying the instance data dir itself", async () => {
+    using tmp = new DisposableTempDir("mcp-plugin-data-corrupt-leaf");
+    const dataPath = path.join(tmp.path, "plugin-data", "abc123");
+    await fs.mkdir(path.dirname(dataPath), { recursive: true });
+    await fs.writeFile(dataPath, "stale blob", "utf8");
+
+    await prepareStdioLaunch({
+      transport: "stdio",
+      command: "bunx",
+      args: [],
+      env: { PLUGIN_ROOT: tmp.path, PLUGIN_DATA: dataPath },
+      disabled: false,
+      plugin: {
+        pluginName: "demo",
+        serverName: "srv",
+        sourceScope: "global",
+        sourceLocation: ".mux/plugins/demo",
+      },
+    });
+
+    expect((await fs.stat(dataPath)).isDirectory()).toBe(true);
+  });
+
+  test("rejects plugin servers without an absolute PLUGIN_DATA env (defensive)", async () => {
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(
+      prepareStdioLaunch({
+        transport: "stdio",
+        command: "bunx",
+        args: [],
+        disabled: false,
+        plugin: {
+          pluginName: "demo",
+          serverName: "srv",
+          sourceScope: "global",
+          sourceLocation: ".mux/plugins/demo",
+        },
+      })
+    ).rejects.toThrow("PLUGIN_DATA");
   });
 });
 

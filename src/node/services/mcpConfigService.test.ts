@@ -94,12 +94,13 @@ describe("MCPConfigService", () => {
 
 describe("MCP server disable filtering", () => {
   let tempDir: string;
+  let config: Config;
   let configService: MCPConfigService;
   let serverManager: MCPServerManager;
 
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mcp-test-"));
-    const config = new Config(tempDir);
+    config = new Config(tempDir);
 
     configService = new MCPConfigService(config);
     serverManager = new MCPServerManager(configService);
@@ -136,6 +137,98 @@ describe("MCP server disable filtering", () => {
     expect(enabledServers).toEqual({
       "enabled-server": { transport: "stdio", command: "cmd1", disabled: false },
     });
+  });
+
+  // --- Agent Plugins provider (agent-plugins experiment) ---
+
+  const PLUGIN_SERVER = {
+    transport: "stdio" as const,
+    command: "bunx",
+    args: ["-y", "some-server"],
+    disabled: true,
+    plugin: {
+      pluginName: "demo",
+      serverName: "srv",
+      sourceScope: "global" as const,
+      sourceLocation: ".mux/plugins/demo",
+    },
+  };
+
+  test("listServers merges Agent Plugins servers at the lowest precedence", async () => {
+    const withProvider = new MCPConfigService(config, {
+      agentPluginsMcpProvider: () =>
+        Promise.resolve({
+          "plugin:abc:srv": PLUGIN_SERVER,
+          // A hostile plugin key colliding with a user server must lose.
+          collides: { ...PLUGIN_SERVER, command: "plugin-command" },
+        }),
+    });
+    await withProvider.addServer("collides", { transport: "stdio", command: "user-command" });
+
+    const servers = await withProvider.listServers();
+
+    expect(servers["plugin:abc:srv"]).toEqual(PLUGIN_SERVER);
+    expect(servers.collides).toEqual({
+      transport: "stdio",
+      command: "user-command",
+      disabled: false,
+      toolAllowlist: undefined,
+    });
+  });
+
+  test("listServers resolves the Agent Plugins context: default, explicit, and null", async () => {
+    const seenArgs: Array<{ projectRoot?: string; projectKey?: string; trusted: boolean }> = [];
+    const withProvider = new MCPConfigService(config, {
+      agentPluginsMcpProvider: (args) => {
+        seenArgs.push(args);
+        return Promise.resolve({});
+      },
+    });
+
+    // Default: scan under projectPath, keyed by projectPath (project-level flows).
+    await withProvider.listServers();
+    await withProvider.listServers("/proj", false);
+    await withProvider.listServers("/proj", true);
+    // Explicit context: workspace flows scan the active worktree, keyed by the project.
+    await withProvider.listServers("/proj", true, {
+      agentPlugins: { projectRoot: "/worktrees/ws-1", projectKey: "/proj" },
+    });
+    // Null: off-host workspace — provider must not be consulted at all.
+    await withProvider.listServers("/proj", true, { agentPlugins: null });
+
+    expect(seenArgs).toEqual([
+      { projectRoot: undefined, projectKey: undefined, trusted: false },
+      { projectRoot: "/proj", projectKey: "/proj", trusted: false },
+      { projectRoot: "/proj", projectKey: "/proj", trusted: true },
+      { projectRoot: "/worktrees/ws-1", projectKey: "/proj", trusted: true },
+    ]);
+  });
+
+  test("a throwing Agent Plugins provider never breaks listServers", async () => {
+    const withProvider = new MCPConfigService(config, {
+      agentPluginsMcpProvider: () => Promise.reject(new Error("boom")),
+    });
+    await withProvider.addServer("still-there", { transport: "stdio", command: "cmd" });
+
+    const servers = await withProvider.listServers();
+
+    expect(Object.keys(servers)).toEqual(["still-there"]);
+  });
+
+  test("plugin servers are never persisted: mutations reject plugin keys", async () => {
+    const withProvider = new MCPConfigService(config, {
+      agentPluginsMcpProvider: () => Promise.resolve({ "plugin:abc:srv": PLUGIN_SERVER }),
+    });
+
+    expect((await withProvider.setServerEnabled("plugin:abc:srv", true)).success).toBe(false);
+    expect((await withProvider.removeServer("plugin:abc:srv")).success).toBe(false);
+    expect((await withProvider.setToolAllowlist("plugin:abc:srv", [])).success).toBe(false);
+
+    // The on-disk global config never gained a plugin entry.
+    const globalRaw = await fs
+      .readFile(path.join(config.rootDir, "mcp.jsonc"), "utf-8")
+      .catch(() => "");
+    expect(globalRaw).not.toContain("plugin:abc:srv");
   });
 });
 

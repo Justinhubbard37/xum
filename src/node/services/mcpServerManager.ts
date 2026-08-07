@@ -1,3 +1,5 @@
+import * as fsPromises from "node:fs/promises";
+import * as path from "node:path";
 import { createMCPClient, type OAuthClientProvider } from "@ai-sdk/mcp";
 import type { Tool } from "ai";
 import { log } from "@/node/services/log";
@@ -8,10 +10,16 @@ import type {
   MCPServerInfo,
   MCPServerMap,
   MCPServerTransport,
+  MCPStdioServerInfo,
   MCPTestResult,
   WorkspaceMCPOverrides,
 } from "@/common/types/mcp";
+import assert from "@/common/utils/assert";
+import { shellQuote } from "@/common/utils/shell";
 import type { Runtime } from "@/node/runtime/Runtime";
+import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
+import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
+import type { AgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
 import type { PolicyService } from "@/node/services/policyService";
 import type { MCPConfigService } from "@/node/services/mcpConfigService";
 import {
@@ -411,13 +419,119 @@ async function extractBearerOauthChallenge(options: {
 
 export type { MCPTestResult } from "@/common/types/mcp";
 
+/** Shell command + exec options composed for a stdio server launch. */
+interface StdioLaunch {
+  command: string;
+  cwd?: string;
+  env?: Record<string, string>;
+}
+
+/**
+ * mkdir -p that self-heals corrupted plugin data state: when the target or one
+ * of its ancestors exists as a non-directory (a stray file where
+ * `~/.mux/plugin-data` or an instance dir should be), the offending entry is
+ * quarantined (renamed aside) and the mkdir retried, instead of ENOTDIR/EEXIST
+ * permanently bricking every test/launch until the user repairs disk state by
+ * hand. Renaming preserves whatever data the file held.
+ */
+async function mkdirSelfHealing(target: string): Promise<void> {
+  try {
+    await fsPromises.mkdir(target, { recursive: true });
+    return;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "EEXIST" && code !== "ENOTDIR") {
+      throw error;
+    }
+  }
+
+  // Walk root→leaf to find the shallowest existing non-directory prefix.
+  const prefixes: string[] = [];
+  for (let current = target; ; current = path.dirname(current)) {
+    prefixes.unshift(current);
+    if (path.dirname(current) === current) {
+      break;
+    }
+  }
+  for (const prefix of prefixes) {
+    let isDirectory: boolean;
+    try {
+      // stat (not lstat): a symlink to a directory is a valid path segment.
+      isDirectory = (await fsPromises.stat(prefix)).isDirectory();
+    } catch {
+      // Nothing (or a broken symlink) at this prefix. lstat distinguishes:
+      // a broken symlink still occupies the name and must be quarantined.
+      const lstat = await fsPromises.lstat(prefix).catch(() => null);
+      if (lstat === null) {
+        break;
+      }
+      isDirectory = false;
+    }
+    if (!isDirectory) {
+      const quarantine = `${prefix}.corrupt-${Date.now()}`;
+      log.warn(`[MCP] Quarantining non-directory plugin data path '${prefix}' to '${quarantine}'`);
+      await fsPromises.rename(prefix, quarantine);
+      break;
+    }
+  }
+
+  await fsPromises.mkdir(target, { recursive: true });
+}
+
+/**
+ * Compose the shell command string and exec options for a stdio server.
+ *
+ * Servers with `args` set (Agent Plugins) run in argv mode: `command` and each
+ * arg are individually shell-quoted, so hostile arg content cannot inject
+ * shell syntax. Legacy entries (no `args`) keep raw shell-string behavior.
+ *
+ * For Agent Plugin servers this also creates the `PLUGIN_DATA` directory,
+ * which the spec requires to exist before the subprocess launches (§9.1).
+ *
+ * Exported for tests.
+ */
+export async function prepareStdioLaunch(info: MCPStdioServerInfo): Promise<StdioLaunch> {
+  const command =
+    info.args !== undefined ? [info.command, ...info.args].map(shellQuote).join(" ") : info.command;
+
+  if (info.plugin !== undefined) {
+    const dataPath = info.env?.PLUGIN_DATA;
+    assert(
+      dataPath !== undefined && path.isAbsolute(dataPath),
+      "prepareStdioLaunch: plugin stdio server must carry an absolute PLUGIN_DATA env"
+    );
+    await mkdirSelfHealing(dataPath);
+
+    // A ${PLUGIN_DATA}-rooted cwd (e.g. "${PLUGIN_DATA}/nested") is
+    // client-managed writable state that may not exist yet, and exec()
+    // requires the cwd to exist before spawning. Only data-dir cwds are
+    // created; plugin-root cwds refer to shipped plugin content.
+    if (info.cwd !== undefined) {
+      const relativeToData = path.relative(dataPath, info.cwd);
+      const insideData =
+        relativeToData !== "" &&
+        !relativeToData.startsWith("..") &&
+        !path.isAbsolute(relativeToData);
+      if (insideData) {
+        await mkdirSelfHealing(info.cwd);
+      }
+    }
+  }
+
+  return {
+    command,
+    ...(info.cwd !== undefined ? { cwd: info.cwd } : {}),
+    ...(info.env !== undefined ? { env: info.env } : {}),
+  };
+}
+
 /**
  * Run a test connection to an MCP server.
  * Connects, fetches tools, then closes.
  */
 async function runServerTest(
   server:
-    | { transport: "stdio"; command: string }
+    | { transport: "stdio"; command: string; cwd?: string; env?: Record<string, string> }
     | {
         transport: "http" | "sse" | "auto";
         url: string;
@@ -442,7 +556,8 @@ async function runServerTest(
         log.debug(`[MCP] Testing ${logContext}`, { transport: "stdio" });
 
         const execStream = await runtime.exec(server.command, {
-          cwd: projectPath,
+          cwd: server.cwd ?? projectPath,
+          ...(server.env !== undefined ? { env: server.env } : {}),
           timeout: TEST_TIMEOUT_MS / 1000,
         });
 
@@ -757,11 +872,12 @@ export class MCPServerManager {
    */
   private async getAllServers(
     projectPath: string,
-    trusted = false
+    trusted = false,
+    agentPlugins?: AgentPluginsMcpContext | null
   ): Promise<Record<string, MCPServerInfo>> {
     const configServers = this.ignoreConfigFile
       ? {}
-      : await this.configService.listServers(projectPath, trusted);
+      : await this.configService.listServers(projectPath, trusted, { agentPlugins });
     // Inline servers override config file servers (always enabled)
     const inlineAsInfo: Record<string, MCPServerInfo> = {};
     for (const [name, command] of Object.entries(this.inlineServers)) {
@@ -781,13 +897,16 @@ export class MCPServerManager {
    *
    * @param projectPath - Project path to get servers for
    * @param overrides - Optional workspace-level overrides
+   * @param trusted - Whether repo-local MCP config is allowed
+   * @param agentPlugins - Agent Plugins discovery context (null = off-host workspace, no plugin servers)
    */
   async listServers(
     projectPath: string,
     overrides?: WorkspaceMCPOverrides,
-    trusted = false
+    trusted = false,
+    agentPlugins?: AgentPluginsMcpContext | null
   ): Promise<MCPServerMap> {
-    const allServers = await this.getAllServers(projectPath, trusted);
+    const allServers = await this.getAllServers(projectPath, trusted, agentPlugins);
     const enabled = this.applyServerOverrides(allServers, overrides);
     return this.filterServersByPolicy(enabled);
   }
@@ -920,6 +1039,8 @@ export class MCPServerManager {
     overrides?: WorkspaceMCPOverrides;
     /** Project secrets, used for resolving {secret: "KEY"} header references. */
     projectSecrets?: Record<string, string>;
+    /** Agent Plugins discovery context (null = off-host workspace, no plugin servers). */
+    agentPlugins?: AgentPluginsMcpContext | null;
   }): Promise<MCPToolsForWorkspaceResult> {
     const {
       workspaceId,
@@ -929,10 +1050,26 @@ export class MCPServerManager {
       trusted = false,
       overrides,
       projectSecrets,
+      agentPlugins,
     } = options;
 
     // Fetch full server info for project-level allowlists and server filtering
-    const fullServerInfo = await this.getAllServers(projectPath, trusted);
+    const allServers = await this.getAllServers(projectPath, trusted, agentPlugins);
+
+    // Agent Plugins v1: plugin servers launch via host fs paths (command, cwd,
+    // PLUGIN_ROOT/PLUGIN_DATA), so they are only offered when the runtime
+    // executes on the host. Backstop for callers that omit agentPlugins: SSH /
+    // Docker remotes exec remotely, and DevcontainerRuntime execs inside the
+    // container even though it extends LocalBaseRuntime.
+    const fullServerInfo: Record<string, MCPServerInfo> = {};
+    const execsOffHost = runtime instanceof RemoteRuntime || runtime instanceof DevcontainerRuntime;
+    for (const [name, info] of Object.entries(allServers)) {
+      if (info.plugin !== undefined && execsOffHost) {
+        log.debug("[MCP] Skipping Agent Plugin server on off-host runtime", { workspaceId, name });
+        continue;
+      }
+      fullServerInfo[name] = info;
+    }
 
     // Apply server-level overrides (enabled/disabled) before caching
     const enabledServers = this.filterServersByPolicy(
@@ -947,7 +1084,14 @@ export class MCPServerManager {
     const signatureEntries: Record<string, unknown> = {};
     for (const [name, info] of enabledEntries) {
       if (info.transport === "stdio") {
-        signatureEntries[name] = { transport: "stdio", command: info.command };
+        // args/env/cwd participate so plugin mcp.json edits recycle servers.
+        signatureEntries[name] = {
+          transport: "stdio",
+          command: info.command,
+          args: info.args ?? null,
+          env: info.env ?? null,
+          cwd: info.cwd ?? null,
+        };
         continue;
       }
 
@@ -1300,6 +1444,8 @@ export class MCPServerManager {
     url?: string;
     headers?: Record<string, MCPHeaderValue>;
     projectSecrets?: Record<string, string>;
+    /** Agent Plugins discovery context for named-server lookups (null = no plugin servers). */
+    agentPlugins?: AgentPluginsMcpContext | null;
   }): Promise<MCPTestResult> {
     const isTransportAllowed = (t: MCPServerTransport): boolean => {
       return !this.policyService?.isEnforced() || this.policyService.isMcpTransportAllowed(t);
@@ -1313,11 +1459,12 @@ export class MCPServerManager {
       url,
       headers,
       projectSecrets,
+      agentPlugins,
     } = options;
     const trimmedName = name?.trim();
 
     if (trimmedName && !command?.trim() && !url?.trim()) {
-      const servers = await this.configService.listServers(projectPath, trusted);
+      const servers = await this.configService.listServers(projectPath, trusted, { agentPlugins });
       const server = servers[trimmedName];
       if (!server) {
         return { success: false, error: `Server "${trimmedName}" not found in configuration` };
@@ -1328,8 +1475,9 @@ export class MCPServerManager {
       }
 
       if (server.transport === "stdio") {
+        const launch = await prepareStdioLaunch(server);
         return runServerTest(
-          { transport: "stdio", command: server.command },
+          { transport: "stdio", ...launch },
           projectPath,
           `server "${trimmedName}"`
         );
@@ -1652,8 +1800,10 @@ export class MCPServerManager {
 
     if (info.transport === "stdio") {
       log.debug("[MCP] Spawning stdio server", { name });
-      const execStream = await runtime.exec(info.command, {
-        cwd: workspacePath,
+      const launch = await prepareStdioLaunch(info);
+      const execStream = await runtime.exec(launch.command, {
+        cwd: launch.cwd ?? workspacePath,
+        ...(launch.env !== undefined ? { env: launch.env } : {}),
         timeout: 60 * 60 * 24, // 24 hours — process lifetime, not startup
         abortSignal: signal,
       });

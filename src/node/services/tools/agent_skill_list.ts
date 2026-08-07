@@ -15,6 +15,7 @@ import type { AgentSkillListToolResult } from "@/common/types/tools";
 import { getErrorMessage } from "@/common/utils/errors";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
+import { discoverAgentPlugins } from "@/node/services/agentPlugins/discovery";
 import {
   discoverAgentSkills,
   getDefaultAgentSkillsRoots,
@@ -167,6 +168,8 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
 
       // claude-skills-compat experiment: also list read-only .claude/skills roots.
       const includeClaudeSkills = config.experiments?.claudeSkillsCompat === true;
+      // agent-plugins experiment: also list read-only Agent Plugins skill roots.
+      const includeAgentPlugins = config.experiments?.agentPlugins === true;
 
       try {
         const skillCtx = resolveSkillStorageContext({
@@ -174,6 +177,7 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
           workspacePath: config.cwd,
           muxScope: config.muxScope ?? null,
           includeClaudeSkills,
+          includeAgentPlugins,
         });
 
         if (skillCtx.kind === "project-runtime") {
@@ -181,6 +185,7 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
           // listings include .mux/skills and .agents/skills plus ~/.mux/skills and ~/.agents/skills.
           const roots = getDefaultAgentSkillsRoots(skillCtx.runtime, skillCtx.workspacePath, {
             includeClaudeSkills,
+            includeAgentPlugins,
           });
 
           const discovered = await discoverAgentSkills(skillCtx.runtime, skillCtx.workspacePath, {
@@ -211,6 +216,12 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
           skillsRoot: string;
           containmentRoot: string;
           scope: "global" | "project";
+          /**
+           * Agent Plugins root: per-skill containment anchors at the plugin
+           * root (§4.1), so contained symlinked skill dirs stay listed —
+           * matching stream discovery and agent_skill_read.
+           */
+          isPlugin?: boolean;
         }> = [
           {
             skillsRoot: path.join(muxScope.muxHome, "skills"),
@@ -259,8 +270,58 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
           );
         }
 
+        if (includeAgentPlugins) {
+          // agent-plugins experiment: expand plugin containers into per-plugin skills/ roots.
+          // Containers anchor at the CHECKOUT root (matching buildProjectLocalRoots):
+          // for subProjectPath workspaces `projectRoot` is the execution
+          // subdirectory, but plugins live at the checkout level.
+          const pluginAnchor =
+            muxScope.type === "project" ? (muxScope.checkoutRoot ?? muxScope.projectRoot) : null;
+          const pluginContainers = [
+            ...(pluginAnchor != null
+              ? [
+                  {
+                    path: path.join(pluginAnchor, ".mux", "plugins"),
+                    scope: "project" as const,
+                  },
+                  {
+                    path: path.join(pluginAnchor, ".agents", "plugins"),
+                    scope: "project" as const,
+                  },
+                ]
+              : []),
+            { path: path.join(muxScope.muxHome, "plugins"), scope: "global" as const },
+            { path: path.join(userHome, ".agents", "plugins"), scope: "global" as const },
+          ];
+          const { plugins } = await discoverAgentPlugins(pluginContainers);
+          for (const plugin of plugins) {
+            if (plugin.skillsDir == null) {
+              continue;
+            }
+            // Project plugin roots keep the repo-symlink posture of other project
+            // roots: the plugin root itself must stay inside the checkout root.
+            if (plugin.scope === "project" && pluginAnchor != null) {
+              try {
+                await ensurePathContained(pluginAnchor, plugin.rootPath);
+              } catch {
+                log.warn(
+                  `Skipping project plugin '${plugin.name}': plugin root resolves outside the project root`
+                );
+                continue;
+              }
+            }
+            // Per-skill containment anchors at the plugin root (§4.1).
+            roots.push({
+              skillsRoot: plugin.skillsDir,
+              containmentRoot: plugin.rootPath,
+              scope: plugin.scope,
+              isPlugin: true,
+            });
+          }
+        }
+
         const skills: AgentSkillDescriptor[] = [];
-        for (const { skillsRoot, containmentRoot, scope } of roots) {
+        for (const { skillsRoot, containmentRoot, scope, isPlugin } of roots) {
           let skillsRootReal: string;
           try {
             skillsRootReal = await fsPromises.realpath(skillsRoot);
@@ -283,8 +344,10 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
           const directoryEntries = await listSkillDirectories(skillsRootReal);
           for (const entry of directoryEntries) {
             // Project scope: reject symlinked skill directories to avoid resolving
-            // repo-controlled entries to out-of-project locations.
-            if (scope === "project" && entry.isSymbolicLink) {
+            // repo-controlled entries to out-of-project locations. Plugin roots
+            // are exempt: readSkillDescriptor enforces realpath containment at
+            // the plugin root, the same rule stream discovery applies.
+            if (scope === "project" && !isPlugin && entry.isSymbolicLink) {
               log.warn(
                 `Skipping project skill '${entry.name}': skill directory is a symbolic link`
               );
