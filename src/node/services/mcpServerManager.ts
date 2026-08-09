@@ -1,7 +1,13 @@
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
-import { createMCPClient, type OAuthClientProvider } from "@ai-sdk/mcp";
+import type { OAuthClientProvider, PriorDiscovery } from "@modelcontextprotocol/client";
 import type { Tool } from "ai";
+import {
+  createMCPClient,
+  isModernEra,
+  MCP_TOOL_CALL_TIMEOUT_MS,
+  type MCPClientHandle,
+} from "@/node/services/mcpClient";
 import { log } from "@/node/services/log";
 import { MCPStdioTransport } from "@/node/services/mcpStdioTransport";
 import type {
@@ -34,13 +40,25 @@ import { getErrorMessage } from "@/common/utils/errors";
 
 const TEST_TIMEOUT_MS = 10_000;
 const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+
+/**
+ * Freshness horizon for cached *legacy* era verdicts.
+ *
+ * A stale modern verdict fails loudly at connect (EraNegotiationFailed), so
+ * modern verdicts never expire. A stale legacy verdict succeeds silently
+ * forever (an upgraded server still answers `initialize`), so legacy verdicts
+ * are re-probed after this horizon to notice server upgrades.
+ */
+const LEGACY_ERA_VERDICT_TTL_MS = 24 * 60 * 60 * 1000;
 const IDLE_CHECK_INTERVAL_MS = 60 * 1000; // Check every minute
 const MCP_STARTUP_TIMEOUT_MS = 60_000; // 60s — generous for npx package downloads
 const MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS = 5_000; // fail-safe so timeout error cannot hang forever
 
-/** Detect errors from the @ai-sdk/mcp SDK indicating the client/transport is closed.
- *  MCPClientError is not exported from the SDK, so we match on known message patterns.
- *  Known patterns: "closed client", "Connection closed", "Connection closed unexpectedly". */
+/** Detect errors from the MCP SDK indicating the client/transport is closed.
+ *  We match on known message patterns rather than error classes so wrapped or
+ *  re-thrown errors are still recognized.
+ *  Known patterns: "Not connected", "Connection closed" (official SDK v2),
+ *  plus "closed client" kept from the previous @ai-sdk/mcp integration. */
 export function isClosedClientError(error: unknown): boolean {
   const msg = getErrorMessage(error).toLowerCase();
   return (
@@ -49,8 +67,6 @@ export function isClosedClientError(error: unknown): boolean {
     msg.includes("not connected")
   );
 }
-
-const MCP_TOOL_CALL_TIMEOUT_MS = 300_000;
 
 /**
  * Thrown by runMCPToolWithDeadline when abort or timeout wins the race.
@@ -61,6 +77,19 @@ class MCPDeadlineError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "MCPDeadlineError";
+  }
+}
+
+/**
+ * Wraps errors raised while connecting a freshly-spawned stdio MCP client.
+ * Typed so the negotiation retry loop can distinguish "the connect (possibly
+ * the server/discover probe) failed against a live process" — which warrants
+ * one legacy respawn retry — from spawn/exec failures that a retry cannot fix.
+ */
+class MCPStdioConnectError extends Error {
+  constructor(readonly cause: unknown) {
+    super(`MCP stdio connect failed: ${getErrorMessage(cause)}`);
+    this.name = "MCPStdioConnectError";
   }
 }
 
@@ -364,7 +393,8 @@ function extractWwwAuthenticateHeader(error: unknown): string | null {
 function createWwwAuthenticateCaptureFetch() {
   let capturedHeader: string | null = null;
 
-  // @ai-sdk/mcp expects a full fetch implementation (including static helpers like
+  // The MCP SDK accepts any fetch-like function, but some call paths (and our
+  // own probes) may rely on static helpers like
   // preconnect), so wrap the call path while preserving the original function shape.
   const fetchWithCapture = Object.assign(async (...args: Parameters<typeof fetch>) => {
     const response = await fetch(...args);
@@ -541,9 +571,25 @@ async function runServerTest(
   projectPath: string,
   logContext: string
 ): Promise<MCPTestResult> {
-  const timeoutPromise = new Promise<MCPTestResult>((resolve) =>
-    setTimeout(() => resolve({ success: false, error: "Connection timed out" }), TEST_TIMEOUT_MS)
-  );
+  // Resettable deadline: the fragile-legacy stdio respawn below restarts the
+  // clock so the compatibility retry gets a full test window instead of
+  // whatever is left after the failed probe attempt.
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  let resolveTimeout: (result: MCPTestResult) => void;
+  const timeoutPromise = new Promise<MCPTestResult>((resolve) => {
+    resolveTimeout = resolve;
+  });
+  const armTestDeadline = () => {
+    timeoutHandle = setTimeout(
+      () => resolveTimeout({ success: false, error: "Connection timed out" }),
+      TEST_TIMEOUT_MS
+    );
+  };
+  const resetTestDeadline = () => {
+    clearTimeout(timeoutHandle);
+    armTestDeadline();
+  };
+  armTestDeadline();
 
   const testPromise = (async (): Promise<MCPTestResult> => {
     let stdioTransport: MCPStdioTransport | null = null;
@@ -555,15 +601,43 @@ async function runServerTest(
         const runtime = createRuntime({ type: "local", srcBaseDir: projectPath });
         log.debug(`[MCP] Testing ${logContext}`, { transport: "stdio" });
 
-        const execStream = await runtime.exec(server.command, {
-          cwd: server.cwd ?? projectPath,
-          ...(server.env !== undefined ? { env: server.env } : {}),
-          timeout: TEST_TIMEOUT_MS / 1000,
-        });
+        const spawnTransport = async () => {
+          const execStream = await runtime.exec(server.command, {
+            cwd: server.cwd ?? projectPath,
+            ...(server.env !== undefined ? { env: server.env } : {}),
+            timeout: TEST_TIMEOUT_MS / 1000,
+          });
 
-        stdioTransport = new MCPStdioTransport(execStream);
-        await stdioTransport.start();
-        client = await createMCPClient({ transport: stdioTransport });
+          const transport = new MCPStdioTransport(execStream);
+          await transport.start();
+          return transport;
+        };
+
+        stdioTransport = await spawnTransport();
+        try {
+          client = await createMCPClient({ transport: stdioTransport });
+        } catch (error) {
+          // Fragile legacy stdio servers can exit on the server/discover
+          // negotiation probe. Mirror the production startup path
+          // (startSingleServerImpl): respawn once and connect with a legacy
+          // verdict so a working legacy server does not fail the test.
+          log.debug(`[MCP] ${logContext} stdio probe connect failed; retrying as legacy`, {
+            error: getErrorMessage(error),
+          });
+          try {
+            await stdioTransport.close();
+          } catch {
+            // ignore cleanup errors
+          }
+          // Give the respawned process a full test window; the failed probe
+          // attempt may have consumed most of the original deadline.
+          resetTestDeadline();
+          stdioTransport = await spawnTransport();
+          client = await createMCPClient({
+            transport: stdioTransport,
+            prior: { kind: "legacy" },
+          });
+        }
       } else {
         log.debug(`[MCP] Testing ${logContext}`, { transport: server.transport });
 
@@ -574,11 +648,6 @@ async function runServerTest(
           url: server.url,
           headers: server.headers,
           fetch: challengeCapture.fetch,
-          // AI SDK 7 rejects HTTP redirects by default (SSRF hardening for
-          // untrusted URLs). MCP server URLs here are user-configured and
-          // already trusted to execute tools, so keep following redirects to
-          // avoid breaking existing setups (e.g. http→https, trailing slash).
-          redirect: "follow" as const,
           ...(server.authProvider ? { authProvider: server.authProvider } : {}),
         };
 
@@ -620,6 +689,7 @@ async function runServerTest(
 
       const tools = await client.tools();
       const toolNames = Object.keys(tools);
+      const protocolVersion = client.negotiatedProtocolVersion();
 
       await client.close();
       client = null;
@@ -629,8 +699,15 @@ async function runServerTest(
         stdioTransport = null;
       }
 
-      log.info(`[MCP] ${logContext} test successful`, { toolCount: toolNames.length });
-      return { success: true, tools: toolNames };
+      log.info(`[MCP] ${logContext} test successful`, {
+        toolCount: toolNames.length,
+        protocolVersion,
+      });
+      return {
+        success: true,
+        tools: toolNames,
+        ...(protocolVersion !== undefined ? { protocolVersion } : {}),
+      };
     } catch (error) {
       const message = getErrorMessage(error);
       log.warn(`[MCP] ${logContext} test failed`, { error: message });
@@ -677,6 +754,15 @@ interface MCPServerInstance {
   tools: Record<string, Tool>;
   /** True once the underlying MCP client/transport has been closed. */
   isClosed: boolean;
+  /**
+   * Re-fetch tools/list through the SDK's SEP-2549 response cache and swap in
+   * the refreshed tool set. Only present on 2026-07-28+ connections, whose
+   * list results carry ttlMs/cacheScope freshness hints: a still-fresh cached
+   * list is served with zero round trips, a stale one refetches. Legacy
+   * connections keep the previous instance-lifetime tool caching (their list
+   * results carry no freshness hints).
+   */
+  refreshTools?: () => Promise<void>;
   close: () => Promise<void>;
 }
 
@@ -719,6 +805,14 @@ export interface MCPServerManagerOptions {
 export class MCPServerManager {
   private readonly workspaceServers = new Map<string, WorkspaceServers>();
   private readonly workspaceLeases = new Map<string, number>();
+  /**
+   * Cached per-server protocol era verdicts, keyed by server config
+   * (name + transport-relevant fields). Lets subsequent startups skip the
+   * connect-time server/discover probe. In-memory only: a config change
+   * yields a different key, so verdicts never outlive the config they were
+   * probed against.
+   */
+  private readonly eraVerdicts = new Map<string, { prior: PriorDiscovery; cachedAtMs: number }>();
   private readonly idleCheckInterval: ReturnType<typeof setInterval>;
   private inlineServers: Record<string, string> = {};
   private readonly policyService: PolicyService | null;
@@ -753,6 +847,48 @@ export class MCPServerManager {
 
   private getLeaseCount(workspaceId: string): number {
     return this.workspaceLeases.get(workspaceId) ?? 0;
+  }
+
+  private getCachedEraVerdict(key: string): PriorDiscovery | undefined {
+    const entry = this.eraVerdicts.get(key);
+    if (!entry) {
+      return undefined;
+    }
+    if (!isModernEra(entry.prior) && Date.now() - entry.cachedAtMs > LEGACY_ERA_VERDICT_TTL_MS) {
+      // Legacy verdicts go stale silently; re-probe past the horizon.
+      this.eraVerdicts.delete(key);
+      return undefined;
+    }
+    return entry.prior;
+  }
+
+  private storeEraVerdict(key: string, prior: PriorDiscovery): void {
+    this.eraVerdicts.set(key, { prior, cachedAtMs: Date.now() });
+  }
+
+  /**
+   * Best-effort tools/list refresh for cached modern-era instances
+   * (SEP-2549): a still-fresh cached list is served by the SDK with zero
+   * round trips; a stale one refetches. Failures keep the existing tool set —
+   * tool availability must never regress because a refresh failed.
+   */
+  private async refreshModernInstanceTools(
+    instances: Map<string, MCPServerInstance>
+  ): Promise<void> {
+    await Promise.all(
+      [...instances.values()]
+        .filter((instance) => instance.refreshTools !== undefined && !instance.isClosed)
+        .map(async (instance) => {
+          try {
+            await instance.refreshTools!();
+          } catch (error) {
+            log.debug("[MCP] Tool list refresh failed; keeping cached tools", {
+              name: instance.name,
+              error: getErrorMessage(error),
+            });
+          }
+        })
+    );
   }
 
   /**
@@ -1181,7 +1317,8 @@ export class MCPServerManager {
             projectPath,
             workspacePath,
             projectSecrets,
-            () => this.markActivity(workspaceId)
+            () => this.markActivity(workspaceId),
+            workspaceId
           );
 
           // Config changes can replace the workspace cache entry while this retry is still
@@ -1249,6 +1386,10 @@ export class MCPServerManager {
         serverCount: enabledEntries.length,
       });
 
+      // Honor SEP-2549 freshness hints on modern-era connections instead of
+      // caching tool lists for the instance lifetime.
+      await this.refreshModernInstanceTools(existing.instances);
+
       return {
         tools: this.collectTools(existing.instances, fullServerInfo, overrides),
         stats: existing.stats,
@@ -1313,7 +1454,8 @@ export class MCPServerManager {
           projectPath,
           workspacePath,
           projectSecrets,
-          () => this.markActivity(workspaceId)
+          () => this.markActivity(workspaceId),
+          workspaceId
         );
         restartFailedNames = failedNames;
         restartTimedOutNames = timedOutNames;
@@ -1358,6 +1500,10 @@ export class MCPServerManager {
       );
       existing.stats = leasedStats;
 
+      // Honor SEP-2549 freshness hints on modern-era connections instead of
+      // caching tool lists for the instance lifetime.
+      await this.refreshModernInstanceTools(instancesForTools);
+
       return {
         tools: this.collectTools(instancesForTools, fullServerInfo, overrides),
         stats: leasedStats,
@@ -1388,7 +1534,8 @@ export class MCPServerManager {
       projectPath,
       workspacePath,
       projectSecrets,
-      () => this.markActivity(workspaceId)
+      () => this.markActivity(workspaceId),
+      workspaceId
     );
 
     const allFailedNames = [...restartFailedNames, ...startFailedNames];
@@ -1637,7 +1784,8 @@ export class MCPServerManager {
     projectPath: string,
     workspacePath: string,
     projectSecrets: Record<string, string> | undefined,
-    onActivity: () => void
+    onActivity: () => void,
+    workspaceId?: string
   ): Promise<{
     instances: Map<string, MCPServerInstance>;
     failedServerNames: string[];
@@ -1657,7 +1805,8 @@ export class MCPServerManager {
           projectPath,
           workspacePath,
           projectSecrets,
-          onActivity
+          onActivity,
+          workspaceId
         );
         if (instance) {
           instances.set(name, instance);
@@ -1682,7 +1831,8 @@ export class MCPServerManager {
     projectPath: string,
     workspacePath: string,
     projectSecrets: Record<string, string> | undefined,
-    onActivity: () => void
+    onActivity: () => void,
+    workspaceId?: string
   ): Promise<MCPServerInstance | null> {
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
     const abortController = new AbortController();
@@ -1704,7 +1854,8 @@ export class MCPServerManager {
       projectSecrets,
       onActivity,
       abortController.signal,
-      registerAbortCleanup
+      registerAbortCleanup,
+      workspaceId
     ).then(
       (instance) => (didTimeout ? keepPendingAfterTimeout() : instance),
       (error) => {
@@ -1792,13 +1943,106 @@ export class MCPServerManager {
     projectSecrets: Record<string, string> | undefined,
     onActivity: () => void,
     signal: AbortSignal,
-    onAbortCleanup?: (cleanupPromise: Promise<void>) => void
+    onAbortCleanup?: (cleanupPromise: Promise<void>) => void,
+    workspaceId?: string
   ): Promise<MCPServerInstance | null> {
     if (signal.aborted) {
       return null;
     }
 
     if (info.transport === "stdio") {
+      // Scope verdicts by workspace identity (each workspace binds exactly
+      // one runtime, and workspace IDs are unique across hosts) plus the
+      // effective execution cwd: the same command can resolve different
+      // server versions from different worktrees, hosts, or runtimes, so a
+      // verdict probed in one execution context must not leak into another.
+      const verdictKey = JSON.stringify([
+        "stdio",
+        workspaceId ?? null,
+        name,
+        info.command,
+        info.args ?? null,
+        info.env ?? null,
+        info.cwd ?? workspacePath,
+      ]);
+      let prior = this.getCachedEraVerdict(verdictKey);
+      // A cached verdict of either kind can go stale without a config change:
+      // a modern verdict after a server downgrade (typed EraNegotiationFailed)
+      // and a legacy verdict after an upgrade to a 2026-only server that
+      // rejects the initialize handshake. On the first connect failure with a
+      // cached verdict, drop it and re-probe from scratch.
+      let priorFromCache = prior !== undefined;
+      // A server/discover probe can kill fragile legacy stdio servers that
+      // exit on any pre-initialize request. Allow one legacy respawn retry
+      // when no cached verdict skipped the probe.
+      let allowLegacyRetry = prior === undefined;
+
+      // Negotiation retry loop; bounded (each branch below fires at most once).
+      for (;;) {
+        try {
+          const started = await this.startStdioInstance(
+            name,
+            info,
+            runtime,
+            workspacePath,
+            onActivity,
+            signal,
+            onAbortCleanup,
+            prior
+          );
+          if (started === null) {
+            return null;
+          }
+          this.storeEraVerdict(verdictKey, started.prior);
+          return started.instance;
+        } catch (error) {
+          if (signal.aborted) {
+            return null;
+          }
+          if (priorFromCache) {
+            log.info("[MCP] Cached era verdict rejected; re-probing", {
+              name,
+              cachedEra: prior !== undefined && isModernEra(prior) ? "modern" : "legacy",
+              error: getErrorMessage(error instanceof MCPStdioConnectError ? error.cause : error),
+            });
+            this.eraVerdicts.delete(verdictKey);
+            prior = undefined;
+            priorFromCache = false;
+            allowLegacyRetry = true;
+            continue;
+          }
+          if (allowLegacyRetry && error instanceof MCPStdioConnectError) {
+            log.info("[MCP] stdio negotiation probe failed; respawning as legacy", {
+              name,
+              error: getErrorMessage(error.cause),
+            });
+            prior = { kind: "legacy" };
+            allowLegacyRetry = false;
+            continue;
+          }
+          throw error instanceof MCPStdioConnectError ? error.cause : error;
+        }
+      }
+    }
+
+    return this.startRemoteInstance(name, info, projectSecrets, onActivity, signal, onAbortCleanup);
+  }
+
+  /**
+   * Spawn and connect a stdio MCP server (one attempt; negotiation retries
+   * live in startSingleServerImpl). Returns null when aborted.
+   */
+  private async startStdioInstance(
+    name: string,
+    info: MCPStdioServerInfo,
+    runtime: Runtime,
+    workspacePath: string,
+    onActivity: () => void,
+    signal: AbortSignal,
+    onAbortCleanup: ((cleanupPromise: Promise<void>) => void) | undefined,
+    prior: PriorDiscovery | undefined
+  ): Promise<{ instance: MCPServerInstance; prior: PriorDiscovery } | null> {
+    {
       log.debug("[MCP] Spawning stdio server", { name });
       const launch = await prepareStdioLaunch(info);
       const execStream = await runtime.exec(launch.command, {
@@ -1917,7 +2161,16 @@ export class MCPServerManager {
           return null;
         }
 
-        client = await createMCPClient({ transport });
+        try {
+          client = await createMCPClient({
+            transport,
+            ...(prior !== undefined ? { prior } : {}),
+          });
+        } catch (error) {
+          // The connect failure may have been the negotiation probe killing a
+          // fragile legacy server; typed so the caller can respawn as legacy.
+          throw new MCPStdioConnectError(error);
+        }
         if (signal.aborted) {
           await cleanupStartupResources();
           return null;
@@ -1935,17 +2188,22 @@ export class MCPServerManager {
           return null;
         }
 
-        const tools = wrapMCPTools(rawTools as unknown as Record<string, Tool>, {
-          onActivity,
-          onClosed: () => {
-            if (instanceRef.current) instanceRef.current.isClosed = true;
-          },
-        });
+        const wrapRawTools = (raw: Record<string, Tool>) =>
+          wrapMCPTools(raw, {
+            onActivity,
+            onClosed: () => {
+              if (instanceRef.current) instanceRef.current.isClosed = true;
+            },
+          });
+
+        const tools = wrapRawTools(rawTools as unknown as Record<string, Tool>);
+        const negotiatedPrior = readyClient.priorDiscovery();
 
         log.info("[MCP] Server ready", {
           name,
           transport: "stdio",
           toolCount: Object.keys(tools).length,
+          protocolVersion: readyClient.negotiatedProtocolVersion(),
         });
 
         const instance: MCPServerInstance = {
@@ -1954,6 +2212,14 @@ export class MCPServerManager {
           autoFallbackUsed: false,
           tools,
           isClosed: transportClosed,
+          ...(isModernEra(negotiatedPrior)
+            ? {
+                refreshTools: async () => {
+                  const raw = await readyClient.tools();
+                  instance.tools = wrapRawTools(raw);
+                },
+              }
+            : {}),
           close: async () => {
             // Mark closed first to prevent any new tool calls from being treated as
             // valid by higher-level caching logic.
@@ -1974,7 +2240,7 @@ export class MCPServerManager {
         };
 
         instanceRef.current = instance;
-        return instance;
+        return { instance, prior: negotiatedPrior };
       } catch (error) {
         await cleanupStartupResources();
         if (signal.aborted) {
@@ -1985,7 +2251,20 @@ export class MCPServerManager {
         signal.removeEventListener("abort", onAbort);
       }
     }
+  }
 
+  /**
+   * Connect an HTTP/SSE MCP server (with auto http→sse fallback and one
+   * stale-modern-verdict retry). Returns null when aborted.
+   */
+  private async startRemoteInstance(
+    name: string,
+    info: Exclude<MCPServerInfo, MCPStdioServerInfo>,
+    projectSecrets: Record<string, string> | undefined,
+    onActivity: () => void,
+    signal: AbortSignal,
+    onAbortCleanup?: (cleanupPromise: Promise<void>) => void
+  ): Promise<MCPServerInstance | null> {
     const { headers } = resolveHeaders(info.headers, projectSecrets);
 
     // Only attach authProvider when we have stored OAuth tokens for this server.
@@ -2019,11 +2298,11 @@ export class MCPServerManager {
     const transportBase = {
       url: info.url,
       headers,
-      // AI SDK 7 rejects HTTP redirects by default; these URLs are
-      // user-configured and trusted (see the test-connection transport above).
-      redirect: "follow" as const,
       ...(authProvider ? { authProvider } : {}),
     };
+
+    const verdictKey = JSON.stringify(["remote", name, info.transport, info.url, headers ?? null]);
+    let prior = this.getCachedEraVerdict(verdictKey);
 
     const tryHttp = async () =>
       createMCPClient({
@@ -2032,6 +2311,7 @@ export class MCPServerManager {
           ...transportBase,
         },
         onUncaughtError,
+        ...(prior !== undefined ? { prior } : {}),
       });
 
     const trySse = async () =>
@@ -2041,6 +2321,7 @@ export class MCPServerManager {
           ...transportBase,
         },
         onUncaughtError,
+        ...(prior !== undefined ? { prior } : {}),
       });
 
     let client: Awaited<ReturnType<typeof createMCPClient>> | null = null;
@@ -2087,27 +2368,51 @@ export class MCPServerManager {
     };
     signal.addEventListener("abort", onAbort, { once: true });
 
-    try {
+    const establishClient = async (): Promise<MCPClientHandle> => {
       if (info.transport === "http") {
         resolvedTransport = "http";
-        client = await tryHttp();
-      } else if (info.transport === "sse") {
+        return await tryHttp();
+      }
+      if (info.transport === "sse") {
         resolvedTransport = "sse";
-        client = await trySse();
-      } else {
-        // auto
-        try {
-          resolvedTransport = "http";
-          client = await tryHttp();
-        } catch (error) {
-          if (!shouldAutoFallbackToSse(error)) {
-            throw error;
-          }
-          autoFallbackUsed = true;
-          resolvedTransport = "sse";
-          log.debug("[MCP] Auto-fallback http→sse", { name, status: extractHttpStatusCode(error) });
-          client = await trySse();
+        return await trySse();
+      }
+      // auto
+      try {
+        resolvedTransport = "http";
+        return await tryHttp();
+      } catch (error) {
+        if (!shouldAutoFallbackToSse(error)) {
+          throw error;
         }
+        autoFallbackUsed = true;
+        resolvedTransport = "sse";
+        log.debug("[MCP] Auto-fallback http→sse", { name, status: extractHttpStatusCode(error) });
+        return await trySse();
+      }
+    };
+
+    try {
+      try {
+        client = await establishClient();
+      } catch (error) {
+        if (prior === undefined) {
+          throw error;
+        }
+        // A cached verdict of either kind can go stale without a config
+        // change: a modern verdict after a server downgrade (typed
+        // EraNegotiationFailed) and a legacy verdict after an upgrade to a
+        // 2026-only server that rejects the initialize handshake. Drop the
+        // verdict and reconnect with a fresh probe.
+        log.info("[MCP] Cached era verdict rejected; re-probing", {
+          name,
+          cachedEra: isModernEra(prior) ? "modern" : "legacy",
+          error: getErrorMessage(error),
+        });
+        this.eraVerdicts.delete(verdictKey);
+        prior = undefined;
+        autoFallbackUsed = false;
+        client = await establishClient();
       }
 
       if (signal.aborted) {
@@ -2128,18 +2433,24 @@ export class MCPServerManager {
 
       let clientClosed = false;
 
-      const tools = wrapMCPTools(rawTools as unknown as Record<string, Tool>, {
-        onActivity,
-        onClosed: () => {
-          if (instanceRef.current) instanceRef.current.isClosed = true;
-        },
-      });
+      const wrapRawTools = (raw: Record<string, Tool>) =>
+        wrapMCPTools(raw, {
+          onActivity,
+          onClosed: () => {
+            if (instanceRef.current) instanceRef.current.isClosed = true;
+          },
+        });
+
+      const tools = wrapRawTools(rawTools as unknown as Record<string, Tool>);
+      const negotiatedPrior = activeClient.priorDiscovery();
+      this.storeEraVerdict(verdictKey, negotiatedPrior);
 
       log.info("[MCP] Server ready", {
         name,
         transport: resolvedTransport,
         toolCount: Object.keys(tools).length,
         autoFallbackUsed,
+        protocolVersion: activeClient.negotiatedProtocolVersion(),
       });
 
       const instance: MCPServerInstance = {
@@ -2148,6 +2459,14 @@ export class MCPServerManager {
         autoFallbackUsed,
         tools,
         isClosed: transportErrored || clientClosed,
+        ...(isModernEra(negotiatedPrior)
+          ? {
+              refreshTools: async () => {
+                const raw = await activeClient.tools();
+                instance.tools = wrapRawTools(raw);
+              },
+            }
+          : {}),
         close: async () => {
           // Mark closed first to prevent any new tool calls from being treated as
           // valid by higher-level caching logic.
