@@ -257,20 +257,19 @@ describe("ProviderService.getConfig", () => {
     });
   });
 
-  it("surfaces non-secret op:// API key references", () => {
+  it("reports legacy op:// API key references as not set", () => {
     withTempConfig((config, service) => {
-      const opRef = "op://Personal/Anthropic/credential";
       config.saveProvidersConfig({
         anthropic: {
-          apiKey: opRef,
+          apiKey: "op://Personal/Anthropic/credential",
         },
       });
 
       const cfg = service.getConfig();
 
-      expect(cfg.anthropic.apiKeySet).toBe(true);
-      expect(cfg.anthropic.apiKeyIsOpRef).toBe(true);
-      expect(cfg.anthropic.apiKeyOpRef).toBe(opRef);
+      // Runtime env fallback is covered in providerRequirements.test.ts;
+      // getConfig() reads process.env, so only assert the display flag here.
+      expect(cfg.anthropic.apiKeySet).toBe(false);
     });
   });
 
@@ -466,9 +465,6 @@ describe("ProviderService.getConfig", () => {
 
       expect(cfg["local-vllm"]).toEqual({
         apiKeySet: false,
-        apiKeyIsOpRef: undefined,
-        apiKeyOpRef: undefined,
-        apiKeyOpLabel: undefined,
         apiKeyFile: undefined,
         apiKeySource: "keyless",
         baseUrl: LOCAL_VLLM_BASE_URL,

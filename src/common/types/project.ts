@@ -204,6 +204,10 @@ export interface ProjectsConfig {
 
   settingsBackup?: SettingsBackup;
 
-  /** Optional 1Password account name used for desktop SDK account selection. */
-  onePasswordAccountName?: string;
+  /**
+   * Legacy 1Password account name. The integration was removed; the value is
+   * preserved across saves (never used at runtime) so downgrading restores a
+   * working 1Password setup without re-entering the account.
+   */
+  legacyOnePasswordAccountName?: string;
 }

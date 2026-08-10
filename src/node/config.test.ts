@@ -13,7 +13,7 @@ import {
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
-import { type ExternalSecretResolver, secretsToRecord } from "@/common/types/secrets";
+import { secretsToRecord } from "@/common/types/secrets";
 
 describe("Config", () => {
   let tempDir: string;
@@ -907,13 +907,12 @@ describe("Config", () => {
     });
   });
 
-  describe("onePasswordAccountName loading", () => {
+  describe("top-level settings loading", () => {
     it("loads top-level settings even when projects is missing", () => {
       const configFile = path.join(tempDir, "config.json");
       fs.writeFileSync(
         configFile,
         JSON.stringify({
-          onePasswordAccountName: "personal-account",
           muxGovernorUrl: "https://governor.example.com",
           terminalDefaultShell: "zsh",
         })
@@ -921,9 +920,25 @@ describe("Config", () => {
 
       const loaded = config.loadConfigOrDefault();
       expect(loaded.projects.size).toBe(0);
-      expect(loaded.onePasswordAccountName).toBe("personal-account");
       expect(loaded.muxGovernorUrl).toBe("https://governor.example.com");
       expect(loaded.terminalDefaultShell).toBe("zsh");
+    });
+
+    it("round-trips the legacy 1Password account name across unrelated saves", async () => {
+      const configFile = path.join(tempDir, "config.json");
+      fs.writeFileSync(
+        configFile,
+        JSON.stringify({ onePasswordAccountName: "my-team.1password.com" })
+      );
+
+      await config.editConfig((current) => ({
+        ...current,
+        terminalDefaultShell: "zsh",
+      }));
+
+      const raw = JSON.parse(fs.readFileSync(configFile, "utf-8")) as Record<string, unknown>;
+      expect(raw.onePasswordAccountName).toBe("my-team.1password.com");
+      expect(raw.terminalDefaultShell).toBe("zsh");
     });
   });
 
@@ -2171,6 +2186,63 @@ describe("Config", () => {
       expect(parsed.__global__).toEqual([{ key: "GLOBAL_A", value: "1" }]);
     });
 
+    it("preserves unsupported legacy entries on disk when saving unrelated secrets", async () => {
+      const secretsFile = path.join(tempDir, "secrets.json");
+      const legacyEntry = { key: "LEGACY_OP", value: { op: "op://Vault/Item/field" } };
+      fs.writeFileSync(
+        secretsFile,
+        JSON.stringify({
+          __global__: [legacyEntry, { key: "KEEP", value: "kept" }],
+          "/other/project": [legacyEntry],
+        })
+      );
+
+      // Legacy entries are hidden from runtime/UI views...
+      expect(config.getGlobalSecrets()).toEqual([{ key: "KEEP", value: "kept" }]);
+
+      await config.updateGlobalSecrets([
+        { key: "KEEP", value: "kept" },
+        { key: "NEW", value: "added" },
+      ]);
+
+      // ...but survive on disk so a downgrade can still read them, in both the
+      // updated bucket and untouched buckets.
+      const parsed = JSON.parse(fs.readFileSync(secretsFile, "utf-8")) as Record<string, unknown>;
+      expect(parsed.__global__).toEqual([
+        { key: "KEEP", value: "kept" },
+        { key: "NEW", value: "added" },
+        legacyEntry,
+      ]);
+      expect(parsed["/other/project"]).toEqual([legacyEntry]);
+    });
+
+    it("drops a preserved legacy entry when an update reuses its key", async () => {
+      const secretsFile = path.join(tempDir, "secrets.json");
+      fs.writeFileSync(
+        secretsFile,
+        JSON.stringify({
+          __global__: [{ key: "TOKEN", value: { op: "op://Vault/Item/field" } }],
+        })
+      );
+
+      await config.updateGlobalSecrets([{ key: "TOKEN", value: "replaced" }]);
+
+      const parsed = JSON.parse(fs.readFileSync(secretsFile, "utf-8")) as Record<string, unknown>;
+      expect(parsed.__global__).toEqual([{ key: "TOKEN", value: "replaced" }]);
+    });
+
+    it("preserves legacy entries from trailing-slash duplicate project buckets", async () => {
+      const secretsFile = path.join(tempDir, "secrets.json");
+      const legacyEntry = { key: "LEGACY_OP", value: { op: "op://Vault/Item/field" } };
+      fs.writeFileSync(secretsFile, JSON.stringify({ "/repo/": [legacyEntry] }));
+
+      await config.updateProjectSecrets("/repo", [{ key: "NEW", value: "added" }]);
+
+      const parsed = JSON.parse(fs.readFileSync(secretsFile, "utf-8")) as Record<string, unknown>;
+      expect(parsed["/repo/"]).toBeUndefined();
+      expect(parsed["/repo"]).toEqual([{ key: "NEW", value: "added" }, legacyEntry]);
+    });
+
     it("does not inherit global secrets by default", async () => {
       await config.updateGlobalSecrets([
         { key: "TOKEN", value: "global" },
@@ -2306,27 +2378,6 @@ describe("Config", () => {
       });
     });
 
-    it("resolves project secret aliases to global { op } values", async () => {
-      const opRef = "op://Vault/Item/field";
-      await config.updateGlobalSecrets([{ key: "GLOBAL_OP", value: { op: opRef } }]);
-
-      const projectPath = "/fake/project";
-      await config.updateProjectSecrets(projectPath, [
-        { key: "TOKEN", value: { secret: "GLOBAL_OP" } },
-      ]);
-
-      const effective = config.getEffectiveSecrets(projectPath);
-      expect(effective).toEqual([{ key: "TOKEN", value: { op: opRef } }]);
-
-      const resolver: ExternalSecretResolver = (ref: string) => {
-        if (ref === opRef) return Promise.resolve("resolved-op");
-        return Promise.resolve(undefined);
-      };
-
-      const record = await secretsToRecord(effective, resolver);
-      expect(record).toEqual({ TOKEN: "resolved-op" });
-    });
-
     it("omits missing referenced secrets when resolving secretsToRecord", async () => {
       const record = await secretsToRecord([
         { key: "GLOBAL", value: "1" },
@@ -2346,63 +2397,17 @@ describe("Config", () => {
       expect(record).toEqual({ OK: "y" });
     });
 
-    it("resolves { op } values via external resolver", async () => {
-      const resolver: ExternalSecretResolver = (ref: string) => {
-        if (ref === "op://Dev/Stripe/key") return Promise.resolve("sk-resolved");
-        return Promise.resolve(undefined);
-      };
-
-      const record = await secretsToRecord(
-        [
-          { key: "STRIPE_KEY", value: { op: "op://Dev/Stripe/key" } },
-          { key: "LITERAL", value: "plain" },
-        ],
-        resolver
-      );
-
-      expect(record).toEqual({ STRIPE_KEY: "sk-resolved", LITERAL: "plain" });
-    });
-
-    it("omits { op } values when no resolver is provided", async () => {
+    it("resolves mixed literal and { secret } values", async () => {
       const record = await secretsToRecord([
-        { key: "A", value: { op: "op://Dev/Stripe/key" } },
-        { key: "B", value: "literal" },
+        { key: "LITERAL", value: "raw" },
+        { key: "GLOBAL_TOKEN", value: "abc" },
+        { key: "ALIAS", value: { secret: "GLOBAL_TOKEN" } },
       ]);
-
-      expect(record).toEqual({ B: "literal" });
-    });
-
-    it("omits { op } values when resolver returns undefined", async () => {
-      const resolver: ExternalSecretResolver = () => Promise.resolve(undefined);
-      const record = await secretsToRecord(
-        [{ key: "A", value: { op: "op://Dev/Stripe/key" } }],
-        resolver
-      );
-
-      expect(record).toEqual({});
-    });
-
-    it("resolves mixed literal, { secret }, and { op } values", async () => {
-      const resolver: ExternalSecretResolver = (ref: string) => {
-        if (ref === "op://Vault/Item/field") return Promise.resolve("op-resolved");
-        return Promise.resolve(undefined);
-      };
-
-      const record = await secretsToRecord(
-        [
-          { key: "LITERAL", value: "raw" },
-          { key: "GLOBAL_TOKEN", value: "abc" },
-          { key: "ALIAS", value: { secret: "GLOBAL_TOKEN" } },
-          { key: "OP_REF", value: { op: "op://Vault/Item/field" } },
-        ],
-        resolver
-      );
 
       expect(record).toEqual({
         LITERAL: "raw",
         GLOBAL_TOKEN: "abc",
         ALIAS: "abc",
-        OP_REF: "op-resolved",
       });
     });
     it("normalizes project paths so trailing slashes don't split secrets", async () => {

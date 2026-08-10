@@ -6,12 +6,7 @@ import { EventEmitter } from "events";
 import writeFileAtomic from "write-file-atomic";
 import { log } from "@/node/services/log";
 import type { WorkspaceMetadata, FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import {
-  isSecretReferenceValue,
-  isOpSecretValue,
-  type Secret,
-  type SecretsConfig,
-} from "@/common/types/secrets";
+import { isSecretReferenceValue, type Secret, type SecretsConfig } from "@/common/types/secrets";
 import type {
   Workspace,
   ProjectConfig,
@@ -1211,7 +1206,7 @@ export class Config {
           settingsBackup: SettingsBackupSchema.optional()
             .catch(undefined)
             .parse(parsed.settingsBackup),
-          onePasswordAccountName: parseOptionalNonEmptyString(parsed.onePasswordAccountName),
+          legacyOnePasswordAccountName: parseOptionalNonEmptyString(parsed.onePasswordAccountName),
         };
       }
     } catch (error) {
@@ -1502,9 +1497,13 @@ export class Config {
         data.settingsBackup = config.settingsBackup;
       }
 
-      const onePasswordAccountName = parseOptionalNonEmptyString(config.onePasswordAccountName);
-      if (onePasswordAccountName) {
-        data.onePasswordAccountName = onePasswordAccountName;
+      // Round-trip the legacy 1Password account name so unrelated saves don't
+      // delete it from config.json; downgrades depend on it to reinitialize.
+      const legacyOnePasswordAccountName = parseOptionalNonEmptyString(
+        config.legacyOnePasswordAccountName
+      );
+      if (legacyOnePasswordAccountName) {
+        data.onePasswordAccountName = legacyOnePasswordAccountName;
       }
 
       await writeFileAtomic(this.configFile, JSON.stringify(data, null, 2), "utf-8");
@@ -2528,7 +2527,7 @@ ${jsonString}`;
       return true;
     }
 
-    return isSecretReferenceValue(value) || isOpSecretValue(value);
+    return isSecretReferenceValue(value);
   }
 
   private static isSecret(value: unknown): value is Secret {
@@ -2574,6 +2573,39 @@ ${jsonString}`;
     }
 
     return sanitizedSecrets;
+  }
+
+  /**
+   * Merge an updated secrets list with raw on-disk entries, preserving entries
+   * whose value shapes this build no longer understands (e.g. legacy 1Password
+   * `{ op: ... }` references) so a downgrade can still read them. Supported
+   * entries are fully represented in the UI, so `next` is authoritative for
+   * them; a preserved legacy entry is dropped only when the update reuses its
+   * key (the new value intentionally replaces it).
+   */
+  private static mergeSecretsPreservingUnsupported(
+    rawEntries: unknown[],
+    next: Secret[]
+  ): unknown[] {
+    const nextKeys = new Set(next.map((secret) => secret.key));
+    const preserved: unknown[] = [];
+
+    for (const entry of rawEntries) {
+      if (Config.isSecret(entry)) {
+        continue;
+      }
+
+      if (
+        typeof entry === "object" &&
+        entry !== null &&
+        typeof (entry as { key?: unknown }).key === "string" &&
+        !nextKeys.has((entry as { key: string }).key)
+      ) {
+        preserved.push(entry);
+      }
+    }
+
+    return [...next, ...preserved];
   }
 
   private static mergeSecretsByKey(primary: Secret[], secondary: Secret[]): Secret[] {
@@ -2635,10 +2667,62 @@ ${jsonString}`;
   }
 
   /**
+   * Load the secrets file without filtering entry shapes. Used by the update
+   * paths so unsupported legacy entries survive round-trips to disk instead of
+   * being silently deleted when an unrelated secret is saved.
+   */
+  private loadRawSecretsConfig(): Record<string, unknown> {
+    try {
+      if (fs.existsSync(this.secretsFile)) {
+        const parsed = JSON.parse(fs.readFileSync(this.secretsFile, "utf-8")) as unknown;
+        if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+          return { ...(parsed as Record<string, unknown>) };
+        }
+      }
+    } catch (error) {
+      log.error("Error loading secrets config:", error);
+    }
+
+    return {};
+  }
+
+  /**
+   * Replace one bucket of the secrets file (global sentinel or a normalized
+   * project path) while leaving every other bucket byte-for-byte intact and
+   * preserving unsupported legacy entries within the target bucket.
+   */
+  private async updateSecretsBucket(bucketKey: string, secrets: Secret[]): Promise<void> {
+    const raw = this.loadRawSecretsConfig();
+
+    // Project paths may be persisted with trailing slashes; fold every raw key
+    // that maps to this bucket so preserved entries aren't left in a shadowed
+    // duplicate bucket.
+    const rawBucketEntries: unknown[] = [];
+    for (const [rawKey, rawValue] of Object.entries(raw)) {
+      const mappedKey =
+        rawKey === Config.GLOBAL_SECRETS_KEY
+          ? rawKey
+          : Config.normalizeSecretsProjectPath(rawKey) || rawKey;
+      if (mappedKey !== bucketKey) {
+        continue;
+      }
+
+      if (Array.isArray(rawValue)) {
+        // Array.isArray narrows unknown to any[]; retype to unknown[] for safe handling.
+        rawBucketEntries.push(...(rawValue as unknown[]));
+      }
+      delete raw[rawKey];
+    }
+
+    raw[bucketKey] = Config.mergeSecretsPreservingUnsupported(rawBucketEntries, secrets);
+    await this.saveSecretsConfig(raw);
+  }
+
+  /**
    * Save secrets configuration to JSON file
    * @param config The secrets configuration to save
    */
-  async saveSecretsConfig(config: SecretsConfig): Promise<void> {
+  async saveSecretsConfig(config: SecretsConfig | Record<string, unknown>): Promise<void> {
     try {
       if (!fs.existsSync(this.rootDir)) {
         ensurePrivateDirSync(this.rootDir);
@@ -2666,9 +2750,7 @@ ${jsonString}`;
 
   /** Update global secrets (not project-scoped). */
   async updateGlobalSecrets(secrets: Secret[]): Promise<void> {
-    const config = this.loadSecretsConfig();
-    config[Config.GLOBAL_SECRETS_KEY] = secrets;
-    await this.saveSecretsConfig(config);
+    await this.updateSecretsBucket(Config.GLOBAL_SECRETS_KEY, secrets);
   }
 
   /**
@@ -2711,7 +2793,7 @@ ${jsonString}`;
       try {
         const raw = globalRawByKey.get(key);
 
-        if (typeof raw === "string" || isOpSecretValue(raw)) {
+        if (typeof raw === "string") {
           globalResolved.set(key, raw);
           return raw;
         }
@@ -2825,9 +2907,7 @@ ${jsonString}`;
    */
   async updateProjectSecrets(projectPath: string, secrets: Secret[]): Promise<void> {
     const normalizedProjectPath = Config.normalizeSecretsProjectPath(projectPath) || projectPath;
-    const config = this.loadSecretsConfig();
-    config[normalizedProjectPath] = secrets;
-    await this.saveSecretsConfig(config);
+    await this.updateSecretsBucket(normalizedProjectPath, secrets);
   }
 }
 

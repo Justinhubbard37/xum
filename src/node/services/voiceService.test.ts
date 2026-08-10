@@ -1,4 +1,4 @@
-import { describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -29,6 +29,23 @@ async function withTempConfig(
 }
 
 describe("VoiceService.transcribe", () => {
+  // Voice credential resolution consults process.env (config -> file -> env
+  // funnel), so pin the env key to keep "unconfigured" scenarios deterministic.
+  let savedOpenAiEnvKey: string | undefined;
+
+  beforeEach(() => {
+    savedOpenAiEnvKey = process.env.OPENAI_API_KEY;
+    delete process.env.OPENAI_API_KEY;
+  });
+
+  afterEach(() => {
+    if (savedOpenAiEnvKey === undefined) {
+      delete process.env.OPENAI_API_KEY;
+    } else {
+      process.env.OPENAI_API_KEY = savedOpenAiEnvKey;
+    }
+  });
+
   it("returns provider-disabled error without calling fetch", async () => {
     await withTempConfig(async (config, service) => {
       config.saveProvidersConfig({
@@ -72,32 +89,6 @@ describe("VoiceService.transcribe", () => {
 
         expect(result).toEqual({ success: true, data: "transcribed text" });
         expect(fetchSpy).toHaveBeenCalledTimes(1);
-      } finally {
-        fetchSpy.mockRestore();
-      }
-    });
-  });
-
-  it("returns error without calling fetch when OpenAI key is unresolved op:// reference", async () => {
-    await withTempConfig(async (config, service) => {
-      config.saveProvidersConfig({
-        openai: {
-          apiKey: "op://Personal/OpenAI/password",
-        },
-      });
-
-      const fetchSpy = spyOn(globalThis, "fetch");
-      fetchSpy.mockResolvedValue(new Response("transcribed text"));
-
-      try {
-        const result = await service.transcribe("Zm9v");
-
-        expect(result).toEqual({
-          success: false,
-          error:
-            "OpenAI API key could not be resolved from 1Password. Update the key in Settings → Providers and try again.",
-        });
-        expect(fetchSpy).not.toHaveBeenCalled();
       } finally {
         fetchSpy.mockRestore();
       }
