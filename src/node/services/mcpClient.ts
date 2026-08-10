@@ -7,6 +7,10 @@ import {
   type Transport,
 } from "@modelcontextprotocol/client";
 import { dynamicTool, jsonSchema, type JSONSchema7, type Tool } from "ai";
+import {
+  stripSyntheticNulls,
+  widenOptionalPropertiesToNullable,
+} from "@/common/utils/tools/optionalNullSchema";
 import assert from "@/common/utils/assert";
 
 /**
@@ -203,6 +207,26 @@ function mcpToModelOutput({
   return { type: "content", value: convertedContent };
 }
 
+function isJsonSchemaProperties(value: unknown): value is NonNullable<JSONSchema7["properties"]> {
+  return value != null && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Build the provider contract and restore the MCP server contract during input parsing. */
+export function createMCPToolInputSchema(inputSchema: Record<string, unknown> | undefined) {
+  const sourceSchema: JSONSchema7 = {
+    ...(inputSchema ?? { type: "object" }),
+    properties: isJsonSchemaProperties(inputSchema?.properties) ? inputSchema.properties : {},
+    additionalProperties: inputSchema?.additionalProperties ?? false,
+  };
+
+  return jsonSchema(widenOptionalPropertiesToNullable(sourceSchema) as JSONSchema7, {
+    validate: (value) => ({
+      success: true as const,
+      value: stripSyntheticNulls(sourceSchema, value),
+    }),
+  });
+}
+
 /**
  * Connect to an MCP server and return a handle exposing AI SDK tools.
  *
@@ -238,21 +262,10 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
 
       const tools: Record<string, Tool> = {};
       for (const definition of listResult.tools) {
-        const inputSchema = definition.inputSchema ?? { type: "object" };
         tools[definition.name] = dynamicTool({
           description: definition.description,
           title: definition.title ?? definition.annotations?.title,
-          // Server-provided JSON schemas are runtime data; the SDK types them
-          // as loose JSON values, so narrow to the AI SDK's JSONSchema7 shape.
-          // Preserve a server-declared additionalProperties (map-style params
-          // like env vars or labels rely on it); default to false only when
-          // absent, matching the previous @ai-sdk/mcp behavior for strict
-          // providers. Provider-specific strictness stays in schemaSanitizer.
-          inputSchema: jsonSchema({
-            ...inputSchema,
-            properties: inputSchema.properties ?? {},
-            additionalProperties: inputSchema.additionalProperties ?? false,
-          } as JSONSchema7),
+          inputSchema: createMCPToolInputSchema(definition.inputSchema),
           execute: async (args: unknown, options: { abortSignal?: AbortSignal }) => {
             options.abortSignal?.throwIfAborted();
             return await client.callTool(

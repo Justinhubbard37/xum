@@ -158,7 +158,7 @@ import {
 } from "@/node/services/terminalAttentionStore";
 import { readAgentWorkflowRunReferences } from "@/node/services/agentWorkflowRunReferences";
 import { isWorkflowRunTaskId } from "@/node/services/tools/taskId";
-import { normalizeWorkflowAgentReportPayloadForHostSchema } from "@/common/utils/tools/workflowReportPayload";
+import { stripSyntheticNulls } from "@/common/utils/tools/optionalNullSchema";
 import {
   formatJsonSchemaValidationErrors,
   validateJsonSchemaSubset,
@@ -425,10 +425,7 @@ function normalizeWorkflowAgentReportArgsForWorkflowTask(
   }
   return {
     ...reportArgs,
-    structuredOutput: normalizeWorkflowAgentReportPayloadForHostSchema(
-      workflowTask.outputSchema,
-      reportArgs.structuredOutput
-    ),
+    structuredOutput: stripSyntheticNulls(workflowTask.outputSchema, reportArgs.structuredOutput),
   };
 }
 
@@ -456,7 +453,7 @@ function validateWorkflowAgentReportStructuredOutput(params: {
     });
   }
 
-  const structuredOutput = normalizeWorkflowAgentReportPayloadForHostSchema(
+  const structuredOutput = stripSyntheticNulls(
     workflowTask.outputSchema,
     params.reportArgs.structuredOutput
   );
