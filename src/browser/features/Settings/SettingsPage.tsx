@@ -141,6 +141,7 @@ export function getSettingsSections(
     label: "Backup",
     icon: <ArchiveRestore className="h-4 w-4" />,
     component: BackupSection,
+    experimental: true,
   });
   if (governorEnabled) {
     sections.push({
@@ -280,6 +281,9 @@ export function SettingsPage(props: SettingsPageProps) {
               >
                 {section.icon}
                 {section.label}
+                {section.experimental && (
+                  <FlaskConical aria-hidden="true" className="text-warning h-3 w-3 shrink-0" />
+                )}
               </Button>
             ))}
           </nav>
@@ -301,6 +305,9 @@ export function SettingsPage(props: SettingsPageProps) {
                 >
                   {section.icon}
                   {section.label}
+                  {section.experimental && (
+                    <FlaskConical aria-hidden="true" className="text-warning h-3 w-3 shrink-0" />
+                  )}
                 </Button>
               ))}
             </nav>
