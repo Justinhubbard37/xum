@@ -4,6 +4,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === "object" && !Array.isArray(value);
 }
 
+function containsReferenceKeyword(value: unknown): boolean {
+  if (Array.isArray(value)) {
+    return value.some(containsReferenceKeyword);
+  }
+  if (!isRecord(value)) {
+    return false;
+  }
+  if (["$ref", "$dynamicRef", "$recursiveRef"].some((key) => Object.hasOwn(value, key))) {
+    return true;
+  }
+  return Object.values(value).some(containsReferenceKeyword);
+}
+
 function getRequiredProperties(schema: Record<string, unknown>): Set<string> {
   const required = new Set(
     Array.isArray(schema.required)
@@ -129,6 +142,27 @@ function widenSchemaNode(schema: unknown, inheritedRequired = new Set<string>())
       }
     }
   }
+}
+
+export interface OptionalNullSchemaContract {
+  modelSchema: unknown;
+  strict: false | undefined;
+  restore: (value: unknown) => unknown;
+}
+
+export function createOptionalNullSchemaContract(schema: unknown): OptionalNullSchemaContract {
+  if (containsReferenceKeyword(schema)) {
+    return {
+      modelSchema: structuredClone(schema),
+      strict: false,
+      restore: (value) => value,
+    };
+  }
+  return {
+    modelSchema: widenOptionalPropertiesToNullable(schema),
+    strict: undefined,
+    restore: (value) => stripSyntheticNulls(schema, value),
+  };
 }
 
 /**

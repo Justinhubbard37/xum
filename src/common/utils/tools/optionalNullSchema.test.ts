@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 
-import { stripSyntheticNulls, widenOptionalPropertiesToNullable } from "./optionalNullSchema";
+import {
+  createOptionalNullSchemaContract,
+  stripSyntheticNulls,
+  widenOptionalPropertiesToNullable,
+} from "./optionalNullSchema";
 
 describe("optional null JSON Schema contract", () => {
   test("round trips a Linear-shaped optional argument schema", () => {
@@ -118,16 +122,21 @@ describe("optional null JSON Schema contract", () => {
     expect(stripSyntheticNulls(source, { value: null })).toEqual({ value: null });
   });
 
-  test("leaves unknown reference nullability unchanged", () => {
-    const source = {
-      type: "object",
-      properties: { value: { $ref: "#/$defs/value" } },
-      $defs: { value: { type: "string" } },
-    };
+  test.each(["$ref", "$dynamicRef", "$recursiveRef"])(
+    "falls back to non-strict decoding for schemas with %s",
+    (keyword) => {
+      const source = {
+        type: "object",
+        properties: { value: { [keyword]: "#/$defs/value" } },
+        $defs: { value: { type: "string" } },
+      };
+      const contract = createOptionalNullSchemaContract(source);
 
-    expect(widenOptionalPropertiesToNullable(source)).toEqual(source);
-    expect(stripSyntheticNulls(source, { value: null })).toEqual({ value: null });
-  });
+      expect(contract.strict).toBe(false);
+      expect(contract.modelSchema).toEqual(source);
+      expect(contract.restore({ value: null })).toEqual({ value: null });
+    }
+  );
 
   test("handles boolean schemas without changing explicit valid nulls", () => {
     const source = {

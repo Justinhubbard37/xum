@@ -7,10 +7,7 @@ import {
   type Transport,
 } from "@modelcontextprotocol/client";
 import { dynamicTool, jsonSchema, type JSONSchema7, type Tool } from "ai";
-import {
-  stripSyntheticNulls,
-  widenOptionalPropertiesToNullable,
-} from "@/common/utils/tools/optionalNullSchema";
+import { createOptionalNullSchemaContract } from "@/common/utils/tools/optionalNullSchema";
 import assert from "@/common/utils/assert";
 
 /**
@@ -211,20 +208,37 @@ function isJsonSchemaProperties(value: unknown): value is NonNullable<JSONSchema
   return value != null && typeof value === "object" && !Array.isArray(value);
 }
 
+function createMCPSourceSchema(inputSchema: Record<string, unknown> | undefined): JSONSchema7 {
+  const sourceSchema: JSONSchema7 = { ...(inputSchema ?? { type: "object" }) };
+  const hasComposition = ["$ref", "$dynamicRef", "$recursiveRef", "allOf", "anyOf", "oneOf"].some(
+    (key) => Object.hasOwn(sourceSchema, key)
+  );
+  if (isJsonSchemaProperties(inputSchema?.properties)) {
+    sourceSchema.properties = inputSchema.properties;
+    sourceSchema.additionalProperties = inputSchema.additionalProperties ?? false;
+  } else if (!hasComposition || inputSchema?.additionalProperties !== undefined) {
+    sourceSchema.properties = {};
+    sourceSchema.additionalProperties = inputSchema?.additionalProperties ?? false;
+  }
+  return sourceSchema;
+}
+
+export function createMCPToolContract(inputSchema: Record<string, unknown> | undefined) {
+  const contract = createOptionalNullSchemaContract(createMCPSourceSchema(inputSchema));
+  return {
+    strict: contract.strict,
+    inputSchema: jsonSchema(contract.modelSchema as JSONSchema7, {
+      validate: (value) => ({
+        success: true as const,
+        value: contract.restore(value),
+      }),
+    }),
+  };
+}
+
 /** Build the provider contract and restore the MCP server contract during input parsing. */
 export function createMCPToolInputSchema(inputSchema: Record<string, unknown> | undefined) {
-  const sourceSchema: JSONSchema7 = {
-    ...(inputSchema ?? { type: "object" }),
-    properties: isJsonSchemaProperties(inputSchema?.properties) ? inputSchema.properties : {},
-    additionalProperties: inputSchema?.additionalProperties ?? false,
-  };
-
-  return jsonSchema(widenOptionalPropertiesToNullable(sourceSchema) as JSONSchema7, {
-    validate: (value) => ({
-      success: true as const,
-      value: stripSyntheticNulls(sourceSchema, value),
-    }),
-  });
+  return createMCPToolContract(inputSchema).inputSchema;
 }
 
 /**
@@ -262,10 +276,12 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
 
       const tools: Record<string, Tool> = {};
       for (const definition of listResult.tools) {
+        const contract = createMCPToolContract(definition.inputSchema);
         tools[definition.name] = dynamicTool({
           description: definition.description,
           title: definition.title ?? definition.annotations?.title,
-          inputSchema: createMCPToolInputSchema(definition.inputSchema),
+          strict: contract.strict,
+          inputSchema: contract.inputSchema,
           execute: async (args: unknown, options: { abortSignal?: AbortSignal }) => {
             options.abortSignal?.throwIfAborted();
             return await client.callTool(

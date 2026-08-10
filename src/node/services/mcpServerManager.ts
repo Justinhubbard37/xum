@@ -175,6 +175,9 @@ export async function runMCPToolWithDeadline<T>(
 }
 
 function shouldRecycleClientAfterToolError(error: unknown): boolean {
+  if (error instanceof MCPToolCallError) {
+    return false;
+  }
   return isClosedClientError(error) || error instanceof MCPDeadlineError;
 }
 

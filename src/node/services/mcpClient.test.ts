@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { createMCPToolInputSchema } from "./mcpClient";
+import { createMCPToolContract, createMCPToolInputSchema } from "./mcpClient";
 
 describe("createMCPToolInputSchema", () => {
   test("exposes a nullable model contract and restores the server contract", async () => {
@@ -37,6 +37,43 @@ describe("createMCPToolInputSchema", () => {
       success: true,
       value: { issueId: "CODAGT-709", cursor: "" },
     });
+  });
+
+  test.each(["$ref", "$dynamicRef", "$recursiveRef"])(
+    "uses the non-strict fallback for schemas with %s",
+    async (keyword) => {
+      const source = {
+        type: "object",
+        properties: { value: { [keyword]: "#/$defs/value" } },
+        $defs: { value: { type: "string" } },
+      };
+      const contract = createMCPToolContract(source);
+
+      expect(contract.strict).toBe(false);
+      expect(contract.inputSchema.jsonSchema as Record<string, unknown>).toEqual({
+        ...source,
+        additionalProperties: false,
+      });
+      expect(await contract.inputSchema.validate?.({ value: null })).toEqual({
+        success: true,
+        value: { value: null },
+      });
+    }
+  );
+
+  test("does not close a composed root schema with synthetic empty properties", () => {
+    const inputSchema = createMCPToolInputSchema({
+      type: "object",
+      allOf: [
+        {
+          type: "object",
+          properties: { value: { type: "string" } },
+        },
+      ],
+    });
+
+    expect(inputSchema.jsonSchema).not.toHaveProperty("additionalProperties");
+    expect(inputSchema.jsonSchema).not.toHaveProperty("properties");
   });
 
   test("preserves dictionary schemas", () => {

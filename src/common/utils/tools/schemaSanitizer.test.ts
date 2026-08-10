@@ -193,6 +193,7 @@ describe("schemaSanitizer", () => {
       const mcpTool = {
         type: "dynamic",
         description: "MCP test tool",
+        strict: false,
         inputSchema: {
           validate,
           // Simulate the jsonSchema getter that the MCP tool adapter creates
@@ -206,6 +207,7 @@ describe("schemaSanitizer", () => {
       const sanitized = sanitizeToolSchemaForOpenAI(mcpTool);
       const schema = getInputSchema(sanitized);
 
+      expect(sanitized.strict).toBe(false);
       const sanitizedInputSchema = sanitized.inputSchema as { validate?: unknown };
       expect(sanitizedInputSchema.validate).toBe(validate);
 
