@@ -282,7 +282,6 @@ export interface TaskCreateArgs {
     programmaticToolCalling?: boolean;
     programmaticToolCallingExclusive?: boolean;
     advisorTool?: boolean;
-    execSubagentHardRestart?: boolean;
     dynamicWorkflows?: boolean;
   };
 }
@@ -727,9 +726,10 @@ function isWorkspaceTurnRecoverableStreamError(errorType: StreamErrorType): bool
 /**
  * Provider-terminal stream errors that settle a child task even while it is
  * still `running` (before it owes its completion tool). Subset of
- * NON_RETRYABLE_STREAM_ERRORS: errors with in-session recovery
- * (context_exceeded) or user intent (aborted) must not terminally settle a
- * running task.
+ * NON_RETRYABLE_STREAM_ERRORS: user intent (aborted) must never terminally
+ * settle a running task, and errors with in-session recovery
+ * (context_exceeded) settle only after that recovery declines (see
+ * handleTaskStreamError).
  */
 const RUNNING_TASK_TERMINAL_STREAM_ERRORS: ReadonlySet<StreamErrorType> = new Set([
   "model_refusal",
@@ -9859,9 +9859,20 @@ export class TaskService {
 
   private async hasRecoverableWorkspaceTurnRetryInFlight(
     workspaceId: string,
+    errorMessageId: string,
     options: { requireAutoRetry: boolean }
   ): Promise<boolean> {
-    await this.workspaceService.waitForPendingStreamErrorRecoveryDecision(workspaceId);
+    const recoveryOutcome = await this.workspaceService.waitForPendingStreamErrorRecoveryDecision(
+      workspaceId,
+      errorMessageId
+    );
+    // The recorded per-attempt outcome survives a fast retry that already
+    // finished streaming by the time this waiter (queued behind the workspace
+    // event lock) runs; isStreaming alone would misread that success as
+    // terminal.
+    if (recoveryOutcome === "retry-started") {
+      return true;
+    }
     if (this.aiService.isStreaming(workspaceId)) {
       return true;
     }
@@ -9888,7 +9899,7 @@ export class TaskService {
     if (
       event.errorType != null &&
       isWorkspaceTurnRecoverableStreamError(event.errorType) &&
-      (await this.hasRecoverableWorkspaceTurnRetryInFlight(record.workspaceId, {
+      (await this.hasRecoverableWorkspaceTurnRetryInFlight(record.workspaceId, event.messageId, {
         requireAutoRetry: !explicitRecovery,
       }))
     ) {
@@ -9951,9 +9962,8 @@ export class TaskService {
     // rather than "all non-retryable":
     // - `aborted` is a steerable user pause, not a terminal failure.
     // - `context_exceeded` has in-session recovery (compaction retry, post-compaction
-    //   retry, exec-subagent hard restart in AgentSession.handleStreamError) listening
-    //   on the same error event; settling here would race that recovery and interrupt
-    //   a child that was about to continue.
+    //   retry in AgentSession.handleStreamError) listening on the same error event;
+    //   it settles below only after that recovery declines.
     const settlesRunningTask =
       event.errorType != null && RUNNING_TASK_TERMINAL_STREAM_ERRORS.has(event.errorType);
 
@@ -9966,6 +9976,47 @@ export class TaskService {
       });
       await this.failAgentTaskTerminally(workspaceId, entry, {
         errorType: event.errorType ?? "unknown",
+        errorMessage: event.error,
+      });
+      return;
+    }
+
+    if (status === "running" && event.errorType === "context_exceeded") {
+      // Wait for AgentSession.handleStreamError's recovery decision instead of
+      // racing it. When no retry started, the turn failed terminally without a
+      // later stream-end, so leaving the task `running` would block the
+      // parent's waitForAgentReport until timeout.
+      //
+      // Act on the recorded per-attempt outcome, not live phase flags: a fast
+      // successful retry can start AND finish before this handler (queued
+      // behind the workspace event lock) gets here, so sampling isStreaming
+      // would misread a successful recovery as declined. "retry-started"
+      // means this attempt's recovery completed stream startup; that retry's
+      // own stream events (including a possible follow-up error event, which
+      // gets its own decision) settle the task later. "terminal" means the
+      // error settled with no retry. Queued messages must NOT count as
+      // recovery — the terminal error path does not dispatch the queue, so an
+      // unrelated queued message would otherwise leave the task running
+      // forever.
+      const recoveryOutcome = await this.workspaceService.waitForPendingStreamErrorRecoveryDecision(
+        workspaceId,
+        event.messageId
+      );
+      if (recoveryOutcome === "retry-started") {
+        return;
+      }
+      // No recorded decision means the session is gone or was recreated
+      // (e.g. restart recovery); a live stream then belongs to a real
+      // continuing turn, so leave settlement to its stream events.
+      if (recoveryOutcome === undefined && this.aiService.isStreaming(workspaceId)) {
+        return;
+      }
+      log.error("Task hit context_exceeded and in-session recovery declined; interrupting task", {
+        workspaceId,
+        error: event.error,
+      });
+      await this.failAgentTaskTerminally(workspaceId, entry, {
+        errorType: event.errorType,
         errorMessage: event.error,
       });
       return;

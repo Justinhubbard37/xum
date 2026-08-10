@@ -4830,7 +4830,10 @@ describe("TaskService", () => {
       errorType: "context_exceeded",
     });
 
-    expect(waitForPendingStreamErrorRecoveryDecision).toHaveBeenCalledWith("childworkspace");
+    expect(waitForPendingStreamErrorRecoveryDecision).toHaveBeenCalledWith(
+      "childworkspace",
+      "msg_1"
+    );
     const snapshot = await taskService.getWorkspaceTurnSnapshot(parentId, "wst_handle");
     expect(snapshot).toMatchObject({
       status: "running",
@@ -4867,7 +4870,10 @@ describe("TaskService", () => {
       errorType: "stream_truncated",
     });
 
-    expect(waitForPendingStreamErrorRecoveryDecision).toHaveBeenCalledWith("childworkspace");
+    expect(waitForPendingStreamErrorRecoveryDecision).toHaveBeenCalledWith(
+      "childworkspace",
+      "msg_truncated"
+    );
     expect(await taskService.getWorkspaceTurnSnapshot(parentId, "wst_handle")).toMatchObject({
       status: "running",
       workspaceId: "childworkspace",
@@ -19352,7 +19358,11 @@ describe("TaskService", () => {
       testTaskSettings(1, 3)
     );
 
-    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    // In-session context recovery recorded a started retry for the
+    // context_exceeded event below, so the task must keep running.
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+      waitForPendingStreamErrorRecoveryDecision: mock(() => Promise.resolve("retry-started")),
+    });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
     const internal = taskService as unknown as {
@@ -19370,8 +19380,8 @@ describe("TaskService", () => {
     });
 
     // context_exceeded is non-retryable but has in-session recovery (compaction
-    // retry / exec-subagent hard restart) racing on the same error event;
-    // settling here would interrupt a child that was about to continue.
+    // retry) listening on the same error event; while that recovery is preparing
+    // a retry, settling here would interrupt a child that was about to continue.
     await internal.handleTaskStreamError({
       type: "error",
       workspaceId: childId,
@@ -19397,6 +19407,69 @@ describe("TaskService", () => {
       .find((workspace) => workspace.id === childId);
     expect(childWorkspace?.taskStatus).toBe("running");
     expect(childWorkspace?.taskLaunchError).toBeUndefined();
+  });
+
+  test("settles a running task on context_exceeded once in-session recovery declines", async () => {
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const parentId = "parent-111";
+    const childId = "child-222";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentId),
+        projectWorkspace(projectPath, "child", childId, {
+          name: "agent_explore_child",
+          parentWorkspaceId: parentId,
+          agentType: "explore",
+          taskStatus: "running",
+          taskModelString: "openai:gpt-5.5-pro",
+        }),
+      ],
+      testTaskSettings(1, 3)
+    );
+
+    // Recovery decision resolved terminal: compaction retries declined and the
+    // turn failed with no later stream-end. An unrelated queued message on the
+    // child must NOT keep the task running — the terminal error path never
+    // dispatches the queue.
+    const { workspaceService, sendMessage, resumeStream } = createWorkspaceServiceMocks({
+      waitForPendingStreamErrorRecoveryDecision: mock(() => Promise.resolve("terminal")),
+      hasQueuedMessages: mock((workspaceId: string) => workspaceId === childId),
+      hasPendingQueuedOrPreparingTurn: mock((workspaceId: string) => workspaceId === childId),
+    });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const internal = taskService as unknown as {
+      handleTaskStreamError: (event: ErrorEvent) => Promise<void>;
+    };
+
+    const contextMessage = "Prompt is too long: 250000 tokens > 200000 maximum";
+    await internal.handleTaskStreamError({
+      type: "error",
+      workspaceId: childId,
+      messageId: "assistant-error-context",
+      error: contextMessage,
+      errorType: "context_exceeded",
+    });
+
+    // No stream-end follows a terminal handleStreamError, so the task must be
+    // settled here; otherwise the parent's waitForAgentReport blocks until timeout.
+    await flushTerminalAttentionDrains(taskService);
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(resumeStream).toHaveBeenCalledWith(parentId, expect.any(Object), {
+      agentInitiated: true,
+    });
+
+    const postCfg = config.loadConfigOrDefault();
+    const childWorkspace = Array.from(postCfg.projects.values())
+      .flatMap((project) => project.workspaces)
+      .find((workspace) => workspace.id === childId);
+    expect(childWorkspace?.taskStatus).toBe("interrupted");
+    expect(childWorkspace?.taskLaunchError).toBe(contextMessage);
   });
 
   test("background task refusal stays observable after cleanup and restart via failure artifact", async () => {

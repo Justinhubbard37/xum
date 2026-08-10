@@ -19,7 +19,6 @@ import type {
   WorkspaceChatMessage,
   SendMessageOptions,
   FilePart,
-  DeleteMessage,
   OnChatMode,
   OnChatCursor,
   ProvidersConfigMap,
@@ -79,11 +78,7 @@ import {
 import {
   createRuntimeContextForWorkspace,
   createRuntimeForWorkspace,
-  type WorkspaceRuntimeContext,
 } from "@/node/runtime/runtimeHelpers";
-import { isExecLikeEditingCapableInResolvedChain } from "@/common/utils/agentTools";
-import { readAgentDefinition } from "@/node/services/agentDefinitions/agentDefinitionsService";
-import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/resolveAgentInheritanceChain";
 import { MessageQueue } from "./messageQueue";
 import {
   copyStreamLifecycleSnapshot,
@@ -385,10 +380,6 @@ interface AgentSessionOptions {
   telemetryService?: TelemetryService;
   backgroundProcessManager: BackgroundProcessManager;
   workspaceGoalService?: WorkspaceGoalService;
-  /** Destructive clear coordinator used by exec hard restart. */
-  clearHistoryForHardRestart?: (options: {
-    monitorHistoryLockHeld: boolean;
-  }) => Promise<Result<number[]>>;
   /** When true, skip terminating background processes on dispose/compaction (for bench/CI) */
   keepBackgroundProcesses?: boolean;
   /** Called when compaction completes (e.g., to clear idle compaction pending state) */
@@ -406,6 +397,16 @@ enum TurnPhase {
   COMPLETING = "completing",
 }
 
+/**
+ * Recorded outcome of handleStreamError for the current recovery episode.
+ * "retry-started" means an in-session recovery retry completed stream startup
+ * (isStreaming was true at resolution); "terminal" means the error settled
+ * with no retry. Waiters (task/workspace-turn stream-error settlement) act on
+ * this recorded outcome instead of sampling transient phase flags, which a
+ * fast retry could outrun.
+ */
+export type StreamErrorRecoveryOutcome = "retry-started" | "terminal";
+
 type StartupAutoRetryCheckOutcome = "completed" | "deferred";
 
 interface CachedMemoryContext {
@@ -421,9 +422,6 @@ export class AgentSession {
   private readonly initStateManager: InitStateManager;
   private readonly backgroundProcessManager: BackgroundProcessManager;
   private readonly workspaceGoalService?: WorkspaceGoalService;
-  private readonly clearHistoryForHardRestart?: (options: {
-    monitorHistoryLockHeld: boolean;
-  }) => Promise<Result<number[]>>;
   private readonly keepBackgroundProcesses: boolean;
   private readonly onPostCompactionStateChange?: () => void;
   private readonly emitter = new EventEmitter();
@@ -529,9 +527,6 @@ export class AgentSession {
   /** Track user message ids that already retried without post-compaction injection. */
   private readonly postCompactionRetryAttempts = new Set<string>();
 
-  /** Track user message ids that already hard-restarted for exec-like subagents. */
-  private readonly execSubagentHardRestartAttempts = new Set<string>();
-
   /** Backend start time for the current stream, used to avoid charging goals created mid-stream. */
   private activeStreamStartedAtMs?: number;
 
@@ -577,8 +572,23 @@ export class AgentSession {
    */
   private activeStreamFailureHandled = false;
 
-  private streamErrorRecoveryDecision: { promise: Promise<void>; resolve: () => void } | null =
-    null;
+  /**
+   * Stream-error recovery decisions keyed by the failed assistant messageId.
+   * Per-attempt tracking (not a single shared decision) because recovery
+   * episodes can overlap: a retry stream can emit its own error before the
+   * original retry path resumes, and folding both into one decision would let
+   * one episode's "retry-started" mask the other's "terminal". Resolved
+   * outcomes are retained so waiters queued behind workspace event locks can
+   * read the decision after the fact.
+   */
+  private readonly streamErrorRecoveryDecisions = new Map<
+    string,
+    {
+      promise: Promise<StreamErrorRecoveryOutcome>;
+      resolve: (outcome: StreamErrorRecoveryOutcome) => void;
+      outcome?: StreamErrorRecoveryOutcome;
+    }
+  >();
 
   /** Tracks whether the current stream included post-compaction attachments. */
   private activeStreamHadPostCompactionInjection = false;
@@ -598,7 +608,6 @@ export class AgentSession {
     agentInitiated?: boolean;
     openaiTruncationModeOverride?: "auto" | "disabled";
     providersConfig: ProvidersConfigMap | null;
-    monitorHistoryLockHeld?: boolean;
     goalKind?: GoalSyntheticMessageKind;
   };
 
@@ -620,7 +629,6 @@ export class AgentSession {
       telemetryService,
       backgroundProcessManager,
       workspaceGoalService,
-      clearHistoryForHardRestart,
       keepBackgroundProcesses,
       onCompactionComplete,
       onIdleCompactionOutcome,
@@ -638,7 +646,6 @@ export class AgentSession {
     this.initStateManager = initStateManager;
     this.backgroundProcessManager = backgroundProcessManager;
     this.workspaceGoalService = workspaceGoalService;
-    this.clearHistoryForHardRestart = clearHistoryForHardRestart;
     this.keepBackgroundProcesses = keepBackgroundProcesses ?? false;
     this.onPostCompactionStateChange = onPostCompactionStateChange;
 
@@ -893,22 +900,45 @@ export class AgentSession {
     this.emitChatEvent(event);
   }
 
-  private beginStreamErrorRecoveryDecision(): void {
-    let resolveDecision!: () => void;
-    const promise = new Promise<void>((resolve) => {
-      resolveDecision = resolve;
-    });
-    this.streamErrorRecoveryDecision = { promise, resolve: resolveDecision };
-  }
-
-  private resolveStreamErrorRecoveryDecision(): void {
-    const decision = this.streamErrorRecoveryDecision;
-    if (decision == null) {
+  private beginStreamErrorRecoveryDecision(messageId: string): void {
+    // Duplicate error events for the same attempt share one decision.
+    if (this.streamErrorRecoveryDecisions.has(messageId)) {
       return;
     }
 
-    this.streamErrorRecoveryDecision = null;
-    decision.resolve();
+    // Bound retention: evict oldest resolved decisions (insertion order),
+    // never pending ones — deleting a pending decision would orphan waiters.
+    const maxRetainedDecisions = 8;
+    for (const [key, entry] of this.streamErrorRecoveryDecisions) {
+      if (this.streamErrorRecoveryDecisions.size < maxRetainedDecisions) {
+        break;
+      }
+      if (entry.outcome != null) {
+        this.streamErrorRecoveryDecisions.delete(key);
+      }
+    }
+
+    let resolveDecision!: (outcome: StreamErrorRecoveryOutcome) => void;
+    const promise = new Promise<StreamErrorRecoveryOutcome>((resolve) => {
+      resolveDecision = resolve;
+    });
+    this.streamErrorRecoveryDecisions.set(messageId, { promise, resolve: resolveDecision });
+  }
+
+  private resolveStreamErrorRecoveryDecision(
+    messageId: string,
+    outcome: StreamErrorRecoveryOutcome
+  ): void {
+    const decision = this.streamErrorRecoveryDecisions.get(messageId);
+    // First resolution per attempt wins: the errorHandler's terminal safety
+    // net must not overwrite a "retry-started" already recorded for the same
+    // attempt.
+    if (decision == null || decision.outcome != null) {
+      return;
+    }
+
+    decision.outcome = outcome;
+    decision.resolve(outcome);
   }
 
   private async handleStreamFailureForAutoRetry(error: RetryFailureError): Promise<void> {
@@ -2441,7 +2471,6 @@ export class AgentSession {
       startStreamInBackground?: boolean;
       onAccepted?: () => Promise<void> | void;
       onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
-      monitorHistoryLockState?: { held: boolean };
       onCanceled?: (reason: string) => Promise<void> | void;
       cancelState?: { canceledBeforeAcceptance: boolean };
       cancelSignal?: AbortSignal;
@@ -3177,8 +3206,7 @@ export class AgentSession {
           agentInitiated,
           preparedTurnAbortController.signal,
           goalKind,
-          turnThinkingOverride,
-          internal?.monitorHistoryLockState?.held === true
+          turnThinkingOverride
         );
         if (streamResult.success && preparedTurnAbortController.signal.aborted) {
           await notifyAcceptedPreStreamFailure(
@@ -3842,8 +3870,7 @@ export class AgentSession {
     // Session-owned per-turn holder for mid-turn thinking changes. Passed
     // explicitly (not read from the field) so a preempted turn can never pick
     // up its replacement's holder. Absent for internal retry paths.
-    activeTurnThinkingOverride?: ActiveTurnThinkingOverride,
-    monitorHistoryLockHeld = false
+    activeTurnThinkingOverride?: ActiveTurnThinkingOverride
   ): Promise<Result<void, SendMessageError>> {
     const isStartupAbortRequested = (): boolean => abortSignal?.aborted === true;
 
@@ -3866,7 +3893,6 @@ export class AgentSession {
       agentInitiated,
       openaiTruncationModeOverride,
       ...(goalKind != null ? { goalKind } : {}),
-      monitorHistoryLockHeld,
       providersConfig,
     };
     this.activeStreamUserMessageId = undefined;
@@ -4264,7 +4290,6 @@ export class AgentSession {
     await this.finalizeCompactionRetry(data.messageId);
     this.setAutoRetryResumeState(retryOptionsForResume, retryAgentInitiated, retryGoalKind);
     this.setTurnPhase(TurnPhase.PREPARING);
-    this.resolveStreamErrorRecoveryDecision();
     let retryResult: Result<void, SendMessageError>;
     try {
       retryResult = await this.streamWithHistory(
@@ -4282,6 +4307,10 @@ export class AgentSession {
       }
     }
     if (!retryResult.success) {
+      // Leave the recovery decision pending: the terminal path in
+      // handleStreamError resolves it once settlement state is final, so
+      // waiters (task/workspace-turn settlement) never observe a transient
+      // "retry preparing" that already failed before stream startup.
       log.error("Compaction retry failed to start", {
         workspaceId: this.workspaceId,
         error: retryResult.error,
@@ -4289,6 +4318,10 @@ export class AgentSession {
       return false;
     }
 
+    // streamWithHistory resolves once stream startup completed (the stream is
+    // registered, so isStreaming is true); resolve the recovery decision only
+    // now so waiters observe the actual retry outcome, not a pre-stream state.
+    this.resolveStreamErrorRecoveryDecision(data.messageId, "retry-started");
     return true;
   }
 
@@ -4351,7 +4384,6 @@ export class AgentSession {
 
     // Retry the same request, but without post-compaction injection.
     this.setTurnPhase(TurnPhase.PREPARING);
-    this.resolveStreamErrorRecoveryDecision();
     let retryResult: Result<void, SendMessageError>;
     try {
       retryResult = await this.streamWithHistory(
@@ -4370,6 +4402,9 @@ export class AgentSession {
     }
 
     if (!retryResult.success) {
+      // Leave the recovery decision pending: the terminal path in
+      // handleStreamError resolves it once settlement state is final (see
+      // maybeRetryCompactionOnContextExceeded).
       log.error("Post-compaction retry failed to start", {
         workspaceId: this.workspaceId,
         error: retryResult.error,
@@ -4377,342 +4412,9 @@ export class AgentSession {
       return false;
     }
 
-    return true;
-  }
-
-  private async maybeHardRestartExecSubagentOnContextExceeded(data: {
-    messageId: string;
-    errorType?: string;
-  }): Promise<boolean> {
-    if (data.errorType !== "context_exceeded") {
-      return false;
-    }
-
-    // Only enabled via experiment (and only when we still have a valid retry context).
-    const context = this.activeStreamContext;
-    const requestId = this.activeStreamUserMessageId;
-    const experimentEnabled = context?.options?.experiments?.execSubagentHardRestart === true;
-    if (!experimentEnabled || !context || !requestId) {
-      return false;
-    }
-
-    // Guardrail: don't hard-restart after any meaningful output.
-    // This is intended to recover from "prompt too long" cases before the model starts streaming.
-    if (this.activeStreamHadAnyDelta) {
-      return false;
-    }
-
-    if (this.execSubagentHardRestartAttempts.has(requestId)) {
-      return false;
-    }
-
-    // Guard for test mocks that may not implement getWorkspaceMetadata.
-    if (typeof this.aiService.getWorkspaceMetadata !== "function") {
-      return false;
-    }
-
-    const metadataResult = await this.aiService.getWorkspaceMetadata(this.workspaceId);
-    if (!metadataResult.success) {
-      return false;
-    }
-
-    const metadata = metadataResult.data;
-    if (!metadata.parentWorkspaceId) {
-      return false;
-    }
-
-    const agentIdCandidates = [
-      ...resolvePersistedAgentIdCandidates(metadata),
-      WORKSPACE_DEFAULTS.agentId,
-    ].filter((agentId, index, candidates) => candidates.indexOf(agentId) === index);
-    let resolvedAgentIdForLog = agentIdCandidates[0] ?? WORKSPACE_DEFAULTS.agentId;
-
-    const metadataCandidates: Array<typeof metadata> = [metadata];
-
-    try {
-      const parentMetadataResult = await this.aiService.getWorkspaceMetadata(
-        metadata.parentWorkspaceId
-      );
-      if (parentMetadataResult.success) {
-        metadataCandidates.push(parentMetadataResult.data);
-      }
-    } catch {
-      // Ignore: child discovery still handles built-in agents.
-    }
-
-    const discoveryContexts: WorkspaceRuntimeContext[] = [];
-    for (const agentMetadata of metadataCandidates) {
-      try {
-        const { runtime, workspacePath } = createRuntimeContextForWorkspace(agentMetadata);
-        discoveryContexts.push({
-          runtime,
-          workspacePath:
-            context.options?.disableWorkspaceAgents === true
-              ? agentMetadata.projectPath
-              : workspacePath,
-        });
-      } catch {
-        // Ignore: try the next metadata source.
-      }
-    }
-
-    let chain: Awaited<ReturnType<typeof resolveAgentInheritanceChain>> | undefined;
-    for (const candidateAgentId of agentIdCandidates) {
-      let fallbackChain: Awaited<ReturnType<typeof resolveAgentInheritanceChain>> | undefined;
-      let fallbackAgentId: string | undefined;
-      for (const discovery of discoveryContexts) {
-        try {
-          const agentDefinition = await readAgentDefinition(
-            discovery.runtime,
-            discovery.workspacePath,
-            candidateAgentId
-          );
-          const candidateChain = await resolveAgentInheritanceChain({
-            runtime: discovery.runtime,
-            workspacePath: discovery.workspacePath,
-            agentId: agentDefinition.id,
-            agentDefinition,
-            workspaceId: this.workspaceId,
-          });
-
-          if (agentDefinition.scope === "project") {
-            chain = candidateChain;
-            resolvedAgentIdForLog = agentDefinition.id;
-            break;
-          }
-          fallbackChain ??= candidateChain;
-          fallbackAgentId ??= agentDefinition.id;
-        } catch {
-          // Try the next discovery context before moving to the next persisted agent id.
-        }
-      }
-
-      if (chain != null) {
-        break;
-      }
-      if (fallbackChain != null) {
-        chain = fallbackChain;
-        resolvedAgentIdForLog = fallbackAgentId ?? resolvedAgentIdForLog;
-        break;
-      }
-    }
-
-    if (!chain) {
-      // If we fail to resolve tool policy/inheritance, treat as non-exec-like.
-      return false;
-    }
-
-    if (!isExecLikeEditingCapableInResolvedChain(chain)) {
-      return false;
-    }
-
-    this.execSubagentHardRestartAttempts.add(requestId);
-
-    const continuationNotice =
-      "Context limit reached. Mux restarted this agent's chat history and will replay your original prompt below. " +
-      "Continue using only the current workspace state (files, git history, command output); " +
-      "re-inspect the repo as needed.";
-
-    log.info("Exec-like subagent hit context limit; hard-restarting history and retrying", {
-      workspaceId: this.workspaceId,
-      requestId,
-      model: context.modelString,
-      agentId: resolvedAgentIdForLog,
-    });
-
-    // Only need the current compaction epoch — if compaction already happened, the
-    // original task prompt is summarized in the boundary and pre-boundary messages
-    // aren't useful for replaying.
-    const historyResult = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
-    if (!historyResult.success) {
-      return false;
-    }
-
-    const messages = historyResult.data;
-
-    const firstPromptIndex = messages.findIndex(
-      (msg) => msg.role === "user" && msg.metadata?.synthetic !== true
-    );
-    if (firstPromptIndex === -1) {
-      return false;
-    }
-
-    // Include any synthetic snapshots that were persisted immediately before the task prompt.
-    let seedStartIndex = firstPromptIndex;
-    for (let i = firstPromptIndex - 1; i >= 0; i -= 1) {
-      const msg = messages[i];
-      const isSnapshot =
-        msg.role === "user" &&
-        msg.metadata?.synthetic === true &&
-        (msg.metadata?.fileAtMentionSnapshot ?? msg.metadata?.agentSkillSnapshot);
-      if (!isSnapshot) {
-        break;
-      }
-      seedStartIndex = i;
-    }
-
-    const seedMessages = messages.slice(seedStartIndex, firstPromptIndex + 1);
-    if (seedMessages.length === 0) {
-      return false;
-    }
-
-    // Best-effort: discard pending post-compaction state so we don't immediately re-inject it.
-    this.postCompactionLoadedSkills = [];
-    try {
-      await this.compactionHandler.discardPendingState("execSubagentHardRestart");
-      this.onPostCompactionStateChange?.();
-    } catch (error) {
-      log.warn("Failed to discard pending post-compaction state before hard restart", {
-        workspaceId: this.workspaceId,
-        error: getErrorMessage(error),
-      });
-    }
-
-    // Abort the failed assistant placeholder and clean up partial/history state.
-    this.activeCompactionRequest = undefined;
-    this.resetActiveStreamState();
-    if (!this.disposed) {
-      this.clearQueue();
-    }
-
-    this.emitChatEvent({
-      type: "stream-abort",
-      workspaceId: this.workspaceId,
-      messageId: data.messageId,
-    });
-
-    const partialDeleteResult = await this.historyService.deletePartial(this.workspaceId);
-    if (!partialDeleteResult.success) {
-      log.warn("Failed to delete partial before exec subagent hard restart", {
-        workspaceId: this.workspaceId,
-        error: partialDeleteResult.error,
-      });
-    }
-
-    this.clearUsageState();
-    const clearResult = this.clearHistoryForHardRestart
-      ? await this.clearHistoryForHardRestart({
-          monitorHistoryLockHeld: context.monitorHistoryLockHeld === true,
-        })
-      : await this.historyService.clearHistory(this.workspaceId);
-    if (!clearResult.success) {
-      log.warn("Failed to clear history for exec subagent hard restart", {
-        workspaceId: this.workspaceId,
-        error: clearResult.error,
-      });
-      return false;
-    }
-
-    // This clear bypasses WorkspaceService.replaceHistory, so announce it on the chat funnel the
-    // timeline already consumes: a log that cannot explain missing history defeats its purpose.
-    this.emitChatEvent({
-      type: "history-cleared",
-      workspaceId: this.workspaceId,
-      reason: "exec sub-agent hard restart",
-    });
-
-    const deletedSequences = clearResult.data;
-    if (deletedSequences.length > 0) {
-      const deleteMessage: DeleteMessage = {
-        type: "delete",
-        historySequences: deletedSequences,
-      };
-      this.emitChatEvent(deleteMessage);
-    }
-
-    const cloneForAppend = (msg: MuxMessage): MuxMessage => {
-      const metadataCopy = msg.metadata ? { ...msg.metadata } : undefined;
-      if (metadataCopy) {
-        metadataCopy.historySequence = undefined;
-        metadataCopy.partial = undefined;
-        metadataCopy.error = undefined;
-        metadataCopy.errorType = undefined;
-      }
-
-      return {
-        ...msg,
-        metadata: metadataCopy,
-        parts: [...msg.parts],
-      };
-    };
-
-    const continuationMessage = createMuxMessage(
-      createUserMessageId(),
-      "user",
-      continuationNotice,
-      {
-        timestamp: Date.now(),
-        synthetic: true,
-        uiVisible: true,
-      }
-    );
-
-    const messagesToAppend = [continuationMessage, ...seedMessages.map(cloneForAppend)];
-    for (const message of messagesToAppend) {
-      const appendResult = await this.historyService.appendToHistory(this.workspaceId, message);
-      if (!appendResult.success) {
-        log.error("Failed to append message during exec subagent hard restart", {
-          workspaceId: this.workspaceId,
-          messageId: message.id,
-          error: appendResult.error,
-        });
-        return false;
-      }
-
-      // Add type: "message" for discriminated union (MuxMessage doesn't have it)
-      this.emitChatEvent({
-        ...message,
-        type: "message" as const,
-      });
-    }
-
-    const existingInstructions = context.options?.additionalSystemInstructions;
-    const mergedAdditionalSystemInstructions = existingInstructions
-      ? `${continuationNotice}\n\n${existingInstructions}`
-      : continuationNotice;
-
-    const retryOptions: SendMessageOptions | undefined = context.options
-      ? {
-          ...context.options,
-          additionalSystemInstructions: mergedAdditionalSystemInstructions,
-        }
-      : {
-          model: context.modelString,
-          agentId: WORKSPACE_DEFAULTS.agentId,
-          additionalSystemInstructions: mergedAdditionalSystemInstructions,
-          experiments: {
-            execSubagentHardRestart: true,
-          },
-        };
-
-    this.setAutoRetryResumeState(retryOptions, context.agentInitiated, context.goalKind);
-    this.setTurnPhase(TurnPhase.PREPARING);
-    this.resolveStreamErrorRecoveryDecision();
-    let retryResult: Result<void, SendMessageError>;
-    try {
-      retryResult = await this.streamWithHistory(
-        context.modelString,
-        retryOptions,
-        context.openaiTruncationModeOverride,
-        undefined,
-        context.agentInitiated,
-        undefined,
-        context.goalKind
-      );
-    } finally {
-      if (this.turnPhase === TurnPhase.PREPARING) {
-        this.setTurnPhase(TurnPhase.IDLE);
-      }
-    }
-
-    if (!retryResult.success) {
-      log.error("Exec subagent hard restart retry failed to start", {
-        workspaceId: this.workspaceId,
-        error: retryResult.error,
-      });
-      return false;
-    }
-
+    // Resolve only after startup completed so waiters observe the actual
+    // retry outcome (see maybeRetryCompactionOnContextExceeded).
+    this.resolveStreamErrorRecoveryDecision(data.messageId, "retry-started");
     return true;
   }
 
@@ -4843,15 +4545,6 @@ export class AgentSession {
       return; // retry set PREPARING
     }
 
-    if (
-      await this.maybeHardRestartExecSubagentOnContextExceeded({
-        messageId: data.messageId,
-        errorType: data.errorType,
-      })
-    ) {
-      return; // retry set PREPARING
-    }
-
     // Terminal error — no retry succeeded
     const failedUserMessageId = this.activeStreamUserMessageId;
     const failureType = data.errorType ?? "unknown";
@@ -4871,7 +4564,7 @@ export class AgentSession {
       message: data.error,
     });
     await this.updateStartupAutoRetryAbandonFromFailure(failureType, failedUserMessageId);
-    this.resolveStreamErrorRecoveryDecision();
+    this.resolveStreamErrorRecoveryDecision(data.messageId, "terminal");
 
     this.emitChatEvent(streamErrorMessage);
     this.setTurnPhase(TurnPhase.IDLE);
@@ -5308,12 +5001,20 @@ export class AgentSession {
       }
       const data = raw as StreamErrorPayload & { workspaceId: string };
       this.activeStreamErrorEventReceived = true;
-      this.beginStreamErrorRecoveryDecision();
+      // Begin synchronously at event emission so settlement waiters (which
+      // observe the same AIService error event) always find this attempt's
+      // decision when they run.
+      this.beginStreamErrorRecoveryDecision(data.messageId);
       void this.handleStreamError({
         messageId: data.messageId,
         error: data.error,
         errorType: data.errorType,
-      }).finally(() => this.resolveStreamErrorRecoveryDecision());
+      })
+        // Safety net for exceptions inside handleStreamError: a successful
+        // retry already resolved "retry-started" for this attempt (no-op
+        // here); an unwound handler means no retry survived, so record
+        // terminal.
+        .finally(() => this.resolveStreamErrorRecoveryDecision(data.messageId, "terminal"));
     };
 
     this.aiListeners.push({ event: "error", handler: errorHandler });
@@ -5496,7 +5197,6 @@ export class AgentSession {
       onAccepted?: () => Promise<void> | void;
       onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
       onCanceled?: (reason: string) => Promise<void> | void;
-      monitorHistoryLockState?: { held: boolean };
       cancelState?: { canceledBeforeAcceptance: boolean };
       cancelSignal?: AbortSignal;
     }
@@ -5704,8 +5404,20 @@ export class AgentSession {
     return true;
   }
 
-  async waitForPendingStreamErrorRecoveryDecision(): Promise<void> {
-    await this.streamErrorRecoveryDecision?.promise;
+  /**
+   * Waits for the stream-error recovery decision of one failed attempt
+   * (keyed by the error event's assistant messageId) and returns its outcome.
+   * Late callers receive the retained outcome; undefined means no decision
+   * was recorded for that attempt (e.g. the session was recreated).
+   */
+  async waitForPendingStreamErrorRecoveryDecision(
+    messageId: string
+  ): Promise<StreamErrorRecoveryOutcome | undefined> {
+    const decision = this.streamErrorRecoveryDecisions.get(messageId);
+    if (decision == null) {
+      return undefined;
+    }
+    return decision.outcome ?? decision.promise;
   }
 
   hasPendingAutoRetry(): boolean {

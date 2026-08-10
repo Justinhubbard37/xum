@@ -24,7 +24,7 @@ import { askUserQuestionManager } from "@/node/services/askUserQuestionManager";
 import { delegatedToolCallManager } from "@/node/services/delegatedToolCallManager";
 import { log } from "@/node/services/log";
 import { isPathInsideDir } from "@/node/utils/pathUtils";
-import { AgentSession } from "@/node/services/agentSession";
+import { AgentSession, type StreamErrorRecoveryOutcome } from "@/node/services/agentSession";
 import type { HistoryService } from "@/node/services/historyService";
 import type { AIService } from "@/node/services/aiService";
 import type { InitStateManager } from "@/node/services/initStateManager";
@@ -2272,7 +2272,7 @@ export class WorkspaceService extends EventEmitter {
 
   private drainBashMonitorWakes(ownerWorkspaceId: string): Promise<void> {
     // No wake may own the history mutex until startup recovery has finished discovering and
-    // converting stale registry records. This also makes the lock-held hard-restart path safe.
+    // converting stale registry records.
     return this.bashMonitorRecoveryPromise.then(() =>
       this.bashMonitorHistoryLocks.withLock(ownerWorkspaceId, () =>
         this.drainBashMonitorWakesUnlocked(ownerWorkspaceId)
@@ -2546,7 +2546,6 @@ export class WorkspaceService extends EventEmitter {
         skipAutoResumeReset: true,
         synthetic: true,
         agentInitiated: true,
-        monitorHistoryLockState: { held: true },
         cancelState: cancellation.dispatchState,
         cancelSignal: cancellation.abortController.signal,
         queueDedupeKey: queueKey,
@@ -3490,13 +3489,6 @@ export class WorkspaceService extends EventEmitter {
       telemetryService: this.telemetryService,
       initStateManager: this.initStateManager,
       workspaceGoalService: this.workspaceGoalService,
-      clearHistoryForHardRestart: ({ monitorHistoryLockHeld }) => {
-        const clear = () => this.historyService.clearHistory(workspaceId);
-        const options = { discardUnacceptedOnSuccess: true };
-        return monitorHistoryLockHeld
-          ? this.clearHistoryWithRetiredBashMonitorWakesUnlocked(workspaceId, clear, options)
-          : this.clearHistoryWithRetiredBashMonitorWakes(workspaceId, clear, options);
-      },
       backgroundProcessManager: this.backgroundProcessManager,
       onCompactionComplete: (metadata) => {
         this.schedulePostCompactionMetadataRefresh(workspaceId);
@@ -8484,7 +8476,6 @@ export class WorkspaceService extends EventEmitter {
       onCanceled?: (reason: string) => Promise<void> | void;
       onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
       cancelState?: { canceledBeforeAcceptance: boolean };
-      monitorHistoryLockState?: { held: boolean };
       /** Cancels a synthetic send even after it has left MessageQueue for PREPARING. */
       cancelSignal?: AbortSignal;
       /** Return once the user message is accepted; stream startup continues asynchronously. */
@@ -8609,7 +8600,6 @@ export class WorkspaceService extends EventEmitter {
             synthetic: internal?.synthetic,
             agentInitiated: internal?.agentInitiated,
             goalKind: internal?.goalKind,
-            monitorHistoryLockState: internal?.monitorHistoryLockState,
             cancelState: internal?.cancelState,
             cancelSignal: internal?.cancelSignal,
             onCanceled: internal?.onCanceled,
@@ -8692,12 +8682,6 @@ export class WorkspaceService extends EventEmitter {
           return Ok(undefined);
         }
 
-        if (internal?.monitorHistoryLockState != null) {
-          // The originating drain releases its mutex as soon as this enqueue returns. Deferred
-          // dispatch must reacquire it during any later hard restart.
-          internal.monitorHistoryLockState.held = false;
-        }
-
         // Background any foreground task waits so the queued message can dispatch promptly.
         // This must happen after queueMessage succeeds — if enqueue fails (throws),
         // we must not cancel foreground waits. Use the queue's effective dispatch mode
@@ -8707,7 +8691,6 @@ export class WorkspaceService extends EventEmitter {
           agentInitiated: internal?.agentInitiated,
           dedupeKey: internal?.queueDedupeKey,
           removableDedupeKey: internal?.removableQueueDedupeKey,
-          monitorHistoryLockState: internal?.monitorHistoryLockState,
           cancelState: internal?.cancelState,
           cancelSignal: internal?.cancelSignal,
           onCanceled: internal?.onCanceled,
@@ -8786,7 +8769,6 @@ export class WorkspaceService extends EventEmitter {
         goalKind: internal?.goalKind,
         goalContinuation: internal?.goalContinuation,
         startStreamInBackground: internal?.startStreamInBackground,
-        monitorHistoryLockState: internal?.monitorHistoryLockState,
         cancelState: internal?.cancelState,
         cancelSignal: internal?.cancelSignal,
         onCanceled: internal?.onCanceled,
@@ -9432,9 +9414,12 @@ export class WorkspaceService extends EventEmitter {
     return this.sessions.get(workspaceId.trim())?.hasQueuedMessages(dispatchMode) ?? false;
   }
 
-  async waitForPendingStreamErrorRecoveryDecision(workspaceId: string): Promise<void> {
+  async waitForPendingStreamErrorRecoveryDecision(
+    workspaceId: string,
+    messageId: string
+  ): Promise<StreamErrorRecoveryOutcome | undefined> {
     const session = this.sessions.get(workspaceId.trim());
-    await session?.waitForPendingStreamErrorRecoveryDecision();
+    return session?.waitForPendingStreamErrorRecoveryDecision(messageId);
   }
 
   async waitForIdle(workspaceId: string): Promise<void> {
