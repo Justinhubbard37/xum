@@ -49,13 +49,7 @@ import {
   findWorkspaceEntry,
 } from "@/node/services/taskUtils";
 import { validateWorkspaceName } from "@/common/utils/validation/workspaceValidation";
-import {
-  TASK_GROUP_KIND,
-  getTaskGroupCount,
-  normalizeTaskGroupKind,
-  normalizeTaskGroupLabel,
-  type TaskGroupKind,
-} from "@/common/utils/tools/taskGroups";
+import { getTaskGroupCount } from "@/common/utils/tools/taskGroups";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { Ok, Err, type Result } from "@/common/types/result";
 import { DEFAULT_TASK_SETTINGS, type TaskSettings } from "@/common/types/tasks";
@@ -234,8 +228,6 @@ export interface TaskCreateArgs {
     groupId: string;
     index: number;
     total: number;
-    kind?: TaskGroupKind;
-    label?: string;
   };
   workflowTask?: {
     runId: string;
@@ -943,6 +935,62 @@ function collectReferencedTaskIdsFromTaskToolOutput(output: unknown, into: Set<s
       }
     }
   }
+}
+
+interface RecoveredTaskToolInput {
+  data: z.infer<typeof TaskToolArgsSchema>;
+  groupCount: number;
+  legacyVariants: boolean;
+}
+
+/**
+ * Persisted partials may contain the removed `variants` input. Keep that field out of the
+ * model-facing schema while accepting it narrowly during crash recovery so completed legacy
+ * siblings can still finalize their parent tool call.
+ */
+function parseTaskToolInputForRecovery(input: unknown): RecoveredTaskToolInput | null {
+  const current = TaskToolArgsSchema.safeParse(input);
+  if (current.success) {
+    return {
+      data: current.data,
+      groupCount: getTaskGroupCount(current.data),
+      legacyVariants: false,
+    };
+  }
+
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return null;
+  }
+
+  const sanitized = { ...(input as Record<string, unknown>) };
+  const variants = sanitized.variants;
+  delete sanitized.variants;
+  const parsed = TaskToolArgsSchema.safeParse(sanitized);
+  if (!parsed.success) {
+    return null;
+  }
+
+  if (variants == null) {
+    return {
+      data: parsed.data,
+      groupCount: getTaskGroupCount(parsed.data),
+      legacyVariants: false,
+    };
+  }
+  if (!Array.isArray(variants) || variants.length < 1 || variants.length > 20) {
+    return null;
+  }
+
+  const labels = variants.map((variant) => (typeof variant === "string" ? variant.trim() : ""));
+  if (labels.some((label) => label.length === 0) || new Set(labels).size !== labels.length) {
+    return null;
+  }
+
+  return {
+    data: parsed.data,
+    groupCount: labels.length,
+    legacyVariants: true,
+  };
 }
 
 function collectWorkflowRunIdsFromTaskAwaitInput(input: unknown): string[] {
@@ -2494,7 +2542,9 @@ export class TaskService {
     const bestOfParentWorkspaceIds = new Set<string>();
     for (const task of completedReportTasks) {
       const parentWorkspaceId = coerceNonEmptyString(task.parentWorkspaceId);
-      if (!parentWorkspaceId || (task.bestOf?.total ?? 1) <= 1) {
+      const taskId = coerceNonEmptyString(task.id);
+      const bestOf = taskId ? this.getEffectiveTaskGroup(taskId, task) : undefined;
+      if (!parentWorkspaceId || (bestOf?.total ?? 1) <= 1) {
         continue;
       }
       if (this.aiService.isStreaming(parentWorkspaceId)) {
@@ -2657,20 +2707,10 @@ export class TaskService {
         if (bestOf.index >= bestOf.total) {
           return Err("Task.createMany: bestOf.index must be less than bestOf.total");
         }
-        const kind = normalizeTaskGroupKind(bestOf.kind);
-        const label = normalizeTaskGroupLabel(bestOf.label);
-        if (kind === TASK_GROUP_KIND.VARIANTS && !label) {
-          return Err("Task.createMany: bestOf.label is required when bestOf.kind is variants");
-        }
-        if (kind !== TASK_GROUP_KIND.VARIANTS && label) {
-          return Err("Task.createMany: bestOf.label is only allowed when bestOf.kind is variants");
-        }
         normalizedBestOf = {
           groupId,
           index: bestOf.index,
           total: bestOf.total,
-          kind,
-          ...(label ? { label } : {}),
         };
       }
 
@@ -3796,21 +3836,10 @@ export class TaskService {
         return Err("Task.create: bestOf.index must be less than bestOf.total");
       }
 
-      const kind = normalizeTaskGroupKind(bestOf.kind);
-      const label = normalizeTaskGroupLabel(bestOf.label);
-      if (kind === TASK_GROUP_KIND.VARIANTS && !label) {
-        return Err("Task.create: bestOf.label is required when bestOf.kind is variants");
-      }
-      if (kind !== TASK_GROUP_KIND.VARIANTS && label) {
-        return Err("Task.create: bestOf.label is only allowed when bestOf.kind is variants");
-      }
-
       normalizedBestOf = {
         groupId,
         index: bestOf.index,
         total: bestOf.total,
-        kind,
-        ...(label ? { label } : {}),
       };
     }
 
@@ -9517,7 +9546,7 @@ export class TaskService {
           skipInitHook,
           preferredTrunkBranch: task.taskTrunkBranch,
           workflowTask: task.workflowTask,
-          bestOf: task.bestOf,
+          bestOf: this.getEffectiveTaskGroup(taskId, task),
           experiments: task.taskExperiments,
         });
       }
@@ -11161,7 +11190,7 @@ export class TaskService {
     this.rejectWaiters(workspaceId, options?.rejectionError ?? new Error("Task interrupted"));
 
     const parentWorkspaceId = entry.workspace.parentWorkspaceId;
-    const bestOf = entry.workspace.bestOf;
+    const bestOf = this.getEffectiveTaskGroup(workspaceId, entry.workspace);
     if (
       parentWorkspaceId &&
       bestOf?.total != null &&
@@ -11565,12 +11594,12 @@ export class TaskService {
       return null;
     }
 
-    const parsedInput = TaskToolArgsSchema.safeParse(pendingParts[0].input);
-    if (!parsedInput.success) {
+    const parsedInput = parseTaskToolInputForRecovery(pendingParts[0].input);
+    if (!parsedInput) {
       return null;
     }
 
-    const requestedTotal = getTaskGroupCount(parsedInput.data);
+    const requestedTotal = parsedInput.groupCount;
     if (requestedTotal <= 1) {
       return null;
     }
@@ -11609,6 +11638,30 @@ export class TaskService {
         const entry = groups.get(groupId) ?? { groupId, total, createdAtMs: [] };
         const createdAtMs =
           typeof workspace.createdAt === "string" ? Date.parse(workspace.createdAt) : Number.NaN;
+        if (Number.isFinite(createdAtMs)) {
+          entry.createdAtMs.push(createdAtMs);
+        }
+        groups.set(groupId, entry);
+      }
+    }
+
+    if (parsedInput.legacyVariants) {
+      for (const workspace of this.config.listLegacyTaskVariantWorkspaces(parentWorkspaceId)) {
+        const { groupId, total } = workspace.bestOf;
+        if (total !== requestedTotal) {
+          continue;
+        }
+
+        const workspaceAgentId = normalizeAgentId(workspace.agentId ?? workspace.agentType, "");
+        if (requestedAgentId && workspaceAgentId && workspaceAgentId !== requestedAgentId) {
+          continue;
+        }
+        if (requestedTitle && workspace.title && workspace.title !== requestedTitle) {
+          continue;
+        }
+
+        const entry = groups.get(groupId) ?? { groupId, total, createdAtMs: [] };
+        const createdAtMs = workspace.createdAt ? Date.parse(workspace.createdAt) : Number.NaN;
         if (Number.isFinite(createdAtMs)) {
           entry.createdAtMs.push(createdAtMs);
         }
@@ -12391,8 +12444,6 @@ export class TaskService {
     index: number;
     agentId?: string;
     agentType?: string;
-    kind: TaskGroupKind;
-    label?: string;
     taskStatus?: WorkspaceConfigEntry["taskStatus"];
   }> {
     const cfg = this.config.loadConfigOrDefault();
@@ -12401,8 +12452,6 @@ export class TaskService {
       index: number;
       agentId?: string;
       agentType?: string;
-      kind: TaskGroupKind;
-      label?: string;
       taskStatus?: WorkspaceConfigEntry["taskStatus"];
     }> = [];
 
@@ -12427,13 +12476,23 @@ export class TaskService {
           index: workspace.bestOf.index,
           agentId: coerceNonEmptyString(workspace.agentId),
           agentType: coerceNonEmptyString(workspace.agentType),
-          kind: normalizeTaskGroupKind(workspace.bestOf.kind),
-          ...(normalizeTaskGroupLabel(workspace.bestOf.label)
-            ? { label: normalizeTaskGroupLabel(workspace.bestOf.label) }
-            : {}),
           taskStatus: workspace.taskStatus,
         });
       }
+    }
+
+    const siblingTaskIds = new Set(siblings.map((sibling) => sibling.taskId));
+    for (const workspace of this.config.listLegacyTaskVariantWorkspaces(params.parentWorkspaceId)) {
+      if (workspace.bestOf.groupId !== params.groupId || siblingTaskIds.has(workspace.id)) {
+        continue;
+      }
+      siblings.push({
+        taskId: workspace.id,
+        index: workspace.bestOf.index,
+        agentId: workspace.agentId,
+        agentType: workspace.agentType,
+        taskStatus: workspace.taskStatus,
+      });
     }
 
     siblings.sort(
@@ -12476,8 +12535,6 @@ export class TaskService {
       title?: string;
       agentId?: string;
       agentType?: string;
-      groupKind?: TaskGroupKind;
-      label?: string;
       modelString?: string;
       thinkingLevel?: ThinkingLevel;
     }> = [];
@@ -12496,8 +12553,6 @@ export class TaskService {
         structuredOutput: artifact.structuredOutput,
         agentId: sibling.agentId,
         agentType: sibling.agentType,
-        groupKind: sibling.kind,
-        label: sibling.label,
         modelString: artifact.model,
         thinkingLevel: artifact.thinkingLevel,
       });
@@ -12545,8 +12600,8 @@ export class TaskService {
 
       if (part.state === "input-available") {
         pendingTaskToolCount += 1;
-        const parsedInput = TaskToolArgsSchema.safeParse(part.input);
-        if (parsedInput.success && getTaskGroupCount(parsedInput.data) > 1) {
+        const parsedInput = parseTaskToolInputForRecovery(part.input);
+        if (parsedInput && parsedInput.groupCount > 1) {
           pendingBestOfTaskToolCount += 1;
         }
         continue;
@@ -12603,6 +12658,17 @@ export class TaskService {
     );
   }
 
+  private getEffectiveTaskGroup(
+    workspaceId: string,
+    workspace: Pick<WorkspaceConfigEntry, "bestOf">
+  ): TaskCreateArgs["bestOf"] {
+    const bestOf = workspace.bestOf ?? this.config.getLegacyTaskVariantGroup(workspaceId);
+    if (!bestOf) {
+      return undefined;
+    }
+    return { groupId: bestOf.groupId, index: bestOf.index, total: bestOf.total };
+  }
+
   private async deliverReportToParent(
     parentWorkspaceId: string,
     childWorkspaceId: string,
@@ -12620,7 +12686,10 @@ export class TaskService {
     );
 
     let cleanupTaskIds: readonly string[] = [];
-    const bestOfTotal = childEntry?.workspace.bestOf?.total ?? 1;
+    const bestOf = childEntry
+      ? this.getEffectiveTaskGroup(childWorkspaceId, childEntry.workspace)
+      : undefined;
+    const bestOfTotal = bestOf?.total ?? 1;
     if (bestOfTotal > 1) {
       await this.deferredBestOfLocks.withLock(parentWorkspaceId, async () => {
         cleanupTaskIds = await this.deliverReportToParentUnlocked(
@@ -12697,7 +12766,10 @@ export class TaskService {
         return finalization.taskIds.filter((taskId) => taskId !== childWorkspaceId);
       }
 
-      if (childEntry?.workspace.bestOf?.total != null && childEntry.workspace.bestOf.total > 1) {
+      const bestOf = childEntry
+        ? this.getEffectiveTaskGroup(childWorkspaceId, childEntry.workspace)
+        : undefined;
+      if (bestOf?.total != null && bestOf.total > 1) {
         const parentTaskToolState = await this.getTaskToolPartialState(parentWorkspaceId);
 
         // Concurrent sibling completions can arrive after another sibling already finalized
@@ -12711,8 +12783,8 @@ export class TaskService {
           finalization.kind === "not_ready" &&
           (await this.shouldDeferBestOfFallback({
             parentWorkspaceId,
-            groupId: childEntry.workspace.bestOf.groupId,
-            total: childEntry.workspace.bestOf.total,
+            groupId: bestOf.groupId,
+            total: bestOf.total,
           }))
         ) {
           return [];
@@ -12814,17 +12886,16 @@ export class TaskService {
 
     const toolCallId = pendingParts[0].toolCallId;
 
-    const parsedInput = TaskToolArgsSchema.safeParse(pendingParts[0].input);
-    if (!parsedInput.success) {
+    const parsedInput = parseTaskToolInputForRecovery(pendingParts[0].input);
+    if (!parsedInput) {
       log.error("tryFinalizePendingTaskToolCallInPartial: task input validation failed", {
         workspaceId,
-        error: parsedInput.error.message,
       });
       return { kind: "failed" };
     }
 
     let finalizedOutput: z.infer<typeof TaskToolResultSchema> = parsedOutput.data;
-    if (getTaskGroupCount(parsedInput.data) > 1) {
+    if (parsedInput.groupCount > 1) {
       const hasGroupedCompletedOutput =
         Array.isArray(parsedOutput.data.taskIds) &&
         "reports" in parsedOutput.data &&
@@ -12832,7 +12903,8 @@ export class TaskService {
       if (hasGroupedCompletedOutput) {
         finalizedOutput = parsedOutput.data;
       } else {
-        const bestOf = childEntry?.workspace.bestOf;
+        const bestOf =
+          childEntry?.workspace.bestOf ?? this.config.getLegacyTaskVariantGroup(childWorkspaceId);
         if (!bestOf) {
           return { kind: "failed" };
         }
@@ -12913,12 +12985,13 @@ export class TaskService {
       return { ok: false, reason: "task_not_reported" };
     }
 
-    if (entry.workspace.bestOf?.total != null && entry.workspace.bestOf.total > 1) {
+    const bestOf = this.getEffectiveTaskGroup(workspaceId, entry.workspace);
+    if (bestOf?.total != null && bestOf.total > 1) {
       if (
         await this.shouldDeferBestOfFallback({
           parentWorkspaceId,
-          groupId: entry.workspace.bestOf.groupId,
-          total: entry.workspace.bestOf.total,
+          groupId: bestOf.groupId,
+          total: bestOf.total,
         })
       ) {
         return { ok: false, reason: "best_of_parent_partial_pending" };

@@ -261,6 +261,142 @@ describe("Config", () => {
     });
   });
 
+  describe("legacy task variant compatibility", () => {
+    it("loads variant children as ordinary sub-agents without destroying downgrade metadata", async () => {
+      const configFile = path.join(tempDir, "config.json");
+      fs.writeFileSync(
+        configFile,
+        JSON.stringify({
+          projects: [
+            [
+              "/repo",
+              {
+                workspaces: [
+                  {
+                    path: "/repo/legacy-variant",
+                    id: "legacy-variant",
+                    name: "legacy-variant",
+                    parentWorkspaceId: "parent",
+                    bestOf: {
+                      groupId: "legacy-variant-group",
+                      index: 0,
+                      total: 2,
+                      kind: "variants",
+                      label: "frontend",
+                    },
+                  },
+                  {
+                    path: "/repo/best-of",
+                    id: "best-of",
+                    name: "best-of",
+                    parentWorkspaceId: "parent",
+                    bestOf: { groupId: "best-of-group", index: 0, total: 2 },
+                  },
+                ],
+              },
+            ],
+          ],
+        })
+      );
+
+      const workspaces = config.loadConfigOrDefault().projects.get("/repo")?.workspaces;
+      expect(
+        workspaces?.find((workspace) => workspace.id === "legacy-variant")?.bestOf
+      ).toBeUndefined();
+      expect(workspaces?.find((workspace) => workspace.id === "best-of")?.bestOf).toEqual({
+        groupId: "best-of-group",
+        index: 0,
+        total: 2,
+      });
+
+      await flushConfigEdits();
+      const persisted = JSON.parse(fs.readFileSync(configFile, "utf-8")) as {
+        projects?: Array<
+          [
+            string,
+            {
+              workspaces?: Array<{
+                id?: string;
+                bestOf?: {
+                  groupId?: string;
+                  index?: number;
+                  total?: number;
+                  kind?: string;
+                  label?: string;
+                };
+              }>;
+            },
+          ]
+        >;
+      };
+      const persistedWorkspaces = persisted.projects?.[0]?.[1].workspaces;
+      expect(
+        persistedWorkspaces?.find((workspace) => workspace.id === "legacy-variant")?.bestOf
+      ).toEqual({
+        groupId: "legacy-variant-group",
+        index: 0,
+        total: 2,
+        kind: "variants",
+        label: "frontend",
+      });
+      expect(
+        persistedWorkspaces?.find((workspace) => workspace.id === "best-of")?.bestOf?.groupId
+      ).toBe("best-of-group");
+    });
+
+    it("drops variant grouping read from legacy metadata.json", async () => {
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [["/repo", { workspaces: [{ path: "/repo/legacy" }] }]],
+        })
+      );
+      const sessionDir = path.join(tempDir, "sessions", "repo-legacy");
+      fs.mkdirSync(sessionDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(sessionDir, "metadata.json"),
+        JSON.stringify({
+          id: "legacy-child",
+          name: "legacy",
+          projectName: "repo",
+          projectPath: "/repo",
+          parentWorkspaceId: "parent",
+          createdAt: new Date().toISOString(),
+          runtimeConfig: { type: "local" },
+          bestOf: {
+            groupId: "legacy-variant-group",
+            index: 0,
+            total: 2,
+            kind: "variants",
+            label: "frontend",
+          },
+        })
+      );
+
+      const metadata = await config.getAllWorkspaceMetadata();
+      expect(metadata).toHaveLength(1);
+      expect(metadata[0]?.parentWorkspaceId).toBe("parent");
+      expect(metadata[0]?.bestOf).toBeUndefined();
+
+      await flushConfigEdits();
+      const persisted = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
+        projects?: Array<
+          [
+            string,
+            { workspaces?: Array<{ id?: string; bestOf?: { kind?: string; label?: string } }> },
+          ]
+        >;
+      };
+      const persistedWorkspace = persisted.projects?.[0]?.[1].workspaces?.find(
+        (workspace) => workspace.id === "legacy-child"
+      );
+      expect(persistedWorkspace?.bestOf).toMatchObject({
+        kind: "variants",
+        label: "frontend",
+      });
+    });
+  });
+
   describe("legacy workspace migration identity", () => {
     // Regression (PR #3694 Codex P2): the queued ??= migration preserves values already
     // persisted in config. Returned metadata must use those same values — returning a

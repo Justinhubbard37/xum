@@ -16011,27 +16011,6 @@ describe("TaskService", () => {
     expect(workspacePathExists).toBe(false);
   }, 20_000);
 
-  test("Task.create rejects variants metadata without a label", async () => {
-    const config = await createTestConfig(rootDir);
-    const { taskService } = createTaskServiceHarness(config);
-
-    const created = await createAgentTask(taskService, "parent-workspace", "review frontend", {
-      title: "Split review",
-      bestOf: {
-        groupId: "task-group-variants",
-        index: 0,
-        total: 2,
-        kind: "variants",
-      },
-    });
-
-    expect(created.success).toBe(false);
-    if (created.success) {
-      return;
-    }
-    expect(created.error).toContain("bestOf.label is required when bestOf.kind is variants");
-  });
-
   test("agent_report posts report to parent, finalizes pending task tool output, and triggers cleanup", async () => {
     const config = await createTestConfig(rootDir);
 
@@ -16258,7 +16237,7 @@ describe("TaskService", () => {
     toolCallId: string;
     title: string;
     n?: number;
-    variants?: string[];
+    legacyVariants?: string[];
     timestamp: number;
     prompt?: string;
     additionalParts?: MuxMessage["parts"];
@@ -16278,7 +16257,7 @@ describe("TaskService", () => {
             prompt: params.prompt ?? "compare options",
             title: params.title,
             ...(params.n != null ? { n: params.n } : {}),
-            ...(params.variants ? { variants: params.variants } : {}),
+            ...(params.legacyVariants ? { variants: params.legacyVariants } : {}),
           },
           state: "input-available",
         },
@@ -16497,44 +16476,78 @@ describe("TaskService", () => {
     expect(remainingTaskIds).toContain(childTwoId);
   });
 
-  test("agent_report finalizes variants parent output with labels", async () => {
-    const parentId = "parent-variants";
-    const childOneId = "child-variants-1";
-    const childTwoId = "child-variants-2";
-    const taskGroup = {
-      groupId: "task-group-variants",
-      index: 0,
-      total: 2,
-      kind: "variants",
-      label: "frontend",
-    } as const;
+  test("agent_report recovers a pending legacy variants task call", async () => {
+    const parentId = "parent-legacy-variants";
+    const childOneId = "child-legacy-variant-1";
+    const childTwoId = "child-legacy-variant-2";
+    const groupId = "legacy-variant-group";
 
-    const { historyService, partialService, taskService } =
+    const { config, historyService, partialService, taskService } =
       await createBestOfTaskServiceTestHarness({
         parentId,
         children: [
           {
             id: childOneId,
             name: "agent_explore_frontend",
+            title: "Split review",
             taskStatus: "running",
-            bestOf: taskGroup,
+            bestOf: { groupId, index: 0, total: 2 },
           },
           {
             id: childTwoId,
             name: "agent_explore_backend",
+            title: "Split review",
             taskStatus: "running",
-            bestOf: { ...taskGroup, index: 1, label: "backend" },
+            bestOf: { groupId, index: 1, total: 2 },
           },
         ],
       });
 
+    const configFile = path.join(config.rootDir, "config.json");
+    const rawConfig = JSON.parse(await fsPromises.readFile(configFile, "utf-8")) as {
+      projects: Array<[string, { workspaces: Array<Record<string, unknown>> }]>;
+    };
+    for (const [, project] of rawConfig.projects) {
+      for (const workspace of project.workspaces) {
+        if (workspace.id === childOneId) {
+          workspace.bestOf = {
+            groupId,
+            index: 0,
+            total: 2,
+            kind: "variants",
+            label: "frontend",
+          };
+        }
+        if (workspace.id === childTwoId) {
+          workspace.bestOf = {
+            groupId,
+            index: 1,
+            total: 2,
+            kind: "variants",
+            label: "backend",
+          };
+        }
+      }
+    }
+    await fsPromises.writeFile(configFile, JSON.stringify(rawConfig, null, 2));
+
+    const runtimeWorkspaces = Array.from(config.loadConfigOrDefault().projects.values()).flatMap(
+      (project) => project.workspaces
+    );
+    expect(
+      runtimeWorkspaces.find((workspace) => workspace.id === childOneId)?.bestOf
+    ).toBeUndefined();
+    expect(
+      runtimeWorkspaces.find((workspace) => workspace.id === childTwoId)?.bestOf
+    ).toBeUndefined();
+
     await writePendingBestOfParentPartial({
       partialService,
       parentId,
-      messageId: "assistant-parent-variants-partial",
-      toolCallId: "task-variants-call",
+      messageId: "assistant-parent-legacy-variants-partial",
+      toolCallId: "task-legacy-variants-call",
       title: "Split review",
-      variants: ["frontend", "backend"],
+      legacyVariants: ["frontend", "backend"],
       prompt: "Review ${variant} for regressions",
       timestamp: Date.now(),
     });
@@ -16548,9 +16561,11 @@ describe("TaskService", () => {
       title: "Frontend review",
       prompt: "Review frontend for regressions",
     });
-
-    const parentPartialAfterFirst = await partialService.readPartial(parentId);
-    expect(getTaskToolPart(parentPartialAfterFirst)?.state).toBe("input-available");
+    expect(getTaskToolPart(await partialService.readPartial(parentId))?.state).toBe(
+      "input-available"
+    );
+    const parentHistoryAfterFirst = await collectFullHistory(historyService, parentId);
+    expect(JSON.stringify(parentHistoryAfterFirst)).not.toContain("Frontend findings");
 
     await finalizeReportedChildTaskForTest({
       historyService,
@@ -16562,18 +16577,24 @@ describe("TaskService", () => {
       prompt: "Review backend for regressions",
     });
 
-    const parentPartialAfterSecond = await partialService.readPartial(parentId);
-    expect(parentPartialAfterSecond).not.toBeNull();
-    const toolPart = getTaskToolPart(parentPartialAfterSecond);
+    const toolPart = getTaskToolPart(await partialService.readPartial(parentId));
     expect(toolPart?.state).toBe("output-available");
     const serializedOutput = JSON.stringify(toolPart?.output);
-    expect(serializedOutput).toContain(childOneId);
-    expect(serializedOutput).toContain(childTwoId);
     expect(serializedOutput).toContain("Frontend findings");
     expect(serializedOutput).toContain("Backend findings");
-    expect(serializedOutput).toContain('"groupKind":"variants"');
-    expect(serializedOutput).toContain('"label":"frontend"');
-    expect(serializedOutput).toContain('"label":"backend"');
+
+    const persisted = JSON.parse(await fsPromises.readFile(configFile, "utf-8")) as {
+      projects: Array<
+        [string, { workspaces: Array<{ id?: string; bestOf?: { kind?: string; label?: string } }> }]
+      >;
+    };
+    const persistedWorkspaces = persisted.projects.flatMap(([, project]) => project.workspaces);
+    expect(
+      persistedWorkspaces.find((workspace) => workspace.id === childOneId)?.bestOf
+    ).toMatchObject({ kind: "variants", label: "frontend" });
+    expect(
+      persistedWorkspaces.find((workspace) => workspace.id === childTwoId)?.bestOf
+    ).toMatchObject({ kind: "variants", label: "backend" });
   });
 
   // Test exercises real config + history + partial-on-disk I/O across many
@@ -20891,6 +20912,92 @@ describe("TaskService", () => {
     expect(remainingTaskIds).toContain(childTwoId);
 
     expect(remove).not.toHaveBeenCalled();
+  });
+
+  test("initialize finalizes ready legacy variants partials", async () => {
+    const parentId = "parent-legacy-variants-initialize";
+    const childOneId = "child-legacy-variants-initialize-1";
+    const childTwoId = "child-legacy-variants-initialize-2";
+    const groupId = "legacy-variants-initialize-group";
+    const partialTimestamp = Date.now();
+    const createdAt = new Date(partialTimestamp + 60_000).toISOString();
+
+    const { config, partialService, taskService } = await createBestOfTaskServiceTestHarness({
+      parentId,
+      children: [
+        {
+          id: childOneId,
+          name: "agent_explore_frontend",
+          title: "Split review",
+          taskStatus: "reported",
+          createdAt,
+          bestOf: { groupId, index: 0, total: 2 },
+        },
+        {
+          id: childTwoId,
+          name: "agent_explore_backend",
+          title: "Split review",
+          taskStatus: "reported",
+          createdAt,
+          bestOf: { groupId, index: 1, total: 2 },
+        },
+      ],
+    });
+
+    const configFile = path.join(config.rootDir, "config.json");
+    const rawConfig = JSON.parse(await fsPromises.readFile(configFile, "utf-8")) as {
+      projects: Array<[string, { workspaces: Array<Record<string, unknown>> }]>;
+    };
+    for (const [, project] of rawConfig.projects) {
+      for (const workspace of project.workspaces) {
+        if (workspace.id === childOneId) {
+          workspace.bestOf = {
+            groupId,
+            index: 0,
+            total: 2,
+            kind: "variants",
+            label: "frontend",
+          };
+        }
+        if (workspace.id === childTwoId) {
+          workspace.bestOf = {
+            groupId,
+            index: 1,
+            total: 2,
+            kind: "variants",
+            label: "backend",
+          };
+        }
+      }
+    }
+    await fsPromises.writeFile(configFile, JSON.stringify(rawConfig, null, 2));
+
+    await writePendingBestOfParentPartial({
+      partialService,
+      parentId,
+      messageId: "assistant-parent-legacy-variants-initialize",
+      toolCallId: "task-legacy-variants-initialize-call",
+      title: "Split review",
+      legacyVariants: ["frontend", "backend"],
+      prompt: "Review ${variant} for regressions",
+      timestamp: partialTimestamp,
+    });
+    await upsertTestSubagentReports({
+      config,
+      parentId,
+      reports: [
+        { childTaskId: childOneId, reportMarkdown: "Frontend findings", title: "Frontend" },
+        { childTaskId: childTwoId, reportMarkdown: "Backend findings", title: "Backend" },
+      ],
+    });
+
+    await taskService.initialize();
+
+    const toolPart = getTaskToolPart(await partialService.readPartial(parentId));
+    expect(toolPart?.state).toBe("output-available");
+    const serializedOutput = JSON.stringify(toolPart?.output);
+    expect(serializedOutput).toContain("Frontend findings");
+    expect(serializedOutput).toContain("Backend findings");
   });
 
   async function setupPlanModeStreamEndHarness(options?: {
