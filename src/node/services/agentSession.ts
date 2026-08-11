@@ -590,6 +590,12 @@ export class AgentSession {
     }
   >();
 
+  /** Compaction persistence outcomes keyed by the compact assistant message. */
+  private readonly compactionCompletionDecisions = new Map<
+    string,
+    { promise: Promise<boolean>; resolve: (handled: boolean) => void; outcome?: boolean }
+  >();
+
   /** Tracks whether the current stream included post-compaction attachments. */
   private activeStreamHadPostCompactionInjection = false;
 
@@ -609,6 +615,7 @@ export class AgentSession {
     openaiTruncationModeOverride?: "auto" | "disabled";
     providersConfig: ProvidersConfigMap | null;
     goalKind?: GoalSyntheticMessageKind;
+    workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
   };
 
   private activeCompactionRequest?: {
@@ -898,6 +905,22 @@ export class AgentSession {
       return;
     }
     this.emitChatEvent(event);
+  }
+
+  private beginCompactionCompletionDecision(messageId: string): void {
+    if (this.compactionCompletionDecisions.has(messageId)) return;
+    let resolveDecision!: (handled: boolean) => void;
+    const promise = new Promise<boolean>((resolve) => {
+      resolveDecision = resolve;
+    });
+    this.compactionCompletionDecisions.set(messageId, { promise, resolve: resolveDecision });
+  }
+
+  private resolveCompactionCompletionDecision(messageId: string, handled: boolean): void {
+    const decision = this.compactionCompletionDecisions.get(messageId);
+    if (decision == null || decision.outcome != null) return;
+    decision.outcome = handled;
+    decision.resolve(handled);
   }
 
   private beginStreamErrorRecoveryDecision(messageId: string): void {
@@ -2939,6 +2962,7 @@ export class AgentSession {
           options: optionsForStream,
           modelForStream,
           fileParts: followUpFileParts,
+          agentInitiated,
           goalKind,
           muxMetadata: typedMuxMetadata,
           workspaceTurnMetadata: inheritedWorkspaceTurnMetadata,
@@ -3579,6 +3603,7 @@ export class AgentSession {
     options: SendMessageOptions;
     modelForStream: string;
     fileParts?: FilePart[];
+    agentInitiated?: boolean;
     goalKind?: GoalSyntheticMessageKind;
     muxMetadata?: MuxMessageMetadata;
     workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
@@ -3589,6 +3614,10 @@ export class AgentSession {
       agentId: params.options.agentId,
       ...pickPreservedSendOptions(params.options),
     };
+
+    if (params.agentInitiated === true) {
+      followUp.agentInitiated = true;
+    }
 
     if (params.goalKind != null) {
       followUp.goalKind = params.goalKind;
@@ -3756,8 +3785,10 @@ export class AgentSession {
         // buildCompactionMessageText can hide the internal resume marker.
         messageText: "Continue",
         options: streamContext.options,
+        agentInitiated: streamContext.agentInitiated,
         goalKind: streamContext.goalKind,
         modelForStream: streamContext.modelString,
+        muxMetadata: streamContext.workspaceTurnMetadata,
       });
       const autoCompactionRequest = this.buildAutoCompactionRequest({
         followUpContent,
@@ -3771,7 +3802,7 @@ export class AgentSession {
           ...autoCompactionRequest.sendOptions,
           muxMetadata: autoCompactionRequest.metadata,
         },
-        { synthetic: true }
+        { synthetic: true, agentInitiated: autoCompactionRequest.agentInitiated }
       );
       if (!sendResult.success) {
         log.warn("Failed to dispatch mid-stream compaction request", {
@@ -4020,6 +4051,12 @@ export class AgentSession {
           : retryMuxMetadata?.type === "bash-monitor-wake"
             ? inheritOpenWorkspaceTurnMetadata(historyResult.data)
             : undefined;
+    // Mid-stream compaction runs after the original send options have already been resolved against
+    // history (notably bash-monitor wakes). Persist the actual correlation used by this stream so the
+    // post-compaction continuation remains the same delegated workspace turn.
+    if (this.activeStreamContext != null) {
+      this.activeStreamContext.workspaceTurnMetadata = streamMuxMetadata;
+    }
     const acpPromptId =
       normalizeAcpPromptId(options?.acpPromptId) ?? extractAcpPromptId(optionsMuxMetadata);
     const delegatedToolNames =
@@ -4846,10 +4883,14 @@ export class AgentSession {
         streamEndedAtMs: number;
       } | null = null;
       let emittedStreamEnd = false;
+      const completedCompactionRequest = this.activeCompactionRequest;
+      let continuedAfterCompaction = false;
 
       try {
-        const completedCompactionRequest = this.activeCompactionRequest;
         this.activeCompactionRequest = undefined;
+        if (completedCompactionRequest != null) {
+          this.beginCompactionCompletionDecision(streamEndPayload.messageId);
+        }
         this.updateUsageStateFromModelUsage({
           model: streamEndPayload.metadata.model,
           usage: streamEndPayload.metadata.contextUsage,
@@ -4911,8 +4952,9 @@ export class AgentSession {
         this.resetActiveStreamState();
 
         if (handled) {
-          // Dispatch follow-up AFTER reset so it can set its own stream state.
-          await this.dispatchPendingFollowUp();
+          // Dispatch follow-up AFTER reset so it can set its own stream state. Child lifecycle
+          // settlement defers only when this durable continuation was actually accepted.
+          continuedAfterCompaction = await this.dispatchPendingFollowUp();
         }
 
         // Stream end: auto-send queued messages (for user messages typed during streaming)
@@ -4972,6 +5014,13 @@ export class AgentSession {
           }
         }
       } finally {
+        if (completedCompactionRequest != null) {
+          this.resolveCompactionCompletionDecision(
+            streamEndPayload.messageId,
+            continuedAfterCompaction
+          );
+        }
+
         // Only clean up if we're still in COMPLETING — a new turn started by
         // dispatchPendingFollowUp() or sendQueuedMessages()
         // owns the stream state now.
@@ -5404,6 +5453,18 @@ export class AgentSession {
     return true;
   }
 
+  async waitForPendingCompactionCompletionDecision(messageId: string): Promise<boolean> {
+    if (!this.compactionCompletionDecisions.has(messageId)) {
+      if (this.activeCompactionRequest == null) return false;
+      this.beginCompactionCompletionDecision(messageId);
+    }
+    const decision = this.compactionCompletionDecisions.get(messageId);
+    assert(decision, "compaction completion decision must exist");
+    const handled = await (decision.outcome ?? decision.promise);
+    this.compactionCompletionDecisions.delete(messageId);
+    return handled;
+  }
+
   /**
    * Waits for the stream-error recovery decision of one failed attempt
    * (keyed by the error event's assistant messageId) and returns its outcome.
@@ -5775,7 +5836,7 @@ export class AgentSession {
     // The compaction summary is now the source of truth for the next live resume
     // request. Pre-arm retry state from the reconstructed follow-up so failures
     // before stream startup do not fall back to the already-completed compact turn.
-    this.setAutoRetryResumeState(options, undefined, followUp.goalKind);
+    this.setAutoRetryResumeState(options, followUp.agentInitiated, followUp.goalKind);
 
     // Await sendMessage to ensure the follow-up is persisted before returning.
     // This guarantees ordering: the follow-up message is written to history
@@ -5784,6 +5845,7 @@ export class AgentSession {
     // re-enable auto-retry after a user explicitly opted out.
     const sendResult = await this.sendMessage(finalText, options, {
       synthetic: true,
+      agentInitiated: followUp.agentInitiated,
       goalKind: followUp.goalKind,
       goalContinuation: followUp.goalKind === GOAL_CONTINUATION_KIND,
     });
