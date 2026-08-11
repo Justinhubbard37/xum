@@ -1,6 +1,6 @@
 import { getTaskGroupMemberDepth } from "@/browser/components/sidebarItemLayout";
 import {
-  isRunningOrStartingTaskStatus,
+  isSidebarSubAgentRunning,
   isWorkspaceDelegatedActivityActive,
   type AgentRowRenderMeta,
 } from "@/browser/utils/ui/workspaceFiltering";
@@ -81,6 +81,8 @@ export interface SidebarTaskGroupModel {
   runningCount: number;
   queuedCount: number;
   interruptedCount: number;
+  /** Active workflow-run header retained between transient worker steps; not a member-task count. */
+  runActiveWithoutMembers?: boolean;
   /** True while any member is queued or actively working: drives default expansion (D6). */
   hasActiveMember: boolean;
 }
@@ -156,8 +158,8 @@ export function getWorkflowGroupStorageKey(workspace: FrontendWorkspaceMetadata)
 
 /**
  * Collect workflow groups that currently have a non-terminal member. The
- * sidebar accumulates these per session so a run's group stays mounted across
- * step gaps (see ensureWorkflowGroupMembersVisible).
+ * sidebar caches their run-level group model per session so a header can stay
+ * mounted across step gaps after transient worker workspaces are deleted.
  */
 export function collectActiveWorkflowGroupKeys(
   workspaces: FrontendWorkspaceMetadata[],
@@ -166,10 +168,11 @@ export function collectActiveWorkflowGroupKeys(
   const keys = new Set<string>();
   for (const workspace of workspaces) {
     const key = getWorkflowGroupStorageKey(workspace);
-    if (key == null || keys.has(key) || hasCompletedAgentReport(workspace)) {
+    if (key == null || keys.has(key)) {
       continue;
     }
     if (
+      workspace.taskExecutionStatus === "queued" ||
       workspace.taskStatus === "queued" ||
       isWorkspaceDelegatedActivityActive(workspace, options)
     ) {
@@ -177,57 +180,6 @@ export function collectActiveWorkflowGroupKeys(
     }
   }
   return keys;
-}
-
-/**
- * Keep workflow-run groups mounted for the entire run. Between sequential
- * steps every member of a run can be terminal, and completed-sub-agent
- * filtering would hide them all - flashing the group out of the sidebar and
- * back when the next step's task spawns. Re-include hidden leaf members of
- * session-active runs (in their original order) so the group header keeps a
- * stable anchor row.
- */
-export function ensureWorkflowGroupMembersVisible(params: {
-  /** Unfiltered rows in render order. */
-  allRows: FrontendWorkspaceMetadata[];
-  /** Rows that survived completed-sub-agent filtering, in the same order. */
-  visibleRows: FrontendWorkspaceMetadata[];
-  sessionActiveGroupKeys: ReadonlySet<string>;
-}): FrontendWorkspaceMetadata[] {
-  if (params.sessionActiveGroupKeys.size === 0) {
-    return params.visibleRows;
-  }
-
-  const visibleIds = new Set(params.visibleRows.map((workspace) => workspace.id));
-  const parentIdsWithChildren = new Set<string>();
-  for (const workspace of params.allRows) {
-    if (workspace.parentWorkspaceId) {
-      parentIdsWithChildren.add(workspace.parentWorkspaceId);
-    }
-  }
-
-  let changed = false;
-  const result: FrontendWorkspaceMetadata[] = [];
-  for (const workspace of params.allRows) {
-    if (visibleIds.has(workspace.id)) {
-      result.push(workspace);
-      continue;
-    }
-    const key = getWorkflowGroupStorageKey(workspace);
-    if (
-      key != null &&
-      params.sessionActiveGroupKeys.has(key) &&
-      // Leaf-only rule (D4): members with their own subtree are not grouped.
-      !parentIdsWithChildren.has(workspace.id) &&
-      workspace.parentWorkspaceId != null &&
-      // Never resurrect rows whose parent chain is itself hidden.
-      visibleIds.has(workspace.parentWorkspaceId)
-    ) {
-      result.push(workspace);
-      changed = true;
-    }
-  }
-  return changed ? result : params.visibleRows;
 }
 
 function sortBestOfMembers(members: FrontendWorkspaceMetadata[]): FrontendWorkspaceMetadata[] {
@@ -336,10 +288,8 @@ export function computeSidebarTaskGroups(params: {
     let queuedCount = 0;
     let interruptedCount = 0;
     for (const member of allMembers) {
-      if (hasCompletedAgentReport(member)) {
-        completedCount += 1;
-        continue;
-      }
+      // A reawakened child retains its prior report while the private continuation runs. Live
+      // execution state must win over completed-report evidence so grouped rows stay active.
       if (
         isWorkspaceDelegatedActivityActive(member, {
           isWorkspaceLiveActive: params.isWorkspaceLiveActive,
@@ -348,8 +298,12 @@ export function computeSidebarTaskGroups(params: {
         runningCount += 1;
         continue;
       }
-      if (member.taskStatus === "queued") {
+      if (member.taskExecutionStatus === "queued" || member.taskStatus === "queued") {
         queuedCount += 1;
+        continue;
+      }
+      if (hasCompletedAgentReport(member)) {
+        completedCount += 1;
         continue;
       }
       if (member.taskStatus === "interrupted") {
@@ -362,22 +316,19 @@ export function computeSidebarTaskGroups(params: {
     let title: string;
     let totalCount: number;
     if (descriptor.kind === "workflow") {
-      if (hasActiveMember) {
-        // D9: active runs show their full task list, including completed
-        // siblings that completed-sub-agent filtering would otherwise hide.
-        displayMembers = sortWorkflowMembers(allMembers);
-      } else {
-        const selected =
-          params.selectedWorkspaceId != null
-            ? allMembers.find((member) => member.id === params.selectedWorkspaceId)
-            : undefined;
-        const visibleIds = new Set(visibleMembers.map((member) => member.id));
-        displayMembers = sortWorkflowMembers(
-          selected != null && !visibleIds.has(selected.id)
-            ? [...visibleMembers, selected]
-            : visibleMembers
-        );
-      }
+      // Retained terminal members may be present only to anchor a session-active workflow header
+      // between steps. Keep those inactive children out of the expanded member rows; the transcript
+      // decoration is the canonical persistent hierarchy for them.
+      displayMembers = sortWorkflowMembers(
+        visibleMembers.filter(
+          (member) =>
+            member.taskExecutionStatus === "queued" ||
+            member.taskStatus === "queued" ||
+            isWorkspaceDelegatedActivityActive(member, {
+              isWorkspaceLiveActive: params.isWorkspaceLiveActive,
+            })
+        )
+      );
       const workflowName = allMembers.find((member) => member.workflowTask?.workflowName != null)
         ?.workflowTask?.workflowName;
       title = workflowName ?? shortenWorkflowRunId(descriptor.id);
@@ -431,13 +382,20 @@ export function computeTaskGroupMemberRowMeta(params: {
   group: SidebarTaskGroupModel;
   headerMeta: AgentRowRenderMeta;
   headerDepth: number;
+  isWorkspaceLiveActive?: (workspaceId: string) => boolean;
 }): Map<string, AgentRowRenderMeta> {
   const members = params.group.displayMembers;
   const memberDepth = getTaskGroupMemberDepth(params.headerDepth);
 
   let lastRunningMemberIndex = -1;
   for (let index = members.length - 1; index >= 0; index -= 1) {
-    if (isRunningOrStartingTaskStatus(members[index]?.taskStatus)) {
+    const member = members[index];
+    if (
+      member != null &&
+      isSidebarSubAgentRunning(member, {
+        isWorkspaceLiveActive: params.isWorkspaceLiveActive,
+      })
+    ) {
       lastRunningMemberIndex = index;
       break;
     }

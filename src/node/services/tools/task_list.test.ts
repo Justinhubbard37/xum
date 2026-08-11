@@ -103,7 +103,6 @@ describe("task_list tool", () => {
 
     expect(result).toEqual({ tasks: [] });
     expect(listDescendantAgentTasks).toHaveBeenCalledWith("root-workspace", {
-      statuses: ["queued", "starting", "running", "awaiting_report"],
       excludeWorkflowTasks: true,
     });
   });
@@ -123,7 +122,6 @@ describe("task_list tool", () => {
 
     expect(result).toEqual({ tasks: [] });
     expect(listDescendantAgentTasks).toHaveBeenCalledWith("root-workspace", {
-      statuses: ["running"],
       excludeWorkflowTasks: true,
     });
   });
@@ -143,7 +141,6 @@ describe("task_list tool", () => {
         createdAt: "2025-01-01T00:00:00.000Z",
         modelString: "anthropic:claude-haiku-4-5",
         thinkingLevel: "low",
-        sticky: true,
         depth: 1,
       },
     ]);
@@ -165,11 +162,30 @@ describe("task_list tool", () => {
           createdAt: "2025-01-01T00:00:00.000Z",
           modelString: "anthropic:claude-haiku-4-5",
           thinkingLevel: "low",
-          sticky: true,
           depth: 1,
         },
       ],
     });
+  });
+
+  it("guides cleanup when listed user-owned children are inactive", async () => {
+    using tempDir = new TestTempDir("test-task-list-inactive-cleanup-note");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });
+    const listDescendantAgentTasks = mock(() => [
+      buildAgentTask("reviewer", "reported"),
+      buildAgentTask("tooling-mapper", "interrupted"),
+    ]);
+    const taskService = { listDescendantAgentTasks } as unknown as TaskService;
+    const tool = createTaskListTool({ ...baseConfig, taskService });
+
+    const result = (await Promise.resolve(
+      tool.execute!({ statuses: ["reported", "interrupted"] }, mockToolCallOptions)
+    )) as { tasks: unknown[]; note?: string };
+
+    expect(result.tasks).toHaveLength(2);
+    expect(result.note).toContain("task_retitle");
+    expect(result.note).toContain("task_remove");
+    expect(result.note).toContain("ask them to finalize");
   });
 
   it("hides archived non-actionable descendant agent tasks by default", async () => {
@@ -225,7 +241,10 @@ describe("task_list tool", () => {
     );
 
     expect(taskIds(result)).toEqual([
+      "archived-reported",
       "archived-running",
+      "archived-interrupted",
+      "ancestor-archived-child",
       "open-reported",
       "unarchived-reported",
       "missing-reported",
@@ -267,12 +286,178 @@ describe("task_list tool", () => {
       tool.execute!({ statuses: ["reported"], includeArchived: true }, mockToolCallOptions)
     );
 
-    expect(taskIds(defaultResult)).toEqual(["open-reported"]);
+    expect(taskIds(defaultResult)).toEqual([
+      "archived-reported",
+      "ancestor-archived-child",
+      "open-reported",
+    ]);
     expect(taskIds(includeArchivedResult)).toEqual([
       "archived-reported",
       "ancestor-archived-child",
       "open-reported",
     ]);
+  });
+
+  it("overlays a reawakened execution onto the stable child task row", async () => {
+    using tempDir = new TestTempDir("test-task-list-reactivated-child");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });
+    const taskService = {
+      listDescendantAgentTasks: mock(() => [
+        {
+          taskId: "child-agent",
+          status: "reported" as const,
+          parentWorkspaceId: "parent-agent",
+          title: "React lifecycle expert",
+          executionTaskId: "wst_internal",
+          executionStatus: "running" as const,
+          depth: 2,
+        },
+      ]),
+      getDescendantAgentTaskExecutionSnapshot: mock(() =>
+        Promise.resolve({
+          ownerWorkspaceId: "parent-agent",
+          record: {
+            kind: "workspace_turn" as const,
+            handleId: "wst_internal",
+            ownerWorkspaceId: "parent-agent",
+            workspaceId: "child-agent",
+            turnId: "turn",
+            status: "running" as const,
+            createdAt: "2026-08-10T00:00:00.000Z",
+            updatedAt: "2026-08-10T00:00:00.000Z",
+            createdWorkspace: false,
+            disposableWorkspace: false,
+          },
+        })
+      ),
+      listWorkspaceTurnTasks: mock(() => Promise.resolve([])),
+    } as unknown as TaskService;
+    const tool = createTaskListTool({ ...baseConfig, taskService });
+
+    expect(
+      await Promise.resolve(tool.execute!({ statuses: ["running"] }, mockToolCallOptions))
+    ).toEqual({
+      tasks: [
+        {
+          taskId: "child-agent",
+          status: "running",
+          parentWorkspaceId: "parent-agent",
+          title: "React lifecycle expert",
+          depth: 2,
+        },
+      ],
+    });
+  });
+
+  it("maps terminal continuation outcomes onto stable child rows", async () => {
+    using tempDir = new TestTempDir("test-task-list-terminal-continuation-status");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });
+    const taskService = {
+      listDescendantAgentTasks: mock(() => [
+        {
+          taskId: "failed-child",
+          status: "reported" as const,
+          parentWorkspaceId: "root-workspace",
+          executionTaskId: "wst_failed",
+          executionStatus: "error" as const,
+          depth: 1,
+        },
+        {
+          taskId: "interrupted-child",
+          status: "reported" as const,
+          parentWorkspaceId: "root-workspace",
+          executionTaskId: "wst_interrupted",
+          executionStatus: "interrupted" as const,
+          depth: 1,
+        },
+      ]),
+      getDescendantAgentTaskExecutionSnapshot: mock(
+        (_ancestorWorkspaceId: string, taskId: string) =>
+          Promise.resolve({
+            ownerWorkspaceId: "root-workspace",
+            record: {
+              status: taskId === "failed-child" ? ("error" as const) : ("interrupted" as const),
+            },
+          })
+      ),
+      listWorkspaceTurnTasks: mock(() => Promise.resolve([])),
+    } as unknown as TaskService;
+    const tool = createTaskListTool({ ...baseConfig, taskService });
+
+    const result = (await Promise.resolve(
+      tool.execute!({ statuses: ["failed", "interrupted"] }, mockToolCallOptions)
+    )) as { tasks: unknown[]; note?: string };
+
+    expect(result.note).toContain("task_remove");
+    expect(result.tasks).toEqual([
+      {
+        taskId: "failed-child",
+        status: "failed",
+        parentWorkspaceId: "root-workspace",
+        depth: 1,
+      },
+      {
+        taskId: "interrupted-child",
+        status: "interrupted",
+        parentWorkspaceId: "root-workspace",
+        depth: 1,
+      },
+    ]);
+  });
+
+  it("never exposes settled continuation handles for descendant agent workspaces", async () => {
+    using tempDir = new TestTempDir("test-task-list-hidden-continuation-handles");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });
+    const listDescendantAgentTasks = mock(() => [
+      {
+        taskId: "child-agent",
+        status: "reported" as const,
+        parentWorkspaceId: "root-workspace",
+        title: "React lifecycle expert",
+        executionTaskId: "wst_current",
+        depth: 1,
+      },
+    ]);
+    const listWorkspaceTurnTasks = mock(() =>
+      Promise.resolve([
+        {
+          kind: "workspace_turn" as const,
+          handleId: "wst_previous",
+          ownerWorkspaceId: "root-workspace",
+          workspaceId: "child-agent",
+          turnId: "turn-previous",
+          status: "completed" as const,
+          createdAt: "2026-08-09T00:00:00.000Z",
+          updatedAt: "2026-08-09T00:00:01.000Z",
+          createdWorkspace: false,
+          disposableWorkspace: false,
+        },
+        {
+          kind: "workspace_turn" as const,
+          handleId: "wst_current",
+          ownerWorkspaceId: "root-workspace",
+          workspaceId: "child-agent",
+          turnId: "turn-current",
+          status: "completed" as const,
+          createdAt: "2026-08-10T00:00:00.000Z",
+          updatedAt: "2026-08-10T00:00:01.000Z",
+          createdWorkspace: false,
+          disposableWorkspace: false,
+        },
+      ])
+    );
+    const taskService = {
+      listDescendantAgentTasks,
+      isDescendantAgentTask: mock((_ancestorWorkspaceId: string, candidateWorkspaceId: string) =>
+        Promise.resolve(candidateWorkspaceId === "child-agent")
+      ),
+      listWorkspaceTurnTasks,
+    } as unknown as TaskService;
+    const tool = createTaskListTool({ ...baseConfig, taskService });
+
+    expect(
+      await Promise.resolve(tool.execute!({ statuses: ["completed"] }, mockToolCallOptions))
+    ).toEqual({ tasks: [] });
   });
 
   it("lists workspace-turn handles with workspace metadata", async () => {
@@ -668,13 +853,11 @@ describe("task_list tool", () => {
     });
   });
 
-  it("discovers resumable workflow runs without querying agent tasks", async () => {
+  it("discovers resumable workflow runs while checking stable child continuations", async () => {
     using tempDir = new TestTempDir("test-task-list-resumable-workflows");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });
 
-    const listDescendantAgentTasks = mock(() => {
-      throw new Error("workflow-only statuses must not hit the agent task index");
-    });
+    const listDescendantAgentTasks = mock(() => []);
     const taskService = { listDescendantAgentTasks } as unknown as TaskService;
     const listRuns = mock(() =>
       Promise.resolve([
@@ -695,7 +878,9 @@ describe("task_list tool", () => {
       tool.execute!({ statuses: ["failed"] }, mockToolCallOptions)
     );
 
-    expect(listDescendantAgentTasks).not.toHaveBeenCalled();
+    expect(listDescendantAgentTasks).toHaveBeenCalledWith("root-workspace", {
+      excludeWorkflowTasks: true,
+    });
     expect(result).toEqual({
       tasks: [
         {

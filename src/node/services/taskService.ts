@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
+import * as path from "node:path";
 import * as fsPromises from "fs/promises";
 
 import type { z } from "zod";
@@ -57,11 +58,7 @@ import {
 } from "@/common/utils/tools/taskGroups";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { Ok, Err, type Result } from "@/common/types/result";
-import {
-  DEFAULT_TASK_SETTINGS,
-  normalizeTaskSettings,
-  type TaskSettings,
-} from "@/common/types/tasks";
+import { DEFAULT_TASK_SETTINGS, type TaskSettings } from "@/common/types/tasks";
 import {
   resolveBackgroundWorkAttentionPolicy,
   type BackgroundWorkAttentionPolicy,
@@ -146,6 +143,7 @@ import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import {
   TaskHandleStore,
   WORKSPACE_TURN_TASK_ID_PREFIX,
+  isActiveWorkspaceTurnTaskStatus,
   isWorkspaceTurnTaskId,
   type WorkspaceTurnFinalMessageRef,
   type WorkspaceTurnTaskHandleRecord,
@@ -199,7 +197,7 @@ export interface AgentTaskTimestamps {
   reportedAt?: string;
 }
 
-type WorkspaceLifecycleAction = "archive" | "delete_worktree" | "remove";
+type WorkspaceLifecycleAction = "archive" | "unarchive" | "delete_worktree" | "remove";
 interface WorkspaceLifecycleTarget {
   taskId?: string;
   workspaceId?: string;
@@ -214,6 +212,7 @@ interface WorkspaceLifecycleOptions {
 
 interface ResolvedWorkspaceLifecycleTarget {
   action: WorkspaceLifecycleAction;
+  targetKind: "agent_task" | "workspace_turn";
   taskId?: string;
   taskTitle?: string;
   workspaceId: string;
@@ -243,12 +242,6 @@ export interface TaskCreateArgs {
    * "fork" (isolated copy) when omitted. Ignored (treated as "fork") on unsupported runtimes.
    */
   isolation?: TaskIsolation;
-  /**
-   * Keep the child workspace after it reports. This is an explicit per-task retention request;
-   * automatic cleanup and workflow sweeps must leave sticky tasks intact until the user chooses a
-   * lifecycle action.
-   */
-  sticky?: boolean;
   parentRuntimeAiSettings?: { modelString?: string; thinkingLevel?: ThinkingLevel };
   /**
    * Model-refusal policy persisted on the child workspace. "fail" opts the task
@@ -292,6 +285,8 @@ function formatSubagentReportUserMessage(params: {
   title: string;
   reportMarkdown: string;
   status: "in_progress" | "completed";
+  executionVersion?: string;
+  executionId?: string;
   model?: string;
   thinkingLevel?: ThinkingLevel;
   structuredOutput?: unknown;
@@ -307,6 +302,8 @@ function formatSubagentReportUserMessage(params: {
     status: params.status,
     title: params.title,
     reportMarkdown: params.reportMarkdown,
+    ...(params.executionVersion != null ? { executionVersion: params.executionVersion } : {}),
+    ...(params.executionId != null ? { executionId: params.executionId } : {}),
     ...(params.model != null ? { model: params.model } : {}),
     ...(params.thinkingLevel != null ? { thinkingLevel: params.thinkingLevel } : {}),
     ...(params.structuredOutput !== undefined ? { structuredOutput: params.structuredOutput } : {}),
@@ -320,6 +317,13 @@ function parseTerminalSubagentTaskId(content: string): string | null {
   return /<task_id>([^\n<]+)<\/task_id>/.exec(content)?.[1] ?? null;
 }
 
+function parseTerminalSubagentExecutionVersion(content: string): string | null {
+  const report = parseSubagentReportEnvelope(content);
+  if (report?.executionVersion != null) return report.executionVersion;
+  if (!content.startsWith(SUBAGENT_FAILURE_ENVELOPE_TAG)) return null;
+  return /<execution_version>([^\n<]+)<\/execution_version>/.exec(content)?.[1] ?? null;
+}
+
 // Failure twin of formatSubagentReportUserMessage: terminal child failures are
 // delivered into the parent context as an explicit failure block (never as a
 // report) so a later wake-up — by ANY sibling's settlement — cannot present the
@@ -327,6 +331,8 @@ function parseTerminalSubagentTaskId(content: string): string | null {
 function formatSubagentFailureUserMessage(params: {
   childWorkspaceId: string;
   agentType: string;
+  executionVersion?: string;
+  executionId?: string;
   errorType: string;
   errorMessage: string;
 }): string {
@@ -337,6 +343,10 @@ function formatSubagentFailureUserMessage(params: {
   return [
     SUBAGENT_FAILURE_ENVELOPE_TAG,
     `<task_id>${params.childWorkspaceId}</task_id>`,
+    ...(params.executionVersion != null
+      ? [`<execution_version>${params.executionVersion}</execution_version>`]
+      : []),
+    ...(params.executionId != null ? [`<execution_id>${params.executionId}</execution_id>`] : []),
     `<agent_type>${params.agentType}</agent_type>`,
     `<error_type>${params.errorType}</error_type>`,
     "<error_message>",
@@ -503,6 +513,8 @@ export interface WorkspaceTurnCreateArgs {
    * from `run_in_background`: background -> "notify_on_terminal"; foreground/default
    * -> "blocking_until_terminal". Defaults to blocking when omitted.
    */
+  /** Internal-only: allow a persistent descendant agent workspace as an existing target. */
+  allowAgentWorkspace?: boolean;
   attentionPolicy?: BackgroundWorkAttentionPolicy;
 }
 
@@ -516,6 +528,7 @@ export interface WorkspaceTurnCreateResult {
 export interface WorkspaceTurnWaitResult {
   taskId: string;
   workspaceId: string;
+  updatedAt: string;
   reportMarkdown: string;
   title?: string;
   messageId?: string;
@@ -572,7 +585,6 @@ interface TaskLaunchPlan {
   bestOf?: TaskCreateArgs["bestOf"];
   experiments?: TaskCreateArgs["experiments"];
   onRefusal?: TaskCreateArgs["onRefusal"];
-  sticky?: TaskCreateArgs["sticky"];
   attentionPolicy?: TaskCreateArgs["attentionPolicy"];
 }
 
@@ -592,9 +604,19 @@ interface MaterializedTaskLaunch {
 export type TaskMessageQueueDispatchMode = "tool-end" | "turn-end";
 
 export interface SendAgentTaskMessageResult {
-  delivery: "accepted" | "queued";
+  delivery: "accepted" | "queued" | "reactivated";
   queueDispatchMode?: TaskMessageQueueDispatchMode;
+  executionTaskId?: string;
 }
+
+export interface RetitleAgentTaskResult {
+  title: string;
+}
+
+export type RetitleAgentTaskError =
+  | { code: "not_found" }
+  | { code: "invalid_scope" }
+  | { code: "update_failed"; message: string };
 
 export type SendAgentTaskMessageError =
   | { code: "not_found" }
@@ -615,9 +637,10 @@ export interface DescendantAgentTaskInfo {
   workspaceName?: string;
   title?: string;
   createdAt?: string;
+  executionTaskId?: string;
+  executionStatus?: WorkspaceTurnTaskStatus;
   modelString?: string;
   thinkingLevel?: ThinkingLevel;
-  sticky?: boolean;
   depth: number;
 }
 
@@ -642,6 +665,7 @@ function isWorkspaceBusyIdleOnlySend(error: unknown): boolean {
   );
 }
 
+const REMOVED_AGENT_TASKS_DIR = "removed-agent-tasks";
 const COMPLETED_REPORT_CACHE_MAX_ENTRIES = 128;
 
 /** Maximum consecutive auto-resumes before stopping. Prevents infinite loops when descendants are stuck. */
@@ -1198,6 +1222,9 @@ export class TaskService {
   // Serialize lifecycle actions per resolved child workspace: a batch may include both the
   // created handle and later existing-mode handles for the same workspace.
   private readonly workspaceLifecycleLocks = new MutexMap<string>();
+  // Serialize lifecycle transitions across a whole parent/descendant tree. Reawakening/removal of a
+  // child and archiving an ancestor must never cross and leave active work hidden behind the archive.
+  private readonly workspaceTreeLifecycleLocks = new MutexMap<string>();
   // Serialize terminal writes per workspace-turn handle so late completions/interruptions cannot
   // overwrite an already-settled handle.
   private readonly workspaceTurnSettlementLocks = new MutexMap<string>();
@@ -1988,6 +2015,50 @@ export class TaskService {
     };
   }
 
+  private taskTreeRootId(workspaceId: string): string {
+    const index = this.buildAgentTaskIndex(this.config.loadConfigOrDefault());
+    let currentWorkspaceId = workspaceId;
+    const visited = new Set<string>();
+    for (let depth = 0; depth < 32; depth++) {
+      if (visited.has(currentWorkspaceId)) {
+        log.warn("Task tree lifecycle lock encountered a parent cycle", { workspaceId });
+        return workspaceId;
+      }
+      visited.add(currentWorkspaceId);
+      const parentWorkspaceId = index.parentById.get(currentWorkspaceId);
+      if (parentWorkspaceId == null) {
+        return currentWorkspaceId;
+      }
+      currentWorkspaceId = parentWorkspaceId;
+    }
+    log.warn("Task tree lifecycle lock exceeded parent traversal depth", { workspaceId });
+    return workspaceId;
+  }
+
+  async withTaskTreeLifecycleLock<T>(workspaceId: string, operation: () => Promise<T>): Promise<T> {
+    assert(workspaceId.length > 0, "withTaskTreeLifecycleLock requires workspaceId");
+    return await this.withTaskTreeLifecycleLocks([workspaceId], operation);
+  }
+
+  private async withTaskTreeLifecycleLocks<T>(
+    workspaceIds: readonly string[],
+    operation: () => Promise<T>
+  ): Promise<T> {
+    const rootIds = [
+      ...new Set(workspaceIds.map((workspaceId) => this.taskTreeRootId(workspaceId))),
+    ]
+      .filter((workspaceId) => workspaceId.length > 0)
+      .sort();
+    const acquire = async (index: number): Promise<T> => {
+      const rootId = rootIds[index];
+      if (rootId == null) {
+        return await operation();
+      }
+      return await this.workspaceTreeLifecycleLocks.withLock(rootId, () => acquire(index + 1));
+    };
+    return await acquire(0);
+  }
+
   private async editWorkspaceEntry(
     workspaceId: string,
     updater: (workspace: WorkspaceConfigEntry) => void,
@@ -2015,6 +2086,122 @@ export class TaskService {
     return found;
   }
 
+  private async reconcileAgentTaskExecutionIds(): Promise<void> {
+    const config = this.config.loadConfigOrDefault();
+    let records: WorkspaceTurnTaskHandleRecord[];
+    try {
+      records = await this.taskHandleStore.listAllWorkspaceTurns();
+    } catch (error: unknown) {
+      // Startup initialization must be self-healing: inability to scan task handles should disable
+      // this recovery pass, not prevent the application from starting.
+      log.warn("Skipping persistent sub-agent execution reconciliation", { error });
+      return;
+    }
+
+    interface TimestampedWorkspaceTurn {
+      record: WorkspaceTurnTaskHandleRecord;
+      updatedAtMs: number;
+    }
+    const timestampedRecords: TimestampedWorkspaceTurn[] = [];
+    for (const record of records) {
+      const updatedAtMs = Date.parse(record.updatedAt);
+      const canonicalUpdatedAt = Number.isFinite(updatedAtMs)
+        ? new Date(updatedAtMs).toISOString()
+        : null;
+      if (canonicalUpdatedAt !== record.updatedAt) {
+        log.warn("Ignoring persistent sub-agent execution with invalid updatedAt", {
+          handleId: record.handleId,
+          workspaceId: record.workspaceId,
+          updatedAt: record.updatedAt,
+        });
+        continue;
+      }
+      timestampedRecords.push({ record, updatedAtMs });
+    }
+    const recordsByHandleId = new Map(
+      timestampedRecords.map((candidate) => [candidate.record.handleId, candidate])
+    );
+    const recordsByWorkspaceId = new Map<string, TimestampedWorkspaceTurn[]>();
+    for (const candidate of timestampedRecords) {
+      const workspaceRecords = recordsByWorkspaceId.get(candidate.record.workspaceId) ?? [];
+      workspaceRecords.push(candidate);
+      recordsByWorkspaceId.set(candidate.record.workspaceId, workspaceRecords);
+    }
+
+    for (const task of this.listAgentTaskWorkspaces(config)) {
+      if (task.id == null) continue;
+      try {
+        const candidates = recordsByWorkspaceId.get(task.id) ?? [];
+        const referenced =
+          task.taskExecutionId != null ? recordsByHandleId.get(task.taskExecutionId) : undefined;
+        // Recover the crash window where the handle record became durable before the stable child
+        // pointer. Invalid timestamps are ignored so corrupt records cannot outrank active work.
+        const latestCandidate = candidates.reduce<TimestampedWorkspaceTurn | undefined>(
+          (latest, candidate) => {
+            if (latest == null) return candidate;
+            return candidate.updatedAtMs > latest.updatedAtMs ? candidate : latest;
+          },
+          undefined
+        );
+        const selected =
+          referenced == null
+            ? latestCandidate
+            : latestCandidate != null && latestCandidate.updatedAtMs > referenced.updatedAtMs
+              ? latestCandidate
+              : referenced;
+        const record = selected?.record;
+        if (record == null) {
+          if (task.taskExecutionId != null) {
+            await this.updateAgentTaskExecutionState(task.id, task.taskExecutionId, null);
+          }
+          continue;
+        }
+
+        let normalized: WorkspaceTurnTaskHandleRecord | null;
+        try {
+          normalized = await this.normalizeWorkspaceTurnRecord(record);
+        } catch (error: unknown) {
+          log.warn("Failed to reconcile persistent sub-agent execution", {
+            taskId: task.id,
+            handleId: record.handleId,
+            error,
+          });
+          continue;
+        }
+        if (normalized?.workspaceId !== task.id) {
+          if (task.taskExecutionId != null) {
+            await this.updateAgentTaskExecutionState(task.id, task.taskExecutionId, null);
+          }
+          continue;
+        }
+
+        await this.editWorkspaceEntry(
+          task.id,
+          (workspace) => {
+            workspace.taskExecutionId = normalized.handleId;
+            workspace.taskExecutionStatus = normalized.status;
+          },
+          { allowMissing: true }
+        );
+        await this.emitWorkspaceMetadata(task.id);
+        if (isActiveWorkspaceTurnTaskStatus(normalized.status)) {
+          this.activeWorkspaceTurnHandleByWorkspaceId.set(task.id, {
+            handleId: normalized.handleId,
+            ownerWorkspaceId: normalized.ownerWorkspaceId,
+          });
+        }
+      } catch (error: unknown) {
+        // Startup recovery is best-effort: one read-only/corrupt child must not prevent Mux startup
+        // or block reconciliation of the remaining persistent children.
+        log.warn("Failed to persist persistent sub-agent execution reconciliation", {
+          taskId: task.id,
+          handleId: task.taskExecutionId,
+          error,
+        });
+      }
+    }
+  }
+
   async initialize(): Promise<void> {
     const startupStartedAt = Date.now();
     const startupConfig = this.config.loadConfigOrDefault();
@@ -2025,6 +2212,8 @@ export class TaskService {
     log.info("[startup] TaskService.initialize starting", {
       queuedTaskCountAtStartup,
     });
+
+    await this.reconcileAgentTaskExecutionIds();
 
     const staleStartingTasks = this.listAgentTaskWorkspaces(startupConfig).filter(
       (task) => task.taskStatus === "starting" && typeof task.id === "string"
@@ -2431,7 +2620,20 @@ export class TaskService {
     if (argsList.length === 0) {
       return Ok([]);
     }
+    const parentWorkspaceIds = argsList.map((args) => coerceNonEmptyString(args.parentWorkspaceId));
+    if (parentWorkspaceIds.some((workspaceId) => workspaceId == null)) {
+      return Err("Task.createMany: parentWorkspaceId is required");
+    }
+    return await this.withTaskTreeLifecycleLocks(
+      parentWorkspaceIds.filter((workspaceId): workspaceId is string => workspaceId != null),
+      () => this.createManyUnderTaskTreeLifecycleLocks(argsList, options)
+    );
+  }
 
+  private async createManyUnderTaskTreeLifecycleLocks(
+    argsList: TaskCreateArgs[],
+    options: TaskCreateManyOptions
+  ): Promise<Result<TaskCreateResult[], string>> {
     // sharedWorkspacePath is set for honored isolation: "none" plans; the entry is persisted
     // pointing at the parent's checkout and startReservedAgentTask reuses it without fork/init.
     const plans: Array<
@@ -2501,6 +2703,12 @@ export class TaskService {
       }
       const parentMeta = parentMetaResult.data;
       const parentEntry = findWorkspaceEntry(cfg, parentWorkspaceId);
+      if (
+        parentEntry != null &&
+        isWorkspaceArchived(parentEntry.workspace.archivedAt, parentEntry.workspace.unarchivedAt)
+      ) {
+        return Err("Task.createMany: parent workspace is archived");
+      }
       const parentIsScratch = parentEntry?.workspace.kind === "scratch";
       const configProjectPath = parentIsScratch
         ? SCRATCH_PROJECT_CONFIG_KEY
@@ -2512,7 +2720,17 @@ export class TaskService {
         );
       }
 
-      if (parentEntry?.workspace.taskStatus === "reported") {
+      if (
+        parentEntry?.workspace.taskStatus === "interrupted" &&
+        !isActiveWorkspaceTurnTaskStatus(parentEntry.workspace.taskExecutionStatus)
+      ) {
+        return Err("Task.createMany: cannot spawn new tasks after task_stop");
+      }
+
+      if (
+        parentEntry?.workspace.taskStatus === "reported" &&
+        !isActiveWorkspaceTurnTaskStatus(parentEntry.workspace.taskExecutionStatus)
+      ) {
         return Err("Task.createMany: cannot spawn new tasks after agent_report");
       }
 
@@ -2673,7 +2891,6 @@ export class TaskService {
         bestOf: normalizedBestOf,
         experiments: args.experiments,
         onRefusal: args.onRefusal,
-        sticky: args.sticky === true ? true : undefined,
         attentionPolicy: args.attentionPolicy,
         status,
         ...(sharedWorkspacePath != null ? { sharedWorkspacePath } : {}),
@@ -2753,7 +2970,6 @@ export class TaskService {
           taskOnRefusal: plan.onRefusal,
           taskExperiments: plan.experiments,
           taskIsolation: plan.sharedWorkspacePath != null ? "none" : undefined,
-          taskSticky: plan.sticky === true ? true : undefined,
           taskAttentionPolicy: plan.attentionPolicy,
           projects: plan.parentMeta.projects,
         });
@@ -3251,13 +3467,15 @@ export class TaskService {
     const handleId = `${WORKSPACE_TURN_TASK_ID_PREFIX}${this.config.generateStableId()}`;
     const turnId = this.config.generateStableId();
     const createdAt = getIsoNow();
-    // Workspace turns currently always run the exec agent (see the sendMessage
-    // call below). Key every defaults/persisted-settings lookup off this so the
-    // right agent's settings follow automatically if workspace turns ever run
-    // other agents.
-    const workspaceTurnAgentId = "exec";
+    // New workspace turns use exec. Follow-ups in a persistent agent-task workspace preserve that
+    // child's original agent identity and task-level model settings.
+    let workspaceTurnAgentId = "exec";
     let targetWorkspaceId: string;
     let targetAiSettings: ResolvedWorkspaceAiSettings | undefined;
+    let targetTaskModelString: string | undefined;
+    let targetTaskThinkingLevel: ThinkingLevel | undefined;
+    let targetTaskExperiments: TaskCreateArgs["experiments"];
+    let targetIsAgentWorkspace = false;
     let createdWorkspace = false;
     let queuedForExistingWorkspace = false;
 
@@ -3270,19 +3488,41 @@ export class TaskService {
       if (!existingWorkspaceId) {
         return Err("Task.createWorkspaceTurn: workspace.workspaceId is required for existing mode");
       }
-      const ownsExistingWorkspace = ownerWorkspaceTurns.some(
+      const targetEntry = findWorkspaceEntry(cfg, existingWorkspaceId);
+      const targetTaskIndex = this.buildAgentTaskIndex(cfg);
+      const ownsExistingWorkspaceTurn = ownerWorkspaceTurns.some(
         (record) => record.createdWorkspace && record.workspaceId === existingWorkspaceId
       );
-      if (!ownsExistingWorkspace) {
+      const ownsDescendantAgentWorkspace =
+        args.allowAgentWorkspace === true &&
+        targetEntry?.workspace.parentWorkspaceId != null &&
+        this.isDescendantAgentTaskUsingParentById(
+          targetTaskIndex.parentById,
+          ownerWorkspaceId,
+          existingWorkspaceId
+        );
+      if (!ownsExistingWorkspaceTurn && !ownsDescendantAgentWorkspace) {
         return Err("Task.createWorkspaceTurn: invalid_scope for existing workspace");
       }
+      if (
+        targetEntry != null &&
+        isWorkspaceArchived(targetEntry.workspace.archivedAt, targetEntry.workspace.unarchivedAt)
+      ) {
+        return Err("Task.createWorkspaceTurn: existing workspace is archived");
+      }
       targetWorkspaceId = existingWorkspaceId;
+      if (ownsDescendantAgentWorkspace && targetEntry != null) {
+        targetIsAgentWorkspace = true;
+        workspaceTurnAgentId = resolveTaskAgentIdForResume(targetEntry.workspace);
+        targetTaskModelString = coerceNonEmptyString(targetEntry.workspace.taskModelString);
+        targetTaskThinkingLevel = targetEntry.workspace.taskThinkingLevel;
+        targetTaskExperiments = targetEntry.workspace.taskExperiments;
+      }
       // Follow-up sends continue the target workspace's own last-used settings
       // (persisted on every send, or manually changed by the user in that
       // workspace) instead of re-inheriting the owner's live settings on each
       // message — the owner changing its model/thinking must not drag
       // already-created children along.
-      const targetEntry = findWorkspaceEntry(cfg, existingWorkspaceId);
       targetAiSettings = targetEntry
         ? this.resolveWorkspaceAISettings(targetEntry.workspace, workspaceTurnAgentId)
         : undefined;
@@ -3329,6 +3569,7 @@ export class TaskService {
     const model =
       coerceNonEmptyString(args.modelString) ??
       coerceNonEmptyString(targetAiSettings?.model) ??
+      targetTaskModelString ??
       coerceNonEmptyString(workspaceTurnAgentDefault?.modelString) ??
       coerceNonEmptyString(args.parentRuntimeAiSettings?.modelString) ??
       coerceNonEmptyString(parentMeta.aiSettingsByAgent?.[workspaceTurnAgentId]?.model) ??
@@ -3344,6 +3585,7 @@ export class TaskService {
             this.aiService.getProvidersConfig()
           )
         : (targetAiSettings?.thinkingLevel ??
+          targetTaskThinkingLevel ??
           workspaceTurnAgentDefault?.thinkingLevel ??
           args.parentRuntimeAiSettings?.thinkingLevel ??
           parentMeta.aiSettingsByAgent?.[workspaceTurnAgentId]?.thinkingLevel ??
@@ -3388,6 +3630,9 @@ export class TaskService {
       ...(args.attentionPolicy != null ? { attentionPolicy: args.attentionPolicy } : {}),
     };
     await this.taskHandleStore.upsertWorkspaceTurn(record);
+    if (targetIsAgentWorkspace) {
+      await this.updateAgentTaskExecutionState(targetWorkspaceId, handleId, record.status);
+    }
     if (record.status !== "queued") {
       this.activeWorkspaceTurnHandleByWorkspaceId.set(targetWorkspaceId, {
         handleId,
@@ -3414,6 +3659,18 @@ export class TaskService {
             updatedAt: getIsoNow(),
           });
         }
+        if (targetIsAgentWorkspace) {
+          await this.updateAgentTaskExecutionState(targetWorkspaceId, handleId, "running");
+          // A stopped queued child keeps its only copy of the initial brief in taskPrompt. Once the
+          // continuation accepts the replayed prompt, history owns that brief and the config copy can go.
+          await this.editWorkspaceEntry(
+            targetWorkspaceId,
+            (workspace) => {
+              delete workspace.taskPrompt;
+            },
+            { allowMissing: true }
+          );
+        }
         this.activeWorkspaceTurnHandleByWorkspaceId.set(targetWorkspaceId, {
           handleId,
           ownerWorkspaceId,
@@ -3430,7 +3687,7 @@ export class TaskService {
         ...(thinkingLevel != null ? { thinkingLevel } : {}),
         ...(reasoningMode != null ? { reasoningMode } : {}),
         muxMetadata: this.buildWorkspaceTurnMuxMetadata(record),
-        experiments: args.experiments,
+        experiments: args.experiments ?? targetTaskExperiments,
         ...(mode === "existing" ? { queueDispatchMode } : {}),
       },
       {
@@ -3517,6 +3774,15 @@ export class TaskService {
     if (!parentWorkspaceId) {
       return Err("Task.create: parentWorkspaceId is required");
     }
+    return await this.withTaskTreeLifecycleLock(parentWorkspaceId, async () =>
+      this.createUnderTaskTreeLifecycleLock(args, parentWorkspaceId)
+    );
+  }
+
+  private async createUnderTaskTreeLifecycleLock(
+    args: TaskCreateArgs,
+    parentWorkspaceId: string
+  ): Promise<Result<TaskCreateResult, string>> {
     if (args.kind !== "agent") {
       return Err("Task.create: unsupported kind");
     }
@@ -3587,6 +3853,12 @@ export class TaskService {
     const cfg = this.config.loadConfigOrDefault();
     const taskSettings = cfg.taskSettings ?? DEFAULT_TASK_SETTINGS;
     const parentEntry = findWorkspaceEntry(cfg, parentWorkspaceId);
+    if (
+      parentEntry != null &&
+      isWorkspaceArchived(parentEntry.workspace.archivedAt, parentEntry.workspace.unarchivedAt)
+    ) {
+      return Err("Task.create: parent workspace is archived");
+    }
     const parentIsScratch = parentEntry?.workspace.kind === "scratch";
     const configProjectPath = parentIsScratch
       ? SCRATCH_PROJECT_CONFIG_KEY
@@ -3602,7 +3874,17 @@ export class TaskService {
       );
     }
 
-    if (parentEntry?.workspace.taskStatus === "reported") {
+    if (
+      parentEntry?.workspace.taskStatus === "interrupted" &&
+      !isActiveWorkspaceTurnTaskStatus(parentEntry.workspace.taskExecutionStatus)
+    ) {
+      return Err("Task.create: cannot spawn new tasks after task_stop");
+    }
+
+    if (
+      parentEntry?.workspace.taskStatus === "reported" &&
+      !isActiveWorkspaceTurnTaskStatus(parentEntry.workspace.taskExecutionStatus)
+    ) {
       return Err("Task.create: cannot spawn new tasks after agent_report");
     }
 
@@ -3835,7 +4117,6 @@ export class TaskService {
           taskOnRefusal: args.onRefusal,
           taskExperiments: args.experiments,
           taskIsolation: useSharedWorkspace ? "none" : undefined,
-          taskSticky: args.sticky === true ? true : undefined,
           taskAttentionPolicy: args.attentionPolicy,
           projects: parentMeta.projects,
         });
@@ -4006,7 +4287,6 @@ export class TaskService {
         taskOnRefusal: args.onRefusal,
         taskExperiments: args.experiments,
         taskIsolation: useSharedWorkspace ? "none" : undefined,
-        taskSticky: args.sticky === true ? true : undefined,
         taskAttentionPolicy: args.attentionPolicy,
         projects: inheritedProjects,
       });
@@ -4077,6 +4357,39 @@ export class TaskService {
     });
   }
 
+  async retitleDescendantAgentTask(
+    ancestorWorkspaceId: string,
+    taskId: string,
+    title: string
+  ): Promise<Result<RetitleAgentTaskResult, RetitleAgentTaskError>> {
+    assert(ancestorWorkspaceId.length > 0, "retitleDescendantAgentTask: ancestor ID is required");
+    assert(taskId.length > 0, "retitleDescendantAgentTask: task ID is required");
+    const trimmedTitle = title.trim();
+    assert(trimmedTitle.length > 0, "retitleDescendantAgentTask: title is required");
+
+    return await this.withTaskTreeLifecycleLock(taskId, async () => {
+      const cfg = this.config.loadConfigOrDefault();
+      const entry = findWorkspaceEntry(cfg, taskId);
+      if (entry == null) {
+        return Err({ code: "not_found" as const });
+      }
+
+      const index = this.buildAgentTaskIndex(cfg);
+      if (
+        !this.isDescendantAgentTaskUsingParentById(index.parentById, ancestorWorkspaceId, taskId) ||
+        this.isWorkflowOwnedTaskUsingIndex(index, taskId)
+      ) {
+        return Err({ code: "invalid_scope" as const });
+      }
+
+      const result = await this.workspaceService.updateTitle(taskId, trimmedTitle);
+      if (!result.success) {
+        return Err({ code: "update_failed" as const, message: result.error });
+      }
+      return Ok({ title: trimmedTitle });
+    });
+  }
+
   async sendMessageToDescendantAgentTask(
     ancestorWorkspaceId: string,
     taskId: string,
@@ -4116,14 +4429,10 @@ export class TaskService {
       ) {
         return Err({ code: "invalid_scope" as const });
       }
-      if (isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)) {
-        return Err({
-          code: "not_active" as const,
-          taskStatus: entry.workspace.taskStatus ?? "unknown",
-          message: "Task workspace is archived and cannot accept updated guidance.",
-        });
-      }
       if (entry.workspace.taskStatus !== "queued") {
+        return Ok(null);
+      }
+      if (isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)) {
         return Ok(null);
       }
 
@@ -4146,118 +4455,303 @@ export class TaskService {
       return Ok(queuedUpdateResult.data);
     }
 
-    return this.workspaceEventLocks.withLock(taskId, async () => {
-      const cfg = this.config.loadConfigOrDefault();
-      const entry = findWorkspaceEntry(cfg, taskId);
-      if (!entry) {
-        return Err({ code: "not_found" as const });
-      }
-      const taskIndex = this.buildAgentTaskIndex(cfg);
-      if (
-        !this.isDescendantAgentTaskUsingParentById(
-          taskIndex.parentById,
-          ancestorWorkspaceId,
-          taskId
-        )
-      ) {
-        return Err({ code: "invalid_scope" as const });
-      }
+    return this.withTaskTreeLifecycleLock(taskId, async () =>
+      this.workspaceEventLocks.withLock(taskId, async () => {
+        const cfg = this.config.loadConfigOrDefault();
+        const entry = findWorkspaceEntry(cfg, taskId);
+        if (!entry) {
+          return Err({ code: "not_found" as const });
+        }
+        const taskIndex = this.buildAgentTaskIndex(cfg);
+        if (
+          !this.isDescendantAgentTaskUsingParentById(
+            taskIndex.parentById,
+            ancestorWorkspaceId,
+            taskId
+          )
+        ) {
+          return Err({ code: "invalid_scope" as const });
+        }
 
-      if (isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)) {
-        return Err({
-          code: "not_active" as const,
-          taskStatus: entry.workspace.taskStatus ?? "unknown",
-          message: "Task workspace is archived and cannot accept updated guidance.",
-        });
-      }
-
-      // Missing status is a legacy running task: old persisted children predate taskStatus.
-      const previousStatus = entry.workspace.taskStatus ?? "running";
-      if (previousStatus !== "running" && previousStatus !== "awaiting_report") {
-        return Err({ code: "not_active" as const, taskStatus: previousStatus ?? "unknown" });
-      }
-
-      const guidanceId = randomUUID();
-      await this.editWorkspaceEntry(
-        taskId,
-        (workspace) => {
-          workspace.taskPendingGuidance = [
-            ...(workspace.taskPendingGuidance ?? []),
-            { id: guidanceId, message: trimmedMessage, queueDispatchMode },
-          ];
-          if (workspace.taskStatus == null || previousStatus === "awaiting_report") {
-            // Persist the legacy implicit-running state so startup recovery can replay this durable
-            // guidance if Mux exits before the replacement turn accepts it.
-            workspace.taskStatus = "running";
+        const currentExecution =
+          entry.workspace.taskExecutionId != null
+            ? ((await this.getDescendantAgentTaskExecutionSnapshot(ancestorWorkspaceId, taskId))
+                ?.record ?? null)
+            : null;
+        const continuationActive = isActiveWorkspaceTurnTaskStatus(currentExecution?.status);
+        const legacyArchived = isWorkspaceArchived(
+          entry.workspace.archivedAt,
+          entry.workspace.unarchivedAt
+        );
+        if (
+          !continuationActive &&
+          (entry.workspace.taskStatus === "reported" ||
+            entry.workspace.taskStatus === "interrupted" ||
+            legacyArchived) &&
+          !this.aiService.isStreaming(taskId)
+        ) {
+          const unarchiveResult = await this.unarchiveAgentTaskAncestry(
+            ancestorWorkspaceId,
+            taskId
+          );
+          if (!unarchiveResult.success) {
+            return Err({ code: "send_failed" as const, message: unarchiveResult.error });
           }
-        },
-        { allowMissing: true }
-      );
+          const refreshedEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
+          if (refreshedEntry == null) {
+            return Err({ code: "not_found" as const });
+          }
+          const updatedGuidance = `Updated guidance from parent:\n\n${trimmedMessage}`;
+          const preservedQueuedPrompt = coerceNonEmptyString(refreshedEntry.workspace.taskPrompt);
+          const execution = await this.createWorkspaceTurn({
+            ownerWorkspaceId: ancestorWorkspaceId,
+            prompt: preservedQueuedPrompt
+              ? `${preservedQueuedPrompt}\n\n${updatedGuidance}`
+              : updatedGuidance,
+            title:
+              coerceNonEmptyString(refreshedEntry.workspace.title) ??
+              coerceNonEmptyString(refreshedEntry.workspace.name) ??
+              "Sub-agent",
+            workspace: { mode: "existing", workspaceId: taskId, queueDispatchMode },
+            allowAgentWorkspace: true,
+            attentionPolicy: "notify_on_terminal",
+          });
+          if (!execution.success) {
+            return Err({ code: "send_failed" as const, message: execution.error });
+          }
+          return Ok({
+            delivery: "reactivated" as const,
+            executionTaskId: execution.data.taskId,
+          });
+        }
 
-      const clearGuidanceReservation = async (restoreAfterFailure: boolean): Promise<void> => {
+        if (isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)) {
+          return Err({
+            code: "not_active" as const,
+            taskStatus: entry.workspace.taskStatus ?? "unknown",
+            message:
+              "Task workspace is archived; retry task_send_message to restore and reawaken it.",
+          });
+        }
+
+        // Missing status is a legacy running task. A reported/interrupted agent workspace may also
+        // have an active follow-up workspace-turn execution; its live stream accepts steering here.
+        const previousStatus = entry.workspace.taskStatus ?? "running";
+        if (
+          previousStatus !== "running" &&
+          previousStatus !== "awaiting_report" &&
+          !this.aiService.isStreaming(taskId) &&
+          !continuationActive
+        ) {
+          return Err({ code: "not_active" as const, taskStatus: previousStatus ?? "unknown" });
+        }
+
+        const guidanceId = randomUUID();
         await this.editWorkspaceEntry(
           taskId,
           (workspace) => {
-            const remainingGuidance = (workspace.taskPendingGuidance ?? []).filter(
-              (guidance) => guidance.id !== guidanceId
-            );
-            workspace.taskPendingGuidance =
-              remainingGuidance.length > 0 ? remainingGuidance : undefined;
-            if (
-              restoreAfterFailure &&
-              remainingGuidance.length === 0 &&
-              workspace.taskStatus === "running"
-            ) {
-              workspace.taskStatus = this.aiService.isStreaming(taskId)
-                ? previousStatus
-                : "awaiting_report";
+            workspace.taskPendingGuidance = [
+              ...(workspace.taskPendingGuidance ?? []),
+              { id: guidanceId, message: trimmedMessage, queueDispatchMode },
+            ];
+            if (workspace.taskStatus == null || previousStatus === "awaiting_report") {
+              // Persist the legacy implicit-running state so startup recovery can replay this durable
+              // guidance if Mux exits before the replacement turn accepts it.
+              workspace.taskStatus = "running";
             }
           },
           { allowMissing: true }
         );
-      };
 
-      let accepted = false;
-      const sendResult = await this.workspaceService.sendMessage(
-        taskId,
-        // Keep the correction explicit in the child transcript so it cannot be confused with the
-        // original brief, while synthetic metadata avoids treating parent orchestration as a direct
-        // human intervention in child-only features such as goals and interactive questions.
-        `Updated guidance from parent:\n\n${trimmedMessage}`,
-        {
-          model: entry.workspace.taskModelString ?? defaultModel,
-          agentId: resolveTaskAgentIdForResume(entry.workspace),
-          thinkingLevel: entry.workspace.taskThinkingLevel,
-          reasoningMode: coerceOpenAIReasoningMode(entry.workspace.aiSettings?.reasoningMode),
-          experiments: entry.workspace.taskExperiments,
-          queueDispatchMode,
-        },
-        {
-          synthetic: true,
-          agentInitiated: true,
-          startStreamInBackground: true,
-          onAcceptedPreStreamFailure: async () => {
-            // If the replacement turn cannot start, remove the settlement reservation and restore
-            // an idle child to completion recovery instead of leaving it permanently running.
-            await clearGuidanceReservation(true);
+        const clearGuidanceReservation = async (restoreAfterFailure: boolean): Promise<void> => {
+          await this.editWorkspaceEntry(
+            taskId,
+            (workspace) => {
+              const remainingGuidance = (workspace.taskPendingGuidance ?? []).filter(
+                (guidance) => guidance.id !== guidanceId
+              );
+              workspace.taskPendingGuidance =
+                remainingGuidance.length > 0 ? remainingGuidance : undefined;
+              if (
+                restoreAfterFailure &&
+                remainingGuidance.length === 0 &&
+                workspace.taskStatus === "running"
+              ) {
+                workspace.taskStatus = this.aiService.isStreaming(taskId)
+                  ? previousStatus
+                  : "awaiting_report";
+              }
+            },
+            { allowMissing: true }
+          );
+        };
+
+        const activeAgentId = resolveTaskAgentIdForResume(entry.workspace);
+        const activeAiSettings = this.resolveWorkspaceAISettings(entry.workspace, activeAgentId);
+        let accepted = false;
+        const sendResult = await this.workspaceService.sendMessage(
+          taskId,
+          // Keep the correction explicit in the child transcript so it cannot be confused with the
+          // original brief, while synthetic metadata avoids treating parent orchestration as a direct
+          // human intervention in child-only features such as goals and interactive questions.
+          `Updated guidance from parent:\n\n${trimmedMessage}`,
+          {
+            model:
+              coerceNonEmptyString(activeAiSettings?.model) ??
+              entry.workspace.taskModelString ??
+              defaultModel,
+            agentId: activeAgentId,
+            thinkingLevel: activeAiSettings?.thinkingLevel ?? entry.workspace.taskThinkingLevel,
+            reasoningMode: coerceOpenAIReasoningMode(activeAiSettings?.reasoningMode),
+            experiments: entry.workspace.taskExperiments,
+            queueDispatchMode,
           },
-          onAccepted: async () => {
-            await clearGuidanceReservation(false);
-            accepted = true;
-          },
+          {
+            synthetic: true,
+            agentInitiated: true,
+            startStreamInBackground: true,
+            onAcceptedPreStreamFailure: async () => {
+              // If the replacement turn cannot start, remove the settlement reservation and restore
+              // an idle child to completion recovery instead of leaving it permanently running.
+              await clearGuidanceReservation(true);
+            },
+            onAccepted: async () => {
+              await clearGuidanceReservation(false);
+              accepted = true;
+            },
+          }
+        );
+
+        if (!sendResult.success) {
+          await clearGuidanceReservation(true);
+          return Err({
+            code: "send_failed" as const,
+            message: formatSendMessageError(sendResult.error).message,
+          });
         }
-      );
 
-      if (!sendResult.success) {
-        await clearGuidanceReservation(true);
-        return Err({
-          code: "send_failed" as const,
-          message: formatSendMessageError(sendResult.error).message,
-        });
+        return Ok(accepted ? { delivery: "accepted" } : { delivery: "queued", queueDispatchMode });
+      })
+    );
+  }
+
+  async stopDescendantAgentTask(
+    ancestorWorkspaceId: string,
+    taskId: string
+  ): Promise<Result<{ stoppedTaskIds: string[] }, string>> {
+    assert(ancestorWorkspaceId.length > 0, "stopDescendantAgentTask: ancestorWorkspaceId required");
+    assert(taskId.length > 0, "stopDescendantAgentTask: taskId required");
+
+    return await this.withTaskTreeLifecycleLock(taskId, () =>
+      this.stopDescendantAgentTaskUnderLifecycleLock(ancestorWorkspaceId, taskId)
+    );
+  }
+
+  private async stopDescendantAgentTaskUnderLifecycleLock(
+    ancestorWorkspaceId: string,
+    taskId: string
+  ): Promise<Result<{ stoppedTaskIds: string[] }, string>> {
+    const stoppedTaskIds: string[] = [];
+    const metadataToEmit = new Set<string>();
+
+    {
+      await using _lock = await this.mutex.acquire();
+      const cfg = this.config.loadConfigOrDefault();
+      const entry = findWorkspaceEntry(cfg, taskId);
+      if (!entry?.workspace.parentWorkspaceId) {
+        return Err("Task not found");
+      }
+      const index = this.buildAgentTaskIndex(cfg);
+      if (
+        !this.isDescendantAgentTaskUsingParentById(index.parentById, ancestorWorkspaceId, taskId)
+      ) {
+        return Err("Task is not a descendant of this workspace");
       }
 
-      return Ok(accepted ? { delivery: "accepted" } : { delivery: "queued", queueDispatchMode });
-    });
+      const taskIds = [taskId, ...this.listDescendantAgentTaskIdsFromIndex(index, taskId)];
+      taskIds.sort(
+        (left, right) =>
+          this.getTaskDepthFromParentById(index.parentById, right) -
+          this.getTaskDepthFromParentById(index.parentById, left)
+      );
+      const activeWorkspaceTurns = await this.taskHandleStore.listAllWorkspaceTurns({
+        statuses: ["queued", "starting", "running"],
+      });
+
+      for (const id of taskIds) {
+        const current = findWorkspaceEntry(this.config.loadConfigOrDefault(), id);
+        if (!current) continue;
+        const status = current.workspace.taskStatus ?? "running";
+        const activeHandles = activeWorkspaceTurns.filter((turn) => turn.workspaceId === id);
+        const executionActive =
+          ACTIVE_AGENT_TASK_STATUSES.has(status) || this.aiService.isStreaming(id);
+        if (!executionActive && activeHandles.length === 0) {
+          continue;
+        }
+
+        for (const handle of activeHandles) {
+          const interrupted = await this.interruptWorkspaceTurn(
+            handle.ownerWorkspaceId,
+            handle.handleId
+          );
+          if (!interrupted.success) {
+            return Err(interrupted.error);
+          }
+          await this.suppressTerminalAttention({
+            ownerWorkspaceId: handle.ownerWorkspaceId,
+            sourceKind: "workspace_turn",
+            sourceId: handle.handleId,
+          });
+        }
+
+        const clearQueueResult = this.workspaceService.clearQueue(id);
+        if (!clearQueueResult.success) {
+          log.debug("stopDescendantAgentTask: clearQueue failed", {
+            taskId: id,
+            error: clearQueueResult.error,
+          });
+        }
+        if (this.aiService.isStreaming(id)) {
+          try {
+            await this.aiService.stopStream(id, { abandonPartial: false });
+          } catch (error: unknown) {
+            log.debug("stopDescendantAgentTask: stopStream threw", { taskId: id, error });
+          }
+        }
+
+        let transitioned = false;
+        let parentWorkspaceId: string | undefined;
+        await this.editWorkspaceEntry(
+          id,
+          (workspace) => {
+            const previousStatus = workspace.taskStatus;
+            parentWorkspaceId = workspace.parentWorkspaceId;
+            const mutation = this.applyInterruptedTaskStatus(workspace);
+            transitioned = mutation === "interrupted" && previousStatus !== "interrupted";
+          },
+          { allowMissing: true }
+        );
+        if (parentWorkspaceId != null) {
+          await this.suppressTerminalAttention({
+            ownerWorkspaceId: parentWorkspaceId,
+            sourceKind: "agent_task",
+            sourceId: id,
+          });
+        }
+        if (transitioned) {
+          this.recordTaskInterrupted(id, parentWorkspaceId);
+          this.rejectWaiters(id, new Error("Task stopped"));
+          metadataToEmit.add(id);
+        }
+        stoppedTaskIds.push(id);
+      }
+    }
+
+    for (const id of metadataToEmit) {
+      await this.emitWorkspaceMetadata(id);
+    }
+    await this.maybeStartQueuedTasks();
+    return Ok({ stoppedTaskIds });
   }
 
   async terminateDescendantAgentTask(
@@ -4459,7 +4953,6 @@ export class TaskService {
           ([taskId, workspace]) =>
             this.isWorkflowRunDescendant(index, taskId, workflowRunId) &&
             workspace.taskStatus === "interrupted" &&
-            workspace.taskSticky !== true &&
             !hasCompletedAgentReport(workspace) &&
             !isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)
         )
@@ -4499,9 +4992,6 @@ export class TaskService {
         if (isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)) {
           continue;
         }
-        // A sticky task may be structurally blocked by archived children, but it must remain visible
-        // until the user explicitly chooses a lifecycle action.
-        if (entry.workspace.taskSticky === true) continue;
         // Defensive: never hide a workspace with an active stream.
         if (this.aiService.isStreaming(taskId)) continue;
         const freshIndex = this.buildAgentTaskIndex(freshConfig);
@@ -4595,7 +5085,6 @@ export class TaskService {
     const inactiveRunIds = new Set<string>();
     for (const [taskId, workspace] of index.byId) {
       if (isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) continue;
-      if (workspace.taskSticky === true) continue;
       // Seed from two unarchived shapes so a crash mid-sweep still self-heals:
       // - interrupted-without-report children (normal leftover garbage), and
       // - reported tasks, covering a crash after phase 1 archived the interrupted
@@ -4751,50 +5240,6 @@ export class TaskService {
     await this.maybeStartQueuedTasks();
 
     return interruptedTaskIds;
-  }
-
-  async cleanupReportedDescendantsAfterArchive(workspaceId: string): Promise<void> {
-    assert(
-      workspaceId.length > 0,
-      "cleanupReportedDescendantsAfterArchive: workspaceId must be non-empty"
-    );
-
-    const cfg = this.config.loadConfigOrDefault();
-    const index = this.buildAgentTaskIndex(cfg);
-    const completedDescendants = this.listCompletedDescendantAgentTaskIds(index, workspaceId);
-    if (completedDescendants.length === 0) {
-      return;
-    }
-
-    const depthById = new Map<string, number>();
-    for (const descendantId of completedDescendants) {
-      depthById.set(descendantId, this.getTaskDepthFromParentById(index.parentById, descendantId));
-    }
-    completedDescendants.sort((a, b) => {
-      const depthDelta = (depthById.get(b) ?? 0) - (depthById.get(a) ?? 0);
-      return depthDelta !== 0 ? depthDelta : a.localeCompare(b);
-    });
-
-    log.debug("cleanupReportedDescendantsAfterArchive: rechecking completed descendants", {
-      workspaceId,
-      descendantCount: completedDescendants.length,
-    });
-
-    for (const descendantId of completedDescendants) {
-      try {
-        log.debug("cleanupReportedDescendantsAfterArchive: rechecking descendant", {
-          workspaceId,
-          descendantWorkspaceId: descendantId,
-        });
-        await this.cleanupReportedLeafTask(descendantId);
-      } catch (error: unknown) {
-        log.error("cleanupReportedDescendantsAfterArchive: failed to clean up descendant", {
-          workspaceId,
-          descendantWorkspaceId: descendantId,
-          error,
-        });
-      }
-    }
   }
 
   private async rollbackFailedTaskCreate(
@@ -4980,6 +5425,7 @@ export class TaskService {
         taskId,
         async (): Promise<{
           handleId: string;
+          generationId: string;
           terminalOutcome: TerminalAttentionOutcome;
         } | null> => {
           const current = await this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, taskId);
@@ -4988,7 +5434,15 @@ export class TaskService {
           const updatedRecord: WorkspaceTurnTaskHandleRecord =
             current.attentionPolicy === "notify_on_terminal"
               ? current
-              : { ...current, attentionPolicy: "notify_on_terminal", updatedAt: getIsoNow() };
+              : {
+                  ...current,
+                  attentionPolicy: "notify_on_terminal",
+                  // Policy-only writes after settlement must not mint a new terminal outcome
+                  // generation or invalidate direct-parent delivery keyed by status + updatedAt.
+                  ...(this.isTerminalWorkspaceTurnStatus(current.status)
+                    ? {}
+                    : { updatedAt: getIsoNow() }),
+                };
           if (updatedRecord !== current) {
             await this.taskHandleStore.upsertWorkspaceTurn(updatedRecord);
           }
@@ -5003,6 +5457,7 @@ export class TaskService {
           ) {
             return {
               handleId: updatedRecord.handleId,
+              generationId: this.workspaceTurnTerminalAttentionGenerationId(updatedRecord),
               terminalOutcome: terminalAttentionOutcome(updatedRecord.status),
             };
           }
@@ -5014,6 +5469,7 @@ export class TaskService {
           ownerWorkspaceId,
           sourceKind: "workspace_turn",
           sourceId: pendingNotification.handleId,
+          generationId: pendingNotification.generationId,
           terminalOutcome: pendingNotification.terminalOutcome,
         });
         await this.workspaceTurnSettlementLocks.withLock(taskId, async () => {
@@ -5093,35 +5549,81 @@ export class TaskService {
     let recoveredCount = 0;
     for (const record of terminalRecords) {
       if (
+        record.directParentResultDeliveryRequiredAt != null &&
+        record.directParentResultDeliveredAt == null
+      ) {
+        try {
+          await this.deliverPersistentChildWorkspaceTurnResult(record, new Set());
+        } catch (error: unknown) {
+          // Startup recovery is best-effort: one read-only/corrupt session must not block the app.
+          log.warn("Failed to recover direct-parent continuation delivery", {
+            ownerWorkspaceId: record.ownerWorkspaceId,
+            workspaceId: record.workspaceId,
+            handleId: record.handleId,
+            error: getErrorMessage(error),
+          });
+        }
+      }
+      if (
         resolveBackgroundWorkAttentionPolicy(record.attentionPolicy) !== "notify_on_terminal" ||
         record.terminalAttentionNotifiedAt != null
       ) {
         continue;
       }
-      await this.enqueueTerminalAttention({
-        ownerWorkspaceId: record.ownerWorkspaceId,
-        sourceKind: "workspace_turn",
-        terminalOutcome: terminalAttentionOutcome(record.status),
-        sourceId: record.handleId,
-      });
-      await this.workspaceTurnSettlementLocks.withLock(record.handleId, async () => {
-        const current = await this.taskHandleStore.getWorkspaceTurn(
+      try {
+        const outcome = terminalAttentionOutcome(record.status);
+        const legacyAttention = await this.terminalAttentionStore.get(
           record.ownerWorkspaceId,
-          record.handleId
+          TerminalAttentionStore.notificationId("workspace_turn", record.handleId)
         );
-        if (
-          current != null &&
-          this.isTerminalWorkspaceTurnStatus(current.status) &&
-          resolveBackgroundWorkAttentionPolicy(current.attentionPolicy) === "notify_on_terminal" &&
-          current.terminalAttentionNotifiedAt == null
-        ) {
-          await this.taskHandleStore.upsertWorkspaceTurn({
-            ...current,
-            terminalAttentionNotifiedAt: getIsoNow(),
+        const legacyCreatedAt =
+          legacyAttention != null ? Date.parse(legacyAttention.createdAt) : Number.NaN;
+        const recordUpdatedAt = Date.parse(record.updatedAt);
+        const legacyRepresentsCurrentOutcome =
+          legacyAttention?.terminalOutcome === outcome &&
+          Number.isFinite(legacyCreatedAt) &&
+          Number.isFinite(recordUpdatedAt) &&
+          legacyCreatedAt >= recordUpdatedAt;
+        if (!legacyRepresentsCurrentOutcome) {
+          // Corrected outcomes must bypass a stale legacy tombstone. New settlements use this same
+          // versioned ID, while the timestamp check preserves old ordinary-settlement dedupe.
+          await this.enqueueTerminalAttention({
+            ownerWorkspaceId: record.ownerWorkspaceId,
+            sourceKind: "workspace_turn",
+            terminalOutcome: outcome,
+            sourceId: record.handleId,
+            generationId: this.workspaceTurnTerminalAttentionGenerationId(record),
           });
         }
-      });
-      recoveredCount += 1;
+        await this.workspaceTurnSettlementLocks.withLock(record.handleId, async () => {
+          const current = await this.taskHandleStore.getWorkspaceTurn(
+            record.ownerWorkspaceId,
+            record.handleId
+          );
+          if (
+            current != null &&
+            current.status === record.status &&
+            current.updatedAt === record.updatedAt &&
+            resolveBackgroundWorkAttentionPolicy(current.attentionPolicy) ===
+              "notify_on_terminal" &&
+            current.terminalAttentionNotifiedAt == null
+          ) {
+            await this.taskHandleStore.upsertWorkspaceTurn({
+              ...current,
+              terminalAttentionNotifiedAt: getIsoNow(),
+            });
+          }
+        });
+        recoveredCount += 1;
+      } catch (error: unknown) {
+        // Startup recovery is best-effort: one read-only/corrupt owner session must not block the app.
+        log.warn("Failed to recover workspace-turn terminal attention", {
+          ownerWorkspaceId: record.ownerWorkspaceId,
+          workspaceId: record.workspaceId,
+          handleId: record.handleId,
+          error: getErrorMessage(error),
+        });
+      }
     }
     return recoveredCount;
   }
@@ -5200,8 +5702,10 @@ export class TaskService {
 
   async markWorkspaceTurnTerminalAttentionConsumed(params: {
     ownerWorkspaceId: string;
+    consumingWorkspaceId: string;
     handleId: string;
     status: WorkspaceTurnTaskStatus;
+    updatedAt: string;
   }): Promise<void> {
     assert(
       params.ownerWorkspaceId.length > 0,
@@ -5211,19 +5715,63 @@ export class TaskService {
       params.handleId.length > 0,
       "markWorkspaceTurnTerminalAttentionConsumed requires handleId"
     );
-    if (!this.isTerminalWorkspaceTurnStatus(params.status)) {
+    assert(
+      params.consumingWorkspaceId.length > 0,
+      "markWorkspaceTurnTerminalAttentionConsumed requires consumingWorkspaceId"
+    );
+    assert(
+      params.updatedAt.length > 0,
+      "markWorkspaceTurnTerminalAttentionConsumed requires updatedAt"
+    );
+    // A nested continuation's owner and direct parent can differ. Returning the result to the
+    // direct parent must not consume the owner-scoped workspace-turn wake for the ancestor that
+    // initiated the continuation.
+    if (
+      params.consumingWorkspaceId !== params.ownerWorkspaceId ||
+      !this.isTerminalWorkspaceTurnStatus(params.status)
+    ) {
       return;
     }
-    await this.terminalAttentionStore.enqueueIfAbsent({
-      ownerWorkspaceId: params.ownerWorkspaceId,
-      sourceKind: "workspace_turn",
-      terminalOutcome: terminalAttentionOutcome(params.status),
-      sourceId: params.handleId,
+    await this.workspaceTurnSettlementLocks.withLock(params.handleId, async () => {
+      const current = await this.taskHandleStore.getWorkspaceTurn(
+        params.ownerWorkspaceId,
+        params.handleId
+      );
+      if (
+        current == null ||
+        current.status !== params.status ||
+        current.updatedAt !== params.updatedAt
+      ) {
+        return;
+      }
+      await this.markWorkspaceTurnTerminalAttentionConsumedUnlocked(current);
     });
-    await this.terminalAttentionStore.markDelivered(
+  }
+
+  private async suppressTerminalAttention(params: {
+    ownerWorkspaceId: string;
+    sourceKind: TerminalAttentionNotification["sourceKind"];
+    sourceId: string;
+  }): Promise<void> {
+    await this.terminalAttentionStore.enqueueIfAbsent({
+      ...params,
+      terminalOutcome: "interrupted",
+    });
+    await this.terminalAttentionStore.markSuperseded(
       params.ownerWorkspaceId,
-      TerminalAttentionStore.notificationId("workspace_turn", params.handleId)
+      TerminalAttentionStore.notificationId(params.sourceKind, params.sourceId)
     );
+  }
+
+  private async getAgentTerminalAttentionGenerationId(
+    ownerWorkspaceId: string,
+    childTaskId: string
+  ): Promise<string | undefined> {
+    const execution = await this.getDescendantAgentTaskExecutionSnapshot(
+      ownerWorkspaceId,
+      childTaskId
+    );
+    return execution?.record.handleId;
   }
 
   private async enqueueTerminalAttention(params: {
@@ -5231,6 +5779,7 @@ export class TaskService {
     sourceKind: TerminalAttentionNotification["sourceKind"];
     terminalOutcome: TerminalAttentionOutcome;
     sourceId: string;
+    generationId?: string;
   }): Promise<void> {
     const created = await this.terminalAttentionStore.enqueueIfAbsent(params);
     if (created == null) {
@@ -5317,12 +5866,16 @@ export class TaskService {
   private async ensureAgentTerminalMessages(
     ownerWorkspaceId: string,
     notifications: readonly TerminalAttentionNotification[]
-  ): Promise<Set<string>> {
-    const deliverableIds = new Set<string>();
-    if (notifications.length === 0) return deliverableIds;
-
+  ): Promise<{
+    deliverableNotificationIds: Set<string>;
+    latestMessageTimestampByTaskId: Map<string, number>;
+  }> {
+    const deliverableNotificationIds = new Set<string>();
+    const latestMessageTimestampByTaskId = new Map<string, number>();
     const historyResult = await this.historyService.getHistoryFromLatestBoundary(ownerWorkspaceId);
-    if (!historyResult.success) return deliverableIds;
+    if (!historyResult.success) {
+      return { deliverableNotificationIds, latestMessageTimestampByTaskId };
+    }
     const existingTaskIds = new Set<string>();
     for (const message of historyResult.data) {
       if (message.role !== "user" || message.metadata?.synthetic !== true) continue;
@@ -5332,13 +5885,24 @@ export class TaskService {
           .map((part) => part.text)
           .join("\n")
       );
-      if (taskId != null) existingTaskIds.add(taskId);
+      if (taskId == null) continue;
+      existingTaskIds.add(taskId);
+      const timestamp = message.metadata?.timestamp;
+      if (typeof timestamp === "number" && Number.isFinite(timestamp)) {
+        latestMessageTimestampByTaskId.set(
+          taskId,
+          Math.max(latestMessageTimestampByTaskId.get(taskId) ?? 0, timestamp)
+        );
+      }
     }
 
     const sessionDir = this.config.getSessionDir(ownerWorkspaceId);
     for (const notification of notifications) {
       if (existingTaskIds.has(notification.sourceId)) {
-        deliverableIds.add(notification.id);
+        // Report/failure delivery necessarily precedes terminal-attention enqueue. Presence in parent
+        // history is therefore authoritative here; continuation freshness is checked separately
+        // against the private execution's createdAt before suppressing its workspace-turn wake.
+        deliverableNotificationIds.add(notification.id);
         continue;
       }
 
@@ -5377,11 +5941,12 @@ export class TaskService {
         continue;
       }
 
+      const timestamp = Date.now();
       const message = createMuxMessage(
         report != null ? createTaskReportMessageId() : createTaskFailureMessageId(),
         "user",
         content,
-        { timestamp: Date.now(), synthetic: true, uiVisible: true }
+        { timestamp, synthetic: true, uiVisible: true }
       );
       const appendResult = await this.historyService.appendToHistory(ownerWorkspaceId, message);
       if (!appendResult.success) {
@@ -5393,9 +5958,11 @@ export class TaskService {
         continue;
       }
       this.workspaceService.emitChatEvent(ownerWorkspaceId, { ...message, type: "message" });
-      deliverableIds.add(notification.id);
+      existingTaskIds.add(notification.sourceId);
+      latestMessageTimestampByTaskId.set(notification.sourceId, timestamp);
+      deliverableNotificationIds.add(notification.id);
     }
-    return deliverableIds;
+    return { deliverableNotificationIds, latestMessageTimestampByTaskId };
   }
 
   private async consumeRespondedAgentTerminalAttention(ownerWorkspaceId: string): Promise<void> {
@@ -5468,6 +6035,13 @@ export class TaskService {
       return;
     }
 
+    if (isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)) {
+      for (const notification of pending) {
+        await this.terminalAttentionStore.markSuperseded(ownerWorkspaceId, notification.id);
+      }
+      return;
+    }
+
     // Defer-until-idle: never inject ahead of an active stream or a queued/preparing user turn.
     const ownerHasPendingQueuedPreparingOrRetry =
       this.workspaceService.hasPendingQueuedOrPreparingTurn(ownerWorkspaceId);
@@ -5494,21 +6068,56 @@ export class TaskService {
     const agentNotifications = pending.filter(
       (notification) => notification.sourceKind === "agent_task"
     );
-    const deliverableAgentNotificationIds = await this.ensureAgentTerminalMessages(
-      ownerWorkspaceId,
-      agentNotifications
+    const {
+      deliverableNotificationIds: deliverableAgentNotificationIds,
+      latestMessageTimestampByTaskId,
+    } = await this.ensureAgentTerminalMessages(ownerWorkspaceId, agentNotifications);
+    const workspaceTurnNotifications = pending.filter(
+      (notification) => notification.sourceKind === "workspace_turn"
     );
-    const awaitHandleIds = pending
-      .filter((notification) => notification.sourceKind === "workspace_turn")
-      .map((notification) => notification.sourceId);
+    const deliverableWorkspaceTurnNotificationIds = new Set<string>();
+    const publicAwaitIds: string[] = [];
+    for (const notification of workspaceTurnNotifications) {
+      const record = await this.taskHandleStore.getWorkspaceTurn(
+        ownerWorkspaceId,
+        notification.sourceId
+      );
+      const isPersistentChildContinuation =
+        record != null &&
+        this.isDescendantAgentTaskUsingParentById(
+          taskIndex.parentById,
+          ownerWorkspaceId,
+          record.workspaceId
+        );
+      if (isPersistentChildContinuation) {
+        const latestTerminalMessageAt = latestMessageTimestampByTaskId.get(record.workspaceId);
+        const continuationCreatedAt = Date.parse(record.createdAt);
+        if (
+          latestTerminalMessageAt != null &&
+          Number.isFinite(continuationCreatedAt) &&
+          latestTerminalMessageAt >= continuationCreatedAt
+        ) {
+          // A persistent child continuation reports through the stable child transcript row. Once
+          // that report/failure is in parent history, a second task_await wake for the private
+          // workspace-turn handle is redundant and exposes an implementation detail to the user.
+          await this.terminalAttentionStore.markSuperseded(ownerWorkspaceId, notification.id);
+          continue;
+        }
+      }
+
+      deliverableWorkspaceTurnNotificationIds.add(notification.id);
+      publicAwaitIds.push(
+        isPersistentChildContinuation ? record.workspaceId : notification.sourceId
+      );
+    }
     const workflowNotifications = pending.filter(
       (notification) => notification.sourceKind === "workflow_run"
     );
     const deliverableWorkflowNotificationIds = new Set<string>();
 
     const promptSections: string[] = [];
-    if (awaitHandleIds.length > 0) {
-      promptSections.push(buildCompletedWorkspaceTurnPrompt(awaitHandleIds));
+    if (publicAwaitIds.length > 0) {
+      promptSections.push(buildCompletedWorkspaceTurnPrompt(publicAwaitIds));
     }
     for (const notification of workflowNotifications) {
       const workflowPrompt = await this.buildWorkflowTerminalPrompt(
@@ -5533,7 +6142,7 @@ export class TaskService {
       if (notification.sourceKind === "workflow_run") {
         return deliverableWorkflowNotificationIds.has(notification.id);
       }
-      return true;
+      return deliverableWorkspaceTurnNotificationIds.has(notification.id);
     });
     if (effectivePending.length === 0) return;
 
@@ -5669,6 +6278,7 @@ export class TaskService {
     return {
       taskId: record.handleId,
       workspaceId: record.workspaceId,
+      updatedAt: record.updatedAt,
       reportMarkdown:
         record.reportMarkdown ?? "Workspace turn completed without final text output.",
       title: record.title,
@@ -5677,27 +6287,28 @@ export class TaskService {
     };
   }
 
-  /**
-   * Settle pending workspace-turn waiters. Returns whether any foreground waiter consumed the
-   * terminal result — callers use this to suppress a duplicate terminal wake-up notification.
-   */
+  /** Settle pending workspace-turn waiters and return the workspaces that consumed the result. */
   private settleWorkspaceTurnWaiters(
     handleId: string,
     settlement:
       | { status: "completed"; result: WorkspaceTurnWaitResult }
       | { status: "error"; error: Error }
-  ): boolean {
+  ): Set<string> {
     assert(handleId.length > 0, "settleWorkspaceTurnWaiters requires handleId");
     const waiters = this.pendingWorkspaceTurnWaitersByHandleId.get(handleId) ?? [];
     this.pendingWorkspaceTurnWaitersByHandleId.delete(handleId);
+    const requestingWorkspaceIds = new Set<string>();
     for (const waiter of waiters) {
+      if (waiter.requestingWorkspaceId != null) {
+        requestingWorkspaceIds.add(waiter.requestingWorkspaceId);
+      }
       if (settlement.status === "completed") {
         waiter.resolve(settlement.result);
       } else {
         waiter.reject(settlement.error);
       }
     }
-    return waiters.length > 0;
+    return requestingWorkspaceIds;
   }
 
   private async cleanupDisposableWorkspaceTurn(
@@ -5726,6 +6337,272 @@ export class TaskService {
     return status === "completed" || status === "interrupted" || status === "error";
   }
 
+  private async updateAgentTaskExecutionState(
+    workspaceId: string,
+    handleId: string,
+    status: WorkspaceTurnTaskStatus | null
+  ): Promise<void> {
+    const updated = await this.editWorkspaceEntry(
+      workspaceId,
+      (workspace) => {
+        if (status == null) {
+          if (workspace.taskExecutionId === handleId) {
+            delete workspace.taskExecutionId;
+            delete workspace.taskExecutionStatus;
+          }
+          return;
+        }
+        if (isActiveWorkspaceTurnTaskStatus(status)) {
+          workspace.taskExecutionId = handleId;
+          workspace.taskExecutionStatus = status;
+          return;
+        }
+        if (workspace.taskExecutionId === handleId) {
+          workspace.taskExecutionStatus = status;
+        }
+      },
+      { allowMissing: true }
+    );
+    if (updated) {
+      await this.emitWorkspaceMetadata(workspaceId);
+    }
+  }
+
+  private workspaceTurnRequiresDirectParentDelivery(
+    record: WorkspaceTurnTaskHandleRecord
+  ): boolean {
+    if (record.status !== "completed" && record.status !== "error") {
+      return false;
+    }
+    const childEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), record.workspaceId);
+    return (
+      childEntry?.workspace.parentWorkspaceId != null && childEntry.workspace.workflowTask == null
+    );
+  }
+
+  private workspaceTurnTerminalAttentionGenerationId(
+    record: Pick<WorkspaceTurnTaskHandleRecord, "handleId" | "status" | "updatedAt">
+  ): string {
+    // A handle can self-heal from an error into a corrected completion. Include the exact terminal
+    // outcome version so an in-flight stale drain cannot transition the replacement notification.
+    return `${record.handleId}:${record.status}:${record.updatedAt}`;
+  }
+
+  private workspaceTurnTerminalAttentionIds(
+    record: Pick<WorkspaceTurnTaskHandleRecord, "handleId" | "status" | "updatedAt">
+  ): [legacyId: string, versionedId: string] {
+    return [
+      TerminalAttentionStore.notificationId("workspace_turn", record.handleId),
+      TerminalAttentionStore.notificationId(
+        "workspace_turn",
+        record.handleId,
+        this.workspaceTurnTerminalAttentionGenerationId(record)
+      ),
+    ];
+  }
+
+  private async deleteWorkspaceTurnTerminalAttention(
+    record: Pick<
+      WorkspaceTurnTaskHandleRecord,
+      "ownerWorkspaceId" | "handleId" | "status" | "updatedAt"
+    >
+  ): Promise<void> {
+    for (const id of this.workspaceTurnTerminalAttentionIds(record)) {
+      await this.terminalAttentionStore.delete(record.ownerWorkspaceId, id);
+    }
+  }
+
+  /** Caller must hold workspaceTurnSettlementLocks for this handle. */
+  private async markWorkspaceTurnTerminalAttentionConsumedUnlocked(
+    record: WorkspaceTurnTaskHandleRecord
+  ): Promise<WorkspaceTurnTaskHandleRecord> {
+    if (
+      !this.isTerminalWorkspaceTurnStatus(record.status) ||
+      resolveBackgroundWorkAttentionPolicy(record.attentionPolicy) !== "notify_on_terminal"
+    ) {
+      return record;
+    }
+
+    const generationId = this.workspaceTurnTerminalAttentionGenerationId(record);
+    await this.terminalAttentionStore.enqueueIfAbsent({
+      ownerWorkspaceId: record.ownerWorkspaceId,
+      sourceKind: "workspace_turn",
+      sourceId: record.handleId,
+      terminalOutcome: terminalAttentionOutcome(record.status),
+    });
+    await this.terminalAttentionStore.enqueueIfAbsent({
+      ownerWorkspaceId: record.ownerWorkspaceId,
+      sourceKind: "workspace_turn",
+      sourceId: record.handleId,
+      generationId,
+      terminalOutcome: terminalAttentionOutcome(record.status),
+    });
+    for (const id of this.workspaceTurnTerminalAttentionIds(record)) {
+      await this.terminalAttentionStore.markDelivered(record.ownerWorkspaceId, id);
+    }
+
+    const consumedAt = getIsoNow();
+    const consumed = {
+      ...record,
+      terminalAttentionNotifiedAt: record.terminalAttentionNotifiedAt ?? consumedAt,
+    };
+    await this.taskHandleStore.upsertWorkspaceTurn(consumed);
+    return consumed;
+  }
+
+  private async deletePersistentChildWorkspaceTurnAttention(
+    record: WorkspaceTurnTaskHandleRecord
+  ): Promise<void> {
+    const childEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), record.workspaceId);
+    if (childEntry == null || childEntry.workspace.workflowTask != null) {
+      return;
+    }
+    const directParentWorkspaceId = childEntry.workspace.parentWorkspaceId;
+    if (directParentWorkspaceId == null) {
+      return;
+    }
+    await this.terminalAttentionStore.delete(
+      directParentWorkspaceId,
+      TerminalAttentionStore.notificationId(
+        "agent_task",
+        record.workspaceId,
+        this.workspaceTurnTerminalAttentionGenerationId(record)
+      )
+    );
+  }
+
+  private async deliverPersistentChildWorkspaceTurnResult(
+    record: WorkspaceTurnTaskHandleRecord,
+    foregroundWaiterWorkspaceIds: ReadonlySet<string>
+  ): Promise<void> {
+    await this.workspaceTurnSettlementLocks.withLock(record.handleId, async () => {
+      const current = await this.taskHandleStore.getWorkspaceTurn(
+        record.ownerWorkspaceId,
+        record.handleId
+      );
+      if (
+        current == null ||
+        current.status !== record.status ||
+        current.updatedAt !== record.updatedAt
+      ) {
+        return;
+      }
+      await this.deliverPersistentChildWorkspaceTurnResultUnlocked(
+        current,
+        foregroundWaiterWorkspaceIds
+      );
+    });
+  }
+
+  private async deliverPersistentChildWorkspaceTurnResultUnlocked(
+    record: WorkspaceTurnTaskHandleRecord,
+    foregroundWaiterWorkspaceIds: ReadonlySet<string>
+  ): Promise<void> {
+    if (record.status !== "completed" && record.status !== "error") {
+      return;
+    }
+
+    if (
+      record.directParentResultDeliveryRequiredAt == null ||
+      record.directParentResultDeliveredAt != null
+    ) {
+      return;
+    }
+    const childEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), record.workspaceId);
+    if (childEntry == null || childEntry.workspace.workflowTask != null) {
+      return;
+    }
+    const directParentWorkspaceId = childEntry.workspace.parentWorkspaceId;
+    if (directParentWorkspaceId == null) {
+      return;
+    }
+    const markDirectParentResultDelivered = async () => {
+      record.directParentResultDeliveredAt = record.directParentResultDeliveredAt ?? getIsoNow();
+      await this.taskHandleStore.upsertWorkspaceTurn(record);
+    };
+    if (foregroundWaiterWorkspaceIds.has(directParentWorkspaceId)) {
+      await markDirectParentResultDelivered();
+      // The direct parent's in-flight tool result already carries this output.
+      return;
+    }
+
+    const deliveryVersion = this.workspaceTurnTerminalAttentionGenerationId(record);
+    const historyResult =
+      await this.historyService.getHistoryFromLatestBoundary(directParentWorkspaceId);
+    const alreadyDelivered =
+      historyResult.success &&
+      historyResult.data.some((message) => {
+        if (message.role !== "user" || message.metadata?.synthetic !== true) {
+          return false;
+        }
+        const content = message.parts
+          .filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text")
+          .map((part) => part.text)
+          .join("\n");
+        return parseTerminalSubagentExecutionVersion(content) === deliveryVersion;
+      });
+
+    const agentType = coerceNonEmptyString(childEntry.workspace.agentType) ?? "agent";
+    const content =
+      record.status === "completed"
+        ? formatSubagentReportUserMessage({
+            executionVersion: deliveryVersion,
+            executionId: record.handleId,
+            childWorkspaceId: record.workspaceId,
+            agentType,
+            title:
+              coerceNonEmptyString(childEntry.workspace.title) ??
+              coerceNonEmptyString(childEntry.workspace.name) ??
+              record.title ??
+              "Subagent report",
+            reportMarkdown:
+              record.reportMarkdown ?? "Workspace turn completed without final text output.",
+            status: "completed",
+            ...(record.modelString != null ? { model: record.modelString } : {}),
+            ...(childEntry.workspace.taskThinkingLevel != null
+              ? { thinkingLevel: childEntry.workspace.taskThinkingLevel }
+              : {}),
+          })
+        : formatSubagentFailureUserMessage({
+            childWorkspaceId: record.workspaceId,
+            agentType,
+            executionVersion: deliveryVersion,
+            executionId: record.handleId,
+            errorType: "workspace_turn_error",
+            errorMessage: record.error ?? "Workspace turn failed",
+          });
+    if (!alreadyDelivered) {
+      const message = createMuxMessage(
+        record.status === "completed" ? createTaskReportMessageId() : createTaskFailureMessageId(),
+        "user",
+        content,
+        { timestamp: Date.now(), synthetic: true, uiVisible: true }
+      );
+      const appendResult = await this.historyService.appendToHistory(
+        directParentWorkspaceId,
+        message
+      );
+      if (!appendResult.success) {
+        log.error("Failed to append persistent child continuation result to direct parent", {
+          directParentWorkspaceId,
+          childWorkspaceId: record.workspaceId,
+          handleId: record.handleId,
+          error: appendResult.error,
+        });
+        return;
+      }
+      this.workspaceService.emitChatEvent(directParentWorkspaceId, { ...message, type: "message" });
+    }
+    await this.enqueueTerminalAttention({
+      ownerWorkspaceId: directParentWorkspaceId,
+      sourceKind: "agent_task",
+      sourceId: record.workspaceId,
+      generationId: this.workspaceTurnTerminalAttentionGenerationId(record),
+      terminalOutcome: terminalAttentionOutcome(record.status),
+    });
+    await markDirectParentResultDelivered();
+  }
+
   private async settleWorkspaceTurn(params: {
     record: WorkspaceTurnTaskHandleRecord;
     next: WorkspaceTurnTaskHandleRecord;
@@ -5749,13 +6626,23 @@ export class TaskService {
       "settleWorkspaceTurn requires stable workspaceId"
     );
 
-    // The settlement lock only persists durable state and resolves waiters. The terminal wake-up is
-    // enqueued AFTER the lock is released (no sendMessage / notifier work while holding the lock).
-    const pendingNotify = await this.workspaceTurnSettlementLocks.withLock(
+    // The settlement lock persists the handle and its stable-child status mirror, then resolves
+    // waiters. The terminal wake-up is enqueued AFTER release (no sendMessage/notifier work here).
+    const settlementResult = await this.workspaceTurnSettlementLocks.withLock(
       params.record.handleId,
-      async (): Promise<
-        { kind: "notify"; resettled: boolean } | { kind: "drain_pending" } | null
-      > => {
+      async (): Promise<{
+        pendingNotify:
+          | {
+              kind: "notify";
+              resettled: boolean;
+              staleAttentionRecord?: WorkspaceTurnTaskHandleRecord;
+            }
+          | { kind: "drain_pending" }
+          | null;
+        winningStatus: WorkspaceTurnTaskStatus;
+        settledRecord?: WorkspaceTurnTaskHandleRecord;
+        foregroundWaiterWorkspaceIds?: Set<string>;
+      } | null> => {
         const current = await this.taskHandleStore.getWorkspaceTurn(
           params.record.ownerWorkspaceId,
           params.record.handleId
@@ -5800,8 +6687,13 @@ export class TaskService {
                   ),
                 }
           );
+          await this.updateAgentTaskExecutionState(
+            current.workspaceId,
+            current.handleId,
+            current.status
+          );
           this.markTaskForegroundRelevant(current.handleId);
-          return null;
+          return { pendingNotify: null, winningStatus: current.status };
         }
 
         // Decide the terminal wake-up using persisted policy + the restart-safe dedupe marker.
@@ -5822,7 +6714,21 @@ export class TaskService {
           });
           delete nextRecord.terminalAttentionNotifiedAt;
         }
+        if (this.workspaceTurnRequiresDirectParentDelivery(nextRecord)) {
+          nextRecord.directParentResultDeliveryRequiredAt = getIsoNow();
+          if (resettleStaleTerminal) {
+            await this.deletePersistentChildWorkspaceTurnAttention(current);
+          }
+          if (resettleStaleTerminal) {
+            delete nextRecord.directParentResultDeliveredAt;
+          }
+        }
         await this.taskHandleStore.upsertWorkspaceTurn(nextRecord);
+        await this.updateAgentTaskExecutionState(
+          nextRecord.workspaceId,
+          nextRecord.handleId,
+          nextRecord.status
+        );
         const active = this.activeWorkspaceTurnHandleByWorkspaceId.get(params.record.workspaceId);
         if (
           active?.handleId === params.record.handleId &&
@@ -5830,27 +6736,63 @@ export class TaskService {
         ) {
           this.activeWorkspaceTurnHandleByWorkspaceId.delete(params.record.workspaceId);
         }
-        const hadForegroundWaiter = this.settleWorkspaceTurnWaiters(
+        const foregroundWaiterWorkspaceIds = this.settleWorkspaceTurnWaiters(
           params.record.handleId,
           params.waiterSettlement
+        );
+        const ownerHadForegroundWaiter = foregroundWaiterWorkspaceIds.has(
+          params.record.ownerWorkspaceId
         );
         this.markTaskForegroundRelevant(params.record.handleId);
         await this.cleanupDisposableWorkspaceTurn(nextRecord);
         this.scheduleMaybeStartQueuedTasks();
 
-        // A foreground waiter that received this terminal result already integrates it, so suppress
-        // this source's synthetic wake-up. Still kick the drain after the lock: another sibling may
-        // have a pending terminal notification that was deferred on this workspace turn.
-        if (hadForegroundWaiter) {
-          return { kind: "drain_pending" };
+        // Suppress the owner-scoped wake only when the owner itself received this terminal result.
+        // Another workspace (for example the persistent child's direct parent) can await the same
+        // handle without consuming the continuation owner's notification.
+        if (ownerHadForegroundWaiter) {
+          return {
+            pendingNotify: { kind: "drain_pending" },
+            winningStatus: nextRecord.status,
+            settledRecord: nextRecord,
+            foregroundWaiterWorkspaceIds,
+          };
         }
         if (!shouldNotify) {
-          return null;
+          return {
+            pendingNotify: null,
+            winningStatus: nextRecord.status,
+            settledRecord: nextRecord,
+            foregroundWaiterWorkspaceIds,
+          };
         }
-        return { kind: "notify", resettled: resettleStaleTerminal };
+        return {
+          pendingNotify: {
+            kind: "notify",
+            resettled: resettleStaleTerminal,
+            ...(resettleStaleTerminal ? { staleAttentionRecord: current } : {}),
+          },
+          winningStatus: nextRecord.status,
+          settledRecord: nextRecord,
+          foregroundWaiterWorkspaceIds,
+        };
       }
     );
 
+    if (settlementResult == null) {
+      return;
+    }
+    const {
+      pendingNotify,
+      settledRecord,
+      foregroundWaiterWorkspaceIds = new Set<string>(),
+    } = settlementResult;
+    if (settledRecord != null) {
+      await this.deliverPersistentChildWorkspaceTurnResult(
+        settledRecord,
+        foregroundWaiterWorkspaceIds
+      );
+    }
     if (pendingNotify == null) {
       return;
     }
@@ -5863,29 +6805,60 @@ export class TaskService {
     // record of intent; only after it is accepted do we set terminalAttentionNotifiedAt on the
     // handle so a duplicate settlement / stale recovery cannot double-wake.
     if (pendingNotify.resettled) {
-      // The stale settlement's wake-up may already be delivered/consumed; enqueueIfAbsent
-      // treats that tombstone as "already notified" and would swallow the corrected outcome.
-      await this.terminalAttentionStore.delete(
-        params.record.ownerWorkspaceId,
-        TerminalAttentionStore.notificationId("workspace_turn", params.record.handleId)
-      );
+      const shouldEnqueueCorrectedAttention =
+        settledRecord != null &&
+        (await this.workspaceTurnSettlementLocks.withLock(params.record.handleId, async () => {
+          const current = await this.taskHandleStore.getWorkspaceTurn(
+            params.record.ownerWorkspaceId,
+            params.record.handleId
+          );
+          if (
+            current == null ||
+            current.status !== settledRecord.status ||
+            current.updatedAt !== settledRecord.updatedAt ||
+            current.terminalAttentionNotifiedAt != null
+          ) {
+            return false;
+          }
+          // Delete the stale generation while holding the same lock used by direct-parent
+          // consumption. If consumption wins next, it installs a delivered tombstone before this
+          // method's enqueueIfAbsent; if it already won, the marker above prevents this deletion.
+          if (pendingNotify.staleAttentionRecord != null) {
+            await this.deleteWorkspaceTurnTerminalAttention(pendingNotify.staleAttentionRecord);
+          }
+          return true;
+        }));
+      if (!shouldEnqueueCorrectedAttention) {
+        return;
+      }
     }
     await this.enqueueTerminalAttention({
       ownerWorkspaceId: params.record.ownerWorkspaceId,
       sourceKind: "workspace_turn",
-      terminalOutcome: terminalAttentionOutcome(params.next.status),
+      terminalOutcome: terminalAttentionOutcome(settlementResult.winningStatus),
       sourceId: params.record.handleId,
+      ...(settledRecord != null
+        ? { generationId: this.workspaceTurnTerminalAttentionGenerationId(settledRecord) }
+        : {}),
     });
-    const terminal = await this.taskHandleStore.getWorkspaceTurn(
-      params.record.ownerWorkspaceId,
-      params.record.handleId
-    );
-    if (terminal != null && terminal.terminalAttentionNotifiedAt == null) {
-      await this.taskHandleStore.upsertWorkspaceTurn({
-        ...terminal,
-        terminalAttentionNotifiedAt: getIsoNow(),
-      });
-    }
+    await this.workspaceTurnSettlementLocks.withLock(params.record.handleId, async () => {
+      const terminal = await this.taskHandleStore.getWorkspaceTurn(
+        params.record.ownerWorkspaceId,
+        params.record.handleId
+      );
+      if (
+        terminal != null &&
+        (settledRecord == null ||
+          (terminal.status === settledRecord.status &&
+            terminal.updatedAt === settledRecord.updatedAt)) &&
+        terminal.terminalAttentionNotifiedAt == null
+      ) {
+        await this.taskHandleStore.upsertWorkspaceTurn({
+          ...terminal,
+          terminalAttentionNotifiedAt: getIsoNow(),
+        });
+      }
+    });
   }
 
   async waitForWorkspaceTurn(
@@ -5894,6 +6867,7 @@ export class TaskService {
       timeoutMs?: number;
       abortSignal?: AbortSignal;
       requestingWorkspaceId: string;
+      ownerWorkspaceId?: string;
       backgroundOnMessageQueued?: boolean;
     }
   ): Promise<WorkspaceTurnWaitResult> {
@@ -5904,6 +6878,8 @@ export class TaskService {
     );
     const timeoutMs = options.timeoutMs ?? 120_000;
     assert(Number.isFinite(timeoutMs) && timeoutMs > 0, "waitForWorkspaceTurn: timeoutMs invalid");
+    const ownerWorkspaceId = options.ownerWorkspaceId ?? options.requestingWorkspaceId;
+    assert(ownerWorkspaceId.length > 0, "waitForWorkspaceTurn: ownerWorkspaceId must be non-empty");
 
     this.markTaskForegroundRelevant(handleId);
 
@@ -5988,10 +6964,7 @@ export class TaskService {
       );
 
       void (async () => {
-        const record = await this.taskHandleStore.getWorkspaceTurn(
-          options.requestingWorkspaceId,
-          handleId
-        );
+        const record = await this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, handleId);
         if (settled) return;
         if (record == null) {
           waiterEntry.reject(new Error("Workspace turn not found or out of scope"));
@@ -6026,16 +6999,38 @@ export class TaskService {
     await this.workspaceEventLocks.withLock(childWorkspaceId, async () => {
       const cfg = this.config.loadConfigOrDefault();
       const childEntry = findWorkspaceEntry(cfg, childWorkspaceId);
-      const parentWorkspaceId = childEntry?.workspace.parentWorkspaceId;
-      if (!childEntry || !parentWorkspaceId) {
+      const directParentWorkspaceId = childEntry?.workspace.parentWorkspaceId;
+      if (!childEntry || !directParentWorkspaceId) {
         throw new Error("agent_report is only available from an active sub-agent task");
       }
-      if (hasCompletedAgentReport(childEntry.workspace)) {
+
+      const executionId = childEntry.workspace.taskExecutionId;
+      let continuationRecord: WorkspaceTurnTaskHandleRecord | null = null;
+      if (executionId != null) {
+        const active = this.activeWorkspaceTurnHandleByWorkspaceId.get(childWorkspaceId);
+        if (active?.handleId === executionId) {
+          continuationRecord = await this.taskHandleStore.getWorkspaceTurn(
+            active.ownerWorkspaceId,
+            executionId
+          );
+        } else {
+          continuationRecord =
+            (await this.taskHandleStore.listAllWorkspaceTurns()).find(
+              (record) => record.handleId === executionId
+            ) ?? null;
+        }
+      }
+      const continuationActive = isActiveWorkspaceTurnTaskStatus(continuationRecord?.status);
+      if (hasCompletedAgentReport(childEntry.workspace) && !continuationActive) {
         throw new Error("agent_report cannot send updates after the sub-agent has completed");
       }
-      if (childEntry.workspace.taskStatus === "interrupted") {
+      if (childEntry.workspace.taskStatus === "interrupted" && !continuationActive) {
         throw new Error("agent_report cannot send updates from an interrupted sub-agent");
       }
+      const parentWorkspaceId =
+        continuationActive && continuationRecord != null
+          ? continuationRecord.ownerWorkspaceId
+          : directParentWorkspaceId;
 
       if (childEntry.workspace.workflowTask != null) {
         // Workflow-owned tasks deliver structured output through WorkflowRunner's journal/result
@@ -6675,6 +7670,57 @@ export class TaskService {
     });
   }
 
+  getAgentTaskExecutionId(taskId: string): string | null {
+    assert(taskId.length > 0, "getAgentTaskExecutionId: taskId must be non-empty");
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
+    return entry?.workspace.taskExecutionId ?? null;
+  }
+
+  async getDescendantAgentTaskExecutionSnapshot(
+    ancestorWorkspaceId: string,
+    taskId: string,
+    options: { consumingWorkspaceId?: string } = {}
+  ): Promise<{
+    ownerWorkspaceId: string;
+    record: WorkspaceTurnTaskHandleRecord;
+  } | null> {
+    assert(
+      ancestorWorkspaceId.length > 0,
+      "getDescendantAgentTaskExecutionSnapshot: ancestorWorkspaceId must be non-empty"
+    );
+    assert(taskId.length > 0, "getDescendantAgentTaskExecutionSnapshot: taskId must be non-empty");
+
+    const cfg = this.config.loadConfigOrDefault();
+    const index = this.buildAgentTaskIndex(cfg);
+    if (!this.isDescendantAgentTaskUsingParentById(index.parentById, ancestorWorkspaceId, taskId)) {
+      return null;
+    }
+
+    const executionTaskId = index.byId.get(taskId)?.taskExecutionId;
+    if (!isWorkspaceTurnTaskId(executionTaskId)) {
+      return null;
+    }
+
+    // A continuation is owned by whichever ancestor reawakened the child, not necessarily by the
+    // ancestor currently listing or awaiting it. Search the child's ancestry, then return the
+    // actual owner so subsequent reads and terminal-attention updates use the correct session.
+    for (const ownerWorkspaceId of this.listAncestorWorkspaceIdsUsingParentById(
+      index.parentById,
+      taskId
+    )) {
+      const record = await this.getWorkspaceTurnSnapshot(
+        ownerWorkspaceId,
+        executionTaskId,
+        options
+      );
+      if (record?.workspaceId === taskId) {
+        return { ownerWorkspaceId, record };
+      }
+    }
+
+    return null;
+  }
+
   getAgentTaskStatus(taskId: string): AgentTaskStatus | null {
     assert(taskId.length > 0, "getAgentTaskStatus: taskId must be non-empty");
 
@@ -6722,6 +7768,14 @@ export class TaskService {
     return statuses;
   }
 
+  hasDescendantAgentTasks(workspaceId: string): boolean {
+    assert(workspaceId.length > 0, "hasDescendantAgentTasks: workspaceId must be non-empty");
+
+    const cfg = this.config.loadConfigOrDefault();
+    const index = this.buildAgentTaskIndex(cfg);
+    return this.listDescendantAgentTaskIdsFromIndex(index, workspaceId).length > 0;
+  }
+
   hasActiveDescendantAgentTasksForWorkspace(workspaceId: string): boolean {
     assert(
       workspaceId.length > 0,
@@ -6730,61 +7784,6 @@ export class TaskService {
 
     const cfg = this.config.loadConfigOrDefault();
     return this.hasActiveDescendantAgentTasks(cfg, workspaceId);
-  }
-
-  hasStickyDescendants(workspaceId: string): boolean {
-    assert(workspaceId.length > 0, "hasStickyDescendants: workspaceId must be non-empty");
-
-    const cfg = this.config.loadConfigOrDefault();
-    const index = this.buildAgentTaskIndex(cfg);
-    return this.listDescendantAgentTaskIdsFromIndex(index, workspaceId).some(
-      (descendantId) => index.byId.get(descendantId)?.taskSticky === true
-    );
-  }
-
-  hasUnarchivedStickyDescendants(workspaceId: string): boolean {
-    assert(workspaceId.length > 0, "hasUnarchivedStickyDescendants: workspaceId must be non-empty");
-
-    const cfg = this.config.loadConfigOrDefault();
-    const index = this.buildAgentTaskIndex(cfg);
-    return this.listDescendantAgentTaskIdsFromIndex(index, workspaceId).some((descendantId) => {
-      const descendant = index.byId.get(descendantId);
-      return (
-        descendant?.taskSticky === true &&
-        !isWorkspaceArchived(descendant.archivedAt, descendant.unarchivedAt)
-      );
-    });
-  }
-
-  hasPreservedCompletedDescendants(workspaceId: string): boolean {
-    assert(
-      workspaceId.length > 0,
-      "hasPreservedCompletedDescendants: workspaceId must be non-empty"
-    );
-
-    const cfg = this.config.loadConfigOrDefault();
-    const taskSettings = normalizeTaskSettings(cfg.taskSettings);
-    if (!taskSettings.preserveSubagentsUntilArchive) {
-      return false;
-    }
-
-    const index = this.buildAgentTaskIndex(cfg);
-    const completedDescendants = this.listCompletedDescendantAgentTaskIds(index, workspaceId);
-    return completedDescendants.some(
-      (descendantId) =>
-        !this.isWorkflowOwnedTaskUsingIndex(index, descendantId) &&
-        !this.hasArchivedAncestor(index, cfg, descendantId)
-    );
-  }
-
-  // This ignores archive state and preserveSubagentsUntilArchive so callers can detect
-  // completed descendants that are still waiting on cleanup prerequisites.
-  hasCompletedDescendants(workspaceId: string): boolean {
-    assert(workspaceId.length > 0, "hasCompletedDescendants: workspaceId must be non-empty");
-
-    const cfg = this.config.loadConfigOrDefault();
-    const index = this.buildAgentTaskIndex(cfg);
-    return this.listCompletedDescendantAgentTaskIds(index, workspaceId).length > 0;
   }
 
   listActiveDescendantAgentTaskIds(
@@ -6837,6 +7836,8 @@ export class TaskService {
        * historical terminal handle on each call.
        */
       repairSettledTurnsFromHistory?: boolean;
+      /** Direct parent whose task_await will return this snapshot, if any. */
+      consumingWorkspaceId?: string;
     } = {}
   ): Promise<WorkspaceTurnTaskHandleRecord | null> {
     assert(record.ownerWorkspaceId.length > 0, "normalizeWorkspaceTurnRecord requires owner id");
@@ -6869,7 +7870,7 @@ export class TaskService {
     }
 
     if (
-      (record.status === "queued" || record.status === "starting" || record.status === "running") &&
+      isActiveWorkspaceTurnTaskStatus(record.status) &&
       !(await this.isLiveWorkspaceTurn(record))
     ) {
       await this.settleStaleWorkspaceTurn(record);
@@ -6882,6 +7883,7 @@ export class TaskService {
     ) {
       return await this.reconcileSettledWorkspaceTurn(record, {
         repairFromHistory: options.repairSettledTurnsFromHistory === true,
+        consumingWorkspaceId: options.consumingWorkspaceId,
       });
     }
 
@@ -6897,7 +7899,7 @@ export class TaskService {
    */
   private async reconcileSettledWorkspaceTurn(
     record: WorkspaceTurnTaskHandleRecord,
-    options: { repairFromHistory: boolean }
+    options: { repairFromHistory: boolean; consumingWorkspaceId?: string }
   ): Promise<WorkspaceTurnTaskHandleRecord | null> {
     assert(
       record.status === "interrupted" || record.status === "error",
@@ -6967,7 +7969,9 @@ export class TaskService {
         if (await deferredBlockersActive()) {
           return record;
         }
-        return await this.persistRepairedSettledWorkspaceTurn(record, recovered);
+        return await this.persistRepairedSettledWorkspaceTurn(record, recovered, {
+          consumingWorkspaceId: options.consumingWorkspaceId,
+        });
       }
       if (message.role !== "user") {
         continue;
@@ -6993,9 +7997,47 @@ export class TaskService {
     return record;
   }
 
+  /**
+   * Record that a terminal snapshot is being returned directly to the persistent child's parent.
+   * Caller must hold workspaceTurnSettlementLocks for the handle so post-settlement delivery cannot
+   * append the same outcome between this marker write and the consuming task_await snapshot.
+   */
+  private async markDirectParentWorkspaceTurnResultConsumedUnlocked(
+    record: WorkspaceTurnTaskHandleRecord | null,
+    consumingWorkspaceId: string | undefined
+  ): Promise<WorkspaceTurnTaskHandleRecord | null> {
+    if (
+      record == null ||
+      consumingWorkspaceId == null ||
+      record.directParentResultDeliveryRequiredAt == null ||
+      !this.workspaceTurnRequiresDirectParentDelivery(record)
+    ) {
+      return record;
+    }
+
+    const childEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), record.workspaceId);
+    if (childEntry?.workspace.parentWorkspaceId !== consumingWorkspaceId) {
+      return record;
+    }
+
+    const consumed = {
+      ...record,
+      directParentResultDeliveredAt: record.directParentResultDeliveredAt ?? getIsoNow(),
+    };
+    if (
+      consumingWorkspaceId === record.ownerWorkspaceId &&
+      resolveBackgroundWorkAttentionPolicy(record.attentionPolicy) === "notify_on_terminal"
+    ) {
+      return await this.markWorkspaceTurnTerminalAttentionConsumedUnlocked(consumed);
+    }
+    await this.taskHandleStore.upsertWorkspaceTurn(consumed);
+    return consumed;
+  }
+
   private async persistRepairedSettledWorkspaceTurn(
     record: WorkspaceTurnTaskHandleRecord,
-    recovered: WorkspaceTurnTaskHandleRecord
+    recovered: WorkspaceTurnTaskHandleRecord,
+    options: { consumingWorkspaceId?: string } = {}
   ): Promise<WorkspaceTurnTaskHandleRecord | null> {
     const next = await this.workspaceTurnSettlementLocks.withLock(record.handleId, async () => {
       const current = await this.taskHandleStore.getWorkspaceTurn(
@@ -7010,7 +8052,27 @@ export class TaskService {
         current.status !== record.status ||
         current.updatedAt !== record.updatedAt
       ) {
-        return current;
+        // If this direct parent's task_await will return that concurrent terminal winner,
+        // consume it here so its post-lock delivery cannot append the same outcome too.
+        return await this.markDirectParentWorkspaceTurnResultConsumedUnlocked(
+          current,
+          options.consumingWorkspaceId
+        );
+      }
+      if (this.workspaceTurnRequiresDirectParentDelivery(recovered)) {
+        await this.deletePersistentChildWorkspaceTurnAttention(current);
+        recovered.directParentResultDeliveryRequiredAt = getIsoNow();
+        const childEntry = findWorkspaceEntry(
+          this.config.loadConfigOrDefault(),
+          recovered.workspaceId
+        );
+        if (childEntry?.workspace.parentWorkspaceId === options.consumingWorkspaceId) {
+          // History repair discovered the corrected result for this direct parent's task_await.
+          // Mark that corrected generation consumed before post-lock replay can append it too.
+          recovered.directParentResultDeliveredAt = getIsoNow();
+        } else {
+          delete recovered.directParentResultDeliveredAt;
+        }
       }
       log.debug("Workspace turn repaired from self-healed child history", {
         handleId: record.handleId,
@@ -7022,6 +8084,7 @@ export class TaskService {
       return recovered;
     });
     if (next === recovered) {
+      await this.deliverPersistentChildWorkspaceTurnResult(recovered, new Set());
       await this.cleanupDisposableWorkspaceTurn(recovered);
       const active = this.activeWorkspaceTurnHandleByWorkspaceId.get(record.workspaceId);
       if (
@@ -7076,11 +8139,11 @@ export class TaskService {
       // The revived turn's next terminal transition is a new outcome; re-arm its wake-up.
       // The notification tombstone must go too: enqueueIfAbsent would otherwise treat the
       // stale settlement's delivered wake-up as "already notified" and swallow the new one.
+      delete next.directParentResultDeliveryRequiredAt;
+      delete next.directParentResultDeliveredAt;
       delete next.terminalAttentionNotifiedAt;
-      await this.terminalAttentionStore.delete(
-        record.ownerWorkspaceId,
-        TerminalAttentionStore.notificationId("workspace_turn", record.handleId)
-      );
+      await this.deleteWorkspaceTurnTerminalAttention(record);
+      await this.deletePersistentChildWorkspaceTurnAttention(current);
       await this.taskHandleStore.upsertWorkspaceTurn(next);
       // Re-register so stream-end/abort/error settlement paths own the handle again.
       this.activeWorkspaceTurnHandleByWorkspaceId.set(record.workspaceId, {
@@ -7098,12 +8161,22 @@ export class TaskService {
 
   async getWorkspaceTurnSnapshot(
     ownerWorkspaceId: string,
-    handleId: string
+    handleId: string,
+    options: { consumingWorkspaceId?: string } = {}
   ): Promise<WorkspaceTurnTaskHandleRecord | null> {
     if (!isWorkspaceTurnTaskId(handleId)) {
       return null;
     }
-    const record = await this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, handleId);
+    const record = await this.workspaceTurnSettlementLocks.withLock(handleId, async () => {
+      const current = await this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, handleId);
+      // A terminal task_await by the direct parent owns this result. Persist that fact while
+      // holding the same lock as continuation delivery, before returning the snapshot, so a
+      // late await cannot race the post-settlement history append and receive the output twice.
+      return await this.markDirectParentWorkspaceTurnResultConsumedUnlocked(
+        current,
+        options.consumingWorkspaceId
+      );
+    });
     if (record == null) {
       return null;
     }
@@ -7111,6 +8184,7 @@ export class TaskService {
     // a stale settlement (interrupted/error) was later corrected by a self-healed retry.
     return await this.normalizeWorkspaceTurnRecord(record, {
       repairSettledTurnsFromHistory: true,
+      consumingWorkspaceId: options.consumingWorkspaceId,
     });
   }
 
@@ -7198,11 +8272,212 @@ export class TaskService {
         log.debug("interruptWorkspaceTurn: stopStream threw", { handleId, error });
       }
     }
+    if (workspaceId != null) {
+      await this.updateAgentTaskExecutionState(workspaceId, handleId, "interrupted");
+    }
     if (interruptedRecord != null) {
       await this.cleanupDisposableWorkspaceTurn(interruptedRecord);
     }
     this.scheduleMaybeStartQueuedTasks();
     return result;
+  }
+
+  private async unarchiveAgentTaskAncestry(
+    ownerWorkspaceId: string,
+    taskId: string
+  ): Promise<Result<boolean, string>> {
+    const config = this.config.loadConfigOrDefault();
+    const index = this.buildAgentTaskIndex(config);
+    const chain: string[] = [];
+    let currentWorkspaceId: string | undefined = taskId;
+    for (let depth = 0; currentWorkspaceId != null && depth < 32; depth++) {
+      chain.push(currentWorkspaceId);
+      if (currentWorkspaceId === ownerWorkspaceId) break;
+      currentWorkspaceId = index.parentById.get(currentWorkspaceId);
+    }
+    if (chain.at(-1) !== ownerWorkspaceId) {
+      return Err("Task is not a descendant of this workspace");
+    }
+
+    // A child cannot appear in the active workspace tree while an ancestor remains archived.
+    // Restore root-to-leaf so every intermediate parent is visible before its child.
+    let didUnarchive = false;
+    chain.reverse();
+    for (const workspaceId of chain) {
+      const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+      if (
+        entry == null ||
+        !isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)
+      ) {
+        continue;
+      }
+      didUnarchive = true;
+      const result = await this.workspaceService.unarchive(workspaceId);
+      if (!result.success) {
+        return Err(result.error);
+      }
+    }
+    return Ok(didUnarchive);
+  }
+
+  /** Parent-scoped lifecycle entry point shared by persistent sub-agents and workspace turns. */
+  async archiveOwnedTaskWorkspace(
+    ownerWorkspaceId: string,
+    target: WorkspaceLifecycleTarget,
+    options: WorkspaceLifecycleOptions = {}
+  ): Promise<Result<WorkspaceLifecycleResult, string>> {
+    return await this.archiveOwnedWorkspaceTurnWorkspace(ownerWorkspaceId, target, options);
+  }
+
+  /** Parent-scoped visibility restore for persistent sub-agents and workspace turns. */
+  async unarchiveOwnedTaskWorkspace(
+    ownerWorkspaceId: string,
+    target: WorkspaceLifecycleTarget
+  ): Promise<Result<WorkspaceLifecycleResult, string>> {
+    assert(ownerWorkspaceId.trim().length > 0, "unarchive lifecycle requires ownerWorkspaceId");
+    const resolved = await this.resolveOwnedWorkspaceLifecycleTarget(
+      ownerWorkspaceId,
+      "unarchive",
+      target
+    );
+    if ("status" in resolved) return Ok(resolved);
+
+    return await this.withWorkspaceLifecycleLock(ownerWorkspaceId, resolved, async (resolved) => {
+      if (resolved.metadata == null) {
+        return Ok({
+          status: "not_found",
+          action: "unarchive",
+          ...this.lifecycleTargetFields(resolved),
+          note: "Owned workspace metadata is absent and cannot be restored.",
+        });
+      }
+      if (resolved.targetKind === "agent_task") {
+        const result = await this.unarchiveAgentTaskAncestry(
+          ownerWorkspaceId,
+          resolved.workspaceId
+        );
+        if (!result.success) {
+          return Ok({
+            status: "error",
+            action: "unarchive",
+            ...this.lifecycleTargetFields(resolved),
+            error: result.error,
+          });
+        }
+        return Ok({
+          status: result.data ? "unarchived" : "already_unarchived",
+          action: "unarchive",
+          ...this.lifecycleTargetFields(resolved),
+        });
+      }
+
+      if (!isWorkspaceArchived(resolved.metadata.archivedAt, resolved.metadata.unarchivedAt)) {
+        return Ok({
+          status: "already_unarchived",
+          action: "unarchive",
+          ...this.lifecycleTargetFields(resolved),
+        });
+      }
+      const result = await this.workspaceService.unarchive(resolved.workspaceId);
+      if (!result.success) {
+        return Ok({
+          status: "error",
+          action: "unarchive",
+          ...this.lifecycleTargetFields(resolved),
+          error: result.error,
+        });
+      }
+      return Ok({
+        status: "unarchived",
+        action: "unarchive",
+        ...this.lifecycleTargetFields(resolved),
+      });
+    });
+  }
+
+  /** Parent-scoped lifecycle entry point shared by persistent sub-agents and workspace turns. */
+  async deleteOwnedTaskWorktree(
+    ownerWorkspaceId: string,
+    target: WorkspaceLifecycleTarget,
+    options: WorkspaceLifecycleOptions = {}
+  ): Promise<Result<WorkspaceLifecycleResult, string>> {
+    return await this.deleteOwnedWorkspaceTurnWorktree(ownerWorkspaceId, target, options);
+  }
+
+  async removeInactiveDescendantAgentTask(
+    ownerWorkspaceId: string,
+    taskId: string
+  ): Promise<Result<WorkspaceLifecycleResult, string>> {
+    assert(ownerWorkspaceId.length > 0, "removeInactiveDescendantAgentTask requires owner");
+    assert(taskId.length > 0, "removeInactiveDescendantAgentTask requires taskId");
+    const resolved = await this.resolveOwnedWorkspaceLifecycleTarget(ownerWorkspaceId, "remove", {
+      taskId,
+    });
+    if ("status" in resolved) return Ok(resolved);
+    if (resolved.targetKind !== "agent_task") {
+      return Ok({ status: "invalid_scope", action: "remove", taskId });
+    }
+
+    return await this.withTaskTreeLifecycleLock(resolved.workspaceId, async () =>
+      this.withWorkspaceLifecycleLock(ownerWorkspaceId, resolved, async (locked) => {
+        const descendantTaskIds = this.listDescendantAgentTasks(locked.workspaceId).map(
+          (task) => task.taskId
+        );
+        if (descendantTaskIds.length > 0) {
+          return Ok({
+            status: "error",
+            action: "remove",
+            ...this.lifecycleTargetFields(locked),
+            descendantTaskIds,
+            error: "Cannot remove a sub-agent while descendant sub-agents remain.",
+          });
+        }
+        if (locked.metadata == null) {
+          return Ok({
+            status: "already_removed",
+            action: "remove",
+            ...this.lifecycleTargetFields(locked),
+          });
+        }
+        const active = await this.handleActiveWorkspaceLifecycleTurns(
+          ownerWorkspaceId,
+          locked,
+          false
+        );
+        if (active != null) return Ok(active);
+        const tombstoneResult = await this.persistRemovedAgentTaskTombstones(locked.workspaceId);
+        if (!tombstoneResult.success) {
+          return Ok({
+            status: "error",
+            action: "remove",
+            ...this.lifecycleTargetFields(locked),
+            error: tombstoneResult.error,
+          });
+        }
+        const result = await this.workspaceService.removeWhileTaskTreeLocked(
+          locked.workspaceId,
+          true
+        );
+        if (!result.success) {
+          return Ok({
+            status: "error",
+            action: "remove",
+            ...this.lifecycleTargetFields(locked),
+            error: result.error,
+          });
+        }
+        return Ok({ status: "removed", action: "remove", ...this.lifecycleTargetFields(locked) });
+      })
+    );
+  }
+
+  /** Parent-scoped lifecycle entry point shared by persistent sub-agents and workspace turns. */
+  async removeOwnedTaskWorkspace(
+    ownerWorkspaceId: string,
+    target: WorkspaceLifecycleTarget,
+    options: WorkspaceLifecycleOptions = {}
+  ): Promise<Result<WorkspaceLifecycleResult, string>> {
+    return await this.removeOwnedWorkspaceTurnWorkspace(ownerWorkspaceId, target, options);
   }
 
   async archiveOwnedWorkspaceTurnWorkspace(
@@ -7218,7 +8493,7 @@ export class TaskService {
     );
     if ("status" in resolved) return Ok(resolved);
 
-    return await this.withWorkspaceLifecycleLock(resolved, async (resolved) => {
+    return await this.withWorkspaceLifecycleLock(ownerWorkspaceId, resolved, async (resolved) => {
       if (resolved.metadata == null) {
         return Ok({
           status: "not_found",
@@ -7285,7 +8560,7 @@ export class TaskService {
     );
     if ("status" in resolved) return Ok(resolved);
 
-    return await this.withWorkspaceLifecycleLock(resolved, async (resolved) => {
+    return await this.withWorkspaceLifecycleLock(ownerWorkspaceId, resolved, async (resolved) => {
       if (resolved.metadata == null) {
         return Ok({
           status: "not_found",
@@ -7346,7 +8621,21 @@ export class TaskService {
     );
     if ("status" in resolved) return Ok(resolved);
 
-    return await this.withWorkspaceLifecycleLock(resolved, async (resolved) => {
+    return await this.withWorkspaceLifecycleLock(ownerWorkspaceId, resolved, async (resolved) => {
+      const descendantTaskIds = this.listDescendantAgentTasks(resolved.workspaceId).map(
+        (task) => task.taskId
+      );
+      if (descendantTaskIds.length > 0) {
+        return Ok({
+          status: "error",
+          action: "remove",
+          ...this.lifecycleTargetFields(resolved),
+          descendantTaskIds,
+          error:
+            "Cannot remove a workspace while descendant sub-agent workspaces remain. Remove descendants deepest-first.",
+        });
+      }
+
       if (resolved.metadata == null) {
         return Ok({
           status: "already_removed",
@@ -7385,17 +8674,122 @@ export class TaskService {
     });
   }
 
-  private async withWorkspaceLifecycleLock<T>(
+  private async withWorkspaceLifecycleLock(
+    ownerWorkspaceId: string,
     resolved: ResolvedWorkspaceLifecycleTarget,
-    operation: (lockedResolved: ResolvedWorkspaceLifecycleTarget) => Promise<T>
-  ): Promise<T> {
+    operation: (
+      lockedResolved: ResolvedWorkspaceLifecycleTarget
+    ) => Promise<Result<WorkspaceLifecycleResult, string>>
+  ): Promise<Result<WorkspaceLifecycleResult, string>> {
     return await this.workspaceLifecycleLocks.withLock(resolved.workspaceId, async () => {
-      const lockedResolved = {
-        ...resolved,
-        metadata: await this.findWorkspaceLifecycleMetadata(resolved.workspaceId),
-      };
+      // Ownership can change while an archive/remove waits for the per-workspace lock. Re-resolve
+      // inside the lock so a reparented or otherwise out-of-scope child cannot be mutated by a
+      // stale authorization decision.
+      const lockedResolved = await this.resolveOwnedWorkspaceLifecycleTarget(
+        ownerWorkspaceId,
+        resolved.action,
+        resolved.taskId != null
+          ? { taskId: resolved.taskId }
+          : { workspaceId: resolved.workspaceId }
+      );
+      if ("status" in lockedResolved) {
+        return Ok(lockedResolved);
+      }
       return await operation(lockedResolved);
     });
+  }
+
+  private removedAgentTaskTombstonePath(ownerWorkspaceId: string, taskId: string): string {
+    return path.join(
+      this.config.getSessionDir(ownerWorkspaceId),
+      REMOVED_AGENT_TASKS_DIR,
+      `${encodeURIComponent(taskId)}.json`
+    );
+  }
+
+  private async hasRemovedAgentTaskTombstone(
+    ownerWorkspaceId: string,
+    taskId: string
+  ): Promise<boolean> {
+    try {
+      const raw = await fsPromises.readFile(
+        this.removedAgentTaskTombstonePath(ownerWorkspaceId, taskId),
+        "utf-8"
+      );
+      const parsed = JSON.parse(raw) as unknown;
+      return (
+        parsed != null &&
+        typeof parsed === "object" &&
+        (parsed as { taskId?: unknown }).taskId === taskId
+      );
+    } catch (error: unknown) {
+      if (
+        error != null &&
+        typeof error === "object" &&
+        "code" in error &&
+        error.code === "ENOENT"
+      ) {
+        return false;
+      }
+      log.debug("Failed to read removed sub-agent tombstone", {
+        ownerWorkspaceId,
+        taskId,
+        error,
+      });
+      return false;
+    }
+  }
+
+  private async persistRemovedAgentTaskTombstones(taskId: string): Promise<Result<void, string>> {
+    const config = this.config.loadConfigOrDefault();
+    const index = this.buildAgentTaskIndex(config);
+    const ancestorWorkspaceIds = this.listAncestorWorkspaceIdsUsingParentById(
+      index.parentById,
+      taskId
+    );
+    if (ancestorWorkspaceIds.length === 0) {
+      return Err("Cannot persist removed sub-agent ownership: missing ancestor lineage");
+    }
+
+    const payload = JSON.stringify(
+      {
+        taskId,
+        ancestorWorkspaceIds,
+        removedAt: getIsoNow(),
+      },
+      null,
+      2
+    );
+    try {
+      for (const ancestorWorkspaceId of ancestorWorkspaceIds) {
+        const filePath = this.removedAgentTaskTombstonePath(ancestorWorkspaceId, taskId);
+        await fsPromises.mkdir(path.dirname(filePath), { recursive: true });
+        await fsPromises.writeFile(filePath, payload, "utf-8");
+      }
+      return Ok(undefined);
+    } catch (error: unknown) {
+      return Err(`Failed to persist removed sub-agent tombstone: ${getErrorMessage(error)}`);
+    }
+  }
+
+  private async isAgentTaskLifecycleTargetInScope(
+    ownerWorkspaceId: string,
+    taskId: string
+  ): Promise<boolean> {
+    const config = this.config.loadConfigOrDefault();
+    const entry = findWorkspaceEntry(config, taskId);
+    if (entry != null) {
+      const index = this.buildAgentTaskIndex(config);
+      return this.isDescendantAgentTaskUsingParentById(index.parentById, ownerWorkspaceId, taskId);
+    }
+
+    if (await this.hasRemovedAgentTaskTombstone(ownerWorkspaceId, taskId)) {
+      return true;
+    }
+
+    // Removed tasks can still be addressed idempotently through their persisted report ancestry.
+    const scopedTaskIds = await this.filterDescendantAgentTaskIds(ownerWorkspaceId, [taskId]);
+    return scopedTaskIds.includes(taskId);
   }
 
   private async resolveOwnedWorkspaceLifecycleTarget(
@@ -7411,39 +8805,56 @@ export class TaskService {
     const hasWorkspaceId = target.workspaceId != null && target.workspaceId.trim().length > 0;
     assert(hasTaskId !== hasWorkspaceId, "workspace lifecycle target must have exactly one ID");
 
+    let targetKind: ResolvedWorkspaceLifecycleTarget["targetKind"];
     let taskId: string | undefined;
     let taskTitle: string | undefined;
     let workspaceId: string;
     if (hasTaskId) {
       taskId = target.taskId;
       assert(taskId != null, "workspace lifecycle taskId must be resolved");
-      if (!isWorkspaceTurnTaskId(taskId)) {
-        return { status: "invalid_scope", action, taskId };
+      if (isWorkspaceTurnTaskId(taskId)) {
+        const record = await this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, taskId);
+        if (record == null) {
+          return { status: "invalid_scope", action, taskId };
+        }
+        if (
+          !(await this.taskHandleStore.isWorkspaceOwnedBy(ownerWorkspaceId, record.workspaceId))
+        ) {
+          return { status: "invalid_scope", action, taskId, workspaceId: record.workspaceId };
+        }
+        targetKind = "workspace_turn";
+        taskTitle = record.title;
+        workspaceId = record.workspaceId;
+      } else {
+        // Agent task IDs are their workspace IDs. Current config lineage is authoritative while the
+        // workspace exists; persisted report ancestry keeps already-removed tasks idempotent.
+        if (!(await this.isAgentTaskLifecycleTargetInScope(ownerWorkspaceId, taskId))) {
+          return { status: "invalid_scope", action, taskId };
+        }
+        targetKind = "agent_task";
+        workspaceId = taskId;
       }
-      const record = await this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, taskId);
-      if (record == null) {
-        return { status: "invalid_scope", action, taskId };
-      }
-      taskTitle = record.title;
-      workspaceId = record.workspaceId;
     } else {
       assert(target.workspaceId != null, "workspace lifecycle workspaceId must be resolved");
       workspaceId = target.workspaceId;
-    }
-
-    const owned = await this.taskHandleStore.isWorkspaceOwnedBy(ownerWorkspaceId, workspaceId);
-    if (!owned) {
-      return {
-        status: "invalid_scope",
-        action,
-        ...(taskId != null ? { taskId } : {}),
-        workspaceId,
-      };
+      if (await this.taskHandleStore.isWorkspaceOwnedBy(ownerWorkspaceId, workspaceId)) {
+        targetKind = "workspace_turn";
+      } else {
+        if (!(await this.isAgentTaskLifecycleTargetInScope(ownerWorkspaceId, workspaceId))) {
+          return {
+            status: "invalid_scope",
+            action,
+            workspaceId,
+          };
+        }
+        targetKind = "agent_task";
+      }
     }
 
     const metadata = await this.findWorkspaceLifecycleMetadata(workspaceId);
     return {
       action,
+      targetKind,
       ...(taskId != null ? { taskId } : {}),
       ...(taskTitle != null ? { taskTitle } : {}),
       workspaceId,
@@ -7502,8 +8913,36 @@ export class TaskService {
         statuses: ["queued", "starting", "running"],
       })
     ).filter((record) => record.workspaceId === resolved.workspaceId);
-    const activeTaskIds = activeRecords.map((record) => record.handleId);
-    if (activeTaskIds.length === 0) {
+    const activeWorkspaceTurnTaskIds = activeRecords.map((record) => record.handleId);
+
+    if (resolved.targetKind === "agent_task") {
+      const activeTaskIds = this.listActiveDescendantAgentTaskIds(resolved.workspaceId);
+      const taskStatus = resolved.metadata?.taskStatus;
+      if (
+        (taskStatus != null && ACTIVE_AGENT_TASK_STATUSES.has(taskStatus)) ||
+        this.aiService.isStreaming(resolved.workspaceId) ||
+        isActiveWorkspaceTurnTaskStatus(resolved.metadata?.taskExecutionStatus)
+      ) {
+        activeTaskIds.unshift(resolved.workspaceId);
+      }
+
+      const uniqueActiveTaskIds = Array.from(
+        new Set([...activeTaskIds, ...activeWorkspaceTurnTaskIds])
+      );
+      if (uniqueActiveTaskIds.length === 0) {
+        return null;
+      }
+
+      return {
+        status: "active",
+        action: resolved.action,
+        ...this.lifecycleTargetFields(resolved),
+        activeTaskIds: uniqueActiveTaskIds,
+        note: "Stop the sub-agent before removing it.",
+      };
+    }
+
+    if (activeWorkspaceTurnTaskIds.length === 0) {
       return null;
     }
     if (!interruptActive) {
@@ -7511,18 +8950,18 @@ export class TaskService {
         status: "active",
         action: resolved.action,
         ...this.lifecycleTargetFields(resolved),
-        activeTaskIds,
+        activeTaskIds: activeWorkspaceTurnTaskIds,
       };
     }
 
-    for (const activeTaskId of activeTaskIds) {
+    for (const activeTaskId of activeWorkspaceTurnTaskIds) {
       const interruptResult = await this.interruptWorkspaceTurn(ownerWorkspaceId, activeTaskId);
       if (!interruptResult.success) {
         return {
           status: "error",
           action: resolved.action,
           ...this.lifecycleTargetFields(resolved),
-          activeTaskIds,
+          activeTaskIds: activeWorkspaceTurnTaskIds,
           error: interruptResult.error,
         };
       }
@@ -7573,9 +9012,10 @@ export class TaskService {
           workspaceName: entry.name,
           title: entry.title,
           createdAt: entry.createdAt,
+          executionTaskId: entry.taskExecutionId,
+          executionStatus: entry.taskExecutionStatus,
           modelString: entry.aiSettings?.model,
           thinkingLevel: entry.aiSettings?.thinkingLevel,
-          sticky: entry.taskSticky === true ? true : undefined,
           depth: next.depth,
         });
       }
@@ -7701,16 +9141,6 @@ export class TaskService {
     return false;
   }
 
-  private listCompletedDescendantAgentTaskIds(
-    index: AgentTaskIndex,
-    workspaceId: string
-  ): string[] {
-    return this.listDescendantAgentTaskIdsFromIndex(index, workspaceId).filter((taskId) => {
-      const entry = index.byId.get(taskId);
-      return entry != null && hasCompletedAgentReport(entry);
-    });
-  }
-
   async isWorkflowOwnedDescendantAgentTask(
     ancestorWorkspaceId: string,
     taskId: string
@@ -7786,6 +9216,10 @@ export class TaskService {
     const cfg = this.config.loadConfigOrDefault();
     const parentById = this.buildAgentTaskIndex(cfg).parentById;
     if (this.isDescendantAgentTaskUsingParentById(parentById, ancestorWorkspaceId, taskId)) {
+      return true;
+    }
+
+    if (await this.hasRemovedAgentTaskTombstone(ancestorWorkspaceId, taskId)) {
       return true;
     }
 
@@ -7882,24 +9316,6 @@ export class TaskService {
     return { byId, childrenByParent, parentById };
   }
 
-  private hasArchivedAncestor(
-    index: AgentTaskIndex,
-    config: ReturnType<Config["loadConfigOrDefault"]>,
-    workspaceId: string
-  ): boolean {
-    const ancestorWorkspaceIds = this.listAncestorWorkspaceIdsUsingParentById(
-      index.parentById,
-      workspaceId
-    );
-    return ancestorWorkspaceIds.some((ancestorWorkspaceId) => {
-      const entry = findWorkspaceEntry(config, ancestorWorkspaceId);
-      return (
-        entry != null &&
-        isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)
-      );
-    });
-  }
-
   private isWorkflowOwnedTaskUsingIndex(index: AgentTaskIndex, taskId: string): boolean {
     assert(taskId.length > 0, "isWorkflowOwnedTaskUsingIndex: taskId must be non-empty");
     return this.findWorkflowTaskOwnerInAncestry(index, taskId) != null;
@@ -7909,9 +9325,7 @@ export class TaskService {
     if (record.status === "running" && this.isForegroundAwaiting(record.workspaceId)) {
       return false;
     }
-    return (
-      record.status === "queued" || record.status === "starting" || record.status === "running"
-    );
+    return isActiveWorkspaceTurnTaskStatus(record.status);
   }
 
   private async hasActiveWorkspaceTurnForWorkspace(
@@ -7979,7 +9393,7 @@ export class TaskService {
   }
 
   private async settleStaleWorkspaceTurn(record: WorkspaceTurnTaskHandleRecord): Promise<void> {
-    if (record.status !== "queued" && record.status !== "starting" && record.status !== "running") {
+    if (!isActiveWorkspaceTurnTaskStatus(record.status)) {
       return;
     }
     const recovered = await this.recoverTerminalWorkspaceTurnFromHistory(record);
@@ -8065,11 +9479,7 @@ export class TaskService {
     const records = await this.taskHandleStore.listWorkspaceTurns(ownerWorkspaceId);
     const taskIds: string[] = [];
     for (const record of records) {
-      if (
-        record.status === "queued" ||
-        record.status === "starting" ||
-        record.status === "running"
-      ) {
+      if (isActiveWorkspaceTurnTaskStatus(record.status)) {
         if (!(await this.isLiveWorkspaceTurn(record))) {
           await this.settleStaleWorkspaceTurn(record);
           continue;
@@ -8088,12 +9498,7 @@ export class TaskService {
         const latest = await this.reconcileSettledWorkspaceTurn(record, {
           repairFromHistory: false,
         });
-        if (
-          latest != null &&
-          (latest.status === "queued" ||
-            latest.status === "starting" ||
-            latest.status === "running")
-        ) {
+        if (latest != null && isActiveWorkspaceTurnTaskStatus(latest.status)) {
           taskIds.push(latest.handleId);
         }
       }
@@ -8208,6 +9613,9 @@ export class TaskService {
   }
 
   private isActiveAgentTaskEntry(task: AgentTaskWorkspaceEntry): boolean {
+    if (isActiveWorkspaceTurnTaskStatus(task.taskExecutionStatus)) {
+      return true;
+    }
     const status: AgentTaskStatus = task.taskStatus ?? "running";
     if (!ACTIVE_AGENT_TASK_STATUSES.has(status)) {
       return false;
@@ -8227,6 +9635,14 @@ export class TaskService {
     let activeCount = 0;
     for (const task of this.listAgentTaskWorkspaces(config)) {
       const status: AgentTaskStatus = task.taskStatus ?? "running";
+      // A reawakened persistent child is represented by its private workspace-turn handle in the
+      // workspace-turn count. Charging its mirrored execution status here would count one task twice.
+      if (
+        isWorkspaceTurnTaskId(task.taskExecutionId) &&
+        isActiveWorkspaceTurnTaskStatus(task.taskExecutionStatus)
+      ) {
+        continue;
+      }
       // If this task workspace is blocked in a foreground wait, do not count it towards parallelism.
       // This prevents deadlocks where a task spawns a nested task in the foreground while
       // maxParallelAgentTasks is low (e.g. 1).
@@ -10222,11 +11638,16 @@ export class TaskService {
     // The failure message is already injected above. Enqueue even when other children are active:
     // the drain defers on blocking work, and the later settling child may have a foreground waiter
     // that suppresses its own terminal wake-up.
+    const generationId = await this.getAgentTerminalAttentionGenerationId(
+      parentWorkspaceId,
+      childWorkspaceId
+    );
     await this.enqueueTerminalAttention({
       ownerWorkspaceId: parentWorkspaceId,
       sourceKind: "agent_task",
       terminalOutcome: "failed",
       sourceId: childWorkspaceId,
+      ...(generationId != null ? { generationId } : {}),
     });
   }
 
@@ -11214,11 +12635,16 @@ export class TaskService {
     // The report is already injected into parent history above (deliverReportToParent). Enqueue the
     // notification even when other children are still active: the drain defers on blocking work and
     // a later foreground-awaited sibling may suppress its own wake-up.
+    const generationId = await this.getAgentTerminalAttentionGenerationId(
+      parentWorkspaceId,
+      childWorkspaceId
+    );
     await this.enqueueTerminalAttention({
       ownerWorkspaceId: parentWorkspaceId,
       sourceKind: "agent_task",
       terminalOutcome: "completed",
       sourceId: childWorkspaceId,
+      ...(generationId != null ? { generationId } : {}),
     });
 
     return { finalized: true };
@@ -12004,12 +13430,6 @@ export class TaskService {
       return { ok: false, reason: "task_not_reported" };
     }
 
-    // Sticky tasks are an explicit user retention request. They can still be archived, removed, or
-    // terminated manually, but no automatic cleanup path should make that lifecycle decision.
-    if (entry.workspace.taskSticky === true) {
-      return { ok: false, reason: "sticky" };
-    }
-
     if (entry.workspace.bestOf?.total != null && entry.workspace.bestOf.total > 1) {
       if (
         await this.shouldDeferBestOfFallback({
@@ -12049,16 +13469,10 @@ export class TaskService {
       return { ok: false, reason: "patch_pending" };
     }
 
-    // Workflow task results are persisted in the workflow run/report artifacts before cleanup,
-    // so the user-level "preserve subagents until archive" setting should not keep those
-    // transient worktrees around indefinitely.
-    const taskSettings = normalizeTaskSettings(config.taskSettings);
-    if (
-      !isWorkflowOwnedTask &&
-      taskSettings.preserveSubagentsUntilArchive &&
-      !this.hasArchivedAncestor(index, config, workspaceId)
-    ) {
-      return { ok: false, reason: "preserved_until_archive" };
+    // User-owned children persist unconditionally until task_remove. Workflow-owned workers remain
+    // transient implementation details because their workflow journal owns the durable result.
+    if (!isWorkflowOwnedTask) {
+      return { ok: false, reason: "preserved" };
     }
 
     return { ok: true, parentWorkspaceId };

@@ -149,6 +149,34 @@ function hasDelegatedActivity(activity: WorkspaceDelegatedActivity): boolean {
   return activity.activeCount > 0 || activity.queuedCount > 0;
 }
 
+export function isSidebarSubAgentActive(workspace: FrontendWorkspaceMetadata): boolean {
+  return (
+    isActionableTaskExecutionStatus(workspace.taskExecutionStatus) ||
+    workspace.taskStatus === "queued" ||
+    workspace.taskStatus === "starting" ||
+    workspace.taskStatus === "running" ||
+    workspace.taskStatus === "awaiting_report"
+  );
+}
+
+export function isSidebarSubAgentRunning(
+  workspace: FrontendWorkspaceMetadata,
+  options: DelegatedActivityOptions = {}
+): boolean {
+  return (
+    workspace.taskExecutionStatus === "starting" ||
+    workspace.taskExecutionStatus === "running" ||
+    isRunningOrStartingTaskStatus(workspace.taskStatus) ||
+    getIsWorkspaceLiveActive(workspace.id, options)
+  );
+}
+
+export function isActionableTaskExecutionStatus(
+  status: FrontendWorkspaceMetadata["taskExecutionStatus"]
+): boolean {
+  return status === "queued" || status === "starting" || status === "running";
+}
+
 export function isActiveOrStartingTaskStatus(
   status: FrontendWorkspaceMetadata["taskStatus"]
 ): boolean {
@@ -181,7 +209,11 @@ export function isWorkspaceDelegatedActivityActive(
   workspace: FrontendWorkspaceMetadata,
   options: DelegatedActivityOptions = {}
 ): boolean {
-  if (isActiveOrStartingTaskStatus(workspace.taskStatus)) {
+  if (
+    workspace.taskExecutionStatus === "starting" ||
+    workspace.taskExecutionStatus === "running" ||
+    isActiveOrStartingTaskStatus(workspace.taskStatus)
+  ) {
     return true;
   }
   if (hasCompletedAgentReport(workspace)) {
@@ -261,7 +293,10 @@ export function computeDelegatedActivityByWorkspaceId(
         if (childWorkflowOwned) {
           descendantActivity.workflowActiveCount += 1;
         }
-      } else if (!hasCompletedAgentReport(child) && child.taskStatus === "queued") {
+      } else if (
+        child.taskExecutionStatus === "queued" ||
+        (!hasCompletedAgentReport(child) && child.taskStatus === "queued")
+      ) {
         descendantActivity.queuedCount += 1;
         if (childWorkflowOwned) {
           descendantActivity.workflowQueuedCount += 1;
@@ -288,6 +323,8 @@ export function computeDelegatedActivityByWorkspaceId(
 
 export interface AgentRowRenderMeta {
   depth: number;
+  /** Nearest visible ancestor after inactive intermediate sub-agents are removed. */
+  visibleParentWorkspaceId?: string;
   rowKind: "primary" | "subagent";
   connectorPosition: "single" | "middle" | "last";
   // Sub-agent trunks should render as a single continuous line, so each row
@@ -305,12 +342,14 @@ export interface AgentRowRenderMeta {
 }
 
 /**
- * Hide completed child tasks by default unless their parent is expanded.
- * Child visibility is inherited from ancestors so hidden parents also hide descendants.
+ * Keep only active sub-agent rows in the left sidebar. Inactive persistent children remain
+ * accessible through the transcript's sub-agent decoration, which is the canonical hierarchy UI.
+ * Active descendants remain visible even when an intermediate persistent parent is inactive.
  */
 export function filterVisibleAgentRows(
   flattenedWorkspaces: FrontendWorkspaceMetadata[],
-  expandedParentIds: ReadonlySet<string> = new Set()
+  _expandedParentIds: ReadonlySet<string> = new Set(),
+  options: DelegatedActivityOptions = {}
 ): FrontendWorkspaceMetadata[] {
   if (flattenedWorkspaces.length === 0) {
     return [];
@@ -351,10 +390,14 @@ export function filterVisibleAgentRows(
       return true;
     }
 
-    const parentVisible = isVisible(parent);
-    const isCompletedChildTask = hasCompletedAgentReport(workspace);
-    const shouldHideCompletedChild = isCompletedChildTask && !expandedParentIds.has(parentId);
-    const visible = parentVisible && !shouldHideCompletedChild;
+    // Completed children are terminal even if WorkspaceStore still has a stale live signal from
+    // their final stream. Reuse the delegated-activity predicate so retained reports cannot leak
+    // inactive persistent children back into the sidebar; queued work remains visible before it has
+    // live runtime state.
+    const visible =
+      workspace.taskExecutionStatus === "queued" ||
+      workspace.taskStatus === "queued" ||
+      isWorkspaceDelegatedActivityActive(workspace, options);
 
     visiting.delete(workspace.id);
     visibilityById.set(workspace.id, visible);
@@ -369,43 +412,47 @@ export function filterVisibleAgentRows(
  */
 export function computeAgentRowRenderMeta(
   flattenedWorkspaces: FrontendWorkspaceMetadata[],
-  depthByWorkspaceId: Record<string, number>,
-  expandedParentIds: ReadonlySet<string> = new Set()
+  _depthByWorkspaceId: Record<string, number>,
+  expandedParentIds: ReadonlySet<string> = new Set(),
+  options: DelegatedActivityOptions = {}
 ): Map<string, AgentRowRenderMeta> {
-  const visibleRows = filterVisibleAgentRows(flattenedWorkspaces, expandedParentIds);
+  const visibleRows = filterVisibleAgentRows(flattenedWorkspaces, expandedParentIds, options);
+  const workspaceById = new Map(
+    flattenedWorkspaces.map((workspace) => [workspace.id, workspace] as const)
+  );
   const visibleWorkspaceIds = new Set(visibleRows.map((workspace) => workspace.id));
-
   const visibleChildrenByParent = new Map<string, FrontendWorkspaceMetadata[]>();
-  const completedChildrenByParent = new Map<string, FrontendWorkspaceMetadata[]>();
   const visibleWorkspaceById = new Map<string, FrontendWorkspaceMetadata>();
+  const effectiveParentByWorkspaceId = new Map<string, string>();
 
   for (const workspace of visibleRows) {
     visibleWorkspaceById.set(workspace.id, workspace);
 
-    const parentId = workspace.parentWorkspaceId;
-    if (!parentId) {
+    let parentId = workspace.parentWorkspaceId;
+    const visitedParentIds = new Set<string>();
+    while (parentId != null && !visibleWorkspaceIds.has(parentId)) {
+      if (visitedParentIds.has(parentId)) {
+        parentId = undefined;
+        break;
+      }
+      visitedParentIds.add(parentId);
+      parentId = workspaceById.get(parentId)?.parentWorkspaceId;
+    }
+    if (parentId == null) {
       continue;
     }
 
+    effectiveParentByWorkspaceId.set(workspace.id, parentId);
     const siblings = visibleChildrenByParent.get(parentId) ?? [];
     siblings.push(workspace);
     visibleChildrenByParent.set(parentId, siblings);
   }
 
-  for (const workspace of flattenedWorkspaces) {
-    if (!workspace.parentWorkspaceId || !hasCompletedAgentReport(workspace)) {
-      continue;
-    }
-
-    const completedChildren = completedChildrenByParent.get(workspace.parentWorkspaceId) ?? [];
-    completedChildren.push(workspace);
-    completedChildrenByParent.set(workspace.parentWorkspaceId, completedChildren);
-  }
-
   const metadataByWorkspaceId = new Map<string, AgentRowRenderMeta>();
 
   for (const workspace of visibleRows) {
-    const rowKind = workspace.parentWorkspaceId ? "subagent" : "primary";
+    const effectiveParentId = effectiveParentByWorkspaceId.get(workspace.id);
+    const rowKind = effectiveParentId != null ? "subagent" : "primary";
 
     let connectorPosition: AgentRowRenderMeta["connectorPosition"] = "single";
     let connectorStartsAtParent = false;
@@ -413,8 +460,8 @@ export function computeAgentRowRenderMeta(
     let sharedTrunkActiveBelowRow = false;
     let ancestorTrunks: AgentRowRenderMeta["ancestorTrunks"] = [];
 
-    if (workspace.parentWorkspaceId) {
-      const siblings = visibleChildrenByParent.get(workspace.parentWorkspaceId) ?? [];
+    if (effectiveParentId != null) {
+      const siblings = visibleChildrenByParent.get(effectiveParentId) ?? [];
       const siblingIndex = siblings.findIndex((sibling) => sibling.id === workspace.id);
       if (siblings.length > 1) {
         connectorPosition = siblings[siblings.length - 1]?.id === workspace.id ? "last" : "middle";
@@ -425,7 +472,8 @@ export function computeAgentRowRenderMeta(
 
         let lastRunningSiblingIndex = -1;
         for (let index = siblings.length - 1; index >= 0; index -= 1) {
-          if (isRunningOrStartingTaskStatus(siblings[index]?.taskStatus)) {
+          const sibling = siblings[index];
+          if (sibling != null && isSidebarSubAgentRunning(sibling, options)) {
             lastRunningSiblingIndex = index;
             break;
           }
@@ -441,12 +489,12 @@ export function computeAgentRowRenderMeta(
 
       const continuingAncestorTrunks: Array<{ depth: number; active: boolean }> = [];
       const visitedAncestorIds = new Set<string>();
-      let ancestorId: string | undefined = workspace.parentWorkspaceId;
+      let ancestorId: string | undefined = effectiveParentId;
       while (ancestorId && !visitedAncestorIds.has(ancestorId)) {
         visitedAncestorIds.add(ancestorId);
 
         const ancestorMeta = metadataByWorkspaceId.get(ancestorId);
-        const ancestorDepth = depthByWorkspaceId[ancestorId] ?? 0;
+        const ancestorDepth = ancestorMeta?.depth ?? 0;
         if (ancestorDepth > 0 && ancestorMeta?.connectorPosition === "middle") {
           continuingAncestorTrunks.push({
             depth: ancestorDepth,
@@ -454,35 +502,33 @@ export function computeAgentRowRenderMeta(
           });
         }
 
-        const ancestorWorkspace = visibleWorkspaceById.get(ancestorId);
-        if (!ancestorWorkspace) {
+        if (!visibleWorkspaceById.has(ancestorId)) {
           break;
         }
-        ancestorId = ancestorWorkspace.parentWorkspaceId;
+        ancestorId = effectiveParentByWorkspaceId.get(ancestorId);
       }
 
       continuingAncestorTrunks.sort((left, right) => left.depth - right.depth);
       ancestorTrunks = continuingAncestorTrunks;
     }
 
-    const completedChildren = completedChildrenByParent.get(workspace.id) ?? [];
-    let visibleCompletedChildrenCount = 0;
-    for (const child of completedChildren) {
-      if (visibleWorkspaceIds.has(child.id)) {
-        visibleCompletedChildrenCount += 1;
-      }
-    }
-
+    const effectiveDepth =
+      effectiveParentId != null
+        ? (metadataByWorkspaceId.get(effectiveParentId)?.depth ?? 0) + 1
+        : 0;
     metadataByWorkspaceId.set(workspace.id, {
-      depth: depthByWorkspaceId[workspace.id] ?? 0,
+      depth: effectiveDepth,
+      ...(effectiveParentId != null ? { visibleParentWorkspaceId: effectiveParentId } : {}),
       rowKind,
       connectorPosition,
       connectorStartsAtParent,
       sharedTrunkActiveThroughRow,
       sharedTrunkActiveBelowRow,
       ancestorTrunks,
-      hasHiddenCompletedChildren: visibleCompletedChildrenCount < completedChildren.length,
-      visibleCompletedChildrenCount,
+      // Inactive sub-agents are intentionally absent from the sidebar; the transcript decoration
+      // is the canonical place to inspect and manage the persistent hierarchy.
+      hasHiddenCompletedChildren: false,
+      visibleCompletedChildrenCount: 0,
     });
   }
 

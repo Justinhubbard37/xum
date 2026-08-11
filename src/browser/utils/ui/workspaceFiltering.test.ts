@@ -23,6 +23,7 @@ interface WorkspaceFixtureOptions {
   isInitializing?: boolean;
   parentWorkspaceId?: string;
   taskStatus?: FrontendWorkspaceMetadata["taskStatus"];
+  taskExecutionStatus?: FrontendWorkspaceMetadata["taskExecutionStatus"];
   reportedAt?: string;
   workflowTask?: FrontendWorkspaceMetadata["workflowTask"];
 }
@@ -53,6 +54,7 @@ const createWorkspace = (
     isInitializing: options.isInitializing,
     parentWorkspaceId: options.parentWorkspaceId,
     taskStatus: options.taskStatus,
+    taskExecutionStatus: options.taskExecutionStatus,
     reportedAt: options.reportedAt,
     workflowTask: options.workflowTask,
   };
@@ -843,6 +845,32 @@ describe("delegated workspace activity roll-up", () => {
     expect(activityByWorkspaceId.get("parent")?.activeCount).toBe(1);
   });
 
+  it("rolls reawakened continuation activity up despite the retained report", () => {
+    const reportedAt = new Date(0).toISOString();
+    const workspaces = [
+      createWorkspace("parent"),
+      createWorkspace("running-continuation", {
+        parentWorkspaceId: "parent",
+        taskStatus: "reported",
+        reportedAt,
+        taskExecutionStatus: "running",
+      }),
+      createWorkspace("queued-continuation", {
+        parentWorkspaceId: "parent",
+        taskStatus: "reported",
+        reportedAt,
+        taskExecutionStatus: "queued",
+      }),
+    ];
+
+    expect(computeDelegatedActivityByWorkspaceId(workspaces).get("parent")).toEqual({
+      activeCount: 1,
+      queuedCount: 1,
+      workflowActiveCount: 0,
+      workflowQueuedCount: 0,
+    });
+  });
+
   it("keeps live interrupted descendants active until report finalization", () => {
     const workspaces = [
       createWorkspace("parent"),
@@ -970,95 +998,58 @@ describe("sub-agent row render metadata", () => {
     expect(metadataByWorkspaceId.get("only-child")?.connectorPosition).toBe("single");
   });
 
-  it("hides reported children by default when parent is not expanded", () => {
+  it("keeps inactive children out of the sidebar even when legacy expansion state is present", () => {
     const flattened = [
       createWorkspace("parent"),
       createWorkspace("active-child", { parentWorkspaceId: "parent", taskStatus: "running" }),
-      createWorkspace("reported-child-1", { parentWorkspaceId: "parent", taskStatus: "reported" }),
-      createWorkspace("reported-child-2", { parentWorkspaceId: "parent", taskStatus: "reported" }),
+      createWorkspace("reported-child", { parentWorkspaceId: "parent", taskStatus: "reported" }),
+      createWorkspace("interrupted-child", {
+        parentWorkspaceId: "parent",
+        taskStatus: "interrupted",
+      }),
     ];
 
-    const visible = filterVisibleAgentRows(flattened);
-    expect(visible.map((workspace) => workspace.id)).toEqual(["parent", "active-child"]);
-
-    const depthByWorkspaceId = computeWorkspaceDepthMap(flattened);
-    const metadataByWorkspaceId = computeAgentRowRenderMeta(flattened, depthByWorkspaceId);
-
-    expect(metadataByWorkspaceId.has("reported-child-1")).toBe(false);
-    expect(metadataByWorkspaceId.get("parent")?.hasHiddenCompletedChildren).toBe(true);
-    expect(metadataByWorkspaceId.get("parent")?.visibleCompletedChildrenCount).toBe(0);
-  });
-
-  it("shows reported children when parent is expanded", () => {
-    const flattened = [
-      createWorkspace("parent"),
-      createWorkspace("active-child", { parentWorkspaceId: "parent", taskStatus: "running" }),
-      createWorkspace("reported-child-1", { parentWorkspaceId: "parent", taskStatus: "reported" }),
-      createWorkspace("reported-child-2", { parentWorkspaceId: "parent", taskStatus: "reported" }),
-    ];
-
-    const expandedParentIds = new Set<string>(["parent"]);
-    const visible = filterVisibleAgentRows(flattened, expandedParentIds);
-    expect(visible.map((workspace) => workspace.id)).toEqual([
-      "parent",
-      "active-child",
-      "reported-child-1",
-      "reported-child-2",
-    ]);
+    const legacyExpandedParentIds = new Set<string>(["parent"]);
+    expect(
+      filterVisibleAgentRows(flattened, legacyExpandedParentIds).map((workspace) => workspace.id)
+    ).toEqual(["parent", "active-child"]);
 
     const depthByWorkspaceId = computeWorkspaceDepthMap(flattened);
     const metadataByWorkspaceId = computeAgentRowRenderMeta(
       flattened,
       depthByWorkspaceId,
-      expandedParentIds
+      legacyExpandedParentIds
     );
-
+    expect(metadataByWorkspaceId.has("reported-child")).toBe(false);
+    expect(metadataByWorkspaceId.has("interrupted-child")).toBe(false);
     expect(metadataByWorkspaceId.get("parent")?.hasHiddenCompletedChildren).toBe(false);
-    expect(metadataByWorkspaceId.get("parent")?.visibleCompletedChildrenCount).toBe(2);
+    expect(metadataByWorkspaceId.get("parent")?.visibleCompletedChildrenCount).toBe(0);
   });
 
-  it("treats interrupted children with reportedAt as completed children", () => {
-    const completedAt = "2026-03-09T11:05:58.780Z";
+  it("promotes active descendants through inactive persistent parents", () => {
     const flattened = [
-      createWorkspace("parent"),
-      createWorkspace("active-child", { parentWorkspaceId: "parent", taskStatus: "running" }),
-      createWorkspace("corrupted-completed-child", {
-        parentWorkspaceId: "parent",
-        taskStatus: "interrupted",
-        reportedAt: completedAt,
-      }),
-      createWorkspace("reported-child", {
-        parentWorkspaceId: "parent",
+      createWorkspace("root"),
+      createWorkspace("inactive-parent", {
+        parentWorkspaceId: "root",
         taskStatus: "reported",
-        reportedAt: completedAt,
+      }),
+      createWorkspace("active-grandchild", {
+        parentWorkspaceId: "inactive-parent",
+        taskStatus: "running",
       }),
     ];
 
-    const depthByWorkspaceId = computeWorkspaceDepthMap(flattened);
-    const collapsedVisible = filterVisibleAgentRows(flattened);
-    expect(collapsedVisible.map((workspace) => workspace.id)).toEqual(["parent", "active-child"]);
-
-    const collapsedMeta = computeAgentRowRenderMeta(flattened, depthByWorkspaceId);
-    expect(collapsedMeta.get("parent")?.hasHiddenCompletedChildren).toBe(true);
-    expect(collapsedMeta.get("parent")?.visibleCompletedChildrenCount).toBe(0);
-    expect(collapsedMeta.has("corrupted-completed-child")).toBe(false);
-
-    const expandedParentIds = new Set<string>(["parent"]);
-    const expandedVisible = filterVisibleAgentRows(flattened, expandedParentIds);
-    expect(expandedVisible.map((workspace) => workspace.id)).toEqual([
-      "parent",
-      "active-child",
-      "corrupted-completed-child",
-      "reported-child",
+    expect(filterVisibleAgentRows(flattened).map((workspace) => workspace.id)).toEqual([
+      "root",
+      "active-grandchild",
     ]);
-
-    const expandedMeta = computeAgentRowRenderMeta(
-      flattened,
-      depthByWorkspaceId,
-      expandedParentIds
-    );
-    expect(expandedMeta.get("parent")?.hasHiddenCompletedChildren).toBe(false);
-    expect(expandedMeta.get("parent")?.visibleCompletedChildrenCount).toBe(2);
+    const depthByWorkspaceId = computeWorkspaceDepthMap(flattened);
+    const metadataByWorkspaceId = computeAgentRowRenderMeta(flattened, depthByWorkspaceId);
+    expect(metadataByWorkspaceId.get("active-grandchild")).toMatchObject({
+      depth: 1,
+      rowKind: "subagent",
+      connectorStartsAtParent: true,
+    });
   });
 
   it("keeps running children with stale reportedAt visible and out of completed counts", () => {
@@ -1081,7 +1072,30 @@ describe("sub-agent row render metadata", () => {
     expect(metadataByWorkspaceId.has("resumed-child")).toBe(true);
   });
 
-  it("keeps unfinished interrupted children visible and out of completed counts", () => {
+  it("keeps reawakened reported children visible while completed rows are collapsed", () => {
+    const flattened = [
+      createWorkspace("parent"),
+      createWorkspace("reawakened-child", {
+        parentWorkspaceId: "parent",
+        taskStatus: "reported",
+        reportedAt: "2026-08-09T00:00:00.000Z",
+        taskExecutionStatus: "running",
+      }),
+    ];
+
+    expect(filterVisibleAgentRows(flattened).map((workspace) => workspace.id)).toEqual([
+      "parent",
+      "reawakened-child",
+    ]);
+
+    const depthByWorkspaceId = computeWorkspaceDepthMap(flattened);
+    const metadataByWorkspaceId = computeAgentRowRenderMeta(flattened, depthByWorkspaceId);
+    expect(metadataByWorkspaceId.get("parent")?.hasHiddenCompletedChildren).toBe(false);
+    expect(metadataByWorkspaceId.get("parent")?.visibleCompletedChildrenCount).toBe(0);
+    expect(metadataByWorkspaceId.has("reawakened-child")).toBe(true);
+  });
+
+  it("hides interrupted children from the sidebar", () => {
     const flattened = [
       createWorkspace("parent"),
       createWorkspace("unfinished-interrupted-child", {
@@ -1090,37 +1104,35 @@ describe("sub-agent row render metadata", () => {
       }),
     ];
 
-    const visible = filterVisibleAgentRows(flattened);
-    expect(visible.map((workspace) => workspace.id)).toEqual([
-      "parent",
-      "unfinished-interrupted-child",
-    ]);
-
+    expect(filterVisibleAgentRows(flattened).map((workspace) => workspace.id)).toEqual(["parent"]);
     const depthByWorkspaceId = computeWorkspaceDepthMap(flattened);
-    const metadataByWorkspaceId = computeAgentRowRenderMeta(flattened, depthByWorkspaceId);
-    expect(metadataByWorkspaceId.get("parent")?.hasHiddenCompletedChildren).toBe(false);
-    expect(metadataByWorkspaceId.get("parent")?.visibleCompletedChildrenCount).toBe(0);
-    expect(metadataByWorkspaceId.has("unfinished-interrupted-child")).toBe(true);
+    expect(
+      computeAgentRowRenderMeta(flattened, depthByWorkspaceId).has("unfinished-interrupted-child")
+    ).toBe(false);
   });
 
-  it("tracks hidden-completed state correctly across collapsed and expanded parent rows", () => {
+  it("does not resurrect reported children from stale live workspace state", () => {
     const flattened = [
       createWorkspace("parent"),
-      createWorkspace("reported-child", { parentWorkspaceId: "parent", taskStatus: "reported" }),
+      createWorkspace("reported-child", {
+        parentWorkspaceId: "parent",
+        taskStatus: "reported",
+        taskExecutionStatus: "completed",
+      }),
     ];
+    const options = {
+      isWorkspaceLiveActive: (workspaceId: string) => workspaceId === "reported-child",
+    };
 
+    expect(
+      filterVisibleAgentRows(flattened, new Set(), options).map((workspace) => workspace.id)
+    ).toEqual(["parent"]);
     const depthByWorkspaceId = computeWorkspaceDepthMap(flattened);
-    const collapsedMeta = computeAgentRowRenderMeta(flattened, depthByWorkspaceId);
-    expect(collapsedMeta.get("parent")?.hasHiddenCompletedChildren).toBe(true);
-    expect(collapsedMeta.get("parent")?.visibleCompletedChildrenCount).toBe(0);
-
-    const expandedMeta = computeAgentRowRenderMeta(
-      flattened,
-      depthByWorkspaceId,
-      new Set<string>(["parent"])
-    );
-    expect(expandedMeta.get("parent")?.hasHiddenCompletedChildren).toBe(false);
-    expect(expandedMeta.get("parent")?.visibleCompletedChildrenCount).toBe(1);
+    expect(
+      computeAgentRowRenderMeta(flattened, depthByWorkspaceId, new Set(), options).has(
+        "reported-child"
+      )
+    ).toBe(false);
   });
 
   it("propagates ancestor trunk continuation metadata for nested rows", () => {
@@ -1194,7 +1206,7 @@ describe("sub-agent row render metadata", () => {
     ]);
   });
 
-  it("preserves mixed active+reported child ordering while filtering", () => {
+  it("preserves active child ordering while ignoring legacy expansion state", () => {
     const flattened = [
       createWorkspace("parent"),
       createWorkspace("active-1", { parentWorkspaceId: "parent", taskStatus: "running" }),
@@ -1215,25 +1227,20 @@ describe("sub-agent row render metadata", () => {
     expect(collapsedMeta.get("active-1")?.connectorPosition).toBe("middle");
     expect(collapsedMeta.get("active-2")?.connectorPosition).toBe("last");
 
-    const expandedParentIds = new Set<string>(["parent"]);
-    const expandedVisible = filterVisibleAgentRows(flattened, expandedParentIds);
-    expect(expandedVisible.map((workspace) => workspace.id)).toEqual([
-      "parent",
-      "active-1",
-      "reported-1",
-      "active-2",
-      "reported-2",
-    ]);
+    const legacyExpandedParentIds = new Set<string>(["parent"]);
+    expect(
+      filterVisibleAgentRows(flattened, legacyExpandedParentIds).map((workspace) => workspace.id)
+    ).toEqual(["parent", "active-1", "active-2"]);
 
-    const expandedMeta = computeAgentRowRenderMeta(
+    const legacyExpandedMeta = computeAgentRowRenderMeta(
       flattened,
       depthByWorkspaceId,
-      expandedParentIds
+      legacyExpandedParentIds
     );
-    expect(expandedMeta.get("active-1")?.connectorPosition).toBe("middle");
-    expect(expandedMeta.get("reported-1")?.connectorPosition).toBe("middle");
-    expect(expandedMeta.get("active-2")?.connectorPosition).toBe("middle");
-    expect(expandedMeta.get("reported-2")?.connectorPosition).toBe("last");
+    expect(legacyExpandedMeta.get("active-1")?.connectorPosition).toBe("middle");
+    expect(legacyExpandedMeta.get("active-2")?.connectorPosition).toBe("last");
+    expect(legacyExpandedMeta.has("reported-1")).toBe(false);
+    expect(legacyExpandedMeta.has("reported-2")).toBe(false);
   });
 });
 

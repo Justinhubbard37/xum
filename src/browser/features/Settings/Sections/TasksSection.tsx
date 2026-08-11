@@ -295,8 +295,7 @@ function areTaskSettingsEqual(a: TaskSettings, b: TaskSettings): boolean {
   return (
     a.maxParallelAgentTasks === b.maxParallelAgentTasks &&
     a.maxTaskNestingDepth === b.maxTaskNestingDepth &&
-    a.proposePlanImplementReplacesChatHistory === b.proposePlanImplementReplacesChatHistory &&
-    a.preserveSubagentsUntilArchive === b.preserveSubagentsUntilArchive
+    a.proposePlanImplementReplacesChatHistory === b.proposePlanImplementReplacesChatHistory
   );
 }
 
@@ -752,12 +751,6 @@ export function TasksSection() {
   const setProposePlanImplementReplacesChatHistory = (value: boolean) => {
     setTaskSettings((prev) =>
       normalizeTaskSettings({ ...prev, proposePlanImplementReplacesChatHistory: value })
-    );
-  };
-
-  const setPreserveSubagentsUntilArchive = (value: boolean) => {
-    setTaskSettings((prev) =>
-      normalizeTaskSettings({ ...prev, preserveSubagentsUntilArchive: value })
     );
   };
 
@@ -1253,23 +1246,6 @@ export function TasksSection() {
               checked={taskSettings.proposePlanImplementReplacesChatHistory ?? false}
               onCheckedChange={setProposePlanImplementReplacesChatHistory}
               aria-label="Toggle plan Implement replaces conversation with plan"
-            />
-          </div>
-
-          <div className="flex items-center justify-between gap-4">
-            <div className="flex-1">
-              <div className="text-foreground text-sm">
-                Preserve subagents until the workspace gets archived
-              </div>
-              <div className="text-muted text-xs">
-                Completed sub-agent workspaces stay visible and expandable until an ancestor
-                workspace is archived, then cleanup runs automatically.
-              </div>
-            </div>
-            <Switch
-              checked={taskSettings.preserveSubagentsUntilArchive ?? false}
-              onCheckedChange={setPreserveSubagentsUntilArchive}
-              aria-label="Toggle preserve subagents until archive"
             />
           </div>
         </div>

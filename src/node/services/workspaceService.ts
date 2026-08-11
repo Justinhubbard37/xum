@@ -19,7 +19,6 @@ import type { Config } from "@/node/config";
 import type { ProjectsConfig, Workspace } from "@/common/types/project";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
-import { normalizeTaskSettings } from "@/common/types/tasks";
 import { askUserQuestionManager } from "@/node/services/askUserQuestionManager";
 import { delegatedToolCallManager } from "@/node/services/delegatedToolCallManager";
 import { log } from "@/node/services/log";
@@ -549,10 +548,10 @@ interface WorkspaceAgentStatus {
 type WorkspaceRuntimeStatus = "running" | "stopped" | "unknown" | "unsupported";
 const POST_COMPACTION_METADATA_REFRESH_DEBOUNCE_MS = 100;
 
-const STICKY_DESCENDANT_ARCHIVE_ERROR =
-  "This workspace has unarchived sticky sub-agent workspaces. Archive or remove those sub-agents explicitly before archiving their parent.";
-const STICKY_DESCENDANT_REMOVE_ERROR =
-  "This workspace has sticky sub-agent workspaces. Remove those sub-agents explicitly before removing their parent.";
+const DESCENDANT_WORKSPACE_REMOVE_ERROR =
+  "This workspace has descendant sub-agent workspaces. Remove those descendants deepest-first before removing their parent.";
+const ACTIVE_DESCENDANT_ARCHIVE_ERROR =
+  "This workspace has active descendant sub-agents. Stop them before archiving their parent.";
 const MULTI_PROJECT_WORKSPACES_DISABLED_ERROR = "Multi-project workspaces experiment is disabled";
 
 function normalizeRepoRootProjectPath(projectPath: string | null | undefined): string {
@@ -1638,12 +1637,27 @@ function createDefaultActivitySnapshot(): WorkspaceActivitySnapshot {
   };
 }
 
-// Merge an optional "active X count" field into an activity snapshot: a positive count
-// sets the field, zero deletes it so the snapshot stays sparse (absent === none). The
-// active-workflow-run and armed-bash-monitor counts share this identical shape.
+function mergeActiveWorkflowRuns(
+  snapshot: WorkspaceActivitySnapshot | null,
+  activeRunIds: ReadonlySet<string>
+): WorkspaceActivitySnapshot {
+  const merged: WorkspaceActivitySnapshot = { ...(snapshot ?? createDefaultActivitySnapshot()) };
+  const sortedRunIds = [...activeRunIds].sort();
+  if (sortedRunIds.length > 0) {
+    merged.activeWorkflowRunIds = sortedRunIds;
+    merged.activeWorkflowRunCount = sortedRunIds.length;
+  } else {
+    delete merged.activeWorkflowRunIds;
+    delete merged.activeWorkflowRunCount;
+  }
+  return merged;
+}
+
+// Merge the optional armed-bash-monitor count into an activity snapshot: a positive count sets
+// the field, while zero deletes it so the snapshot stays sparse (absent === none).
 function mergeActiveCount(
   snapshot: WorkspaceActivitySnapshot | null,
-  key: "activeWorkflowRunCount" | "activeBashMonitorCount",
+  key: "activeBashMonitorCount",
   count: number
 ): WorkspaceActivitySnapshot {
   assert(count >= 0, `${key} must be non-negative`);
@@ -2740,6 +2754,11 @@ export class WorkspaceService extends EventEmitter {
     );
   }
 
+  private isSharedTaskWorkspace(workspaceId: string): boolean {
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    return entry?.workspace.taskIsolation === "none";
+  }
+
   private async getCurrentArchiveUntrackedPaths(args: {
     workspaceId: string;
     workspaceMetadata: WorkspaceMetadata;
@@ -3055,10 +3074,6 @@ export class WorkspaceService extends EventEmitter {
     }
   }
 
-  private async getActiveWorkflowRunCount(workspaceId: string): Promise<number> {
-    return (await this.getActiveWorkflowRunIds(workspaceId)).size;
-  }
-
   private async updateActiveWorkflowRunCount(event: {
     workspaceId: string;
     runId: string;
@@ -3073,7 +3088,7 @@ export class WorkspaceService extends EventEmitter {
     return activeRunIds.size;
   }
 
-  private mergeCachedActiveWorkflowRunCount(
+  private mergeCachedActiveWorkflowRuns(
     workspaceId: string,
     snapshot: WorkspaceActivitySnapshot | null
   ): WorkspaceActivitySnapshot | null {
@@ -3084,7 +3099,7 @@ export class WorkspaceService extends EventEmitter {
     if (snapshot == null && activeRunIds.size === 0) {
       return null;
     }
-    return mergeActiveCount(snapshot, "activeWorkflowRunCount", activeRunIds.size);
+    return mergeActiveWorkflowRuns(snapshot, activeRunIds);
   }
 
   private getActiveBashMonitorCount(workspaceId: string): number {
@@ -3107,15 +3122,11 @@ export class WorkspaceService extends EventEmitter {
     return mergeActiveCount(snapshot, "activeBashMonitorCount", count);
   }
 
-  private async mergeCurrentActiveWorkflowRunCount(
+  private async mergeCurrentActiveWorkflowRuns(
     workspaceId: string,
     snapshot: WorkspaceActivitySnapshot
   ): Promise<WorkspaceActivitySnapshot> {
-    return mergeActiveCount(
-      snapshot,
-      "activeWorkflowRunCount",
-      await this.getActiveWorkflowRunCount(workspaceId)
-    );
+    return mergeActiveWorkflowRuns(snapshot, await this.getActiveWorkflowRunIds(workspaceId));
   }
 
   public async emitWorkflowRunActivity(event: {
@@ -3145,7 +3156,7 @@ export class WorkspaceService extends EventEmitter {
       workspaceId,
       activity: this.mergeCurrentActiveBashMonitorCount(
         workspaceId,
-        this.mergeCachedActiveWorkflowRunCount(
+        this.mergeCachedActiveWorkflowRuns(
           workspaceId,
           this.overlayPendingGoal(workspaceId, snapshot)
         )
@@ -3190,7 +3201,7 @@ export class WorkspaceService extends EventEmitter {
     try {
       this.emitWorkspaceActivity(
         workspaceId,
-        await this.mergeCurrentActiveWorkflowRunCount(workspaceId, await update())
+        await this.mergeCurrentActiveWorkflowRuns(workspaceId, await update())
       );
     } catch (error) {
       log.error(`Failed to ${description}`, { workspaceId, error });
@@ -3280,7 +3291,7 @@ export class WorkspaceService extends EventEmitter {
       const shouldTagIdleCompaction = !streaming && this.idleCompactingWorkspaces.has(workspaceId);
       this.emitWorkspaceActivity(
         workspaceId,
-        await this.mergeCurrentActiveWorkflowRunCount(workspaceId, {
+        await this.mergeCurrentActiveWorkflowRuns(workspaceId, {
           ...snapshot,
           ...(shouldTagCompaction ? { isCompaction: true } : {}),
           ...(shouldTagIdleCompaction ? { isIdleCompaction: true } : {}),
@@ -4723,7 +4734,27 @@ export class WorkspaceService extends EventEmitter {
     }
   }
 
+  private async withTaskTreeLifecycleLock<T>(
+    workspaceId: string,
+    operation: () => Promise<T>
+  ): Promise<T> {
+    const taskService = this.taskService;
+    const withLock = taskService?.withTaskTreeLifecycleLock?.bind(taskService);
+    return withLock == null ? await operation() : await withLock(workspaceId, operation);
+  }
+
   async remove(workspaceId: string, force = false): Promise<Result<void>> {
+    return await this.withTaskTreeLifecycleLock(workspaceId, async () =>
+      this.removeUnlocked(workspaceId, force)
+    );
+  }
+
+  /** Internal entry point for TaskService callers that already hold the task-tree lifecycle lock. */
+  async removeWhileTaskTreeLocked(workspaceId: string, force = false): Promise<Result<void>> {
+    return await this.removeUnlocked(workspaceId, force);
+  }
+
+  private async removeUnlocked(workspaceId: string, force = false): Promise<Result<void>> {
     // Idempotent: if already removing, return success to prevent race conditions
     if (this.removingWorkspaces.has(workspaceId)) {
       return Ok(undefined);
@@ -4744,40 +4775,8 @@ export class WorkspaceService extends EventEmitter {
 
     // Try to remove from runtime (filesystem)
     try {
-      if (this.taskService?.hasStickyDescendants?.(workspaceId) === true) {
-        return Err(STICKY_DESCENDANT_REMOVE_ERROR);
-      }
-
-      if (!force) {
-        const config = this.config.loadConfigOrDefault();
-        const taskSettings = normalizeTaskSettings(config.taskSettings);
-        if (
-          taskSettings.preserveSubagentsUntilArchive &&
-          this.taskService?.hasCompletedDescendants?.(workspaceId)
-        ) {
-          const persistedWorkspaceEntry = findWorkspaceEntry(config, workspaceId);
-          const isArchived =
-            persistedWorkspaceEntry != null &&
-            isWorkspaceArchived(
-              persistedWorkspaceEntry.workspace.archivedAt,
-              persistedWorkspaceEntry.workspace.unarchivedAt
-            );
-
-          // Keep the whole parentWorkspaceId chain intact while completed descendants still exist.
-          // Unarchived ancestors must be archived first so descendant cleanup can safely walk that lineage.
-          if (!isArchived) {
-            return Err(
-              "This workspace has preserved completed sub-agent workspaces. Archive the workspace first to trigger cleanup, then try removing it."
-            );
-          }
-
-          // Archived parents can still retain completed descendants while cleanup waits on
-          // prerequisites like pending patch artifacts. Keep removal blocked until that cleanup
-          // finishes so descendants do not lose the archived ancestor that makes them eligible.
-          return Err(
-            "This workspace still has completed sub-agent workspaces pending cleanup. Wait for cleanup to finish, or force-remove the workspace."
-          );
-        }
+      if (this.taskService?.hasDescendantAgentTasks?.(workspaceId) === true) {
+        return Err(DESCENDANT_WORKSPACE_REMOVE_ERROR);
       }
 
       // Stop any active stream before deleting metadata/config to avoid tool calls racing with removal.
@@ -6686,17 +6685,20 @@ export class WorkspaceService extends EventEmitter {
    */
   async preflightArchive(workspaceId: string): Promise<Result<ArchivePreflightResult>> {
     try {
+      if (this.taskService?.hasActiveDescendantAgentTasksForWorkspace(workspaceId) === true) {
+        return Err(ACTIVE_DESCENDANT_ARCHIVE_ERROR);
+      }
+
       const workspace = this.config.findWorkspace(workspaceId);
       if (!workspace) {
         return Err("Workspace not found");
       }
-      if (this.taskService?.hasUnarchivedStickyDescendants?.(workspaceId) === true) {
-        return Err(STICKY_DESCENDANT_ARCHIVE_ERROR);
-      }
 
       const worktreeArchiveBehavior = this.getWorktreeArchiveBehavior();
       const snapshotBehaviorEnabled =
-        worktreeArchiveBehavior === "snapshot" && this.worktreeArchiveSnapshotService != null;
+        !this.isSharedTaskWorkspace(workspaceId) &&
+        worktreeArchiveBehavior === "snapshot" &&
+        this.worktreeArchiveSnapshotService != null;
 
       if (!snapshotBehaviorEnabled) {
         return Ok({ kind: "ready" as const });
@@ -6726,6 +6728,15 @@ export class WorkspaceService extends EventEmitter {
     }
   }
 
+  async archive(
+    workspaceId: string,
+    acknowledgedUntrackedPaths?: string[]
+  ): Promise<Result<ArchiveWorkspaceResult>> {
+    return await this.withTaskTreeLifecycleLock(workspaceId, async () =>
+      this.archiveUnlocked(workspaceId, acknowledgedUntrackedPaths)
+    );
+  }
+
   /**
    * Archive a workspace. Archived workspaces are hidden from the main sidebar
    * but can be viewed on the project page.
@@ -6736,7 +6747,7 @@ export class WorkspaceService extends EventEmitter {
    * Returns a typed confirmation result instead of a generic error when the current
    * untracked-file set must be re-reviewed before a lossy snapshot archive can proceed.
    */
-  async archive(
+  private async archiveUnlocked(
     workspaceId: string,
     acknowledgedUntrackedPaths?: string[]
   ): Promise<Result<ArchiveWorkspaceResult>> {
@@ -6747,8 +6758,8 @@ export class WorkspaceService extends EventEmitter {
       if (!workspace) {
         return Err("Workspace not found");
       }
-      if (this.taskService?.hasUnarchivedStickyDescendants?.(workspaceId) === true) {
-        return Err(STICKY_DESCENDANT_ARCHIVE_ERROR);
+      if (this.taskService?.hasActiveDescendantAgentTasksForWorkspace(workspaceId) === true) {
+        return Err(ACTIVE_DESCENDANT_ARCHIVE_ERROR);
       }
       const initState = this.initStateManager.getInitState(workspaceId);
       if (initState?.status === "running") {
@@ -6787,7 +6798,9 @@ export class WorkspaceService extends EventEmitter {
       const { projectPath, workspacePath } = workspace;
       const worktreeArchiveBehavior = this.getWorktreeArchiveBehavior();
       const snapshotBehaviorEnabled =
-        worktreeArchiveBehavior === "snapshot" && this.worktreeArchiveSnapshotService != null;
+        !this.isSharedTaskWorkspace(workspaceId) &&
+        worktreeArchiveBehavior === "snapshot" &&
+        this.worktreeArchiveSnapshotService != null;
 
       let beforeArchiveMetadata: WorkspaceMetadata | undefined;
       if (this.workspaceLifecycleHooks || snapshotBehaviorEnabled) {
@@ -6966,13 +6979,6 @@ export class WorkspaceService extends EventEmitter {
         }
       }
 
-      // Best-effort cleanup of preserved completed descendants after archive persistence succeeds.
-      try {
-        await this.taskService?.cleanupReportedDescendantsAfterArchive?.(workspaceId);
-      } catch (error) {
-        log.error("Failed to cleanup reported descendants after archive", { workspaceId, error });
-      }
-
       // Dream trigger (PRD #3534): final consolidation pass — last chance to
       // promote durable workspace-scope lessons to the narrowest available scope
       // before the workspace's memory dies with it. Fire-and-forget; never blocks archive.
@@ -7121,6 +7127,10 @@ export class WorkspaceService extends EventEmitter {
 
       if (!isWorkspaceArchived(workspaceMetadata.archivedAt, workspaceMetadata.unarchivedAt)) {
         return Err("Only archived workspaces can delete their managed worktree");
+      }
+
+      if (workspaceMetadata.taskIsolation === "none") {
+        return Err("Shared-checkout sub-agents do not own a managed worktree");
       }
 
       if (!isWorktreeRuntime(workspaceMetadata.runtimeConfig)) {
@@ -9936,7 +9946,8 @@ export class WorkspaceService extends EventEmitter {
             // "watching" state survives reconnect. The seen-set is used instead of the
             // dedupe map because dedupe entries are dropped around in-flight/failed emits.
             const hadBashMonitorActivityCache = this.bashMonitorSeenWorkspaces.has(workspaceId);
-            const activeWorkflowRunCount = await this.getActiveWorkflowRunCount(workspaceId);
+            const activeWorkflowRunIds = await this.getActiveWorkflowRunIds(workspaceId);
+            const activeWorkflowRunCount = activeWorkflowRunIds.size;
             const activeBashMonitorCount = this.getActiveBashMonitorCount(workspaceId);
             if (activeBashMonitorCount > 0) {
               // A list-delivered non-zero count is a renderer-visible observation too:
@@ -9963,10 +9974,9 @@ export class WorkspaceService extends EventEmitter {
               // during a mid-stream goal set would seed the UI with the stale
               // goal until the next live emit or goal read.
               mergeActiveCount(
-                mergeActiveCount(
+                mergeActiveWorkflowRuns(
                   this.overlayPendingGoal(workspaceId, snapshot),
-                  "activeWorkflowRunCount",
-                  activeWorkflowRunCount
+                  activeWorkflowRunIds
                 ),
                 "activeBashMonitorCount",
                 activeBashMonitorCount

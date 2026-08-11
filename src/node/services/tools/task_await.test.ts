@@ -98,8 +98,94 @@ describe("task_await tool", () => {
     expect(result.results[0]?.finalMessage).toBeUndefined();
     expect(markWorkspaceTurnTerminalAttentionConsumed).toHaveBeenCalledWith({
       ownerWorkspaceId: "parent-workspace",
+      consumingWorkspaceId: "parent-workspace",
       handleId: "wst_done",
       status: "completed",
+      updatedAt: "2026-06-19T00:00:10.000Z",
+    });
+  });
+
+  it("awaits a nested child continuation through its recorded owner", async () => {
+    using tempDir = new TestTempDir("test-task-await-nested-continuation-owner");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });
+    const continuation = {
+      kind: "workspace_turn",
+      handleId: "wst_nested",
+      ownerWorkspaceId: "parent-task",
+      workspaceId: "child-task",
+      turnId: "turn-nested",
+      status: "running",
+      createdAt: "2026-08-10T00:00:00.000Z",
+      updatedAt: "2026-08-10T00:00:01.000Z",
+      createdWorkspace: false,
+      disposableWorkspace: false,
+    } as const;
+    const waitForWorkspaceTurn = mock(
+      (
+        _handleId: string,
+        _options: {
+          timeoutMs?: number;
+          abortSignal?: AbortSignal;
+          requestingWorkspaceId: string;
+          ownerWorkspaceId?: string;
+          backgroundOnMessageQueued?: boolean;
+        }
+      ) =>
+        Promise.resolve({
+          workspaceId: "child-task",
+          updatedAt: "2026-08-10T00:00:01.000Z",
+          reportMarkdown: "Nested work completed",
+        })
+    );
+    const markWorkspaceTurnTerminalAttentionConsumed = mock(() => Promise.resolve());
+    const taskService = {
+      listActiveDescendantAgentTaskIds: mock(() => []),
+      isDescendantAgentTask: mock(() => Promise.resolve(true)),
+      getAgentTaskExecutionId: mock(() => "wst_nested"),
+      getDescendantAgentTaskExecutionSnapshot: mock(() =>
+        Promise.resolve({ ownerWorkspaceId: "parent-task", record: continuation })
+      ),
+      getWorkspaceTurnSnapshot: mock(() => {
+        throw new Error("requester-owned snapshot lookup should not be used");
+      }),
+      waitForWorkspaceTurn,
+      markWorkspaceTurnTerminalAttentionConsumed,
+    } as unknown as TaskService;
+
+    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const result: unknown = await Promise.resolve(
+      tool.execute!({ task_ids: ["child-task"] }, mockToolCallOptions)
+    );
+
+    expect(result).toEqual({
+      results: [
+        {
+          status: "completed",
+          taskId: "child-task",
+          reportMarkdown: "Nested work completed",
+          title: undefined,
+          messageId: undefined,
+          finalMessageRef: undefined,
+          note: COMPLETED_REPORT_REFETCH_NOTE,
+        },
+      ],
+    });
+    expect(waitForWorkspaceTurn).toHaveBeenCalledTimes(1);
+    const [observedHandleId, observedOptions] = waitForWorkspaceTurn.mock.calls[0];
+    expect(observedHandleId).toBe("wst_nested");
+    expect(observedOptions).toMatchObject({
+      timeoutMs: 600_000,
+      requestingWorkspaceId: "root-workspace",
+      ownerWorkspaceId: "parent-task",
+      backgroundOnMessageQueued: true,
+    });
+    expect(observedOptions.abortSignal).toBeInstanceOf(AbortSignal);
+    expect(markWorkspaceTurnTerminalAttentionConsumed).toHaveBeenCalledWith({
+      ownerWorkspaceId: "parent-task",
+      consumingWorkspaceId: "root-workspace",
+      handleId: "wst_nested",
+      status: "completed",
+      updatedAt: "2026-08-10T00:00:01.000Z",
     });
   });
 
@@ -252,7 +338,11 @@ describe("task_await tool", () => {
       markWorkspaceTurnTerminalAttentionConsumed,
       waitForWorkspaceTurn: mock((_taskId: string, options: { timeoutMs?: number }) => {
         observedTimeoutMs = options.timeoutMs;
-        return Promise.resolve({ workspaceId: "child-running", reportMarkdown: "Done" });
+        return Promise.resolve({
+          workspaceId: "child-running",
+          updatedAt: "2026-06-19T00:00:01.000Z",
+          reportMarkdown: "Done",
+        });
       }),
     } as unknown as TaskService;
 
@@ -263,8 +353,10 @@ describe("task_await tool", () => {
 
     expect(markWorkspaceTurnTerminalAttentionConsumed).toHaveBeenCalledWith({
       ownerWorkspaceId: "parent-workspace",
+      consumingWorkspaceId: "parent-workspace",
       handleId: "wst_running",
       status: "completed",
+      updatedAt: "2026-06-19T00:00:01.000Z",
     });
     expect(observedTimeoutMs).toBe(600_000);
   });
@@ -324,8 +416,10 @@ describe("task_await tool", () => {
     ]);
     expect(markWorkspaceTurnTerminalAttentionConsumed).toHaveBeenCalledWith({
       ownerWorkspaceId: "parent-workspace",
+      consumingWorkspaceId: "parent-workspace",
       handleId: "wst_race",
       status: "completed",
+      updatedAt: "2026-06-19T00:00:01.000Z",
     });
   });
 
@@ -376,8 +470,10 @@ describe("task_await tool", () => {
     ]);
     expect(markWorkspaceTurnTerminalAttentionConsumed).toHaveBeenCalledWith({
       ownerWorkspaceId: "parent-workspace",
+      consumingWorkspaceId: "parent-workspace",
       handleId: "wst_failed",
       status: "error",
+      updatedAt: "2026-06-19T00:00:01.000Z",
     });
   });
 
@@ -1597,6 +1693,54 @@ describe("task_await tool", () => {
     });
   });
 
+  it("omitted task_ids await a reactivated child only through its stable task ID", async () => {
+    using tempDir = new TestTempDir("test-task-await-tool-reactivated-descendant");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    const continuation = {
+      kind: "workspace_turn",
+      handleId: "wst_continuation",
+      ownerWorkspaceId: "parent-workspace",
+      workspaceId: "child-task",
+      turnId: "turn-continuation",
+      status: "running",
+      createdAt: "2026-08-10T00:00:00.000Z",
+      updatedAt: "2026-08-10T00:00:00.000Z",
+      createdWorkspace: false,
+      disposableWorkspace: false,
+    } as const;
+    const getWorkspaceTurnSnapshot = mock(() => Promise.resolve(continuation));
+    const taskService = {
+      listActiveDescendantAgentTaskIds: mock(() => ["child-task"]),
+      listWorkspaceTurnTasks: mock(() => Promise.resolve([continuation])),
+      isDescendantAgentTask: mock((_ancestorWorkspaceId: string, taskId: string) =>
+        Promise.resolve(taskId === "child-task")
+      ),
+      getAgentTaskExecutionId: mock((taskId: string) =>
+        taskId === "child-task" ? "wst_continuation" : null
+      ),
+      getWorkspaceTurnSnapshot,
+    } as unknown as TaskService;
+
+    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const result: unknown = await Promise.resolve(
+      tool.execute!({ timeout_secs: 0, min_completed: 2 }, mockToolCallOptions)
+    );
+
+    expect(result).toEqual({
+      results: [
+        {
+          status: "running",
+          taskId: "child-task",
+          note: "Workspace turn is still running.",
+        },
+      ],
+    });
+    expect(getWorkspaceTurnSnapshot).toHaveBeenCalledTimes(1);
+    expect(getWorkspaceTurnSnapshot).toHaveBeenCalledWith("parent-workspace", "wst_continuation", {
+      consumingWorkspaceId: "parent-workspace",
+    });
+  });
+
   it("returns running status when foreground wait is backgrounded", async () => {
     using tempDir = new TestTempDir("test-task-await-tool-backgrounded");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
@@ -1689,6 +1833,45 @@ describe("task_await tool", () => {
     expect(result).toEqual({ results: [{ status: "running", taskId: "t1" }] });
     expect(waitForAgentReport).toHaveBeenCalledTimes(0);
     expect(getAgentTaskStatus).toHaveBeenCalledWith("t1");
+  });
+
+  it("awaits a reawakened child through its stable task ID", async () => {
+    using tempDir = new TestTempDir("test-task-await-reactivated-child");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    const taskService = {
+      listActiveDescendantAgentTaskIds: mock(() => ["child-agent"]),
+      isDescendantAgentTask: mock(() => Promise.resolve(true)),
+      getAgentTaskExecutionId: mock(() => "wst_internal"),
+      getWorkspaceTurnSnapshot: mock(() =>
+        Promise.resolve({
+          kind: "workspace_turn" as const,
+          handleId: "wst_internal",
+          ownerWorkspaceId: "parent-workspace",
+          workspaceId: "child-agent",
+          turnId: "turn",
+          status: "running" as const,
+          createdAt: "2026-08-10T00:00:00.000Z",
+          updatedAt: "2026-08-10T00:00:00.000Z",
+          createdWorkspace: false,
+          disposableWorkspace: false,
+        })
+      ),
+    } as unknown as TaskService;
+    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+
+    expect(
+      await Promise.resolve(
+        tool.execute!({ task_ids: ["child-agent"], timeout_secs: 0 }, mockToolCallOptions)
+      )
+    ).toEqual({
+      results: [
+        {
+          status: "running",
+          taskId: "child-agent",
+          note: "Workspace turn is still running.",
+        },
+      ],
+    });
   });
 
   it("returns completed result when timeout_secs=0 and a cached report is available", async () => {

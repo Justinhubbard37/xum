@@ -214,9 +214,18 @@ export const WorkspaceConfigSchema = z.object({
     .optional()
     .meta({
       description:
-        "When true, automatic agent-task cleanup leaves this workspace intact after it reports. " +
-        "Explicit user lifecycle actions may still archive or remove it.",
+        "Strong retention for an agent-task workspace. Ordinary user-spawned tasks persist after " +
+        "reporting. This legacy field is ignored by modern task lifecycle logic and retained only " +
+        "for downgrade compatibility.",
     }),
+  taskExecutionId: z.string().optional().meta({
+    description:
+      "Latest internal execution handle for a persistent sub-agent reawakened through task_send_message.",
+  }),
+  taskExecutionStatus: z
+    .enum(["queued", "starting", "running", "completed", "interrupted", "error"])
+    .optional()
+    .meta({ description: "Status of the latest internal reawakened sub-agent execution." }),
   taskAttentionPolicy: BackgroundWorkAttentionPolicySchema.optional().meta({
     description:
       "How the owner workspace's stream-end treats this child task while it is active. " +

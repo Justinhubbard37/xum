@@ -247,6 +247,20 @@ export const WorkspaceMetadataSchema = z.object({
     description:
       "Trunk branch used to create/init this agent task workspace (used for restart-safe init on queued tasks).",
   }),
+  taskIsolation: z.enum(["fork", "none"]).optional().meta({
+    description:
+      'Workspace isolation for an agent task. "none" shares an ancestor checkout and must never be treated as an independently managed worktree.',
+  }),
+  taskSticky: z.boolean().optional().meta({
+    description: "Legacy ignored retention marker kept for on-disk downgrade compatibility.",
+  }),
+  taskExecutionId: z.string().optional().meta({
+    description: "Latest internal execution handle for a reawakened persistent sub-agent.",
+  }),
+  taskExecutionStatus: z
+    .enum(["queued", "starting", "running", "completed", "interrupted", "error"])
+    .optional()
+    .meta({ description: "Status of the latest internal reawakened sub-agent execution." }),
   archivedAt: z.string().optional().meta({
     description:
       "ISO 8601 timestamp when workspace was last archived. Workspace is considered archived if archivedAt > unarchivedAt (or unarchivedAt is absent).",
@@ -328,6 +342,10 @@ export const WorkspaceActivitySnapshotSchema = z.object({
   }),
   isIdleCompaction: z.boolean().optional().meta({
     description: "Whether the current streaming activity is an idle (background) compaction",
+  }),
+  activeWorkflowRunIds: z.array(z.string().min(1)).optional().meta({
+    description:
+      "IDs of top-level workflow runs in this workspace that are pending, running, or backgrounded.",
   }),
   activeWorkflowRunCount: z.number().int().nonnegative().optional().meta({
     description:

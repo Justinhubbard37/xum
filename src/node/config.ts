@@ -982,6 +982,29 @@ export class Config {
           configModified = true;
         }
 
+        // Persistent sub-agents must survive a downgrade too. On first load of this behavior,
+        // rewrite the previous false/missing default before TaskService startup can create durable
+        // children; older builds will then keep their reported histories. The migration marker
+        // makes this a one-time default change rather than permanently overriding explicit config.
+        const retentionMigrations = normalizeConfigMigrations(parsed.migrations);
+        if (retentionMigrations.persistentSubagentsDefaulted !== true) {
+          parsed.taskSettings = {
+            ...(parsed.taskSettings ?? {}),
+            preserveSubagentsUntilArchive: true,
+          };
+          parsed.migrations = {
+            ...retentionMigrations,
+            persistentSubagentsDefaulted: true,
+          };
+          configModified = true;
+        }
+        if (parsed.taskSettings?.preserveSubagentsUntilArchive !== true) {
+          parsed.taskSettings = {
+            ...(parsed.taskSettings ?? {}),
+            preserveSubagentsUntilArchive: true,
+          };
+          configModified = true;
+        }
         const taskSettings = normalizeTaskSettings(parsed.taskSettings);
 
         const muxGatewayEnabled = parseOptionalBoolean(parsed.muxGatewayEnabled);
@@ -1230,7 +1253,10 @@ export class Config {
       // migration flag rides along so the first save locks in seed-once
       // semantics (later loads never re-apply the defaults).
       modelFallbacks: { ...DEFAULT_MODEL_FALLBACKS },
-      migrations: { defaultModelFallbacksSeeded: true },
+      migrations: {
+        defaultModelFallbacksSeeded: true,
+        persistentSubagentsDefaulted: true,
+      },
     };
   }
 
@@ -1912,6 +1938,10 @@ export class Config {
               taskThinkingLevel: workspace.taskThinkingLevel,
               taskPrompt: workspace.taskPrompt,
               taskTrunkBranch: workspace.taskTrunkBranch,
+              taskIsolation: workspace.taskIsolation,
+              taskSticky: workspace.taskSticky,
+              taskExecutionId: workspace.taskExecutionId,
+              taskExecutionStatus: workspace.taskExecutionStatus,
               archivedAt: workspace.archivedAt,
               unarchivedAt: workspace.unarchivedAt,
               pinnedAt: workspace.pinnedAt,
@@ -2124,6 +2154,10 @@ export class Config {
               taskThinkingLevel: workspace.taskThinkingLevel,
               taskPrompt: workspace.taskPrompt,
               taskTrunkBranch: workspace.taskTrunkBranch,
+              taskIsolation: workspace.taskIsolation,
+              taskSticky: workspace.taskSticky,
+              taskExecutionId: workspace.taskExecutionId,
+              taskExecutionStatus: workspace.taskExecutionStatus,
               archivedAt: workspace.archivedAt,
               unarchivedAt: workspace.unarchivedAt,
               pinnedAt: workspace.pinnedAt,
@@ -2188,6 +2222,10 @@ export class Config {
             taskThinkingLevel: workspace.taskThinkingLevel,
             taskPrompt: workspace.taskPrompt,
             taskTrunkBranch: workspace.taskTrunkBranch,
+            taskIsolation: workspace.taskIsolation,
+            taskSticky: workspace.taskSticky,
+            taskExecutionId: workspace.taskExecutionId,
+            taskExecutionStatus: workspace.taskExecutionStatus,
             projects: workspaceProjects,
             subProjectPath: workspace.subProjectPath,
           };
@@ -2281,6 +2319,10 @@ export class Config {
         taskThinkingLevel: metadata.taskThinkingLevel,
         taskPrompt: metadata.taskPrompt,
         taskTrunkBranch: metadata.taskTrunkBranch,
+        taskIsolation: metadata.taskIsolation,
+        taskSticky: metadata.taskSticky,
+        taskExecutionId: metadata.taskExecutionId,
+        taskExecutionStatus: metadata.taskExecutionStatus,
         archivedAt: metadata.archivedAt,
         unarchivedAt: metadata.unarchivedAt,
         pinnedAt: metadata.pinnedAt,
