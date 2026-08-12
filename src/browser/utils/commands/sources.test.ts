@@ -486,6 +486,83 @@ test("multi-project workspace command hides itself when the experiment is disabl
   expect(onStartMultiProjectWorkspaceCreation).not.toHaveBeenCalled();
 });
 
+test("Login with Coder command opens providers expanded on Coder and starts the login", async () => {
+  // Regression: the command must reach the login operation (expand the Coder
+  // provider and start the OAuth flow via the one-shot hints consumed by
+  // ProvidersSection), not merely open the generic Providers section.
+  const onOpenSettings = mock();
+  const actions = getActions({ onOpenSettings });
+  const loginAction = actions.find((a) => a.title === "Settings: Login with Coder");
+
+  expect(loginAction).toBeDefined();
+  await loginAction!.run();
+
+  expect(onOpenSettings).toHaveBeenCalledWith("providers", {
+    expandProvider: "coder",
+    startCoderLogin: true,
+  });
+});
+
+test("Login with Coder command hides itself when a custom provider shadows the coder id", () => {
+  // Regression: an upgraded install can carry a custom OpenAI-compatible
+  // provider named "coder". ProvidersSection hides the OAuth block for
+  // shadowed providers, so the login hint would either surface an invisible
+  // "Set the deployment URL first" error or inject built-in OAuth credentials
+  // into the custom provider's section. The command must follow the UI's
+  // shadow handling and hide itself.
+  const onOpenSettings = mock();
+  const shadowed = getActions({
+    onOpenSettings,
+    providersConfig: {
+      coder: { isCustom: true, baseUrl: "http://localhost:9000/v1" },
+    } as unknown as Parameters<typeof buildCoreSources>[0]["providersConfig"],
+  }).find((a) => a.title === "Settings: Login with Coder");
+  expect(shadowed).toBeDefined();
+  expect(shadowed?.visible?.()).toBe(false);
+
+  // Built-in Coder (no shadow): visible, including when no config exists yet.
+  const builtIn = getActions({
+    onOpenSettings,
+    providersConfig: {
+      coder: { coderOauthSet: false },
+    } as unknown as Parameters<typeof buildCoreSources>[0]["providersConfig"],
+  }).find((a) => a.title === "Settings: Login with Coder");
+  expect(builtIn?.visible?.()).toBe(true);
+
+  const noConfig = getActions({ onOpenSettings }).find(
+    (a) => a.title === "Settings: Login with Coder"
+  );
+  expect(noConfig?.visible?.()).toBe(true);
+});
+
+test("Disconnect Coder command revokes via RPC and is gated on a stored credential", async () => {
+  // Regression: Disconnect must be keyboard-reachable and must key its
+  // visibility off credential PRESENCE (coderOauthCredentialStored), not
+  // routability — a blob minted for a previously configured deployment URL
+  // must stay revocable.
+  const disconnect = mock(() => Promise.resolve({ success: true as const, data: undefined }));
+  const actions = getActions({
+    api: { coderOauth: { disconnect } } as unknown as APIClient,
+    providersConfig: {
+      coder: { coderOauthSet: false, coderOauthCredentialStored: true },
+    } as unknown as Parameters<typeof buildCoreSources>[0]["providersConfig"],
+  });
+  const disconnectAction = actions.find((a) => a.title === "Settings: Disconnect Coder");
+
+  expect(disconnectAction).toBeDefined();
+  expect(disconnectAction?.visible?.()).toBe(true);
+  await disconnectAction!.run();
+  expect(disconnect).toHaveBeenCalledTimes(1);
+
+  // Without a stored credential there is nothing to revoke: hidden.
+  const hidden = getActions({
+    providersConfig: {
+      coder: { coderOauthSet: false, coderOauthCredentialStored: false },
+    } as unknown as Parameters<typeof buildCoreSources>[0]["providersConfig"],
+  }).find((a) => a.title === "Settings: Disconnect Coder");
+  expect(hidden?.visible?.()).toBe(false);
+});
+
 test("project commands exclude system projects from options", async () => {
   const allProjects = new Map<string, ProjectConfig>([
     [

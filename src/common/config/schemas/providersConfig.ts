@@ -73,6 +73,39 @@ export const MuxGatewayProviderConfigSchema = BaseProviderConfigSchema.extend({
   voucher: z.string().optional(),
 });
 
+export const CoderProviderConfigSchema = BaseProviderConfigSchema.extend({
+  /** Coder deployment access URL (e.g. https://coder.example.com). */
+  deploymentUrl: z.string().optional(),
+  /** Stored Coder OAuth tokens + dynamic client registration (written by coderOauthService only). */
+  coderOauth: z.record(z.string(), z.unknown()).optional(),
+  /**
+   * Model IDs discovered from the deployment's AI Bridge catalogs (written by
+   * coderOauthService only). Doubles as the authoritative-catalog marker for
+   * gateway routing (see gatewayModelCatalog.ts) and as the bookkeeping that
+   * separates discovered entries from manually added ones in `models`, so
+   * user-managed entries survive re-logins and catalog refreshes.
+   */
+  discoveredModels: z.array(z.string()).optional(),
+  /**
+   * Model IDs the user removed from the model list (discovered or not —
+   * catalog provenance is lossy across re-logins, so every deletion is
+   * recorded). User-managed exclusions: catalog refreshes and re-logins must
+   * not resurrect them (maintained by ProviderService.setModels, honored by
+   * discovery merges).
+   */
+  removedModels: z.array(z.string()).optional(),
+  /**
+   * Cross-process disconnect generation (monotonic counter, incremented by
+   * coderOauthService.disconnect). Each login flow snapshots the persisted
+   * value at start; a flow whose snapshot no longer matches at commit time —
+   * in any Mux process sharing the file — refuses to commit, so an in-flight
+   * login cannot silently reconnect a just-disconnected account. A counter,
+   * not a wall-clock timestamp: clock skew/corrections must not let a
+   * pre-disconnect flow commit or lock out post-disconnect logins.
+   */
+  coderDisconnectGeneration: z.number().optional(),
+});
+
 export const GoogleProviderConfigSchema = BaseProviderConfigSchema;
 export const DeepSeekProviderConfigSchema = BaseProviderConfigSchema;
 export const MoonshotAIProviderConfigSchema = BaseProviderConfigSchema;
@@ -92,6 +125,7 @@ export const ProvidersConfigSchema = z
     moonshotai: MoonshotAIProviderConfigSchema.optional(),
     ollama: OllamaProviderConfigSchema.optional(),
     "github-copilot": GitHubCopilotProviderConfigSchema.optional(),
+    coder: CoderProviderConfigSchema.optional(),
   })
   .catchall(BaseProviderConfigSchema);
 
@@ -107,5 +141,6 @@ export type DeepSeekProviderConfig = z.infer<typeof DeepSeekProviderConfigSchema
 export type MoonshotAIProviderConfig = z.infer<typeof MoonshotAIProviderConfigSchema>;
 export type OllamaProviderConfig = z.infer<typeof OllamaProviderConfigSchema>;
 export type GitHubCopilotProviderConfig = z.infer<typeof GitHubCopilotProviderConfigSchema>;
+export type CoderProviderConfig = z.infer<typeof CoderProviderConfigSchema>;
 
 export type ProvidersConfig = z.infer<typeof ProvidersConfigSchema>;

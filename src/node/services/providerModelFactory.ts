@@ -41,6 +41,8 @@ import { CopilotResponsesLanguageModel } from "@/node/services/copilot/copilotRe
 import type { PolicyService } from "@/node/services/policyService";
 import type { ProviderService } from "@/node/services/providerService";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
+import type { CoderOauthService } from "@/node/services/coderOauthService";
+import { coderAibridgeBaseUrl, isCoderAibridgeOrigin } from "@/common/constants/coderOAuth";
 import type { DevToolsService } from "@/node/services/devToolsService";
 import { captureAndStripDevToolsHeader } from "@/node/services/devToolsHeaderCapture";
 import { createDevToolsMiddleware } from "@/node/services/devToolsMiddleware";
@@ -61,6 +63,7 @@ import { MUX_APP_ATTRIBUTION_TITLE, MUX_APP_ATTRIBUTION_URL } from "@/constants/
 import {
   resolveCustomProviderCredentials,
   resolveProviderCredentials,
+  type ProviderConfigRaw,
   type ProviderRequirementError,
 } from "@/node/utils/providerRequirements";
 import {
@@ -853,13 +856,38 @@ function getConfiguredProviderModelIds(providerConfig: ProviderConfig | undefine
   });
 }
 
-function createGatewayModelAccessibilityChecker(providersConfig: ProvidersConfig) {
-  return (gateway: string, gatewayModelId: string): boolean =>
-    isGatewayModelAccessibleFromAuthoritativeCatalog(
+function createGatewayModelAccessibilityChecker(
+  providersConfig: ProvidersConfig,
+  policyService?: PolicyService | null
+) {
+  // discoveredModels/removedModels are Coder-specific keys (other gateways
+  // have no server-discovered catalog marker), and ProvidersConfig's
+  // loosely-typed Record variant widens them to unknown — validate the shape
+  // once here.
+  const rawDiscovered = providersConfig.coder?.discoveredModels;
+  const coderDiscoveredModels = Array.isArray(rawDiscovered)
+    ? rawDiscovered.filter((id): id is string => typeof id === "string")
+    : undefined;
+  const rawRemoved = providersConfig.coder?.removedModels;
+  const coderRemovedModels = Array.isArray(rawRemoved)
+    ? rawRemoved.filter((id): id is string => typeof id === "string")
+    : undefined;
+  return (gateway: string, gatewayModelId: string): boolean => {
+    // The persisted catalog is deliberately policy-unfiltered (a temporarily
+    // restrictive policy must not survive in durable state); the CURRENT
+    // policy is applied here at routing time, so disallowed gateway models
+    // fall back to other routes instead of dying at model creation.
+    if (policyService?.isEnforced() && !policyService.isModelAllowed(gateway, gatewayModelId)) {
+      return false;
+    }
+    return isGatewayModelAccessibleFromAuthoritativeCatalog(
       gateway,
       gatewayModelId,
-      providersConfig[gateway]?.models
+      providersConfig[gateway]?.models,
+      gateway === "coder" ? coderDiscoveredModels : undefined,
+      gateway === "coder" ? coderRemovedModels : undefined
     );
+  };
 }
 
 function formatCustomProviderRequirementError(
@@ -907,6 +935,7 @@ export class ProviderModelFactory {
   private readonly policyService?: PolicyService;
   private readonly devToolsService?: DevToolsService;
   codexOauthService?: CodexOauthService;
+  coderOauthService?: CoderOauthService;
 
   constructor(
     config: Config,
@@ -922,12 +951,30 @@ export class ProviderModelFactory {
     this.devToolsService = devToolsService;
   }
 
+  /**
+   * Apply an enforced policy forcedBaseUrl to the coder provider's
+   * user-editable deploymentUrl. Coder credentials are issuer-bound, so they
+   * must be resolved against the effective (policy-locked) deployment —
+   * validating against the still-editable config field would wrongly reject
+   * policy-bound credentials after a user edit.
+   */
+  private coderEffectiveProviderConfig(providerConfig: ProviderConfigRaw): ProviderConfigRaw {
+    const forced = this.policyService?.isEnforced()
+      ? this.policyService.getForcedBaseUrl("coder")
+      : undefined;
+    return forced ? { ...providerConfig, deploymentUrl: forced } : providerConfig;
+  }
+
   private isProviderAvailableForRouting(
     provider: ProviderName,
     providersConfig: ProvidersConfig,
     config: ReturnType<Config["loadConfigOrDefault"]>
   ): boolean {
-    const providerConfig = providersConfig[provider] ?? {};
+    const rawProviderConfig = providersConfig[provider] ?? {};
+    const providerConfig =
+      provider === "coder"
+        ? this.coderEffectiveProviderConfig(rawProviderConfig)
+        : rawProviderConfig;
     const credentials = resolveProviderCredentials(provider, providerConfig);
 
     // OpenAI Codex OAuth is a valid credential path even without an API key;
@@ -1906,6 +1953,137 @@ export class ProviderModelFactory {
         return Ok(provider.chat(outboundCopilotModelId));
       }
 
+      // Coder AI Bridge: per-origin endpoints under <deployment>/api/v2/aibridge,
+      // authenticated with Coder OAuth access tokens (refreshed per request).
+      if (providerName === "coder") {
+        // Policy: an enforced forcedBaseUrl must win over the user-editable
+        // deploymentUrl, otherwise Coder traffic would bypass the policy-locked
+        // endpoint. Apply the forced URL BEFORE credential resolution (see
+        // coderEffectiveProviderConfig): credentials are issuer-bound, and
+        // tokens minted by any other deployment fail closed as "not
+        // configured". The login flow itself targets the forced URL
+        // (CoderOauthService is policy-aware), so re-login produces matching
+        // credentials.
+        const creds = resolveProviderCredentials(
+          "coder",
+          this.coderEffectiveProviderConfig(providerConfig)
+        );
+        if (!creds.isConfigured || !creds.deploymentUrl) {
+          return Err({ type: "api_key_not_found", provider: providerName });
+        }
+        const deploymentUrl = creds.deploymentUrl;
+
+        const coderOauthService = this.coderOauthService;
+        if (!coderOauthService) {
+          return Err({
+            type: "invalid_model_string",
+            message: "Coder OAuth service not initialized",
+          });
+        }
+
+        // Model IDs are <origin>/<modelId> (mux-gateway style) because the
+        // bridge has no cross-provider routing: Anthropic models must use
+        // /anthropic/v1/messages, OpenAI models /openai/v1/*.
+        const separatorIndex = modelId.indexOf("/");
+        const origin = separatorIndex > 0 ? modelId.slice(0, separatorIndex) : "";
+        const originModelId = separatorIndex > 0 ? modelId.slice(separatorIndex + 1) : "";
+        if (!isCoderAibridgeOrigin(origin) || !originModelId) {
+          return Err({
+            type: "invalid_model_string",
+            message: `Invalid Coder model "${modelId}". Expected coder:anthropic/<model> or coder:openai/<model>.`,
+          });
+        }
+
+        // Per-request auth wrapper: getValidAuth() transparently refreshes and
+        // persists rotated tokens, so long sessions never send stale tokens.
+        const baseFetch = getProviderFetch(providerConfig);
+        const policyService = this.policyService;
+        // Policy recheck per REQUEST, not just at model creation: an
+        // enforced policy can refresh mid-stream (or during the awaited
+        // setup between resolveAndCreateModel and the first fetch) to deny
+        // Coder or this model. getValidAuth() only validates the
+        // credential/issuer, so without this gate the wrapper would keep
+        // attaching the OAuth token and bypass the newly effective
+        // restriction for the remainder of a long multi-step stream.
+        const assertCoderModelAllowedByPolicy = () => {
+          if (
+            policyService?.isEnforced() &&
+            (!policyService.isProviderAllowed("coder") ||
+              !policyService.isModelAllowed("coder", modelId))
+          ) {
+            throw new Error(`Model coder:${modelId} is not allowed by policy`);
+          }
+        };
+        const coderFetchFn = async (
+          input: Parameters<typeof fetch>[0],
+          init?: Parameters<typeof fetch>[1]
+        ) => {
+          // Fail fast before the (possibly slow) token round-trip below.
+          assertCoderModelAllowedByPolicy();
+          const authResult = await coderOauthService.getValidAuth();
+          if (!authResult.success) {
+            throw new Error(authResult.error);
+          }
+          // This model instance captured its deployment URL at creation time.
+          // If the user has since logged in to a DIFFERENT deployment, the
+          // current credential must not be attached to this model's (old) base
+          // URL — that would send the new deployment's bearer token to the old
+          // host. Fail the request instead; a freshly created model picks up
+          // the new deployment.
+          if (authResult.data.deploymentUrl !== deploymentUrl) {
+            throw new Error(
+              "Coder deployment changed since this model was created. Retry the request."
+            );
+          }
+          // Recheck AFTER the await: getValidAuth() can spend tens of seconds
+          // refreshing an expired token and waiting for cross-process file
+          // locks. A policy refresh landing during that window must not be
+          // bypassed by a check that passed before the await.
+          assertCoderModelAllowedByPolicy();
+
+          const headers = new Headers(input instanceof Request ? input.headers : undefined);
+          if (init?.headers) {
+            for (const [key, value] of new Headers(init.headers).entries()) {
+              headers.set(key, value);
+            }
+          }
+          headers.set("Authorization", `Bearer ${authResult.data.access}`);
+          // The Anthropic SDK authenticates via x-api-key; the bridge reads the
+          // Bearer token instead, so drop the placeholder key.
+          headers.delete("x-api-key");
+          return baseFetch(input, { ...init, headers });
+        };
+        const coderFetch = Object.assign(coderFetchFn, baseFetch) as typeof fetch;
+
+        if (origin === "anthropic") {
+          const disableBeta = muxProviderOptions?.anthropic?.disableBetaFeatures === true;
+          // Same cache_control normalization as direct Anthropic / mux-gateway:
+          // the bridge forwards origin-shaped payloads to the real Anthropic API.
+          const providerFetch = wrapFetchWithAnthropicCacheControl(
+            coderFetch,
+            effectiveAnthropicCacheTtl,
+            { injectCacheControl: !disableBeta }
+          );
+          const { createAnthropic } = await PROVIDER_REGISTRY.anthropic();
+          const provider = createAnthropic({
+            apiKey: "coder", // placeholder; real auth injected by the fetch wrapper
+            baseURL: coderAibridgeBaseUrl(deploymentUrl, origin),
+            fetch: providerFetch,
+          });
+          return Ok(provider(originModelId));
+        }
+
+        const { createOpenAI } = await PROVIDER_REGISTRY.openai();
+        const provider = createOpenAI({
+          apiKey: "coder", // placeholder; real auth injected by the fetch wrapper
+          baseURL: coderAibridgeBaseUrl(deploymentUrl, origin),
+          fetch: coderFetch,
+        });
+        // The bridge intercepts both /responses and /chat/completions; use the
+        // Responses API to match Mux's default OpenAI wire format.
+        return Ok(provider.responses(originModelId));
+      }
+
       // Generic handler for simple providers (standard API key + factory pattern)
       // Providers with custom logic (anthropic, openai, xai, ollama, openrouter, bedrock, mux-gateway,
       // github-copilot) are handled explicitly above. New providers using the standard pattern need
@@ -1991,8 +2169,26 @@ export class ProviderModelFactory {
       SendMessageError
     >
   > {
-    const explicitGateway = getExplicitGatewayProvider(modelString);
-    const canonicalModelString = normalizeToCanonical(modelString);
+    // Shadow check on the RAW prefix, BEFORE the first normalization: a custom
+    // OpenAI-compatible provider can shadow a built-in gateway id (an upgraded
+    // install may already have one named "coder"). normalizeToCanonical would
+    // rewrite e.g. coder:google/gemini-2.5-pro to google:gemini-2.5-pro, and —
+    // because the built-in Coder definition routes only OpenAI/Anthropic — the
+    // explicit-prefix restoration below could never recover the custom model,
+    // silently bypassing the user's custom endpoint. The equivalent guard in
+    // resolveGatewayModelString only protects callers that pass raw strings.
+    const providersConfigForShadowCheck = this.config.loadProvidersConfig() ?? {};
+    const [rawProviderName] = parseModelString(modelString);
+    const rawPrefixShadowedByCustomProvider =
+      rawProviderName.length > 0 &&
+      isCustomOpenAICompatibleProviderConfig(providersConfigForShadowCheck[rawProviderName]);
+
+    const explicitGateway = rawPrefixShadowedByCustomProvider
+      ? undefined
+      : getExplicitGatewayProvider(modelString);
+    const canonicalModelString = rawPrefixShadowedByCustomProvider
+      ? modelString
+      : normalizeToCanonical(modelString);
     let effectiveModelString = canonicalModelString;
     const [canonicalProviderName, canonicalModelId] = parseModelString(canonicalModelString);
 
@@ -2042,7 +2238,10 @@ export class ProviderModelFactory {
   private resolveModelRoute(canonicalModel: string): RouteContext {
     const config = this.config.loadConfigOrDefault();
     const providersConfig = this.config.loadProvidersConfig?.() ?? {};
-    const isGatewayModelAccessible = createGatewayModelAccessibilityChecker(providersConfig);
+    const isGatewayModelAccessible = createGatewayModelAccessibilityChecker(
+      providersConfig,
+      this.policyService
+    );
     return resolveRoute(
       canonicalModel,
       config.routePriority ?? ["direct"],
@@ -2075,6 +2274,22 @@ export class ProviderModelFactory {
           ? explicitGatewayOrLegacyFlag
           : undefined;
 
+    const providersConfig = this.config.loadProvidersConfig() ?? {};
+
+    // Shadow check on the RAW prefix, BEFORE gateway canonicalization: a
+    // custom OpenAI-compatible provider can shadow a built-in gateway id
+    // (an upgraded install may already have one named "coder"). Left to the
+    // canonical check below, fromGatewayModelId would rewrite
+    // coder:openai/foo to openai:foo first and silently route it through
+    // the built-in machinery instead of the user's custom endpoint.
+    const [rawProviderName] = parseModelString(modelString);
+    if (
+      rawProviderName &&
+      isCustomOpenAICompatibleProviderConfig(providersConfig[rawProviderName])
+    ) {
+      return modelString;
+    }
+
     // Backend-authoritative routing avoids frontend localStorage races (issue #1769).
     const canonicalModelString = normalizeToCanonical(modelString);
     const [originProviderName, originModelId] = parseModelString(canonicalModelString);
@@ -2087,7 +2302,6 @@ export class ProviderModelFactory {
       return canonicalModelString;
     }
 
-    const providersConfig = this.config.loadProvidersConfig() ?? {};
     if (isCustomOpenAICompatibleProviderConfig(providersConfig[originProviderName])) {
       // Manual providers.jsonc edits can shadow a built-in provider id. Custom providers
       // are direct-only, so keep the user's model pointed at the custom endpoint.
@@ -2100,7 +2314,10 @@ export class ProviderModelFactory {
 
     const originProvider = originProviderName as ProviderName;
     const config = this.config.loadConfigOrDefault();
-    const isGatewayModelAccessible = createGatewayModelAccessibilityChecker(providersConfig);
+    const isGatewayModelAccessible = createGatewayModelAccessibilityChecker(
+      providersConfig,
+      this.policyService
+    );
     const routeContext =
       typeof modelKeyOrRouteContext === "object" && modelKeyOrRouteContext != null
         ? modelKeyOrRouteContext
@@ -2136,7 +2353,18 @@ export class ProviderModelFactory {
       const explicitGatewayDefinition = PROVIDER_DEFINITIONS[explicitGateway];
       if (explicitGatewayDefinition.kind === "gateway") {
         const explicitGatewayRoutes = explicitGatewayDefinition.routes as readonly ProviderName[];
-        if (explicitGatewayRoutes.includes(originProvider)) {
+        // Authoritative-catalog gate: restoring the explicit gateway must
+        // apply the same accessibility check as resolveRoute, or an explicit
+        // coder:<origin>/<model> absent from the discovered catalog would be
+        // sent to AI Bridge (and fail there) instead of using the fallback
+        // route already resolved above.
+        const explicitGatewayModelId =
+          explicitGatewayDefinition.toGatewayModelId?.(originProvider, originModelId) ??
+          originModelId;
+        if (
+          explicitGatewayRoutes.includes(originProvider) &&
+          isGatewayModelAccessible(explicitGateway, explicitGatewayModelId)
+        ) {
           resolvedRouteProvider = explicitGateway;
         }
       }

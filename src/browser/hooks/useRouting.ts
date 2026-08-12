@@ -140,7 +140,9 @@ export function useRouting(): RoutingState {
       isGatewayModelAccessibleFromAuthoritativeCatalog(
         gateway,
         modelId,
-        providersConfig?.[gateway]?.models
+        providersConfig?.[gateway]?.models,
+        providersConfig?.[gateway]?.discoveredModels,
+        providersConfig?.[gateway]?.removedModels
       ),
     [providersConfig]
   );

@@ -25,6 +25,9 @@ import { Config } from "@/node/config";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { AgentSession } from "@/node/services/agentSession";
 import { CodexOauthService } from "@/node/services/codexOauthService";
+import { CoderOauthService } from "@/node/services/coderOauthService";
+import { PolicyService } from "@/node/services/policyService";
+import { ProviderService } from "@/node/services/providerService";
 import { createCoreServices } from "@/node/services/coreServices";
 import { log, type LogLevel } from "@/node/services/log";
 import { DisposableTempDir } from "@/node/services/tempDir";
@@ -82,6 +85,9 @@ interface WorkflowContext {
   services: WorkflowServices;
   session: AgentSession;
   codexOauthService: CodexOauthService;
+  coderOauthService: CoderOauthService;
+  realProviderService: ProviderService;
+  policyService: PolicyService;
 }
 
 export async function parseWorkflowArgs(input: ParseWorkflowArgsInput): Promise<unknown> {
@@ -235,6 +241,9 @@ async function disposeWorkflowResources(input: {
   services?: WorkflowServices;
   session?: AgentSession;
   codexOauthService?: CodexOauthService;
+  coderOauthService?: CoderOauthService;
+  realProviderService?: ProviderService;
+  policyService?: PolicyService;
 }): Promise<void> {
   // Suppress monitor:stopped before session.dispose() triggers cleanup() so persisted
   // armed-monitor registry records survive shutdown (post-restart "monitor lost" wakes).
@@ -259,6 +268,27 @@ async function disposeWorkflowResources(input: {
     });
   }
   try {
+    await input.coderOauthService?.dispose();
+  } catch (error) {
+    log.warn("mux workflow: failed to dispose Coder OAuth service", {
+      error: getErrorMessage(error),
+    });
+  }
+  try {
+    input.realProviderService?.dispose();
+  } catch (error) {
+    log.warn("mux workflow: failed to dispose real-config provider service", {
+      error: getErrorMessage(error),
+    });
+  }
+  try {
+    input.policyService?.dispose();
+  } catch (error) {
+    log.warn("mux workflow: failed to dispose policy service", {
+      error: getErrorMessage(error),
+    });
+  }
+  try {
     await input.services?.backgroundProcessManager.terminateAll();
   } catch (error) {
     log.warn("mux workflow: failed to terminate background processes", {
@@ -274,6 +304,9 @@ async function disposeWorkflowContext(ctx: WorkflowContext): Promise<void> {
     services: ctx.services,
     session: ctx.session,
     codexOauthService: ctx.codexOauthService,
+    coderOauthService: ctx.coderOauthService,
+    realProviderService: ctx.realProviderService,
+    policyService: ctx.policyService,
   });
 }
 
@@ -285,6 +318,9 @@ async function createWorkflowContext(options: {
   let services: WorkflowServices | undefined;
   let session: AgentSession | undefined;
   let codexOauthService: CodexOauthService | undefined;
+  let coderOauthService: CoderOauthService | undefined;
+  let realProviderService: ProviderService | undefined;
+  let policyService: PolicyService | undefined;
   try {
     const realConfig = new Config();
     const config = new Config(tempDir.path);
@@ -303,13 +339,36 @@ async function createWorkflowContext(options: {
     const runtimeConfig = parseRuntimeConfig(options.opts.runtime);
     const projectTrusted = await resolveProjectTrusted(realConfig, options.projectDir);
 
+    // Enforce managed policy (MUX_POLICY_FILE / Mux Governor) in headless
+    // workflows too, matching the desktop wiring: without this, `mux workflow`
+    // would keep using providers/models/credentials that providerAccess now
+    // denies. Bind to the REAL config so governor enrollment settings
+    // (muxGovernorUrl/Token) are honored.
+    policyService = new PolicyService(realConfig);
+    await policyService.initialize();
+
     services = createCoreServices({
       config,
+      policyService,
       extensionMetadataPath: path.join(tempDir.path, "extensionMetadata.json"),
       mcpConfig: realConfig,
     });
     codexOauthService = new CodexOauthService(config, services.providerService);
     services.aiService.setCodexOauthService(codexOauthService);
+    // Bind Coder OAuth to the REAL config (not the ephemeral tempDir copy):
+    // Coder rotates the refresh token on every use, so persisting rotations
+    // only to tempDir would strand ~/.mux/providers.jsonc with a consumed
+    // (dead) refresh token once this CLI session exits.
+    realProviderService = new ProviderService(realConfig, policyService);
+    coderOauthService = new CoderOauthService(
+      realConfig,
+      realProviderService,
+      undefined,
+      // Policy-aware: an enforced forcedBaseUrl overrides the deployment URL
+      // for token refreshes/issuer checks, and denied providers fail closed.
+      policyService
+    );
+    services.aiService.setCoderOauthService(coderOauthService);
 
     session = new AgentSession({
       workspaceId,
@@ -342,9 +401,20 @@ async function createWorkflowContext(options: {
       services,
       session,
       codexOauthService,
+      coderOauthService,
+      realProviderService,
+      policyService,
     };
   } catch (error) {
-    await disposeWorkflowResources({ tempDir, services, session, codexOauthService });
+    await disposeWorkflowResources({
+      tempDir,
+      services,
+      session,
+      codexOauthService,
+      coderOauthService,
+      realProviderService,
+      policyService,
+    });
     throw error;
   }
 }

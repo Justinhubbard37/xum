@@ -18,6 +18,9 @@ import { Config, type ProjectConfig } from "../node/config";
 import { DisposableTempDir } from "../node/services/tempDir";
 import { AgentSession, type AgentSessionChatEvent } from "../node/services/agentSession";
 import { CodexOauthService } from "../node/services/codexOauthService";
+import { CoderOauthService } from "../node/services/coderOauthService";
+import { PolicyService } from "../node/services/policyService";
+import { ProviderService } from "../node/services/providerService";
 import { createCoreServices } from "../node/services/coreServices";
 import {
   isCaughtUpMessage,
@@ -544,6 +547,14 @@ async function main(): Promise<number> {
     }
   }
 
+  // Enforce managed policy (MUX_POLICY_FILE / Mux Governor) in headless runs
+  // too, matching the desktop wiring: without this, `mux run` would keep using
+  // providers/models/credentials that providerAccess now denies. Bind to the
+  // REAL config so governor enrollment settings (muxGovernorUrl/Token) are
+  // honored — the ephemeral tempDir config only receives project trust flags.
+  const policyService = new PolicyService(realConfig);
+  await policyService.initialize();
+
   // Initialize the core service graph (shared with ServiceContainer).
   // CLI overrides: ephemeral extension metadata, persistent MCP config via
   // realConfig, and CLI-specific MCPServerManager options for inline servers.
@@ -563,6 +574,7 @@ async function main(): Promise<number> {
     idleDispatcher,
   } = createCoreServices({
     config,
+    policyService,
     extensionMetadataPath: path.join(tempDir.path, "extensionMetadata.json"),
     // Session config lives in tempDir (deleted on exit) — disable workspace.*
     // host actions so workflows can't create worktrees whose tags evaporate.
@@ -585,6 +597,21 @@ async function main(): Promise<number> {
   // OAuth tokens from providers.jsonc.
   const codexOauthService = new CodexOauthService(config, providerService);
   aiService.setCodexOauthService(codexOauthService);
+  // Same for Coder OAuth: coder:* models need per-request token loading/refresh.
+  // Bind it to the REAL config (not the ephemeral tempDir copy): Coder rotates
+  // the refresh token on every use, so persisting rotations only to tempDir
+  // would strand ~/.mux/providers.jsonc with a consumed (dead) refresh token
+  // once this CLI session exits.
+  const realProviderService = new ProviderService(realConfig, policyService);
+  const coderOauthService = new CoderOauthService(
+    realConfig,
+    realProviderService,
+    undefined,
+    // Policy-aware: an enforced forcedBaseUrl overrides the deployment URL for
+    // token refreshes/issuer checks, and denied providers fail closed.
+    policyService
+  );
+  aiService.setCoderOauthService(coderOauthService);
 
   // CLI-only exit code control: allows agent to set the process exit code
   // Useful for CI workflows where the agent should block merge on failure
@@ -1426,6 +1453,9 @@ async function main(): Promise<number> {
     session.dispose();
     mcpServerManager.dispose();
     await codexOauthService.dispose();
+    await coderOauthService.dispose();
+    realProviderService.dispose();
+    policyService.dispose();
     if (!keepBackgroundProcesses) {
       await backgroundProcessManager.terminateAll();
     }

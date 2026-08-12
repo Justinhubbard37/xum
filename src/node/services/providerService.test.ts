@@ -1,5 +1,6 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import * as fs from "fs";
+import * as fsPromises from "fs/promises";
 import { writeFile } from "node:fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -588,7 +589,7 @@ describe("ProviderService.getConfig", () => {
           },
         ],
       },
-      (config, service) => {
+      async (config, service) => {
         config.saveProvidersConfig({
           "local-vllm": localVllmConfig({ models: ["llama-3", "mistral"] }),
           "another-custom": {
@@ -606,11 +607,205 @@ describe("ProviderService.getConfig", () => {
         expect(service.list()).toContain("local-vllm");
         expect(service.list()).not.toContain("another-custom");
 
-        const result = service.setModels("another-custom", ["other-model"]);
+        const result = await service.setModels("another-custom", ["other-model"]);
         expect(result.success).toBe(false);
         if (!result.success) {
           expect(result.error).toContain("not allowed by policy");
         }
+      }
+    );
+  });
+
+  it("revalidates policy inside the providers file lock in setModels", async () => {
+    // Regression: policy can refresh while another process holds the
+    // cross-process providers lock. A check done only before the lock wait
+    // would persist models the refreshed policy denies and report success —
+    // the validation must run inside the locked mutation.
+    await withTempPolicyProviderService(
+      {
+        policy_format_version: "0.1",
+        provider_access: [{ id: "openai" }],
+      },
+      async (config, service, policyService) => {
+        // A second Config on the same root stands in for another Mux process
+        // holding the providers file lock while setModels waits for it.
+        const otherProcess = new Config(config.rootDir);
+        let releaseLock!: () => void;
+        const lockGate = new Promise<void>((resolve) => (releaseLock = resolve));
+        let lockHeld!: () => void;
+        const lockHeldPromise = new Promise<void>((resolve) => (lockHeld = resolve));
+        const lockHolder = otherProcess.withProvidersFileLock(async () => {
+          lockHeld();
+          await lockGate;
+        });
+        await lockHeldPromise;
+
+        // setModels passes the pre-lock policy state (openai allowed) and
+        // blocks on the lock...
+        const setModelsPromise = service.setModels("openai", ["gpt-5"]);
+
+        // ...while the policy refreshes to DENY openai.
+        await writeFile(
+          process.env.MUX_POLICY_FILE!,
+          JSON.stringify({
+            policy_format_version: "0.1",
+            provider_access: [{ id: "anthropic" }],
+          }),
+          "utf-8"
+        );
+        const refresh = await policyService.refreshNow();
+        expect(refresh.success).toBe(true);
+        releaseLock();
+        await lockHolder;
+
+        const result = await setModelsPromise;
+        expect(result.success).toBe(false);
+        if (!result.success) {
+          expect(result.error).toContain("not allowed by policy");
+        }
+        // Nothing was persisted for the denied provider.
+        expect(config.loadProvidersConfig()?.openai?.models).toBeUndefined();
+      }
+    );
+  });
+
+  it("reports Coder connection state against the policy-forced deployment URL", async () => {
+    const LOCKED_URL = "https://locked.coder.example.com";
+    await withTempPolicyProviderService(
+      {
+        policy_format_version: "0.1",
+        provider_access: [{ id: "coder", base_url: LOCKED_URL }],
+      },
+      (config, service) => {
+        // Tokens were minted by the forced deployment, but the (unlocked)
+        // editable deploymentUrl field has since been pointed elsewhere.
+        // Connection status must follow routing — which uses the forced URL —
+        // or Settings would show "Not connected" (and hide Disconnect) while
+        // requests keep succeeding against the forced deployment.
+        config.saveProvidersConfig({
+          coder: {
+            deploymentUrl: "https://user-edited.example.com",
+            coderOauth: {
+              type: "oauth",
+              sessionId: "sess",
+              deploymentUrl: LOCKED_URL,
+              access: "at",
+              refresh: "rt",
+              expires: Date.now() + 3_600_000,
+              clientId: "c",
+              clientSecret: "s",
+            },
+          },
+        });
+
+        const cfg = service.getConfig();
+        expect(cfg.coder.coderOauthSet).toBe(true);
+        expect(cfg.coder.isConfigured).toBe(true);
+        expect(cfg.coder.deploymentUrl).toBe(LOCKED_URL);
+      }
+    );
+  });
+
+  it("exposes stored Coder credential presence even when policy denies the provider", async () => {
+    await withTempPolicyProviderService(
+      {
+        policy_format_version: "0.1",
+        provider_access: [{ id: "openai" }], // coder denied
+      },
+      (config, service) => {
+        // A policy refresh that drops coder hides the provider, but the
+        // stored full-privilege credential is still live on its deployment.
+        // getConfig() must surface its PRESENCE (nothing else) so the
+        // Disconnect command keeps a revocation path.
+        config.saveProvidersConfig({
+          coder: {
+            deploymentUrl: "https://coder.example.com",
+            models: ["anthropic/model-a"],
+            coderOauth: {
+              type: "oauth",
+              sessionId: "sess",
+              deploymentUrl: "https://coder.example.com",
+              access: "at",
+              refresh: "rt",
+              expires: Date.now() + 3_600_000,
+              clientId: "c",
+              clientSecret: "s",
+            },
+          },
+        });
+
+        const cfg = service.getConfig();
+        expect(cfg.coder).toBeDefined();
+        expect(cfg.coder.coderOauthCredentialStored).toBe(true);
+        // Presence only: unconfigured/disabled, no deployment URL or models.
+        expect(cfg.coder.isConfigured).toBe(false);
+        expect(cfg.coder.isEnabled).toBe(false);
+        expect(cfg.coder.deploymentUrl).toBeUndefined();
+        expect(cfg.coder.models).toBeUndefined();
+
+        // Without a stored credential the denied provider stays fully hidden.
+        config.saveProvidersConfig({
+          coder: { deploymentUrl: "https://coder.example.com" },
+        });
+        expect(service.getConfig().coder).toBeUndefined();
+      }
+    );
+  });
+
+  it("keeps a stored Coder credential disconnectable after the deployment URL is edited", () => {
+    withTempConfig((config, service) => {
+      // The stored blob no longer matches the configured URL: not routable
+      // (coderOauthSet false), but the credential is still live on its own
+      // issuer and must stay exposed so Disconnect can revoke it.
+      config.saveProvidersConfig({
+        coder: {
+          deploymentUrl: "https://new-deployment.example.com",
+          coderOauth: {
+            type: "oauth",
+            sessionId: "sess",
+            deploymentUrl: "https://old-deployment.example.com",
+            access: "at",
+            refresh: "rt",
+            expires: Date.now() + 3_600_000,
+            clientId: "c",
+            clientSecret: "s",
+          },
+        },
+      });
+
+      const cfg = service.getConfig();
+      expect(cfg.coder.coderOauthSet).toBe(false);
+      expect(cfg.coder.coderOauthCredentialStored).toBe(true);
+
+      // No blob at all: nothing to disconnect.
+      config.saveProvidersConfig({
+        coder: { deploymentUrl: "https://new-deployment.example.com" },
+      });
+      expect(service.getConfig().coder.coderOauthCredentialStored).toBe(false);
+    });
+  });
+
+  it("filters Coder discoveredModels by the current policy at exposure time", async () => {
+    await withTempPolicyProviderService(
+      {
+        policy_format_version: "0.1",
+        provider_access: [{ id: "coder", model_access: ["anthropic/claude-sonnet-4-5"] }],
+      },
+      (config, service) => {
+        // The persisted catalog is policy-unfiltered by design (a temporary
+        // policy must not carve models out of durable state); getConfig()
+        // applies the CURRENT policy when exposing the lists.
+        config.saveProvidersConfig({
+          coder: {
+            deploymentUrl: "https://coder.example.com",
+            models: ["anthropic/claude-sonnet-4-5", "anthropic/claude-opus-4-1"],
+            discoveredModels: ["anthropic/claude-sonnet-4-5", "anthropic/claude-opus-4-1"],
+          },
+        });
+
+        const cfg = service.getConfig();
+        expect(cfg.coder.models).toEqual(["anthropic/claude-sonnet-4-5"]);
+        expect(cfg.coder.discoveredModels).toEqual(["anthropic/claude-sonnet-4-5"]);
       }
     );
   });
@@ -642,9 +837,124 @@ describe("ProviderService model normalization", () => {
     });
   });
 
-  it("normalizes malformed model entries before persisting", () => {
-    withTempConfig((config, service) => {
-      const result = service.setModels("openai", [
+  it("preserves policy-hidden Coder models during model edits", async () => {
+    await withTempPolicyProviderService(
+      {
+        policy_format_version: "0.1",
+        provider_access: [
+          {
+            id: "coder",
+            model_access: ["anthropic/visible-model", "anthropic/other-visible"],
+          },
+        ],
+      },
+      async (config, service) => {
+        // The persisted list is policy-unfiltered; getConfig() exposes only
+        // the allowed subset, so an edit round-trip can never include the
+        // hidden entry. setModels must carry it forward or the edit would
+        // carve it out of durable state until the next login even after the
+        // policy broadens.
+        config.saveProvidersConfig({
+          coder: {
+            deploymentUrl: "https://coder.example.com",
+            models: ["anthropic/visible-model", "anthropic/other-visible", "anthropic/hidden"],
+            discoveredModels: [
+              "anthropic/visible-model",
+              "anthropic/other-visible",
+              "anthropic/hidden",
+            ],
+          },
+        });
+
+        // The user (seeing only the two visible entries) removes one.
+        const result = await service.setModels("coder", ["anthropic/visible-model"]);
+        expect(result.success).toBe(true);
+
+        const stored = config.loadProvidersConfig()?.coder as Record<string, unknown>;
+        // The hidden entry survives; only the visible removal took effect.
+        expect(stored.models).toEqual(["anthropic/visible-model", "anthropic/hidden"]);
+        expect(stored.removedModels).toEqual(["anthropic/other-visible"]);
+      }
+    );
+  });
+
+  it("records removals of discovered Coder models and clears them on re-add", async () => {
+    await withTempConfigAsync(async (config, service) => {
+      config.saveProvidersConfig({
+        coder: {
+          deploymentUrl: "https://coder.example.com",
+          models: ["anthropic/model-a", "anthropic/model-b"],
+          discoveredModels: ["anthropic/model-a", "anthropic/model-b"],
+        },
+      });
+
+      // Removing a discovered model records the exclusion so catalog
+      // refreshes and re-logins cannot resurrect it.
+      const removal = await service.setModels("coder", ["anthropic/model-a"]);
+      expect(removal.success).toBe(true);
+      let stored = config.loadProvidersConfig()?.coder as Record<string, unknown>;
+      expect(stored.models).toEqual(["anthropic/model-a"]);
+      expect(stored.removedModels).toEqual(["anthropic/model-b"]);
+
+      // Re-adding the model clears its exclusion.
+      const readd = await service.setModels("coder", ["anthropic/model-a", "anthropic/model-b"]);
+      expect(readd.success).toBe(true);
+      stored = config.loadProvidersConfig()?.coder as Record<string, unknown>;
+      expect(stored.models).toEqual(["anthropic/model-a", "anthropic/model-b"]);
+      expect(stored.removedModels).toBeUndefined();
+    });
+  });
+
+  it("records removals of Coder models the current catalog no longer lists", async () => {
+    await withTempConfigAsync(async (config, service) => {
+      // Provenance is lossy: a discovered model with a user-authored object
+      // override survives a catalog that temporarily omits its ID (only
+      // `models` still knows it). Deleting it in that state must still
+      // record the exclusion, or the next catalog that lists the ID again
+      // would resurrect a model the user explicitly removed.
+      config.saveProvidersConfig({
+        coder: {
+          deploymentUrl: "https://coder.example.com",
+          models: [
+            { id: "anthropic/overridden", contextWindowTokens: 100_000 },
+            "anthropic/model-a",
+          ],
+          // The current catalog omits the overridden model's ID.
+          discoveredModels: ["anthropic/model-a"],
+        },
+      });
+
+      const result = await service.setModels("coder", ["anthropic/model-a"]);
+      expect(result.success).toBe(true);
+      const stored = config.loadProvidersConfig()?.coder as Record<string, unknown>;
+      expect(stored.models).toEqual(["anthropic/model-a"]);
+      expect(stored.removedModels).toEqual(["anthropic/overridden"]);
+    });
+  });
+
+  it("keeps prior Coder removals across edits made while the catalog is unknown", async () => {
+    await withTempConfigAsync(async (config, service) => {
+      // Post-login state: discoveredModels deleted (catalog unknown), but a
+      // removal recorded earlier must survive an unrelated edit — otherwise
+      // the pending discovery would resurrect the removed model.
+      config.saveProvidersConfig({
+        coder: {
+          deploymentUrl: "https://coder.example.com",
+          models: ["anthropic/model-a"],
+          removedModels: ["anthropic/model-b"],
+        },
+      });
+
+      const result = await service.setModels("coder", ["anthropic/model-a", "anthropic/manual"]);
+      expect(result.success).toBe(true);
+      const stored = config.loadProvidersConfig()?.coder as Record<string, unknown>;
+      expect(stored.removedModels).toEqual(["anthropic/model-b"]);
+    });
+  });
+
+  it("normalizes malformed model entries before persisting", async () => {
+    await withTempConfigAsync(async (config, service) => {
+      const result = await service.setModels("openai", [
         "  gpt-5  ",
         { id: "custom-model", contextWindowTokens: 100_000 },
         { id: "custom-model", contextWindowTokens: 64_000 },
@@ -665,9 +975,9 @@ describe("ProviderService model normalization", () => {
 });
 
 describe("ProviderService custom provider mutations", () => {
-  it("rejects adding a built-in provider id", () => {
-    withTempConfig((config, service) => {
-      const result = service.addCustomOpenAICompatibleProvider({
+  it("rejects adding a built-in provider id", async () => {
+    await withTempConfigAsync(async (config, service) => {
+      const result = await service.addCustomOpenAICompatibleProvider({
         provider: "openai",
         baseUrl: "https://api.example.com/v1",
       });
@@ -680,9 +990,9 @@ describe("ProviderService custom provider mutations", () => {
     });
   });
 
-  it("rejects invalid custom provider ids with the validation reason", () => {
-    withTempConfig((config, service) => {
-      const result = service.addCustomOpenAICompatibleProvider({
+  it("rejects invalid custom provider ids with the validation reason", async () => {
+    await withTempConfigAsync(async (config, service) => {
+      const result = await service.addCustomOpenAICompatibleProvider({
         provider: "Bad Provider",
         baseUrl: "https://api.example.com/v1",
       });
@@ -696,13 +1006,13 @@ describe("ProviderService custom provider mutations", () => {
     });
   });
 
-  it("rejects duplicate custom provider ids", () => {
-    withTempConfig((config, service) => {
+  it("rejects duplicate custom provider ids", async () => {
+    await withTempConfigAsync(async (config, service) => {
       config.saveProvidersConfig({
         "local-vllm": localVllmConfig(),
       });
 
-      const result = service.addCustomOpenAICompatibleProvider({
+      const result = await service.addCustomOpenAICompatibleProvider({
         provider: "local-vllm",
         baseUrl: "https://api.example.com/v1",
       });
@@ -715,9 +1025,9 @@ describe("ProviderService custom provider mutations", () => {
   });
 
   for (const baseUrl of ["", "   ", "not a url", "ftp://api.example.com/v1"] as const) {
-    it(`rejects invalid base URL ${JSON.stringify(baseUrl)}`, () => {
-      withTempConfig((config, service) => {
-        const result = service.addCustomOpenAICompatibleProvider({
+    it(`rejects invalid base URL ${JSON.stringify(baseUrl)}`, async () => {
+      await withTempConfigAsync(async (config, service) => {
+        const result = await service.addCustomOpenAICompatibleProvider({
           provider: "local-vllm",
           baseUrl,
         });
@@ -731,9 +1041,9 @@ describe("ProviderService custom provider mutations", () => {
     });
   }
 
-  it("adds a custom OpenAI-compatible provider and returns provider info", () => {
-    withTempConfig((config, service) => {
-      const result = service.addCustomOpenAICompatibleProvider({
+  it("adds a custom OpenAI-compatible provider and returns provider info", async () => {
+    await withTempConfigAsync(async (config, service) => {
+      const result = await service.addCustomOpenAICompatibleProvider({
         provider: " local-vllm ",
         displayName: " Local vLLM ",
         baseUrl: " http://localhost:8000/v1 ",
@@ -787,8 +1097,8 @@ describe("ProviderService custom provider mutations", () => {
         policy_format_version: "0.1",
         provider_access: [{ id: "openai" }],
       },
-      (config, service) => {
-        const result = service.addCustomOpenAICompatibleProvider({
+      async (config, service) => {
+        const result = await service.addCustomOpenAICompatibleProvider({
           provider: "local-vllm",
           baseUrl: LOCAL_VLLM_BASE_URL,
         });
@@ -808,8 +1118,8 @@ describe("ProviderService custom provider mutations", () => {
         policy_format_version: "0.1",
         provider_access: [{ id: "local-vllm", base_url: "http://policy.local/v1" }],
       },
-      (config, service) => {
-        const result = service.addCustomOpenAICompatibleProvider({
+      async (config, service) => {
+        const result = await service.addCustomOpenAICompatibleProvider({
           provider: "local-vllm",
           baseUrl: LOCAL_VLLM_BASE_URL,
         });
@@ -829,8 +1139,8 @@ describe("ProviderService custom provider mutations", () => {
         policy_format_version: "0.1",
         provider_access: [{ id: "local-vllm", model_access: ["llama-3"] }],
       },
-      (config, service) => {
-        const result = service.addCustomOpenAICompatibleProvider({
+      async (config, service) => {
+        const result = await service.addCustomOpenAICompatibleProvider({
           provider: "local-vllm",
           baseUrl: LOCAL_VLLM_BASE_URL,
           models: ["llama-3", "mixtral"],
@@ -1435,6 +1745,94 @@ describe("ProviderService denied keyPath segments", () => {
       expect(config.loadProvidersConfig()).toBeNull();
     });
   });
+
+  it("updateConfigValue rejects __proto__ in keyPath", async () => {
+    await withTempConfigAsync(async (config, service) => {
+      const result = await service.updateConfigValue("openai", ["auth", "__proto__"], () => ({
+        value: "x",
+      }));
+
+      expect(result).toEqual({
+        success: false,
+        error: 'Denied key path segment: "__proto__"',
+      });
+      expect(config.loadProvidersConfig()).toBeNull();
+    });
+  });
+});
+
+describe("ProviderService.updateConfigValue", () => {
+  it("writes when the predicate accepts and skips when it returns null", async () => {
+    await withTempConfigAsync(async (config, service) => {
+      config.saveProvidersConfig({ coder: { coderOauth: { refresh: "rt_a" } } });
+
+      // Predicate matches: write applies.
+      const applied = await service.updateConfigValue("coder", ["coderOauth"], (current) =>
+        (current as { refresh?: string } | undefined)?.refresh === "rt_a"
+          ? { value: { refresh: "rt_b" } }
+          : null
+      );
+      expect(applied).toEqual({ success: true, data: { applied: true } });
+      expect(
+        (config.loadProvidersConfig()?.coder?.coderOauth as { refresh?: string })?.refresh
+      ).toBe("rt_b");
+
+      // Predicate no longer matches (rt_a was replaced): compare-and-set skips.
+      const skipped = await service.updateConfigValue("coder", ["coderOauth"], (current) =>
+        (current as { refresh?: string } | undefined)?.refresh === "rt_a"
+          ? { value: undefined }
+          : null
+      );
+      expect(skipped).toEqual({ success: true, data: { applied: false } });
+      expect(
+        (config.loadProvidersConfig()?.coder?.coderOauth as { refresh?: string })?.refresh
+      ).toBe("rt_b");
+    });
+  });
+
+  it("serializes concurrent updates so no write is lost", async () => {
+    await withTempConfigAsync(async (config, service) => {
+      config.saveProvidersConfig({ coder: { coderOauth: { generation: 0 } } });
+
+      // Both updates read-modify-write the same value; the lock must serialize
+      // them so both increments land.
+      const increment = () =>
+        service.updateConfigValue("coder", ["coderOauth"], (current) => ({
+          value: {
+            generation: ((current as { generation?: number } | undefined)?.generation ?? 0) + 1,
+          },
+        }));
+      const [a, b] = await Promise.all([increment(), increment()]);
+      expect(a.success && b.success).toBe(true);
+      expect(
+        (config.loadProvidersConfig()?.coder?.coderOauth as { generation?: number })?.generation
+      ).toBe(2);
+    });
+  });
+
+  it("breaks stale locks left by crashed processes", async () => {
+    await withTempConfigAsync(async (config, service) => {
+      config.saveProvidersConfig({ coder: {} });
+      // Simulate a crashed process: lock dir exists with an old mtime.
+      const lockPath = path.join(config.rootDir, "providers.jsonc.lock");
+      await fsPromises.mkdir(lockPath);
+      const past = new Date(Date.now() - 60_000);
+      await fsPromises.utimes(lockPath, past, past);
+
+      const result = await service.updateConfigValue("coder", ["coderOauth"], () => ({
+        value: { refresh: "rt_after_crash" },
+      }));
+      expect(result).toEqual({ success: true, data: { applied: true } });
+      // Lock released after the write.
+      let lockExists = true;
+      try {
+        await fsPromises.access(lockPath);
+      } catch {
+        lockExists = false;
+      }
+      expect(lockExists).toBe(false);
+    });
+  });
 });
 
 describe("ProviderService gateway lifecycle", () => {
@@ -1597,6 +1995,87 @@ describe("ProviderService gateway lifecycle", () => {
       expect(updatedConfig.muxGatewayEnabled).toBeUndefined();
       expect(service.getConfig()["mux-gateway"].isEnabled).toBe(true);
     });
+  });
+
+  it("reports success when the section write lands but the route sync fails", async () => {
+    await withTempConfigAsync(async (config, service) => {
+      await saveRoutePriority(config, ["direct"]);
+
+      // The Coder login write below is auto-route eligible, so the lifecycle
+      // sync wants to edit the MAIN config. That edit failing (e.g. the main
+      // config is unwritable) must not convert the landed providers.jsonc
+      // write into a reported failure: Coder's login commit revokes tokens
+      // for any non-success result, which would strand a credential that IS
+      // stored (and reported as connected) in a revoked state.
+      const editSpy = spyOn(config, "editConfig").mockRejectedValueOnce(
+        new Error("main config unwritable")
+      );
+      try {
+        const result = await service.updateProviderSection("coder", () => ({
+          value: {
+            deploymentUrl: "https://coder.example.com",
+            coderOauth: {
+              type: "oauth",
+              sessionId: "sess",
+              deploymentUrl: "https://coder.example.com",
+              access: "at",
+              refresh: "rt",
+              expires: Date.now() + 3_600_000,
+              clientId: "c",
+              clientSecret: "s",
+            },
+          },
+        }));
+
+        expect(result).toEqual({ success: true, data: { applied: true } });
+        // The credential write itself landed.
+        const stored = config.loadProvidersConfig()?.coder as Record<string, unknown>;
+        expect(stored.coderOauth).toBeDefined();
+      } finally {
+        editSpy.mockRestore();
+      }
+    });
+  });
+
+  it("keeps coder in routePriority under a forced base URL when the editable deploymentUrl differs", async () => {
+    const LOCKED_URL = "https://locked.coder.example.com";
+    await withTempPolicyProviderService(
+      {
+        policy_format_version: "0.1",
+        provider_access: [{ id: "coder", base_url: LOCKED_URL }],
+      },
+      async (config, service) => {
+        await saveRoutePriority(config, ["coder", "direct"]);
+        // Tokens minted by the forced deployment; the (unlocked) editable
+        // deploymentUrl field has since been pointed elsewhere. Lifecycle
+        // checks must resolve against the forced URL — like Settings status
+        // and runtime model creation — or this write would evict coder from
+        // routePriority while requests keep working against the forced
+        // deployment.
+        config.saveProvidersConfig({
+          coder: {
+            deploymentUrl: "https://user-edited.example.com",
+            coderOauth: {
+              type: "oauth",
+              sessionId: "sess",
+              deploymentUrl: LOCKED_URL,
+              access: "at",
+              refresh: "rt",
+              expires: Date.now() + 3_600_000,
+              clientId: "c",
+              clientSecret: "s",
+            },
+          },
+        });
+
+        const result = await service.updateProviderSection("coder", (section) => ({
+          value: { ...(section ?? {}) },
+        }));
+
+        expect(result.success).toBe(true);
+        expect(config.loadConfigOrDefault().routePriority).toContain("coder");
+      }
+    );
   });
 
   it("does not duplicate gateway already in routePriority", async () => {

@@ -1,4 +1,5 @@
 import { THEME_OPTIONS, type ThemePreference } from "@/browser/contexts/ThemeContext";
+import type { OpenSettingsOptions } from "@/browser/contexts/SettingsContext";
 import type { CommandAction } from "@/browser/contexts/CommandRegistryContext";
 import type { APIClient } from "@/browser/contexts/API";
 import type { ConfirmDialogOptions } from "@/browser/contexts/ConfirmDialogContext";
@@ -133,7 +134,7 @@ export interface BuildSourcesParams {
   onOpenWorkspaceInTerminal: (workspaceId: string, runtimeConfig?: RuntimeConfig) => void;
   onToggleTheme: () => void;
   onSetTheme: (theme: ThemePreference) => void;
-  onOpenSettings?: (section?: string) => void;
+  onOpenSettings?: (section?: string, options?: OpenSettingsOptions) => void;
 
   // Layout slots
   layoutPresets?: LayoutPresetsConfig | null;
@@ -1568,8 +1569,73 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         keywords: ["model", "custom", "add"],
         run: () => openSettings("models"),
       },
+      {
+        id: CommandIds.settingsOpenSection("providers-coder-login"),
+        title: "Settings: Login with Coder",
+        subtitle: "Connect to a Coder deployment (AI Bridge)",
+        section: section.settings,
+        keywords: ["coder", "login", "oauth", "aibridge", "deployment", "connect"],
+        // Hidden when a custom OpenAI-compatible provider shadows the "coder"
+        // id (an upgraded install may carry one): ProvidersSection hides the
+        // OAuth block for shadowed providers, so the login hint would either
+        // surface an invisible "Set the deployment URL first" error or —
+        // if the custom section happens to have a deploymentUrl — inject
+        // built-in OAuth credentials into the custom provider's section.
+        visible: () => p.providersConfig?.coder?.isCustom !== true,
+        // Expands the Coder provider and starts the OAuth login (one-shot
+        // hints consumed by ProvidersSection) instead of only opening the
+        // generic Providers list.
+        run: () => openSettings("providers", { expandProvider: "coder", startCoderLogin: true }),
+      },
     ]);
   }
+
+  // Coder disconnect: calls the RPC directly (no settings UI needed), so it is
+  // not gated on onOpenSettings like the section-opening commands above.
+  actions.push(() => [
+    {
+      id: CommandIds.coderDisconnect(),
+      title: "Settings: Disconnect Coder",
+      subtitle: "Revoke the stored Coder OAuth credential",
+      section: section.settings,
+      keywords: ["coder", "logout", "disconnect", "oauth", "revoke", "sign out"],
+      // Gated on credential PRESENCE (not routability): a blob minted for a
+      // previously configured deployment URL must stay revocable — the
+      // backend revokes against the blob's own issuer.
+      visible: () => p.providersConfig?.coder?.coderOauthCredentialStored === true,
+      run: async () => {
+        if (!p.api) {
+          showCommandFeedbackToast({
+            type: "error",
+            title: "Coder Disconnect Failed",
+            message: "Mux API not connected.",
+          });
+          return;
+        }
+        try {
+          const result = await p.api.coderOauth.disconnect();
+          if (!result.success) {
+            showCommandFeedbackToast({
+              type: "error",
+              title: "Coder Disconnect Failed",
+              message: result.error,
+            });
+            return;
+          }
+          showCommandFeedbackToast({
+            type: "success",
+            message: "Coder account disconnected.",
+          });
+        } catch (error) {
+          showCommandFeedbackToast({
+            type: "error",
+            title: "Coder Disconnect Failed",
+            message: getErrorMessage(error),
+          });
+        }
+      },
+    },
+  ]);
 
   return actions;
 }
