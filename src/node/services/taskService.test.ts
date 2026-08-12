@@ -3967,6 +3967,79 @@ describe("TaskService", () => {
     expect(snapshot?.error).toBeUndefined();
   });
 
+  test("bare compaction stream-end resumes the pre-compaction parent identity", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentId = "parent-bare-compaction";
+    const childId = "child-bare-compaction";
+    const execModel = "openai:gpt-5.6-sol";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentId, {
+          aiSettingsByAgent: {
+            exec: { model: execModel, thinkingLevel: "high" },
+          },
+        }),
+        projectWorkspace(projectPath, "child", childId, {
+          parentWorkspaceId: parentId,
+          agentId: "explore",
+          agentType: "explore",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const waitForPendingCompactionCompletionDecision = mock(
+      (): Promise<boolean> => Promise.resolve(false)
+    );
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+      waitForPendingCompactionCompletionDecision,
+    });
+    const { historyService, taskService } = createTaskServiceHarness(config, { workspaceService });
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("pre-compact-exec", "assistant", "Waiting for delegated work", {
+        timestamp: Date.now(),
+        agentId: "exec",
+      })
+    );
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("bare-compact-output", "assistant", "Compaction summary", {
+        timestamp: Date.now(),
+        agentId: "compact",
+      })
+    );
+
+    await handleTaskServiceStreamEndForTest(taskService, {
+      type: "stream-end",
+      workspaceId: parentId,
+      messageId: "bare-compact-output",
+      metadata: {
+        model: "anthropic:claude-sonnet-4-6",
+        agentId: "compact",
+        finishReason: "stop",
+      },
+      parts: [{ type: "text", text: "Compaction summary" }],
+    });
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).toHaveBeenCalledWith(
+      parentId,
+      expect.any(String),
+      expect.objectContaining({
+        agentId: "exec",
+        model: execModel,
+        thinkingLevel: "high",
+      }),
+      expect.any(Object)
+    );
+  });
+
   test("uncorrelated compaction stream-end does not interrupt an active workspace turn", async () => {
     // On-send compaction can consume a monitor-wake continuation mid-turn; the
     // compact turn's own stream-end is uncorrelated and must not supersede the
@@ -18467,6 +18540,83 @@ describe("TaskService", () => {
     expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("running");
     expect(await readSubagentReportArtifact(config.getSessionDir(parentId), childId)).toBeNull();
   });
+
+  // The scan case uses "plan" so it cannot pass via the exec recovery fallback.
+  test.each([
+    [
+      "agent_report resumes the parent with pre-compaction agent settings",
+      "after-compaction",
+      "plan",
+      "openai:gpt-5.6-sol",
+      "xhigh",
+      ["plan", "compact"],
+    ],
+    [
+      "agent_report falls back to exec settings when history only has compaction output",
+      "after-truncation",
+      "exec",
+      "anthropic:claude-sonnet-4-6",
+      "medium",
+      ["compact"],
+    ],
+  ] as const)(
+    "%s",
+    async (_name, idSuffix, expectedAgentId, model, thinkingLevel, historyAgentIds) => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      const parentId = `parent-progress-${idSuffix}`;
+      const childId = `child-progress-${idSuffix}`;
+
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "parent", parentId, {
+            aiSettingsByAgent: {
+              [expectedAgentId]: { model, thinkingLevel },
+            },
+          }),
+          projectWorkspace(projectPath, "child", childId, {
+            parentWorkspaceId: parentId,
+            agentId: "explore",
+            agentType: "explore",
+            taskStatus: "running",
+          }),
+        ],
+        testTaskSettings()
+      );
+
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+      const { historyService, taskService } = createTaskServiceHarness(config, {
+        workspaceService,
+      });
+      for (const [index, agentId] of historyAgentIds.entries()) {
+        await historyService.appendToHistory(
+          parentId,
+          createMuxMessage(`${idSuffix}-assistant-${index}`, "assistant", "Parent turn output", {
+            timestamp: Date.now(),
+            agentId,
+          })
+        );
+      }
+
+      await taskService.reportAgentProgress(childId, `progress-${idSuffix}`, {
+        reportMarkdown: "Found the root cause.",
+      });
+
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      expect(sendMessage).toHaveBeenCalledWith(
+        parentId,
+        expect.any(String),
+        expect.objectContaining({
+          agentId: expectedAgentId,
+          model,
+          thinkingLevel,
+        }),
+        expect.any(Object)
+      );
+    }
+  );
 
   test("terminal reports supersede queued incremental updates for the same child", async () => {
     const config = await createTestConfig(rootDir);
