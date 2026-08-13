@@ -538,6 +538,29 @@ export const modelsExtra: Record<string, ModelData> = {
     supports_response_schema: true,
   },
 
+  // Gemini 3.7 Flash - GA on August 13, 2026. Stable `gemini-3.7-flash` model ID with
+  // 1M context, 65K max output. We encode the introductory rates Google actually
+  // bills through December 31, 2026 ($0.75/M input, $3.75/M output, $0.075/M cached
+  // input) so displayed costs and goal budgets match real charges. TODO(2027-01-01):
+  // raise to the standard list rates ($1.50/$7.50/$0.15) when the intro pricing
+  // expires. Source: Gemini API pricing docs as of 2026-08-13.
+  "gemini-3.7-flash": {
+    max_input_tokens: 1048576,
+    max_output_tokens: 65536,
+    input_cost_per_token: 0.00000075, // $0.75 per million input tokens (intro rate)
+    output_cost_per_token: 0.00000375, // $3.75 per million output tokens, including thinking tokens (intro rate)
+    cache_read_input_token_cost: 0.000000075, // $0.075 per million cached input tokens (intro rate)
+    litellm_provider: "vertex_ai-language-models",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_pdf_input: true,
+    supports_audio_input: true,
+    supports_video_input: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+  },
+
   // Gemini 3.1 Pro Preview - Released February 19, 2026
   // Tiered pricing: ≤200K tokens $2/M input, $12/M output; >200K tokens $4/M input, $18/M output
   // 1M input context, ~64K max output tokens
