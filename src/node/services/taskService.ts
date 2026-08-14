@@ -129,7 +129,7 @@ import {
 import { secretsToRecord } from "@/common/types/secrets";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isNonRetryableStreamError } from "@/common/utils/messages/retryEligibility";
-import type { StreamErrorType } from "@/common/types/errors";
+import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
 import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
@@ -5895,6 +5895,7 @@ export class TaskService {
     if (!historyResult.success) {
       return { deliverableNotificationIds, latestMessageTimestampByTaskId };
     }
+    const existingReportMessages = new Map<string, MuxMessage>();
     const existingTaskIds = new Set<string>();
     for (const message of historyResult.data) {
       if (message.role !== "user" || message.metadata?.synthetic !== true) continue;
@@ -5906,6 +5907,7 @@ export class TaskService {
       );
       if (taskId == null) continue;
       existingTaskIds.add(taskId);
+      existingReportMessages.set(taskId, message);
       const timestamp = message.metadata?.timestamp;
       if (typeof timestamp === "number" && Number.isFinite(timestamp)) {
         latestMessageTimestampByTaskId.set(
@@ -5915,9 +5917,54 @@ export class TaskService {
       }
     }
 
+    const workspaceTurnMuxMetadata =
+      await this.getActiveWorkspaceTurnMuxMetadataForWorkspace(ownerWorkspaceId);
     const sessionDir = this.config.getSessionDir(ownerWorkspaceId);
     for (const notification of notifications) {
       if (existingTaskIds.has(notification.sourceId)) {
+        const existingMessage = existingReportMessages.get(notification.sourceId);
+        if (existingMessage != null && workspaceTurnMuxMetadata != null) {
+          const existingCorrelation = this.getWorkspaceTurnMetadataFromValue(
+            existingMessage.metadata?.muxMetadata
+          );
+          if (existingCorrelation != null) {
+            const matchesActiveTurn =
+              existingCorrelation.taskHandleId === workspaceTurnMuxMetadata.taskHandleId &&
+              existingCorrelation.ownerWorkspaceId === workspaceTurnMuxMetadata.ownerWorkspaceId &&
+              existingCorrelation.turnId === workspaceTurnMuxMetadata.turnId;
+            if (!matchesActiveTurn) {
+              // Keep the old report visible, but do not let it wake or settle a later turn.
+              await this.terminalAttentionStore.markSuperseded(ownerWorkspaceId, notification.id);
+              continue;
+            }
+          } else {
+            const updatedMessage: MuxMessage = {
+              ...existingMessage,
+              metadata: {
+                ...existingMessage.metadata,
+                muxMetadata: workspaceTurnMuxMetadata,
+              },
+            };
+            const updateResult = await this.historyService.updateHistory(
+              ownerWorkspaceId,
+              updatedMessage
+            );
+            if (updateResult.success) {
+              existingReportMessages.set(notification.sourceId, updatedMessage);
+              this.workspaceService.emitChatEvent(ownerWorkspaceId, {
+                ...updatedMessage,
+                type: "message",
+              });
+            } else {
+              log.warn("Failed to backfill workspace-turn metadata on terminal report", {
+                ownerWorkspaceId,
+                taskId: notification.sourceId,
+                error: updateResult.error,
+              });
+            }
+          }
+        }
+
         // Report/failure delivery necessarily precedes terminal-attention enqueue. Presence in parent
         // history is therefore authoritative here; continuation freshness is checked separately
         // against the private execution's createdAt before suppressing its workspace-turn wake.
@@ -5965,7 +6012,12 @@ export class TaskService {
         report != null ? createTaskReportMessageId() : createTaskFailureMessageId(),
         "user",
         content,
-        { timestamp, synthetic: true, uiVisible: true }
+        {
+          timestamp,
+          synthetic: true,
+          uiVisible: true,
+          ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
+        }
       );
       const appendResult = await this.historyService.appendToHistory(ownerWorkspaceId, message);
       if (!appendResult.success) {
@@ -6182,12 +6234,15 @@ export class TaskService {
       entry,
       defaultModel
     );
+    const workspaceTurnMuxMetadata =
+      await this.getActiveWorkspaceTurnMuxMetadataForWorkspace(ownerWorkspaceId);
 
     const sendOptions = {
       model: resumeOptions.model,
       agentId: resumeOptions.agentId,
       thinkingLevel: resumeOptions.thinkingLevel,
       reasoningMode: resumeOptions.reasoningMode,
+      ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
     };
     if (prompt.length === 0) {
       assert(agentNotifications.length > 0, "prompt-free terminal drain requires sub-agent work");
@@ -7086,6 +7141,8 @@ export class TaskService {
         parentEntry,
         defaultModel
       );
+      const workspaceTurnMuxMetadata =
+        await this.getActiveWorkspaceTurnMuxMetadataForWorkspace(parentWorkspaceId);
 
       // A progress report is itself the wake-up message. Unlike terminal attention, it must be
       // allowed through while this child is still active so review findings and other incremental
@@ -7098,18 +7155,48 @@ export class TaskService {
           agentId: resumeOptions.agentId,
           thinkingLevel: resumeOptions.thinkingLevel,
           reasoningMode: resumeOptions.reasoningMode,
+          ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
         },
         {
           skipAutoResumeReset: true,
           synthetic: true,
           agentInitiated: true,
           startStreamInBackground: true,
+          workspaceTurnContinuation: workspaceTurnMuxMetadata != null,
           queueDedupeKey: `agent-report:${childWorkspaceId}:${toolCallId}`,
           removableQueueDedupeKey: true,
+          ...(workspaceTurnMuxMetadata != null
+            ? {
+                onCanceled: async (reason: string) => {
+                  await this.settleWorkspaceTurnContinuationFailure(
+                    parentWorkspaceId,
+                    workspaceTurnMuxMetadata,
+                    "interrupted",
+                    reason
+                  );
+                },
+                onAcceptedPreStreamFailure: async (error: SendMessageError) => {
+                  await this.settleWorkspaceTurnContinuationFailure(
+                    parentWorkspaceId,
+                    workspaceTurnMuxMetadata,
+                    "error",
+                    formatSendMessageError(error).message
+                  );
+                },
+              }
+            : {}),
         }
       );
       if (!sendResult.success) {
         const formattedError = formatSendMessageError(sendResult.error);
+        if (workspaceTurnMuxMetadata != null) {
+          await this.settleWorkspaceTurnContinuationFailure(
+            parentWorkspaceId,
+            workspaceTurnMuxMetadata,
+            "error",
+            formattedError.message
+          );
+        }
         throw new Error(
           `agent_report failed to wake the parent workspace: ${formattedError.message}`
         );
@@ -10228,17 +10315,21 @@ export class TaskService {
   }
 
   /**
-   * Whether a bash-monitor-wake continuation of this exact delegated turn is
-   * pending or already streaming. Pending: the wake is queued next or
-   * mid-dispatch (AgentSession-owned state). Streaming: the active stream —
-   * necessarily newer than the ended one, since a stream leaves the
-   * STARTING/STREAMING states before its stream-end is emitted — inherited
-   * this turn's correlation metadata.
+   * Whether a continuation of this exact delegated turn is pending or streaming.
+   * Pending entries must carry the same correlation metadata as the ended stream.
    */
-  private hasSameTurnWakeContinuation(
+  private hasSameTurnContinuation(
     event: StreamEndEvent,
     correlation: { taskHandleId: string; ownerWorkspaceId: string; turnId: string }
   ): boolean {
+    if (
+      this.workspaceService.hasPendingWorkspaceTurnContinuation(event.workspaceId, {
+        type: "workspace-turn-task",
+        ...correlation,
+      })
+    ) {
+      return true;
+    }
     if (this.workspaceService.hasPendingBashMonitorWakeContinuation(event.workspaceId)) {
       return true;
     }
@@ -10293,17 +10384,16 @@ export class TaskService {
       return true;
     }
 
-    // A queued bash-monitor wake stops the in-flight stream at a tool boundary
-    // with finishReason "tool-calls" and immediately continues the same
-    // delegated turn in a follow-up stream that inherits this turn's
-    // correlation (see AgentSession.inheritOpenWorkspaceTurnMetadata). Defer
-    // settlement to the continuation's terminal stream-end instead of
-    // reporting a false "ended before completion" failure to the owner.
-    // Only wake continuations count: any other queued input (manual message,
-    // /compact) supersedes the turn and must settle the old outcome here.
+    // A queued continuation can stop the in-flight stream at a tool boundary with
+    // finishReason "tool-calls" and continue the same delegated turn. Report
+    // wake-ups carry the exact correlation explicitly; bash-monitor wakes inherit
+    // it from history. Defer settlement until the continuation's terminal
+    // stream-end instead of reporting a false completion failure to the owner.
+    // Any other queued input (manual message, /compact) supersedes the turn and
+    // must settle the old outcome here.
     if (
       event.metadata.finishReason === "tool-calls" &&
-      this.hasSameTurnWakeContinuation(event, metadata)
+      this.hasSameTurnContinuation(event, metadata)
     ) {
       await this.markWorkspaceTurnStreamEndDeferred(event);
       return true;
@@ -10784,7 +10874,7 @@ export class TaskService {
         active.ownerWorkspaceId,
         active.handleId
       );
-      if (record != null) {
+      if (record?.workspaceId === workspaceId && isActiveWorkspaceTurnTaskStatus(record.status)) {
         return record;
       }
       this.activeWorkspaceTurnHandleByWorkspaceId.delete(workspaceId);
@@ -10794,6 +10884,71 @@ export class TaskService {
       statuses: ["starting", "running"],
     });
     return records.toReversed().find((record) => record.workspaceId === workspaceId) ?? null;
+  }
+
+  private async getActiveWorkspaceTurnMuxMetadataForWorkspace(
+    workspaceId: string
+  ): Promise<WorkspaceTurnMuxMetadata | undefined> {
+    const candidate = await this.getActiveWorkspaceTurnRecordForWorkspace(workspaceId);
+    if (candidate == null) {
+      return undefined;
+    }
+
+    return await this.workspaceTurnSettlementLocks.withLock(candidate.handleId, async () => {
+      const current = await this.taskHandleStore.getWorkspaceTurn(
+        candidate.ownerWorkspaceId,
+        candidate.handleId
+      );
+      const active = this.activeWorkspaceTurnHandleByWorkspaceId.get(workspaceId);
+      if (
+        current?.workspaceId !== workspaceId ||
+        !isActiveWorkspaceTurnTaskStatus(current?.status)
+      ) {
+        if (
+          active?.handleId === candidate.handleId &&
+          active.ownerWorkspaceId === candidate.ownerWorkspaceId
+        ) {
+          this.activeWorkspaceTurnHandleByWorkspaceId.delete(workspaceId);
+        }
+        return undefined;
+      }
+
+      return this.buildWorkspaceTurnMuxMetadata(current);
+    });
+  }
+
+  // A queued report can defer the preceding stream-end. If dispatch then fails, settle that
+  // exact turn here because no replacement stream-end can arrive.
+  private async settleWorkspaceTurnContinuationFailure(
+    workspaceId: string,
+    muxMetadata: WorkspaceTurnMuxMetadata,
+    status: "interrupted" | "error",
+    error: string
+  ): Promise<void> {
+    const record = await this.taskHandleStore.getWorkspaceTurn(
+      muxMetadata.ownerWorkspaceId,
+      muxMetadata.taskHandleId
+    );
+    if (
+      record?.workspaceId !== workspaceId ||
+      record?.turnId !== muxMetadata.turnId ||
+      !isActiveWorkspaceTurnTaskStatus(record?.status)
+    ) {
+      return;
+    }
+
+    const next: WorkspaceTurnTaskHandleRecord = {
+      ...record,
+      status,
+      updatedAt: getIsoNow(),
+      error,
+    };
+    delete next.deferredMessageIds;
+    await this.settleWorkspaceTurn({
+      record,
+      next,
+      waiterSettlement: { status: "error", error: new Error(error) },
+    });
   }
 
   private async hasRecoverableWorkspaceTurnRetryInFlight(
@@ -12835,11 +12990,14 @@ export class TaskService {
         : {}),
     });
 
+    const workspaceTurnMuxMetadata =
+      await this.getActiveWorkspaceTurnMuxMetadataForWorkspace(parentWorkspaceId);
     const messageId = createTaskReportMessageId();
     const reportMessage = createMuxMessage(messageId, "user", reportContent, {
       timestamp: Date.now(),
       synthetic: true,
       uiVisible: true,
+      ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
     });
 
     const appendResult = await this.historyService.appendToHistory(

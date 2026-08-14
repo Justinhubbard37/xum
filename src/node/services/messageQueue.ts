@@ -71,6 +71,8 @@ type QueueDispatchMode = NonNullable<SendMessageOptions["queueDispatchMode"]>;
 interface QueuedMessageInternalOptions {
   synthetic?: boolean;
   agentInitiated?: boolean;
+  /** True only for a report that continues an existing workspace turn. */
+  workspaceTurnContinuation?: boolean;
   /** Keep this queued add isolated so its dedupe key can be removed without affecting siblings. */
   sealed?: boolean;
   /** Dedupe-keyed maintenance sends are removable by prefix without changing global queue rules. */
@@ -114,6 +116,8 @@ interface QueueEntry {
   sealed: boolean;
   /** User-originated entries are the only ones exposed to/restored into the composer. */
   userAuthored: boolean;
+  /** True only for a report that continues an existing workspace turn. */
+  workspaceTurnContinuation: boolean;
   addCount: number;
   syntheticCount: number;
   agentInitiatedCount: number;
@@ -177,6 +181,48 @@ export class MessageQueue {
   }
 
   /**
+   * Whether every queued entry continues the exact workspace turn correlation.
+   *
+   * The caller uses this for a new continuation that has not entered the queue.
+   * An unrelated entry anywhere ahead of it supersedes the correlation.
+   */
+  hasAllWorkspaceTurnContinuations(
+    taskHandleId: string,
+    ownerWorkspaceId: string,
+    turnId: string
+  ): boolean {
+    return (
+      this.entries.length > 0 &&
+      this.entries.every((entry) => {
+        const metadata = entry.muxMetadata;
+        return (
+          isWorkspaceTurnMetadata(metadata) &&
+          metadata.taskHandleId === taskHandleId &&
+          metadata.ownerWorkspaceId === ownerWorkspaceId &&
+          metadata.turnId === turnId
+        );
+      })
+    );
+  }
+
+  /**
+   * Whether the next entry continues the exact workspace turn correlation.
+   */
+  hasNextWorkspaceTurnContinuation(
+    taskHandleId: string,
+    ownerWorkspaceId: string,
+    turnId: string
+  ): boolean {
+    const metadata = this.entries[0]?.muxMetadata;
+    return (
+      isWorkspaceTurnMetadata(metadata) &&
+      metadata.taskHandleId === taskHandleId &&
+      metadata.ownerWorkspaceId === ownerWorkspaceId &&
+      metadata.turnId === turnId
+    );
+  }
+
+  /**
    * Whether the next entry to dispatch is a bash-monitor wake. Wake sends are
    * the only queued input that continues an open delegated workspace turn
    * (see AgentSession.inheritOpenWorkspaceTurnMetadata); any other head entry
@@ -206,6 +252,42 @@ export class MessageQueue {
   }
 
   /**
+   * Remove workspace-turn metadata from entries that now follow an unrelated predecessor.
+   *
+   * Queue reordering can move user input ahead of a report after the report was enqueued.
+   * Clear the correlation callbacks with the metadata so the stale report cannot settle
+   * the superseded workspace turn when it later dispatches.
+   */
+  private revalidateWorkspaceTurnCorrelations(): void {
+    let hasUnrelatedPredecessor = false;
+    let priorCorrelation: WorkspaceTurnMetadata | undefined;
+
+    for (const entry of this.entries) {
+      const metadata = isWorkspaceTurnMetadata(entry.muxMetadata) ? entry.muxMetadata : undefined;
+      const matchesPriorCorrelation =
+        metadata != null &&
+        !hasUnrelatedPredecessor &&
+        (priorCorrelation == null ||
+          (metadata.taskHandleId === priorCorrelation.taskHandleId &&
+            metadata.ownerWorkspaceId === priorCorrelation.ownerWorkspaceId &&
+            metadata.turnId === priorCorrelation.turnId));
+
+      if (metadata == null) {
+        hasUnrelatedPredecessor = true;
+      } else if (!matchesPriorCorrelation) {
+        hasUnrelatedPredecessor = true;
+        if (entry.workspaceTurnContinuation) {
+          entry.muxMetadata = undefined;
+          entry.onCanceled = undefined;
+          entry.onAcceptedPreStreamFailure = undefined;
+        }
+      } else {
+        priorCorrelation ??= metadata;
+      }
+    }
+  }
+
+  /**
    * Update the dispatch boundary for every user-visible queued entry represented by the
    * aggregate queued-message card. Hidden synthetic/background entries keep their own mode.
    */
@@ -227,6 +309,7 @@ export class MessageQueue {
     // The user explicitly chose when the aggregate visible card should dispatch. Keep those
     // entries together at the FIFO head so a hidden predecessor cannot contradict that choice.
     this.entries = [...visibleEntries, ...hiddenEntries];
+    this.revalidateWorkspaceTurnCorrelations();
     return true;
   }
 
@@ -341,6 +424,7 @@ export class MessageQueue {
         dispatchMode: incomingMode,
         sealed: incomingIsSealed,
         userAuthored: incomingIsUserAuthored,
+        workspaceTurnContinuation: internal?.workspaceTurnContinuation === true,
         addCount: 0,
         syntheticCount: 0,
         agentInitiatedCount: 0,
@@ -590,6 +674,7 @@ export class MessageQueue {
     if (index > 0) {
       const [entry] = this.entries.splice(index, 1);
       this.entries.unshift(entry);
+      this.revalidateWorkspaceTurnCorrelations();
     }
     return true;
   }

@@ -385,6 +385,7 @@ function createWorkspaceServiceMocks(
     isBusyForMessage: ReturnType<typeof mock>;
     hasPendingQueuedOrPreparingTurn: ReturnType<typeof mock>;
     hasPendingBashMonitorWakeContinuation: ReturnType<typeof mock>;
+    hasPendingWorkspaceTurnContinuation: ReturnType<typeof mock>;
     hasPendingAutoRetry: ReturnType<typeof mock>;
     waitForIdleAndNoQueuedMessages: ReturnType<typeof mock>;
     waitForIdle: ReturnType<typeof mock>;
@@ -417,6 +418,7 @@ function createWorkspaceServiceMocks(
   waitForIdleAndNoQueuedMessages: ReturnType<typeof mock>;
   waitForIdle: ReturnType<typeof mock>;
   hasPendingQueuedOrPreparingTurn: ReturnType<typeof mock>;
+  hasPendingWorkspaceTurnContinuation: ReturnType<typeof mock>;
   hasPendingAutoRetry: ReturnType<typeof mock>;
   waitForPendingCompactionCompletionDecision: ReturnType<typeof mock>;
   waitForPendingStreamErrorRecoveryDecision: ReturnType<typeof mock>;
@@ -450,6 +452,8 @@ function createWorkspaceServiceMocks(
     overrides?.hasPendingQueuedOrPreparingTurn ?? mock(() => false);
   const hasPendingBashMonitorWakeContinuation =
     overrides?.hasPendingBashMonitorWakeContinuation ?? mock(() => false);
+  const hasPendingWorkspaceTurnContinuation =
+    overrides?.hasPendingWorkspaceTurnContinuation ?? mock(() => false);
   const hasPendingAutoRetry = overrides?.hasPendingAutoRetry ?? mock(() => false);
   const waitForIdleAndNoQueuedMessages =
     overrides?.waitForIdleAndNoQueuedMessages ?? mock((): Promise<void> => Promise.resolve());
@@ -504,6 +508,7 @@ function createWorkspaceServiceMocks(
       hasQueuedMessages,
       hasPendingQueuedOrPreparingTurn,
       hasPendingBashMonitorWakeContinuation,
+      hasPendingWorkspaceTurnContinuation,
       hasPendingAutoRetry,
       waitForIdleAndNoQueuedMessages,
       waitForIdle,
@@ -533,6 +538,7 @@ function createWorkspaceServiceMocks(
     hasQueuedMessages,
     isBusyForMessage,
     hasPendingQueuedOrPreparingTurn,
+    hasPendingWorkspaceTurnContinuation,
     hasPendingAutoRetry,
     waitForIdleAndNoQueuedMessages,
     waitForIdle,
@@ -722,6 +728,7 @@ describe("TaskService", () => {
       hasQueuedMessages?: ReturnType<typeof mock>;
       hasPendingQueuedOrPreparingTurn?: ReturnType<typeof mock>;
       hasPendingBashMonitorWakeContinuation?: ReturnType<typeof mock>;
+      hasPendingWorkspaceTurnContinuation?: ReturnType<typeof mock>;
       hasPendingAutoRetry?: ReturnType<typeof mock>;
       waitForPendingStreamErrorRecoveryDecision?: ReturnType<typeof mock>;
     } = {}
@@ -764,6 +771,9 @@ describe("TaskService", () => {
         ? {
             hasPendingBashMonitorWakeContinuation: options.hasPendingBashMonitorWakeContinuation,
           }
+        : {}),
+      ...(options.hasPendingWorkspaceTurnContinuation != null
+        ? { hasPendingWorkspaceTurnContinuation: options.hasPendingWorkspaceTurnContinuation }
         : {}),
       ...(options.hasPendingAutoRetry != null
         ? { hasPendingAutoRetry: options.hasPendingAutoRetry }
@@ -3913,6 +3923,432 @@ describe("TaskService", () => {
       messageId: "msg_continuation_final",
       reportMarkdown: "Final review report",
     });
+  });
+
+  test("nested agent progress preserves workspace-turn correlation", async () => {
+    const hasPendingWorkspaceTurnContinuation = mock(
+      (
+        workspaceId: string,
+        metadata: { taskHandleId: string; ownerWorkspaceId: string; turnId: string }
+      ) =>
+        workspaceId === "childworkspace" &&
+        metadata.taskHandleId === "wst_handle" &&
+        metadata.turnId === "turn"
+    );
+    const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest({
+      hasPendingWorkspaceTurnContinuation,
+    });
+    const correlation = {
+      type: "workspace-turn-task",
+      taskHandleId: "wst_handle",
+      ownerWorkspaceId: parentId,
+      turnId: "turn",
+    } as const;
+
+    await config.editConfig((cfg) => {
+      const project = cfg.projects.get(path.join(rootDir, "repo"));
+      assert(project, "test project must exist");
+      project.workspaces.push({
+        path: path.join(rootDir, "repo", "nested-agent"),
+        id: "nested-agent",
+        name: "nested-agent",
+        createdAt: "2026-06-19T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+        parentWorkspaceId: "childworkspace",
+        taskStatus: "running",
+        agentType: "explore",
+        taskModelString: "anthropic:claude-opus-4-6",
+      });
+      return cfg;
+    });
+
+    await taskService.reportAgentProgress("nested-agent", "progress-call", {
+      reportMarkdown: "The nested agent found the issue.",
+    });
+    expect(workspaceMocks.sendMessage).toHaveBeenCalledTimes(2);
+    expect(workspaceMocks.sendMessage.mock.calls[1]?.[2]).toMatchObject({
+      muxMetadata: correlation,
+    });
+
+    const internal = taskService as unknown as {
+      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
+    };
+    await internal.handleStreamEnd({
+      type: "stream-end",
+      workspaceId: "childworkspace",
+      messageId: "msg_nested_report_cut",
+      metadata: {
+        model: "anthropic:claude-opus-4-6",
+        agentId: "exec",
+        finishReason: "tool-calls",
+        muxMetadata: correlation,
+      },
+      parts: [{ type: "text", text: "Nested report interrupted the turn" }],
+    });
+
+    expect(await taskService.getWorkspaceTurnSnapshot(parentId, "wst_handle")).toMatchObject({
+      status: "running",
+    });
+
+    await config.editConfig((cfg) => {
+      const project = cfg.projects.get(path.join(rootDir, "repo"));
+      assert(project, "test project must exist");
+      const nestedAgent = project.workspaces.find((workspace) => workspace.id === "nested-agent");
+      assert(nestedAgent, "nested agent must exist");
+      nestedAgent.taskStatus = "reported";
+      nestedAgent.reportedAt = "2026-06-19T00:00:01.000Z";
+      return cfg;
+    });
+
+    await internal.handleStreamEnd({
+      type: "stream-end",
+      workspaceId: "childworkspace",
+      messageId: "msg_nested_report_final",
+      metadata: {
+        model: "anthropic:claude-opus-4-6",
+        agentId: "exec",
+        finishReason: "stop",
+        muxMetadata: correlation,
+      },
+      parts: [{ type: "text", text: "Nested report continuation completed" }],
+    });
+
+    expect(await taskService.getWorkspaceTurnSnapshot(parentId, "wst_handle")).toMatchObject({
+      status: "completed",
+      reportMarkdown: "Nested report continuation completed",
+    });
+  });
+
+  test("failed nested agent progress settles the correlated workspace turn", async () => {
+    let sendCount = 0;
+    const sendMessage = mock(
+      async (...args: unknown[]): Promise<Result<void, SendMessageError>> => {
+        sendCount += 1;
+        if (sendCount === 2) {
+          const internal = args[3] as
+            | { onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void }
+            | undefined;
+          await internal?.onAcceptedPreStreamFailure?.({
+            type: "unknown",
+            raw: "Progress wake failed",
+          });
+        }
+        return Ok(undefined);
+      }
+    );
+    const { config, parentId, taskService } = await startWorkspaceTurnForTest({ sendMessage });
+
+    await config.editConfig((cfg) => {
+      const project = cfg.projects.get(path.join(rootDir, "repo"));
+      assert(project, "test project must exist");
+      project.workspaces.push({
+        path: path.join(rootDir, "repo", "nested-progress-failure"),
+        id: "nested-progress-failure",
+        name: "nested-progress-failure",
+        createdAt: "2026-06-19T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+        parentWorkspaceId: "childworkspace",
+        taskStatus: "running",
+        agentType: "explore",
+      });
+      return cfg;
+    });
+
+    await taskService.reportAgentProgress("nested-progress-failure", "progress-call", {
+      reportMarkdown: "The progress wake cannot start.",
+    });
+
+    expect(await taskService.getWorkspaceTurnSnapshot(parentId, "wst_handle")).toMatchObject({
+      status: "error",
+      error: "Progress wake failed",
+    });
+  });
+
+  test("canceled nested agent progress interrupts the correlated workspace turn", async () => {
+    let sendCount = 0;
+    const sendMessage = mock(
+      async (...args: unknown[]): Promise<Result<void, SendMessageError>> => {
+        sendCount += 1;
+        if (sendCount === 2) {
+          const internal = args[3] as
+            | { onCanceled?: (reason: string) => Promise<void> | void }
+            | undefined;
+          await internal?.onCanceled?.("Progress wake was canceled");
+        }
+        return Ok(undefined);
+      }
+    );
+    const { config, parentId, taskService } = await startWorkspaceTurnForTest({ sendMessage });
+
+    await config.editConfig((cfg) => {
+      const project = cfg.projects.get(path.join(rootDir, "repo"));
+      assert(project, "test project must exist");
+      project.workspaces.push({
+        path: path.join(rootDir, "repo", "nested-progress-canceled"),
+        id: "nested-progress-canceled",
+        name: "nested-progress-canceled",
+        createdAt: "2026-06-19T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+        parentWorkspaceId: "childworkspace",
+        taskStatus: "running",
+        agentType: "explore",
+      });
+      return cfg;
+    });
+
+    await taskService.reportAgentProgress("nested-progress-canceled", "progress-call", {
+      reportMarkdown: "The progress wake was canceled.",
+    });
+
+    expect(await taskService.getWorkspaceTurnSnapshot(parentId, "wst_handle")).toMatchObject({
+      status: "interrupted",
+      error: "Progress wake was canceled",
+    });
+  });
+
+  test("terminal nested agent report resumes a workspace turn with correlation", async () => {
+    const { config, parentId, taskService, workspaceMocks, historyService } =
+      await startWorkspaceTurnForTest();
+    await config.editConfig((cfg) => {
+      const project = cfg.projects.get(path.join(rootDir, "repo"));
+      assert(project, "test project must exist");
+      project.workspaces.push({
+        path: path.join(rootDir, "repo", "nested-terminal-agent"),
+        id: "nested-terminal-agent",
+        name: "nested-terminal-agent",
+        createdAt: "2026-06-19T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+        parentWorkspaceId: "childworkspace",
+        taskStatus: "running",
+        agentType: "explore",
+        taskModelString: "anthropic:claude-opus-4-6",
+      });
+      return cfg;
+    });
+
+    await handleTaskServiceStreamEndForTest(taskService, {
+      type: "stream-end",
+      workspaceId: "nested-terminal-agent",
+      messageId: "assistant-nested-terminal-agent",
+      metadata: { model: "anthropic:claude-opus-4-6", finishReason: "stop" },
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "nested-report-call",
+          toolName: "agent_report",
+          input: { reportMarkdown: "The nested terminal report is complete." },
+          state: "output-available",
+          output: {
+            success: true,
+            report: { reportMarkdown: "The nested terminal report is complete." },
+          },
+        },
+        { type: "text", text: "The nested terminal report is complete." },
+      ],
+    });
+
+    const childHistory = await historyService.getHistoryFromLatestBoundary("childworkspace");
+    expect(childHistory.success).toBe(true);
+    if (!childHistory.success) throw new Error("child history read failed");
+    const reportMessage = childHistory.data.find(
+      (message) =>
+        message.role === "user" &&
+        message.parts.some(
+          (part) =>
+            part.type === "text" && part.text.includes("The nested terminal report is complete.")
+        )
+    );
+    expect(reportMessage?.metadata?.muxMetadata).toEqual({
+      type: "workspace-turn-task",
+      taskHandleId: "wst_handle",
+      ownerWorkspaceId: parentId,
+      turnId: "turn",
+    });
+
+    await Promise.all([
+      ...(taskService as unknown as { pendingTerminalAttentionDrains: Set<Promise<void>> })
+        .pendingTerminalAttentionDrains,
+    ]);
+
+    expect(workspaceMocks.resumeStream).toHaveBeenCalledWith(
+      "childworkspace",
+      expect.objectContaining({
+        muxMetadata: {
+          type: "workspace-turn-task",
+          taskHandleId: "wst_handle",
+          ownerWorkspaceId: parentId,
+          turnId: "turn",
+        },
+      }),
+      { agentInitiated: true }
+    );
+  });
+
+  test("backfills workspace-turn correlation on an existing terminal report", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentId = "parent-restart-backfill";
+    const workspaceTurnId = "workspace-turn-restart-backfill";
+    const nestedTaskId = "nested-restart-backfill";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentId),
+        projectWorkspace(projectPath, "workspace-turn", workspaceTurnId),
+        projectWorkspace(projectPath, "nested-agent", nestedTaskId, {
+          parentWorkspaceId: workspaceTurnId,
+          taskStatus: "reported",
+          reportedAt: "2026-08-14T00:00:01.000Z",
+          agentType: "explore",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { historyService, taskService } = createTaskServiceHarness(config);
+    const taskHandleStore = (taskService as unknown as { taskHandleStore: TaskHandleStore })
+      .taskHandleStore;
+    await taskHandleStore.upsertWorkspaceTurn({
+      kind: "workspace_turn",
+      handleId: "wst_restart_backfill",
+      ownerWorkspaceId: parentId,
+      workspaceId: workspaceTurnId,
+      turnId: "turn-restart-backfill",
+      status: "running",
+      createdAt: "2026-08-14T00:00:00.000Z",
+      updatedAt: "2026-08-14T00:00:00.000Z",
+      createdWorkspace: true,
+      disposableWorkspace: false,
+    });
+
+    const reportMessage = createMuxMessage(
+      "existing-terminal-report",
+      "user",
+      formatSubagentReportEnvelope({
+        taskId: nestedTaskId,
+        agentType: "explore",
+        status: "completed",
+        title: "Existing result",
+        reportMarkdown: "The existing report survived the restart.",
+      }),
+      { timestamp: Date.now(), synthetic: true, uiVisible: true }
+    );
+    await historyService.appendToHistory(workspaceTurnId, reportMessage);
+
+    const terminalAttentionStore = new TerminalAttentionStore(config);
+    const notification = await terminalAttentionStore.enqueueIfAbsent({
+      ownerWorkspaceId: workspaceTurnId,
+      sourceKind: "agent_task",
+      sourceId: nestedTaskId,
+    });
+    assert(notification, "terminal attention notification must be created");
+
+    const internal = taskService as unknown as {
+      ensureAgentTerminalMessages: (
+        ownerWorkspaceId: string,
+        notifications: ReadonlyArray<typeof notification>
+      ) => Promise<unknown>;
+    };
+    await internal.ensureAgentTerminalMessages(workspaceTurnId, [notification]);
+
+    const historyResult = await historyService.getHistoryFromLatestBoundary(workspaceTurnId);
+    expect(historyResult.success).toBe(true);
+    if (!historyResult.success) throw new Error("workspace-turn history read failed");
+    const updatedReport = historyResult.data.find((message) => message.id === reportMessage.id);
+    expect(updatedReport?.metadata?.muxMetadata).toEqual({
+      type: "workspace-turn-task",
+      taskHandleId: "wst_restart_backfill",
+      ownerWorkspaceId: parentId,
+      turnId: "turn-restart-backfill",
+    });
+  });
+
+  test("preserves an existing terminal report correlation from an earlier workspace turn", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentId = "parent-restart-preserve";
+    const workspaceTurnId = "workspace-turn-restart-preserve";
+    const nestedTaskId = "nested-restart-preserve";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentId),
+        projectWorkspace(projectPath, "workspace-turn", workspaceTurnId),
+        projectWorkspace(projectPath, "nested-agent", nestedTaskId, {
+          parentWorkspaceId: workspaceTurnId,
+          taskStatus: "reported",
+          reportedAt: "2026-08-14T00:00:01.000Z",
+          agentType: "explore",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { historyService, taskService } = createTaskServiceHarness(config);
+    const taskHandleStore = (taskService as unknown as { taskHandleStore: TaskHandleStore })
+      .taskHandleStore;
+    await taskHandleStore.upsertWorkspaceTurn({
+      kind: "workspace_turn",
+      handleId: "wst_restart_preserve",
+      ownerWorkspaceId: parentId,
+      workspaceId: workspaceTurnId,
+      turnId: "turn-restart-preserve",
+      status: "running",
+      createdAt: "2026-08-14T00:00:00.000Z",
+      updatedAt: "2026-08-14T00:00:00.000Z",
+      createdWorkspace: true,
+      disposableWorkspace: false,
+    });
+
+    const previousCorrelation = {
+      type: "workspace-turn-task" as const,
+      taskHandleId: "wst_previous_turn",
+      ownerWorkspaceId: parentId,
+      turnId: "turn-previous",
+    };
+    const reportMessage = createMuxMessage(
+      "existing-terminal-report-previous-turn",
+      "user",
+      formatSubagentReportEnvelope({
+        taskId: nestedTaskId,
+        agentType: "explore",
+        status: "completed",
+        title: "Previous result",
+        reportMarkdown: "This report belongs to the previous turn.",
+      }),
+      { timestamp: Date.now(), synthetic: true, uiVisible: true, muxMetadata: previousCorrelation }
+    );
+    await historyService.appendToHistory(workspaceTurnId, reportMessage);
+
+    const terminalAttentionStore = new TerminalAttentionStore(config);
+    const notification = await terminalAttentionStore.enqueueIfAbsent({
+      ownerWorkspaceId: workspaceTurnId,
+      sourceKind: "agent_task",
+      sourceId: nestedTaskId,
+    });
+    assert(notification, "terminal attention notification must be created");
+
+    const internal = taskService as unknown as {
+      ensureAgentTerminalMessages: (
+        ownerWorkspaceId: string,
+        notifications: ReadonlyArray<typeof notification>
+      ) => Promise<{ deliverableNotificationIds: Set<string> }>;
+    };
+    const ensureResult = await internal.ensureAgentTerminalMessages(workspaceTurnId, [
+      notification,
+    ]);
+    expect(ensureResult.deliverableNotificationIds.has(notification.id)).toBe(false);
+    expect(await terminalAttentionStore.get(workspaceTurnId, notification.id)).toMatchObject({
+      status: "superseded",
+    });
+
+    const historyResult = await historyService.getHistoryFromLatestBoundary(workspaceTurnId);
+    expect(historyResult.success).toBe(true);
+    if (!historyResult.success) throw new Error("workspace-turn history read failed");
+    const preservedReport = historyResult.data.find((message) => message.id === reportMessage.id);
+    expect(preservedReport?.metadata?.muxMetadata).toEqual(previousCorrelation);
   });
 
   test("workspace-turn tool-calls stream-end with superseding queued input settles error", async () => {

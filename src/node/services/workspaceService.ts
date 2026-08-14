@@ -8483,6 +8483,8 @@ export class WorkspaceService extends EventEmitter {
       startStreamInBackground?: boolean;
       /** When true, reject instead of queueing if the workspace is busy. */
       requireIdle?: boolean;
+      /** Preserve workspace-turn correlation only when this send is the next continuation. */
+      workspaceTurnContinuation?: boolean;
       /** Coalescing for queued sends: drop the message when the same key is already queued. */
       queueDedupeKey?: string;
       /** Keep this dedupe-keyed queue entry isolated so it can be selectively superseded. */
@@ -8585,6 +8587,32 @@ export class WorkspaceService extends EventEmitter {
       }
 
       const normalizedOptions = this.normalizeSendMessageAgentId(options);
+      const normalizedMuxMetadata = normalizedOptions.muxMetadata as MuxMessageMetadata | undefined;
+      const workspaceTurnContinuationMetadata =
+        normalizedMuxMetadata?.type === "workspace-turn-task" ? normalizedMuxMetadata : undefined;
+
+      const isWorkspaceTurnContinuation = internal?.workspaceTurnContinuation === true;
+      const stripWorkspaceTurnCorrelation = (
+        sendOptions: SendMessageOptions & { fileParts?: FilePart[] }
+      ): SendMessageOptions & { fileParts?: FilePart[] } => {
+        const withoutCorrelation = { ...sendOptions };
+        delete withoutCorrelation.muxMetadata;
+        return withoutCorrelation;
+      };
+      const getContinuationSendState = () => {
+        const preserveCorrelation =
+          !isWorkspaceTurnContinuation ||
+          !session.hasQueuedOrDispatchingEntry(workspaceTurnContinuationMetadata);
+        return {
+          options: preserveCorrelation
+            ? normalizedOptions
+            : stripWorkspaceTurnCorrelation(normalizedOptions),
+          onCanceled: preserveCorrelation ? internal?.onCanceled : undefined,
+          onAcceptedPreStreamFailure: preserveCorrelation
+            ? internal?.onAcceptedPreStreamFailure
+            : undefined,
+        };
+      };
 
       // Reject before any settings persistence so an unpriced model can never
       // be saved for a budgeted resumable goal — including via direct callers
@@ -8687,17 +8715,23 @@ export class WorkspaceService extends EventEmitter {
         // This must happen after queueMessage succeeds — if enqueue fails (throws),
         // we must not cancel foreground waits. Use the queue's effective dispatch mode
         // (not incoming options) because MessageQueue makes tool-end sticky.
-        const effectiveQueueDispatchMode = session.queueMessage(message, normalizedOptions, {
-          synthetic: internal?.synthetic,
-          agentInitiated: internal?.agentInitiated,
-          dedupeKey: internal?.queueDedupeKey,
-          removableDedupeKey: internal?.removableQueueDedupeKey,
-          cancelState: internal?.cancelState,
-          cancelSignal: internal?.cancelSignal,
-          onCanceled: internal?.onCanceled,
-          onAccepted: internal?.onAccepted,
-          onAcceptedPreStreamFailure: internal?.onAcceptedPreStreamFailure,
-        });
+        const continuationSendState = getContinuationSendState();
+        const effectiveQueueDispatchMode = session.queueMessage(
+          message,
+          continuationSendState.options,
+          {
+            synthetic: internal?.synthetic,
+            agentInitiated: internal?.agentInitiated,
+            workspaceTurnContinuation: internal?.workspaceTurnContinuation,
+            dedupeKey: internal?.queueDedupeKey,
+            removableDedupeKey: internal?.removableQueueDedupeKey,
+            cancelState: internal?.cancelState,
+            cancelSignal: internal?.cancelSignal,
+            onCanceled: continuationSendState.onCanceled,
+            onAccepted: internal?.onAccepted,
+            onAcceptedPreStreamFailure: continuationSendState.onAcceptedPreStreamFailure,
+          }
+        );
 
         // A dedupe-keyed send that raced an already-pending duplicate is a quiet success:
         // the pending queue entry already covers it (coalescing), so don't double-queue.
@@ -8736,6 +8770,7 @@ export class WorkspaceService extends EventEmitter {
         });
       }
 
+      const continuationSendState = getContinuationSendState();
       const onAcceptedPreStreamFailure = async (error: SendMessageError) => {
         if (resumedInterruptedTask && normalizedOptions?.editMessageId) {
           try {
@@ -8751,7 +8786,7 @@ export class WorkspaceService extends EventEmitter {
             );
           }
         }
-        await internal?.onAcceptedPreStreamFailure?.(error);
+        await continuationSendState.onAcceptedPreStreamFailure?.(error);
       };
 
       const shouldRunPendingAutoTitle =
@@ -8764,7 +8799,7 @@ export class WorkspaceService extends EventEmitter {
         claimedAutoTitle = true;
       }
 
-      const result = await session.sendMessage(message, normalizedOptions, {
+      const result = await session.sendMessage(message, continuationSendState.options, {
         synthetic: internal?.synthetic,
         agentInitiated: internal?.agentInitiated,
         goalKind: internal?.goalKind,
@@ -8772,7 +8807,7 @@ export class WorkspaceService extends EventEmitter {
         startStreamInBackground: internal?.startStreamInBackground,
         cancelState: internal?.cancelState,
         cancelSignal: internal?.cancelSignal,
-        onCanceled: internal?.onCanceled,
+        onCanceled: continuationSendState.onCanceled,
         onAccepted: internal?.onAccepted,
         onAcceptedPreStreamFailure,
       });
@@ -9411,6 +9446,10 @@ export class WorkspaceService extends EventEmitter {
     }
   }
 
+  hasQueuedOrDispatchingEntry(workspaceId: string): boolean {
+    return this.sessions.get(workspaceId.trim())?.hasQueuedOrDispatchingEntry() ?? false;
+  }
+
   hasQueuedMessages(workspaceId: string, dispatchMode?: "tool-end" | "turn-end"): boolean {
     return this.sessions.get(workspaceId.trim())?.hasQueuedMessages(dispatchMode) ?? false;
   }
@@ -9497,6 +9536,17 @@ export class WorkspaceService extends EventEmitter {
   hasPendingBashMonitorWakeContinuation(workspaceId: string): boolean {
     const session = this.sessions.get(workspaceId.trim());
     return session?.hasPendingBashMonitorWakeContinuation() ?? false;
+  }
+
+  /**
+   * Whether a queued or dispatching entry continues the exact workspace-turn correlation.
+   */
+  hasPendingWorkspaceTurnContinuation(
+    workspaceId: string,
+    metadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
+  ): boolean {
+    const session = this.sessions.get(workspaceId.trim());
+    return session?.hasPendingWorkspaceTurnContinuation(metadata) ?? false;
   }
 
   /**

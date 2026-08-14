@@ -1,10 +1,18 @@
 import { describe, expect, mock, spyOn, test } from "bun:test";
 
+import type { MuxMessageMetadata } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import { createAgentSessionHarness } from "./agentSession.testHarness";
+import type { AIService } from "./aiService";
 
 const TEST_MODEL = "anthropic:claude-sonnet-4-5";
+const WORKSPACE_TURN_CORRELATION = {
+  type: "workspace-turn-task",
+  taskHandleId: "wst_preparing",
+  ownerWorkspaceId: "owner-workspace",
+  turnId: "turn-preparing",
+} as const;
 
 function toolCallEndEvent(workspaceId: string): Record<string, unknown> {
   return {
@@ -53,6 +61,122 @@ async function waitForCondition(condition: () => boolean, timeoutMs = 500): Prom
 }
 
 describe("AgentSession queued message tool-call dispatch", () => {
+  test("counts only a different direct preparing send as a superseding predecessor", async () => {
+    const sessionHolder: {
+      current?: {
+        hasQueuedOrDispatchingEntry(
+          continuationMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
+        ): boolean;
+        hasPendingWorkspaceTurnContinuation(
+          continuationMetadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
+        ): boolean;
+      };
+    } = {};
+    let preparingState:
+      | {
+          sameTurn: boolean;
+          differentTurn: boolean;
+          uncorrelated: boolean;
+          pendingSameTurn: boolean;
+          pendingDifferentTurn: boolean;
+        }
+      | undefined;
+    const streamMessage = mock(() => {
+      const session = sessionHolder.current;
+      preparingState = {
+        sameTurn: session?.hasQueuedOrDispatchingEntry(WORKSPACE_TURN_CORRELATION) === true,
+        differentTurn:
+          session?.hasQueuedOrDispatchingEntry({
+            ...WORKSPACE_TURN_CORRELATION,
+            turnId: "turn-different",
+          }) === true,
+        uncorrelated: session?.hasQueuedOrDispatchingEntry() === true,
+        pendingSameTurn:
+          session?.hasPendingWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION) === true,
+        pendingDifferentTurn:
+          session?.hasPendingWorkspaceTurnContinuation({
+            ...WORKSPACE_TURN_CORRELATION,
+            turnId: "turn-different",
+          }) === true,
+      };
+      return Promise.resolve(Ok(undefined));
+    });
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId: "queue-dispatch-preparing-predecessor",
+      aiServiceOverrides: {
+        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+      },
+    });
+    sessionHolder.current = session;
+
+    try {
+      expect(session.hasQueuedOrDispatchingEntry()).toBe(false);
+      const result = await session.sendMessage("direct send", {
+        model: TEST_MODEL,
+        agentId: "exec",
+        muxMetadata: WORKSPACE_TURN_CORRELATION,
+      });
+
+      expect(result.success).toBe(true);
+      expect(preparingState).toEqual({
+        sameTurn: false,
+        differentTurn: true,
+        uncorrelated: true,
+        pendingSameTurn: true,
+        pendingDifferentTurn: false,
+      });
+      expect(session.hasQueuedOrDispatchingEntry()).toBe(false);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("preserves correlation for same-turn queued and dequeued predecessors", async () => {
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId: "queue-dispatch-same-turn-predecessor",
+    });
+    const differentCorrelation = {
+      ...WORKSPACE_TURN_CORRELATION,
+      turnId: "turn-different",
+    };
+
+    try {
+      session.queueMessage(
+        "queued continuation",
+        { model: TEST_MODEL, agentId: "exec", muxMetadata: WORKSPACE_TURN_CORRELATION },
+        { synthetic: true }
+      );
+      expect(session.hasQueuedOrDispatchingEntry(WORKSPACE_TURN_CORRELATION)).toBe(false);
+      expect(session.hasQueuedOrDispatchingEntry(differentCorrelation)).toBe(true);
+
+      session.queueMessage(
+        "second queued continuation",
+        { model: TEST_MODEL, agentId: "exec", muxMetadata: WORKSPACE_TURN_CORRELATION },
+        { synthetic: true }
+      );
+      expect(session.hasQueuedOrDispatchingEntry(WORKSPACE_TURN_CORRELATION)).toBe(false);
+
+      session.queueMessage(
+        "unrelated predecessor",
+        { model: TEST_MODEL, agentId: "exec" },
+        {
+          synthetic: true,
+        }
+      );
+      expect(session.hasQueuedOrDispatchingEntry(WORKSPACE_TURN_CORRELATION)).toBe(true);
+
+      const sendMessage = spyOn(session, "sendMessage").mockResolvedValue(Ok(undefined));
+      session.sendQueuedMessages();
+      expect(session.hasQueuedOrDispatchingEntry(WORKSPACE_TURN_CORRELATION)).toBe(true);
+      expect(session.hasQueuedOrDispatchingEntry(differentCorrelation)).toBe(true);
+      sendMessage.mockRestore();
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
   test("waits for stream-end instead of interrupting between sibling tool results", async () => {
     const workspaceId = "queue-dispatch-full-step";
     const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({

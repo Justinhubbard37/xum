@@ -444,6 +444,88 @@ describe("MessageQueue", () => {
       expect(queue.hasWorkspaceTurn("wst_followup")).toBe(false);
     });
 
+    it("should detect only the next entry with the exact workspace-turn correlation", () => {
+      queue.add("Normal message");
+      queue.add("Follow up", { model: "gpt-4", agentId: "exec", muxMetadata: metadata });
+
+      expect(
+        queue.hasNextWorkspaceTurnContinuation("wst_followup", "parent-workspace", "turn-1")
+      ).toBe(false);
+
+      queue.dequeueNext();
+      expect(
+        queue.hasNextWorkspaceTurnContinuation("wst_followup", "parent-workspace", "turn-1")
+      ).toBe(true);
+      expect(
+        queue.hasNextWorkspaceTurnContinuation("wst_other", "parent-workspace", "turn-1")
+      ).toBe(false);
+    });
+
+    it("should reject a same-turn continuation when any queued predecessor is unrelated", () => {
+      queue.add("First follow up", { model: "gpt-4", agentId: "exec", muxMetadata: metadata });
+      queue.add("Second follow up", { model: "gpt-4", agentId: "exec", muxMetadata: metadata });
+
+      expect(
+        queue.hasAllWorkspaceTurnContinuations("wst_followup", "parent-workspace", "turn-1")
+      ).toBe(true);
+
+      queue.add("Unrelated message");
+
+      expect(
+        queue.hasAllWorkspaceTurnContinuations("wst_followup", "parent-workspace", "turn-1")
+      ).toBe(false);
+    });
+
+    it("should strip correlation when queue reordering moves user input ahead", () => {
+      const onCanceled = () => undefined;
+      const onAcceptedPreStreamFailure = () => undefined;
+      queue.add(
+        "Background report",
+        { model: "gpt-4", agentId: "exec", muxMetadata: metadata },
+        {
+          synthetic: true,
+          agentInitiated: true,
+          workspaceTurnContinuation: true,
+          onCanceled,
+          onAcceptedPreStreamFailure,
+        }
+      );
+      queue.add("User send now", { model: "gpt-4", agentId: "exec" });
+
+      expect(queue.setVisibleQueueDispatchMode("tool-end")).toBe(true);
+
+      const first = queue.dequeueNext();
+      expect(first.message).toBe("User send now");
+
+      const second = queue.dequeueNext();
+      expect(second.message).toBe("Background report");
+      expect(second.options?.muxMetadata).toBeUndefined();
+      expect(second.internal?.onCanceled).toBeUndefined();
+      expect(second.internal?.onAcceptedPreStreamFailure).toBeUndefined();
+    });
+
+    it("should preserve an original queued workspace-turn prompt during reordering", () => {
+      const onAccepted = () => undefined;
+      const onCanceled = () => undefined;
+      queue.add(
+        "Original workspace-turn prompt",
+        { model: "gpt-4", agentId: "exec", muxMetadata: metadata },
+        { agentInitiated: true, onAccepted, onCanceled }
+      );
+      queue.add("User send now", { model: "gpt-4", agentId: "exec" });
+
+      expect(queue.setVisibleQueueDispatchMode("tool-end")).toBe(true);
+
+      const first = queue.dequeueNext();
+      expect(first.message).toBe("User send now");
+
+      const second = queue.dequeueNext();
+      expect(second.message).toBe("Original workspace-turn prompt");
+      expect(second.options?.muxMetadata).toEqual(metadata);
+      expect(second.internal?.onAccepted).toBe(onAccepted);
+      expect(second.internal?.onCanceled).toBe(onCanceled);
+    });
+
     it("should preserve internal workspace-turn callbacks", () => {
       const onAccepted = () => undefined;
       const onAcceptedPreStreamFailure = () => undefined;
