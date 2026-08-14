@@ -1,0 +1,304 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { describe, expect, test } from "bun:test";
+
+import { Ok } from "@/common/types/result";
+import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import type { WorkspaceService } from "./workspaceService";
+import {
+  GitHubReviewNotificationService,
+  formatGitHubReviewNotification,
+  parseGitHubReviewCommandOutput,
+  reconcileGitHubReviewCheckpoint,
+  type GitHubPullRequestReview,
+  type GitHubPullRequestSnapshot,
+} from "./githubReviewNotificationService";
+
+const snapshot: GitHubPullRequestSnapshot = {
+  prKey: "https://github.com/coder/mux/pull/42",
+  prUrl: "https://github.com/coder/mux/pull/42",
+  number: 42,
+  reviews: [],
+};
+
+const workspace = {
+  id: "workspace-1",
+  name: "feature/reviews",
+  projectName: "mux",
+  projectPath: "/tmp/mux",
+  namedWorkspacePath: "/tmp/mux/feature-reviews",
+  runtimeConfig: { type: "local" },
+  githubReviewNotificationsEnabled: true,
+} satisfies FrontendWorkspaceMetadata;
+
+type WorkspaceServiceSendMessageArgs = Parameters<WorkspaceService["sendMessage"]>;
+type WorkspaceServiceSendMessageInternal = NonNullable<WorkspaceServiceSendMessageArgs[3]>;
+type WorkspaceServiceSendMessageResult = Awaited<ReturnType<WorkspaceService["sendMessage"]>>;
+type WorkspaceServiceExecuteBashArgs = Parameters<WorkspaceService["executeBash"]>;
+type WorkspaceServiceExecuteBashResult = Awaited<ReturnType<WorkspaceService["executeBash"]>>;
+
+function githubReviewCommandOutput(reviews: GitHubPullRequestReview[]): string {
+  return JSON.stringify({
+    number: snapshot.number,
+    url: snapshot.prUrl,
+    reviews: reviews.map((review) => ({
+      id: review.id,
+      author: { login: review.author },
+      body: review.body,
+      state: review.state,
+      submittedAt: review.submittedAt,
+    })),
+  });
+}
+
+async function createNotificationServiceHarness() {
+  const sessionDir = await mkdtemp(join(tmpdir(), "mux-github-review-notifications-"));
+  let commandOutput = githubReviewCommandOutput([]);
+  const sends: Array<{
+    message: string;
+    internal: WorkspaceServiceSendMessageInternal | undefined;
+  }> = [];
+
+  const workspaceService = {
+    list: (): Promise<FrontendWorkspaceMetadata[]> => Promise.resolve([workspace]),
+    executeBash: (
+      ..._args: WorkspaceServiceExecuteBashArgs
+    ): Promise<WorkspaceServiceExecuteBashResult> =>
+      Promise.resolve(
+        Ok({
+          success: true as const,
+          output: commandOutput,
+          exitCode: 0,
+          wall_duration_ms: 1,
+        })
+      ),
+    sendMessage: (
+      ...args: WorkspaceServiceSendMessageArgs
+    ): Promise<WorkspaceServiceSendMessageResult> => {
+      sends.push({ message: args[1], internal: args[3] });
+      return Promise.resolve(Ok(undefined));
+    },
+  };
+
+  const service = new GitHubReviewNotificationService({
+    config: {
+      getSessionDir: () => sessionDir,
+    },
+    experimentsService: {
+      isExperimentEnabled: () => true,
+    },
+    workspaceService,
+  });
+
+  return {
+    service,
+    sends,
+    setReviews(reviews: GitHubPullRequestReview[]) {
+      commandOutput = githubReviewCommandOutput(reviews);
+    },
+    async cleanup() {
+      await rm(sessionDir, { recursive: true, force: true });
+    },
+  };
+}
+
+function review(id: string, author = id): GitHubPullRequestReview {
+  return {
+    id,
+    author,
+    body: `${id} body`,
+    state: "COMMENTED",
+    submittedAt: "2026-08-14T04:00:00Z",
+  };
+}
+
+describe("GitHub review notification parsing", () => {
+  test("parses submitted reviews and ignores pending reviews", () => {
+    const result = parseGitHubReviewCommandOutput(
+      JSON.stringify({
+        number: 42,
+        url: snapshot.prUrl,
+        reviews: [
+          {
+            id: "review-1",
+            author: { login: "reviewer" },
+            body: "Please add a test.",
+            state: "CHANGES_REQUESTED",
+            submittedAt: "2026-08-14T04:00:00Z",
+          },
+          {
+            id: "review-2",
+            author: { login: "draft-reviewer" },
+            body: "Draft",
+            state: "PENDING",
+            submittedAt: null,
+          },
+        ],
+      })
+    );
+
+    expect(result).toEqual({
+      kind: "pull-request",
+      snapshot: {
+        ...snapshot,
+        reviews: [
+          {
+            id: "review-1",
+            author: "reviewer",
+            body: "Please add a test.",
+            state: "CHANGES_REQUESTED",
+            submittedAt: "2026-08-14T04:00:00Z",
+          },
+        ],
+      },
+    });
+  });
+
+  test("recognizes the no-pull-request response", () => {
+    expect(parseGitHubReviewCommandOutput('{"no_pr":true}')).toEqual({ kind: "no-pr" });
+  });
+});
+
+describe("GitHub review notification checkpoints", () => {
+  test("baselines an existing pull request and reports only later review IDs", () => {
+    const initial = reconcileGitHubReviewCheckpoint(null, {
+      ...snapshot,
+      reviews: [
+        {
+          id: "old-review",
+          author: "old-reviewer",
+          body: "Existing review",
+          state: "COMMENTED",
+          submittedAt: "2026-08-13T04:00:00Z",
+        },
+      ],
+    });
+
+    expect(initial.baseline).toBe(true);
+    expect(initial.checkpoint.pendingReviews).toEqual([]);
+    expect(initial.checkpoint.knownReviewIds).toEqual(["old-review"]);
+
+    const next = reconcileGitHubReviewCheckpoint(initial.checkpoint, {
+      ...snapshot,
+      reviews: [
+        {
+          id: "old-review",
+          author: "old-reviewer",
+          body: "Existing review",
+          state: "COMMENTED",
+          submittedAt: "2026-08-13T04:00:00Z",
+        },
+        {
+          id: "new-review",
+          author: "new-reviewer",
+          body: "New review",
+          state: "APPROVED",
+          submittedAt: "2026-08-14T04:00:00Z",
+        },
+      ],
+    });
+
+    expect(next.baseline).toBe(false);
+    expect(next.checkpoint.pendingReviews.map((review) => review.id)).toEqual(["new-review"]);
+  });
+
+  test("resets the baseline when the linked pull request changes", () => {
+    const result = reconcileGitHubReviewCheckpoint(
+      {
+        version: 1,
+        prKey: snapshot.prKey,
+        knownReviewIds: ["old-review"],
+        pendingReviews: [],
+      },
+      {
+        ...snapshot,
+        prKey: "https://github.com/coder/mux/pull/43",
+        prUrl: "https://github.com/coder/mux/pull/43",
+        number: 43,
+        reviews: [
+          {
+            id: "review-on-new-pr",
+            author: "reviewer",
+            body: "Existing review",
+            state: "COMMENTED",
+            submittedAt: "2026-08-14T04:00:00Z",
+          },
+        ],
+      }
+    );
+
+    expect(result.baseline).toBe(true);
+    expect(result.checkpoint.knownReviewIds).toEqual(["review-on-new-pr"]);
+    expect(result.checkpoint.pendingReviews).toEqual([]);
+  });
+});
+
+test("keeps queued reviews pending until acceptance and retries canceled batches", async () => {
+  const harness = await createNotificationServiceHarness();
+  const existingReview = review("existing-review");
+  const newReview = review("new-review", "reviewer");
+  const laterReview = review("later-review", "second-reviewer");
+
+  try {
+    await harness.service.pollOnce();
+    expect(harness.sends).toHaveLength(0);
+
+    harness.setReviews([existingReview, newReview]);
+    await harness.service.pollOnce();
+    expect(harness.sends).toHaveLength(1);
+
+    // A queued batch stays in flight, so a later poll does not enqueue a duplicate.
+    harness.setReviews([existingReview, newReview, laterReview]);
+    await harness.service.pollOnce();
+    expect(harness.sends).toHaveLength(1);
+
+    // A later review stays pending while the earlier batch is in flight.
+    const firstInternal = harness.sends[0]?.internal;
+    expect(firstInternal?.onAccepted).toBeDefined();
+    await firstInternal?.onAccepted?.();
+    await harness.service.pollOnce();
+    expect(harness.sends).toHaveLength(2);
+
+    // Cancellation leaves the later durable pending review available for retry.
+    const secondInternal = harness.sends[1]?.internal;
+    expect(secondInternal?.onCanceled).toBeDefined();
+    await secondInternal?.onCanceled?.("test cancellation");
+    await harness.service.pollOnce();
+    expect(harness.sends).toHaveLength(3);
+
+    const thirdInternal = harness.sends[2]?.internal;
+    expect(thirdInternal?.onAccepted).toBeDefined();
+    await thirdInternal?.onAccepted?.();
+    await harness.service.pollOnce();
+    expect(harness.sends).toHaveLength(3);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("formats one notification for multiple new reviews", () => {
+  const message = formatGitHubReviewNotification(snapshot, [
+    {
+      id: "review-1",
+      author: "reviewer-a",
+      body: "First review",
+      state: "COMMENTED",
+      submittedAt: "2026-08-14T04:00:00Z",
+    },
+    {
+      id: "review-2",
+      author: "reviewer-b",
+      body: "Second review",
+      state: "APPROVED",
+      submittedAt: "2026-08-14T04:01:00Z",
+    },
+  ]);
+
+  expect(message).toContain("pull request #42");
+  expect(message).toContain("reviewer-a");
+  expect(message).toContain("reviewer-b");
+  expect(message).toContain("First review");
+  expect(message).toContain("Second review");
+});

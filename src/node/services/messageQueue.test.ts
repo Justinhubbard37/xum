@@ -216,6 +216,41 @@ describe("MessageQueue", () => {
       expect(queue.getQueueDispatchMode()).toBe("turn-end");
     });
 
+    it("keeps a GitHub review notification as a separate turn-end entry", () => {
+      queue.add("User follow-up", {
+        model: "gpt-4",
+        agentId: "exec",
+        queueDispatchMode: "turn-end",
+      });
+      queue.add(
+        "[GitHub pull request review notification]",
+        {
+          model: "gpt-4",
+          agentId: "exec",
+          queueDispatchMode: "turn-end",
+          muxMetadata: {
+            type: "github-pr-review-notification",
+            prUrl: "https://github.com/coder/mux/pull/42",
+            reviewIds: ["review-1"],
+          },
+        },
+        {
+          synthetic: true,
+          agentInitiated: true,
+          removableDedupeKey: true,
+        }
+      );
+
+      expect(queue.getNextQueueDispatchMode()).toBe("turn-end");
+      expect(queue.getMessages()).toEqual([
+        "User follow-up",
+        "[GitHub pull request review notification]",
+      ]);
+      expect(queue.dequeueNext().message).toBe("User follow-up");
+      expect(queue.getNextQueueDispatchMode()).toBe("turn-end");
+      expect(queue.dequeueNext().message).toBe("[GitHub pull request review notification]");
+    });
+
     it("should prioritize tool-end mode when mixed", () => {
       queue.add("Wait until turn ends", {
         model: "gpt-4",

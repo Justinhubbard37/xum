@@ -5491,6 +5491,41 @@ export class WorkspaceService extends EventEmitter {
     return normalizeHeartbeatSettings(resolved.data.workspaceEntry.heartbeat, defaultIntervalMs);
   }
 
+  getGitHubReviewNotificationsEnabled(workspaceId: string): boolean {
+    const normalizedWorkspaceId = workspaceId.trim();
+    const config = this.config.loadConfigOrDefault();
+    for (const project of config.projects.values()) {
+      const workspace = project.workspaces.find((entry) => entry.id === normalizedWorkspaceId);
+      if (workspace) {
+        return workspace.githubReviewNotificationsEnabled === true;
+      }
+    }
+    return false;
+  }
+
+  async setGitHubReviewNotificationsEnabled(
+    workspaceId: string,
+    enabled: boolean
+  ): Promise<Result<void, string>> {
+    const normalizedWorkspaceId = workspaceId.trim();
+    if (normalizedWorkspaceId.length === 0) {
+      return Err("Workspace ID must not be empty");
+    }
+    if (this.config.findWorkspace(normalizedWorkspaceId) == null) {
+      return Err("Workspace not found");
+    }
+
+    try {
+      await this.config.updateWorkspaceMetadata(normalizedWorkspaceId, {
+        githubReviewNotificationsEnabled: enabled,
+      });
+      await this.emitCurrentWorkspaceMetadata(normalizedWorkspaceId);
+      return Ok(undefined);
+    } catch (error) {
+      return Err(`Failed to set GitHub review notifications: ${getErrorMessage(error)}`);
+    }
+  }
+
   private getHeartbeatDefaultIntervalMsFromConfig(config: ProjectsConfig): number {
     const intervalMs = config.heartbeatDefaultIntervalMs ?? HEARTBEAT_DEFAULT_INTERVAL_MS;
     assert(
