@@ -135,6 +135,11 @@ export interface AgentListItemProps extends AgentListItemBaseProps {
   isWorkspaceLiveActive?: boolean;
   delegatedActivity?: WorkspaceDelegatedActivity;
   hiddenSubAgentsSummary?: WorkspaceSubAgentsSummary;
+  /**
+   * Workflow name for an own active run, retained beyond worker lifetimes so
+   * a run between sequential steps (no live worker) stays labeled.
+   */
+  getWorkflowRunName?: (runId: string) => string | undefined;
   completedChildrenExpanded?: boolean;
   onToggleCompletedChildren?: (workspaceId: string) => void;
   onSelectWorkspace: (selection: WorkspaceSelection) => void;
@@ -247,16 +252,15 @@ const EMPTY_WORKFLOW_RUN_IDS: readonly string[] = [];
  */
 function formatHiddenSubAgentsPresentation(
   summary: WorkspaceSubAgentsSummary,
-  ownActiveWorkflowRunIds: readonly string[]
+  ownActiveWorkflowRunIds: readonly string[],
+  getWorkflowRunName?: (runId: string) => string | undefined
 ): { icon: LucideIcon; text: string } | null {
   // An own active run without a live worker (between sequential steps, or
   // before its first worker spawns) is still in progress; count it as running
   // so a concurrent run's workers cannot make it look finished while its rows
   // are hidden.
-  const gapRunCount = ownActiveWorkflowRunIds.filter(
-    (runId) => !summary.workflowRunIds.has(runId)
-  ).length;
-  const runningRunCount = summary.runningWorkflowRunCount + gapRunCount;
+  const gapRunIds = ownActiveWorkflowRunIds.filter((runId) => !summary.workflowRunIds.has(runId));
+  const runningRunCount = summary.runningWorkflowRunCount + gapRunIds.length;
 
   let workflowText: string | null = null;
   if (runningRunCount > 0 || summary.queuedWorkflowRunCount > 0) {
@@ -265,35 +269,50 @@ function formatHiddenSubAgentsPresentation(
     const hasRunningRun = runningRunCount > 0;
     const verb = hasRunningRun ? "running" : "queued";
     const runCount = hasRunningRun ? runningRunCount : summary.queuedWorkflowRunCount;
-    // With no running worker, summary.workflowName is a queued run's name; a
-    // gap-only running label must not borrow it.
+    // When only gap runs are active, summary.workflowName may belong to a queued run.
+    // Only a single gap run has an unambiguous name.
     const workflowName =
-      hasRunningRun && summary.runningWorkflowRunCount === 0 ? undefined : summary.workflowName;
-    const base =
-      runCount === 1 ? `${workflowName ?? "Workflow"} ${verb}` : `${runCount} workflows ${verb}`;
-    const agentCount = hasRunningRun
-      ? summary.runningWorkflowAgentCount
-      : summary.queuedWorkflowAgentCount;
-    // Gap-only runs have no countable workers; skip the "(0 agents)" noise.
-    const agentSuffix =
-      agentCount > 0 ? ` (${agentCount} agent${agentCount === 1 ? "" : "s"})` : "";
-    const queuedSuffix =
-      hasRunningRun && summary.queuedWorkflowAgentCount > 0
-        ? ` · ${summary.queuedWorkflowAgentCount} queued`
-        : "";
-    workflowText = `${base}${agentSuffix}${queuedSuffix}`;
+      hasRunningRun && summary.runningWorkflowRunCount === 0
+        ? gapRunIds.length === 1
+          ? getWorkflowRunName?.(gapRunIds[0])
+          : undefined
+        : summary.workflowName;
+    // The lone running worker's title is the run's current step; counts only
+    // add signal once several workers or runs are in flight.
+    if (
+      hasRunningRun &&
+      runCount === 1 &&
+      summary.runningWorkflowAgentCount === 1 &&
+      summary.runningWorkflowStepTitle != null
+    ) {
+      const queuedSuffix =
+        summary.queuedWorkflowAgentCount > 0 ? ` · ${summary.queuedWorkflowAgentCount} queued` : "";
+      workflowText = `${workflowName ?? "Workflow"} · ${summary.runningWorkflowStepTitle}${queuedSuffix}`;
+    } else {
+      const base =
+        runCount === 1 ? `${workflowName ?? "Workflow"} ${verb}` : `${runCount} workflows ${verb}`;
+      const agentCount = hasRunningRun
+        ? summary.runningWorkflowAgentCount
+        : summary.queuedWorkflowAgentCount;
+      // Gap-only runs have no countable workers; skip the "(0 agents)" noise.
+      const agentSuffix =
+        agentCount > 0 ? ` (${agentCount} agent${agentCount === 1 ? "" : "s"})` : "";
+      const queuedSuffix =
+        hasRunningRun && summary.queuedWorkflowAgentCount > 0
+          ? ` · ${summary.queuedWorkflowAgentCount} queued`
+          : "";
+      workflowText = `${base}${agentSuffix}${queuedSuffix}`;
+    }
   }
 
   let subAgentText: string | null = null;
-  if (summary.runningSubAgentCount > 0 || summary.queuedSubAgentCount > 0) {
-    const parts = [`${summary.subAgentCount} sub-agent${summary.subAgentCount === 1 ? "" : "s"}`];
-    if (summary.runningSubAgentCount > 0) {
-      parts.push(`${summary.runningSubAgentCount} active`);
-    }
+  if (summary.runningSubAgentCount > 0) {
+    subAgentText = formatSubAgentCount(summary.runningSubAgentCount, "active");
     if (summary.queuedSubAgentCount > 0) {
-      parts.push(`${summary.queuedSubAgentCount} queued`);
+      subAgentText += ` · ${summary.queuedSubAgentCount} queued`;
     }
-    subAgentText = parts.join(" · ");
+  } else if (summary.queuedSubAgentCount > 0) {
+    subAgentText = formatSubAgentCount(summary.queuedSubAgentCount, "queued");
   }
 
   if (workflowText != null && subAgentText != null) {
@@ -551,6 +570,7 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
     rowRenderMeta,
     delegatedActivity,
     hiddenSubAgentsSummary,
+    getWorkflowRunName,
     completedChildrenExpanded,
     onToggleCompletedChildren,
     onSelectWorkspace,
@@ -761,7 +781,8 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
   const hiddenSubAgentsPresentation = hiddenSubAgentsSummary
     ? formatHiddenSubAgentsPresentation(
         hiddenSubAgentsSummary,
-        activeWorkflowRunIds ?? EMPTY_WORKFLOW_RUN_IDS
+        activeWorkflowRunIds ?? EMPTY_WORKFLOW_RUN_IDS,
+        getWorkflowRunName
       )
     : null;
   // With sub-agent rows hidden, the summary outranks the coordinator's own

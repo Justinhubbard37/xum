@@ -1020,6 +1020,7 @@ describe("hidden sub-agents summary roll-up", () => {
       queuedWorkflowAgentCount: 1,
       workflowRunIds: new Set(["run-1", "run-2"]),
       workflowName: "Deep Research",
+      runningWorkflowStepTitle: "workspace-worker-a",
     });
   });
 
@@ -1044,6 +1045,7 @@ describe("hidden sub-agents summary roll-up", () => {
       queuedWorkflowAgentCount: 0,
       workflowRunIds: new Set(["run-1"]),
       workflowName: undefined,
+      runningWorkflowStepTitle: "workspace-worker",
     });
   });
 
@@ -1070,6 +1072,21 @@ describe("hidden sub-agents summary roll-up", () => {
       workflowRunIds: new Set(),
       workflowName: undefined,
     });
+  });
+
+  it("labels a workerless active run through the retained-name lookup", () => {
+    const workspaces = [
+      createWorkspace("parent"),
+      createWorkspace("owner-child", { parentWorkspaceId: "parent", taskStatus: "running" }),
+    ];
+
+    const summary = computeSubAgentsSummaryByWorkspaceId(workspaces, {
+      getActiveWorkflowRunIds: (workspaceId) => (workspaceId === "owner-child" ? ["run-gap"] : []),
+      getWorkflowRunName: (runId) => (runId === "run-gap" ? "Deep Research" : undefined),
+    }).get("parent");
+
+    expect(summary?.runningWorkflowRunCount).toBe(1);
+    expect(summary?.workflowName).toBe("Deep Research");
   });
 
   it("counts a hidden owner's workerless active run as running", () => {

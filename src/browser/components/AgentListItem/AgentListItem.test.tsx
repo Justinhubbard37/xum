@@ -271,6 +271,7 @@ function renderWorkspaceItem(
     isWorkspaceLiveActive?: boolean;
     delegatedActivity?: WorkspaceDelegatedActivity;
     hiddenSubAgentsSummary?: WorkspaceSubAgentsSummary;
+    getWorkflowRunName?: (runId: string) => string | undefined;
     completedChildrenExpanded?: boolean;
     onToggleCompletedChildren?: (workspaceId: string) => void;
     onSelectWorkspace?: (selection: WorkspaceSelection) => void;
@@ -291,6 +292,7 @@ function renderWorkspaceItem(
       isWorkspaceLiveActive={options.isWorkspaceLiveActive}
       delegatedActivity={options.delegatedActivity}
       hiddenSubAgentsSummary={options.hiddenSubAgentsSummary}
+      getWorkflowRunName={options.getWorkflowRunName}
       completedChildrenExpanded={options.completedChildrenExpanded}
       onToggleCompletedChildren={options.onToggleCompletedChildren}
       onSelectWorkspace={options.onSelectWorkspace ?? (() => undefined)}
@@ -566,7 +568,7 @@ describe("AgentListItem", () => {
     expect(rowView.queryByText("Workflow running · 1 sub-agent active")).toBeNull();
   });
 
-  test("summarizes hidden sub-agents with total and active counts", () => {
+  test("summarizes hidden sub-agents with only the active count", () => {
     const { row } = renderWorkspaceItem({
       delegatedActivity: {
         activeCount: 1,
@@ -580,7 +582,7 @@ describe("AgentListItem", () => {
 
     expect(row.querySelector(".workspace-status-dot-active")).toBeTruthy();
     const indicator = rowView.getByTestId(`workspace-hidden-subagents-${TEST_WORKSPACE_ID}`);
-    expect(indicator.textContent).toBe("3 sub-agents · 1 active");
+    expect(indicator.textContent).toBe("1 sub-agent active");
     expect(indicator.querySelector("svg")).toBeTruthy();
     expect(rowView.queryByTestId(`workspace-delegated-activity-${TEST_WORKSPACE_ID}`)).toBeNull();
   });
@@ -607,6 +609,55 @@ describe("AgentListItem", () => {
     expect(rowView.queryByText("Workflow running")).toBeNull();
   });
 
+  test("shows the workflow name and current step for a single running worker", () => {
+    const { row } = renderWorkspaceItem({
+      hiddenSubAgentsSummary: makeHiddenSummary({
+        runningWorkflowRunCount: 1,
+        runningWorkflowAgentCount: 1,
+        workflowRunIds: new Set(["run-1"]),
+        workflowName: "Deep Research",
+        runningWorkflowStepTitle: "Implementer",
+      }),
+    });
+
+    expect(
+      within(row).getByTestId(`workspace-hidden-subagents-${TEST_WORKSPACE_ID}`).textContent
+    ).toBe("Deep Research · Implementer");
+  });
+
+  test("appends queued workers after the current step label", () => {
+    const { row } = renderWorkspaceItem({
+      hiddenSubAgentsSummary: makeHiddenSummary({
+        runningWorkflowRunCount: 1,
+        runningWorkflowAgentCount: 1,
+        queuedWorkflowAgentCount: 2,
+        workflowRunIds: new Set(["run-1"]),
+        workflowName: "Deep Research",
+        runningWorkflowStepTitle: "Implementer",
+      }),
+    });
+
+    expect(
+      within(row).getByTestId(`workspace-hidden-subagents-${TEST_WORKSPACE_ID}`).textContent
+    ).toBe("Deep Research · Implementer · 2 queued");
+  });
+
+  test("labels a lone gap-only run with its retained workflow name", () => {
+    mockWorkspaceSidebarState = createWorkspaceSidebarState({
+      activeWorkflowRunIds: ["run-gap"],
+      activeWorkflowRunCount: 1,
+    });
+
+    const { row } = renderWorkspaceItem({
+      hiddenSubAgentsSummary: makeHiddenSummary(),
+      getWorkflowRunName: (runId) => (runId === "run-gap" ? "Deep Research" : undefined),
+    });
+
+    expect(
+      within(row).getByTestId(`workspace-hidden-subagents-${TEST_WORKSPACE_ID}`).textContent
+    ).toBe("Deep Research running");
+  });
+
   test("shows the hidden sub-agents summary while the coordinator itself streams", () => {
     mockWorkspaceSidebarState = createWorkspaceSidebarState({
       canInterrupt: true,
@@ -619,7 +670,7 @@ describe("AgentListItem", () => {
     const rowView = within(row);
 
     expect(rowView.getByTestId(`workspace-hidden-subagents-${TEST_WORKSPACE_ID}`).textContent).toBe(
-      "2 sub-agents · 2 active"
+      "2 sub-agents active"
     );
     expect(rowView.queryByTestId(`workspace-status-indicator-${TEST_WORKSPACE_ID}`)).toBeNull();
     // The row's own streaming state still shows through the green dot.
@@ -635,7 +686,7 @@ describe("AgentListItem", () => {
     const rowView = within(row);
 
     expect(rowView.getByTestId(`workspace-hidden-subagents-${TEST_WORKSPACE_ID}`).textContent).toBe(
-      "2 sub-agents · 2 active"
+      "2 sub-agents active"
     );
     expect(rowView.queryByText("Watching background bash")).toBeNull();
   });
@@ -651,7 +702,7 @@ describe("AgentListItem", () => {
 
     expect(
       within(row).getByTestId(`workspace-hidden-subagents-${TEST_WORKSPACE_ID}`).textContent
-    ).toBe("3 sub-agents · 1 active · 2 queued");
+    ).toBe("1 sub-agent active · 2 queued");
   });
 
   test("labels a workflow with only queued workers as queued, not running", () => {
@@ -753,6 +804,7 @@ describe("AgentListItem", () => {
         workflowRunIds: new Set(["run-queued"]),
         workflowName: "Deep Research",
       }),
+      getWorkflowRunName: (runId) => (runId === "run-queued" ? "Deep Research" : undefined),
     });
 
     expect(
@@ -774,7 +826,7 @@ describe("AgentListItem", () => {
 
     expect(
       within(row).getByTestId(`workspace-hidden-subagents-${TEST_WORKSPACE_ID}`).textContent
-    ).toBe("2 sub-agents · 1 active · Deep Research queued (2 agents)");
+    ).toBe("1 sub-agent active · Deep Research queued (2 agents)");
   });
 
   test("keeps a running workflow ahead of running sub-agents in the combined line", () => {
@@ -796,7 +848,7 @@ describe("AgentListItem", () => {
 
     expect(
       within(row).getByTestId(`workspace-hidden-subagents-${TEST_WORKSPACE_ID}`).textContent
-    ).toBe("Deep Research running (3 agents) · 2 sub-agents · 1 active");
+    ).toBe("Deep Research running (3 agents) · 1 sub-agent active");
   });
 
   test("falls back to the normal status line when hidden sub-agents are all inactive", () => {

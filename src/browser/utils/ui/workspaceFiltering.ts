@@ -394,6 +394,8 @@ export interface WorkspaceSubAgentsSummary {
   workflowRunIds: ReadonlySet<string>;
   /** Name of the first running workflow run, or first queued run when none run. */
   workflowName?: string;
+  /** Title of the first running workflow worker, the run's current step. */
+  runningWorkflowStepTitle?: string;
 }
 
 interface SubAgentsSummaryOptions extends DelegatedActivityOptions {
@@ -403,6 +405,12 @@ interface SubAgentsSummaryOptions extends DelegatedActivityOptions {
    * between sequential steps and has no countable workers.
    */
   getActiveWorkflowRunIds?: (workspaceId: string) => readonly string[];
+  /**
+   * Workflow name for a run, from state retained beyond worker lifetimes.
+   * Workers are deleted after reporting, so a run between sequential steps
+   * has no descendant carrying its name.
+   */
+  getWorkflowRunName?: (runId: string) => string | undefined;
 }
 
 /** Roll a hidden-descendant census up to each ancestor workspace. */
@@ -432,6 +440,7 @@ export function computeSubAgentsSummaryByWorkspaceId(
   interface WorkflowRunRollup {
     hasRunning: boolean;
     name?: string;
+    runningStepTitle?: string;
   }
 
   interface MutableSummary {
@@ -465,6 +474,7 @@ export function computeSubAgentsSummaryByWorkspaceId(
       const run = summary.workflowRunsById.get(runId) ?? { hasRunning: false };
       run.hasRunning ||= rollup.hasRunning;
       run.name ??= rollup.name;
+      run.runningStepTitle ??= rollup.runningStepTitle;
       summary.workflowRunsById.set(runId, run);
     };
 
@@ -491,6 +501,7 @@ export function computeSubAgentsSummaryByWorkspaceId(
         mergeWorkflowRun(childWorkflowRunId, {
           hasRunning: isRunning,
           name: child.workflowTask?.workflowName,
+          runningStepTitle: isRunning ? (child.title ?? child.name) : undefined,
         });
       }
 
@@ -520,13 +531,16 @@ export function computeSubAgentsSummaryByWorkspaceId(
       let queuedWorkflowRunCount = 0;
       let runningWorkflowName: string | undefined;
       let queuedWorkflowName: string | undefined;
-      for (const run of summary.workflowRunsById.values()) {
+      let runningWorkflowStepTitle: string | undefined;
+      for (const [runId, run] of summary.workflowRunsById) {
+        const runName = run.name ?? options.getWorkflowRunName?.(runId);
         if (run.hasRunning) {
           runningWorkflowRunCount += 1;
-          runningWorkflowName ??= run.name;
+          runningWorkflowName ??= runName;
+          runningWorkflowStepTitle ??= run.runningStepTitle;
         } else {
           queuedWorkflowRunCount += 1;
-          queuedWorkflowName ??= run.name;
+          queuedWorkflowName ??= runName;
         }
       }
 
@@ -541,6 +555,7 @@ export function computeSubAgentsSummaryByWorkspaceId(
         workflowRunIds: new Set(summary.workflowRunsById.keys()),
         // A queued-only run must never lend its name to the running label.
         workflowName: runningWorkflowRunCount > 0 ? runningWorkflowName : queuedWorkflowName,
+        runningWorkflowStepTitle,
       });
     }
     return summary;
