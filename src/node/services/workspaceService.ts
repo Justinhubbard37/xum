@@ -1951,6 +1951,9 @@ export class WorkspaceService extends EventEmitter {
   // from older streams from clobbering a newer streaming=true snapshot after async awaits.
   private readonly streamingGenerations = new Map<string, number>();
 
+  private githubReviewNotificationsDisabledListener:
+    | ((workspaceId: string) => Promise<void> | void)
+    | undefined;
   private timelineRecorder: TimelineRecorder = NOOP_TIMELINE_RECORDER;
 
   // Serialize todo snapshot refreshes so back-to-back todo_write/propose_plan updates cannot
@@ -5492,6 +5495,12 @@ export class WorkspaceService extends EventEmitter {
     return normalizeHeartbeatSettings(resolved.data.workspaceEntry.heartbeat, defaultIntervalMs);
   }
 
+  setGitHubReviewNotificationsDisabledListener(
+    listener: (workspaceId: string) => Promise<void> | void
+  ): void {
+    this.githubReviewNotificationsDisabledListener = listener;
+  }
+
   getGitHubReviewNotificationsEnabled(workspaceId: string): boolean {
     const normalizedWorkspaceId = workspaceId.trim();
     const config = this.config.loadConfigOrDefault();
@@ -5533,6 +5542,7 @@ export class WorkspaceService extends EventEmitter {
             error: removalResult.error,
           });
         }
+        await this.githubReviewNotificationsDisabledListener?.(normalizedWorkspaceId);
       }
       await this.emitCurrentWorkspaceMetadata(normalizedWorkspaceId);
       return Ok(undefined);
@@ -8826,6 +8836,7 @@ export class WorkspaceService extends EventEmitter {
         onAcceptedPreStreamFailure,
       });
       if (!result.success) {
+        await onAcceptedPreStreamFailure(result.error);
         log.error("sendMessage handler: session returned error", {
           workspaceId,
           error: result.error,

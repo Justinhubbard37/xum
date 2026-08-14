@@ -273,6 +273,9 @@ export class ServiceContainer {
       experimentsService: this.experimentsService,
       workspaceService: this.workspaceService,
     });
+    this.workspaceService.setGitHubReviewNotificationsDisabledListener((workspaceId) =>
+      this.githubReviewNotificationService.resetWorkspace(workspaceId)
+    );
     this.timelineService = new TimelineService(
       config,
       this.historyService,

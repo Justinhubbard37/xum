@@ -65,6 +65,7 @@ async function createNotificationServiceHarness() {
     exitCode: 0,
     wall_duration_ms: 1,
   });
+  let notificationsEnabled = true;
   const sends: Array<{
     message: string;
     internal: WorkspaceServiceSendMessageInternal | undefined;
@@ -81,6 +82,7 @@ async function createNotificationServiceHarness() {
     }),
     getRuntimeStatuses: (workspaceIds: string[]) =>
       Promise.resolve(Object.fromEntries(workspaceIds.map((id) => [id, "running" as const]))),
+    getGitHubReviewNotificationsEnabled: () => notificationsEnabled,
     sendMessage: (
       ...args: WorkspaceServiceSendMessageArgs
     ): Promise<WorkspaceServiceSendMessageResult> => {
@@ -102,6 +104,9 @@ async function createNotificationServiceHarness() {
   return {
     service,
     sends,
+    setNotificationsEnabled(enabled: boolean) {
+      notificationsEnabled = enabled;
+    },
     setReviews(reviews: GitHubPullRequestReview[]) {
       commandResult = Ok({
         success: true as const,
@@ -284,6 +289,53 @@ test("preserves the checkpoint when the GitHub query fails", async () => {
   }
 });
 
+test("re-baselines after notifications are disabled and re-enabled", async () => {
+  const harness = await createNotificationServiceHarness();
+  const existingReview = review("existing-review");
+  const disabledReview = review("disabled-review");
+
+  try {
+    harness.setReviews([existingReview]);
+    await harness.service.pollOnce();
+
+    harness.setReviews([existingReview, disabledReview]);
+    harness.setNotificationsEnabled(false);
+    await harness.service.pollOnce();
+    expect(harness.sends).toHaveLength(0);
+
+    harness.setNotificationsEnabled(true);
+    await harness.service.pollOnce();
+    expect(harness.sends).toHaveLength(0);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("rolls back accepted reviews after a pre-stream failure", async () => {
+  const harness = await createNotificationServiceHarness();
+  const existingReview = review("existing-review");
+  const newReview = review("new-review");
+
+  try {
+    harness.setReviews([existingReview]);
+    await harness.service.pollOnce();
+
+    harness.setReviews([existingReview, newReview]);
+    await harness.service.pollOnce();
+    expect(harness.sends).toHaveLength(1);
+
+    const internal = harness.sends[0]?.internal;
+    await internal?.onAccepted?.();
+    await internal?.onAcceptedPreStreamFailure?.({ type: "unknown", raw: "startup failed" });
+
+    await harness.service.pollOnce();
+    expect(harness.sends).toHaveLength(2);
+    expect(harness.sends[1]?.message).toContain("new-review body");
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test("continues polling later workspaces after one workspace fails", async () => {
   const sessionDir = await mkdtemp(join(tmpdir(), "mux-github-review-notifications-"));
   const firstWorkspace = workspace;
@@ -322,6 +374,7 @@ test("continues polling later workspaces after one workspace fails", async () =>
     }),
     getRuntimeStatuses: (workspaceIds: string[]) =>
       Promise.resolve(Object.fromEntries(workspaceIds.map((id) => [id, "running" as const]))),
+    getGitHubReviewNotificationsEnabled: () => true,
     sendMessage: (
       ...args: WorkspaceServiceSendMessageArgs
     ): Promise<WorkspaceServiceSendMessageResult> => {
@@ -406,6 +459,7 @@ test("does not wake stopped or remote runtimes during polling", async () => {
           ])
         )
       ),
+    getGitHubReviewNotificationsEnabled: () => true,
     sendMessage: (
       ..._args: WorkspaceServiceSendMessageArgs
     ): Promise<WorkspaceServiceSendMessageResult> => Promise.resolve(Ok(undefined)),

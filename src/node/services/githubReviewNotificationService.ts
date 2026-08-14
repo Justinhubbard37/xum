@@ -244,6 +244,7 @@ interface ReviewNotificationDependencies {
     | "sendMessage"
     | "getGoalContinuationKickoffSendOptions"
     | "getRuntimeStatuses"
+    | "getGitHubReviewNotificationsEnabled"
   >;
 }
 
@@ -251,7 +252,9 @@ interface GitHubReviewNotificationBatch {
   token: string;
   prKey: string;
   reviewIds: string[];
+  reviews: GitHubPullRequestReview[];
   lifecycleVersion: number;
+  workspaceGeneration: number;
 }
 
 export class GitHubReviewNotificationService {
@@ -260,6 +263,7 @@ export class GitHubReviewNotificationService {
   private readonly workspaceService: ReviewNotificationDependencies["workspaceService"];
   private readonly checkpoints = new Map<string, GitHubReviewNotificationCheckpoint | null>();
   private readonly inFlightBatches = new Map<string, GitHubReviewNotificationBatch>();
+  private readonly workspaceGenerations = new Map<string, number>();
   private readonly checkpointOperationChains = new Map<string, Promise<void>>();
   private nextBatchToken = 0;
 
@@ -314,7 +318,21 @@ export class GitHubReviewNotificationService {
 
     this.tickInFlight = false;
     this.inFlightBatches.clear();
+    this.workspaceGenerations.clear();
     this.checkpoints.clear();
+  }
+
+  private getWorkspaceGeneration(workspaceId: string): number {
+    return this.workspaceGenerations.get(workspaceId) ?? 0;
+  }
+
+  /** Reset durable review state so the next enable establishes a fresh baseline. */
+  async resetWorkspace(workspaceId: string): Promise<void> {
+    await this.withCheckpointLock(workspaceId, async () => {
+      this.workspaceGenerations.set(workspaceId, this.getWorkspaceGeneration(workspaceId) + 1);
+      this.inFlightBatches.delete(workspaceId);
+      await this.saveCheckpoint(workspaceId, emptyCheckpoint());
+    });
   }
 
   /** Run one poll cycle. This method also supports deterministic service tests. */
@@ -466,6 +484,7 @@ export class GitHubReviewNotificationService {
     workspace: FrontendWorkspaceMetadata,
     lifecycleVersion: number
   ): Promise<void> {
+    const workspaceGeneration = this.getWorkspaceGeneration(workspace.id);
     if (!(await this.shouldPollWorkspaceRuntime(workspace))) {
       return;
     }
@@ -513,7 +532,10 @@ export class GitHubReviewNotificationService {
     }
 
     const batch = await this.withCheckpointLock(workspace.id, async () => {
-      if (this.lifecycleVersion !== lifecycleVersion) {
+      if (
+        this.lifecycleVersion !== lifecycleVersion ||
+        this.getWorkspaceGeneration(workspace.id) !== workspaceGeneration
+      ) {
         return null;
       }
 
@@ -563,7 +585,9 @@ export class GitHubReviewNotificationService {
         token: `${lifecycleVersion}:${++this.nextBatchToken}`,
         prKey: parsed.snapshot.prKey,
         reviewIds,
+        reviews: reconciled.checkpoint.pendingReviews,
         lifecycleVersion,
+        workspaceGeneration,
       };
       this.inFlightBatches.set(workspace.id, nextBatch);
       return {
@@ -587,6 +611,14 @@ export class GitHubReviewNotificationService {
       });
       return;
     }
+    if (this.getWorkspaceGeneration(workspace.id) !== batch.batch.workspaceGeneration) {
+      return;
+    }
+    if (!this.workspaceService.getGitHubReviewNotificationsEnabled(workspace.id)) {
+      await this.resetWorkspace(workspace.id);
+      return;
+    }
+
     let sendResult;
     try {
       sendResult = await this.workspaceService.sendMessage(
@@ -606,13 +638,14 @@ export class GitHubReviewNotificationService {
           synthetic: true,
           agentInitiated: true,
           skipAutoResumeReset: true,
+          startStreamInBackground: true,
           queueDedupeKey: dedupeKey,
           removableQueueDedupeKey: true,
           onAccepted: async () => {
             await this.acceptBatch(workspace.id, batch.batch);
           },
           onAcceptedPreStreamFailure: async () => {
-            await this.releaseBatch(workspace.id, batch.batch);
+            await this.rollbackAcceptedBatch(workspace.id, batch.batch);
           },
           onCanceled: async () => {
             await this.releaseBatch(workspace.id, batch.batch);
@@ -642,7 +675,10 @@ export class GitHubReviewNotificationService {
     batch: GitHubReviewNotificationBatch
   ): Promise<void> {
     await this.withCheckpointLock(workspaceId, async () => {
-      if (this.lifecycleVersion !== batch.lifecycleVersion) {
+      if (
+        this.lifecycleVersion !== batch.lifecycleVersion ||
+        this.getWorkspaceGeneration(workspaceId) !== batch.workspaceGeneration
+      ) {
         return;
       }
 
@@ -666,12 +702,59 @@ export class GitHubReviewNotificationService {
     });
   }
 
+  private async rollbackAcceptedBatch(
+    workspaceId: string,
+    batch: GitHubReviewNotificationBatch
+  ): Promise<void> {
+    await this.withCheckpointLock(workspaceId, async () => {
+      if (
+        this.lifecycleVersion !== batch.lifecycleVersion ||
+        this.getWorkspaceGeneration(workspaceId) !== batch.workspaceGeneration
+      ) {
+        return;
+      }
+
+      const checkpoint = await this.loadCheckpoint(workspaceId);
+      if (checkpoint?.prKey !== batch.prKey) {
+        return;
+      }
+
+      const batchReviewIds = new Set(batch.reviewIds);
+      const knownReviewIds = checkpoint.knownReviewIds.filter(
+        (reviewId) => !batchReviewIds.has(reviewId)
+      );
+      const knownReviewIdSet = new Set(knownReviewIds);
+      const pendingById = new Map(checkpoint.pendingReviews.map((review) => [review.id, review]));
+      for (const review of batch.reviews) {
+        if (!knownReviewIdSet.has(review.id)) {
+          pendingById.set(review.id, review);
+        }
+      }
+
+      // onAccepted runs before provider/runtime preparation. Restore the durable reservation when
+      // preparation fails so the next poll can deliver the review instead of suppressing it.
+      await this.saveCheckpoint(workspaceId, {
+        ...checkpoint,
+        knownReviewIds,
+        pendingReviews: [...pendingById.values()],
+      });
+
+      const currentBatch = this.inFlightBatches.get(workspaceId);
+      if (currentBatch?.token === batch.token) {
+        this.inFlightBatches.delete(workspaceId);
+      }
+    });
+  }
+
   private async releaseBatch(
     workspaceId: string,
     batch: GitHubReviewNotificationBatch
   ): Promise<void> {
     await this.withCheckpointLock(workspaceId, () => {
-      if (this.lifecycleVersion !== batch.lifecycleVersion) {
+      if (
+        this.lifecycleVersion !== batch.lifecycleVersion ||
+        this.getWorkspaceGeneration(workspaceId) !== batch.workspaceGeneration
+      ) {
         return;
       }
 
