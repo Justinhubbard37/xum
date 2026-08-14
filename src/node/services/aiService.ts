@@ -105,6 +105,14 @@ import {
   resolveProviderOptionsNamespaceKey,
 } from "@/common/utils/ai/providerOptions";
 import { resolveModelParameterOverrides } from "@/common/utils/ai/modelParameterOverrides";
+import type { ProvidersConfig } from "@/common/config/schemas/providersConfig";
+import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
+import {
+  coderGatewayWireProtocol,
+  resolveCoderWireCanonicalModel,
+} from "@/common/constants/coderOAuth";
+import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
+import { isCustomOpenAICompatibleProviderConfig } from "@/common/utils/providers/customProviders";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { getProjects, isMultiProject } from "@/common/utils/multiProject";
@@ -122,6 +130,7 @@ import {
 import {
   enforceThinkingPolicy,
   isXaiGrokFastVariantSwap,
+  lookupMinThinkingLevelOverride,
   resolveEffectiveThinkingLevel,
   resolveMinimumThinkingLevel,
 } from "@/common/utils/thinking/policy";
@@ -153,7 +162,10 @@ import { prepareMessagesForProvider } from "./messagePipeline";
 import { getLegacyModeForAgentMetadata, resolveAgentForStream } from "./agentResolution";
 import { buildPlanInstructions, buildStreamSystemContext } from "./streamContextBuilder";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
-import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
+import {
+  normalizeUsageModelKey,
+  resolveModelForMetadata,
+} from "@/common/utils/providers/modelEntries";
 import {
   simulateContextLimitError,
   simulateToolPolicyNoop,
@@ -405,6 +417,69 @@ function resolveMuxToolScope(
     projectStorageAuthority:
       runtimeType === "ssh" || runtimeType === "docker" ? "runtime" : "host-local",
     ...(checkoutRoot != null ? { checkoutRoot } : {}),
+  };
+}
+
+/**
+ * Pin the factory-resolved Coder instance type into a providers-config view.
+ *
+ * Every request builder (message prep, options, headers, overrides,
+ * capability lookups, mid-turn rebuild closures) consumes ONE snapshot per
+ * request instead of re-reading ProviderService. Pinning closes the residual
+ * race between the factory's own config read and this capture: a concurrent
+ * authoritative catalog refresh that rewrites the selected instance's type
+ * would otherwise make the builders resolve a different wire than the
+ * already-created SDK model. additionalProviders is the highest-precedence
+ * metadata source (resolveCoderGatewayProvider consults it first), so the
+ * pinned entry wins over any concurrently rewritten discovered metadata.
+ * Pinning keys on the RAW selection's instance (coderSelectedInstance), not
+ * on the effective route: a coder: selection that FELL BACK to a direct
+ * provider still has builders resolving the raw model string (capability
+ * lookups, override identity, option/header rebuilds), and a concurrent
+ * retag between the factory's read and this capture would otherwise hand
+ * the already-created fallback model another type's options. Non-coder
+ * selections, shadowed prefixes, and unknown instances have no snapshot and
+ * keep the view untouched.
+ */
+function pinCoderInstanceProvidersConfig(
+  view: ProvidersConfigMap,
+  rawModelString: string,
+  instance: { name: string; type: string } | undefined
+): ProvidersConfigMap {
+  if (!instance || !rawModelString.startsWith("coder:")) {
+    return view;
+  }
+  return {
+    ...view,
+    coder: {
+      ...(view.coder ?? { apiKeySet: false, isEnabled: true, isConfigured: true }),
+      additionalProviders: [{ name: instance.name, type: instance.type }],
+    },
+  };
+}
+
+/**
+ * Raw providers.jsonc counterpart of pinCoderInstanceProvidersConfig for
+ * consumers that need file-shaped config (modelParameters lookups). Same
+ * rationale: additionalProviders is the highest-precedence metadata source,
+ * so pinning the factory-resolved instance there keeps metadata-dependent
+ * decisions (mappedToModel aliases, sampling gates) on the type the SDK
+ * model was created for.
+ */
+function pinCoderInstanceRawProvidersConfig(
+  view: ProvidersConfig | null,
+  rawModelString: string,
+  instance: { name: string; type: string } | undefined
+): ProvidersConfig | null {
+  if (!view || !instance || !rawModelString.startsWith("coder:")) {
+    return view;
+  }
+  return {
+    ...view,
+    coder: {
+      ...(view.coder ?? {}),
+      additionalProviders: [{ name: instance.name, type: instance.type }],
+    },
   };
 }
 
@@ -904,9 +979,54 @@ export class AIService extends EventEmitter {
   async createModel(
     modelString: string,
     muxProviderOptions?: MuxProviderOptions,
-    opts?: { agentInitiated?: boolean; workspaceId?: string }
+    opts?: {
+      agentInitiated?: boolean;
+      workspaceId?: string;
+      /** Snapshot pass-through (see ProviderModelFactory.createModel). */
+      providersConfig?: ProvidersConfig;
+    }
   ): Promise<Result<LanguageModel, SendMessageError>> {
     return this.providerModelFactory.createModel(modelString, muxProviderOptions, opts);
+  }
+
+  /**
+   * Create a model AND its pricing/metadata identity from ONE providers.jsonc
+   * snapshot. For headless callers (status generation, memory sweeps) that
+   * record usage via recordHeadlessUsage: resolving the identity at
+   * completion (or from a second read) races catalog refreshes — a Coder
+   * instance removed/retagged mid-request would attribute the spend to an
+   * unknown or different upstream than the wire the model was created for.
+   */
+  async createModelWithPinnedMetadata(
+    modelString: string,
+    opts?: { agentInitiated?: boolean; workspaceId?: string }
+  ): Promise<Result<{ model: LanguageModel; metadataModel: string }, SendMessageError>> {
+    const providersConfig = this.config.loadProvidersConfig() ?? {};
+    const result = await this.providerModelFactory.createModel(modelString, undefined, {
+      ...opts,
+      providersConfig,
+    });
+    if (!result.success) {
+      return result;
+    }
+    // The identity must follow the EFFECTIVE route (same snapshot, same
+    // resolution createModel dispatched on): a coder: selection whose gateway
+    // is unavailable falls away inside createModel (e.g. cross-typed
+    // coder:openai/<claude>, type anthropic, creates a direct OpenAI model),
+    // and pricing/bucketing from the raw selection would attribute that spend
+    // to the instance's type instead of the route that actually served it.
+    const effectiveModelString = this.providerModelFactory.resolveEffectiveModelString(
+      modelString,
+      undefined,
+      providersConfig
+    );
+    const metadataSeed = effectiveModelString.startsWith("coder:")
+      ? modelString
+      : normalizeToCanonical(effectiveModelString);
+    return Ok({
+      model: result.data,
+      metadataModel: resolveModelForMetadata(metadataSeed, providersConfig),
+    });
   }
 
   private wrapToolsForDelegation(
@@ -1173,11 +1293,14 @@ export class AIService extends EventEmitter {
 
       // Mode (plan|exec|compact) is derived from the selected agent definition.
       const effectiveMuxProviderOptions: MuxProviderOptions = muxProviderOptions ?? {};
-      // Clamp away levels the provider rejects (Mythos-class Anthropic cannot
-      // disable thinking) so provider options, replay transforms, and metadata
-      // all agree with the provider's actual thinking behavior. Providers config
-      // is passed so aliases mapped to Mythos models get the same treatment.
-      const effectiveThinkingLevel: ThinkingLevel = resolveEffectiveThinkingLevel(
+      // Preliminary clamp for the factory call only: the factory reads the
+      // thinking level solely for the xAI Grok variant swap, which never
+      // depends on Coder instance metadata, so a pre-snapshot resolution is
+      // safe there. The FINAL effectiveThinkingLevel is re-resolved below
+      // from the pinned request snapshot — resolving it from this earlier
+      // read would race a concurrent instance retag and disagree with the
+      // wire the factory created the SDK model for.
+      const preliminaryThinkingLevel: ThinkingLevel = resolveEffectiveThinkingLevel(
         modelString,
         thinkingLevel,
         this.providerService.getConfig()
@@ -1187,7 +1310,7 @@ export class AIService extends EventEmitter {
       const resolveAndCreateModelStartedAt = Date.now();
       const modelResult = await this.providerModelFactory.resolveAndCreateModel(
         modelString,
-        effectiveThinkingLevel,
+        preliminaryThinkingLevel,
         effectiveMuxProviderOptions,
         { agentInitiated, workspaceId }
       );
@@ -1199,21 +1322,160 @@ export class AIService extends EventEmitter {
         effectiveModelString,
         canonicalModelString,
         canonicalProviderName,
+        wireProviderName,
         routedThroughGateway,
         routeProvider,
       } = modelResult.data;
-      const capabilityModelString = resolveModelForMetadata(
-        canonicalModelString,
-        this.providerService.getConfig()
+      // ONE providers-config snapshot for every request builder (messages,
+      // options, headers, overrides, capability lookups, mid-turn rebuild
+      // closures). Re-reading ProviderService per builder races concurrent
+      // catalog refreshes: an instance-type change mid-request would hand the
+      // already-created SDK model another wire's options/headers. The
+      // factory-resolved instance type is PINNED into the snapshot so every
+      // coder-wire resolution matches the created model even when the change
+      // lands between the factory's read and this capture.
+      const requestProvidersConfig = pinCoderInstanceProvidersConfig(
+        this.providerService.getConfig(),
+        modelString,
+        modelResult.data.coderSelectedInstance
       );
+      // FINAL thinking clamp from the pinned snapshot (Mythos-class Anthropic
+      // cannot disable thinking; aliases mapped to Mythos models get the same
+      // treatment). Resolved here — not from the pre-factory read — so a
+      // concurrent instance retag cannot leave the level derived from one
+      // type while options/messages are built for the other's wire.
+      const effectiveThinkingLevel: ThinkingLevel = resolveEffectiveThinkingLevel(
+        modelString,
+        thinkingLevel,
+        requestProvidersConfig
+      );
+      // Capability lookups must see the RAW coder identity: name-based
+      // canonicalization can rewrite a cross-typed instance (coder:openai/x
+      // with type anthropic) to openai:x, hiding the instance metadata that
+      // resolveModelForMetadata needs to derive the real capability model.
+      // Non-coder strings keep the canonical form (raw gateway strings like
+      // mux-gateway:origin/x would otherwise leak through unresolved).
+      const capabilityModelString = resolveModelForMetadata(
+        modelString.startsWith("coder:") ? modelString : canonicalModelString,
+        requestProvidersConfig
+      );
+      // Provider-specific tool assembly keys on the WIRE identity of the
+      // EFFECTIVE route: raw coder:<instance>/<model> strings parse as
+      // provider "coder" inside getToolsForModel, which skips the Anthropic
+      // branch (native web tools) and the OpenAI branch (MCP schema
+      // sanitization). The wire variant matters too: openai-chat instance
+      // types (openrouter/google/azure/openai-compat/vercel) are created via
+      // provider.chat(...), so Responses-only assembly (native web_search)
+      // and Responses-only providerOptions must be suppressed via the
+      // existing wireFormat knob. When routing fell away from Coder, the
+      // effective route IS the identity (a coder:openrouter selection that
+      // fell back to direct OpenRouter must not be treated as OpenAI-wire).
+      // The capability identity above stays raw-derived. A custom provider
+      // shadowing the "coder" prefix keeps its raw identity; unknown
+      // instances fall back to the name-canonical form.
+      const resolveToolsIdentity = (
+        raw: string,
+        effective: string,
+        canonical: string,
+        // The factory's wire snapshot — resolved from the SAME config read
+        // that created the SDK model. Re-reading the providers config here
+        // instead would race authoritative catalog refreshes: a mid-request
+        // type change would assemble another wire's tools/options for the
+        // already-created model. Shadowed prefixes and unknown instances have
+        // no snapshot, and their canonical form is the raw string.
+        coderWire:
+          | { origin: "anthropic" | "openai"; modelId: string; providerType: string }
+          | undefined
+      ): { modelString: string; openaiWireFormat?: "chatCompletions" | "responses" } => {
+        if (!raw.startsWith("coder:")) {
+          return { modelString: raw };
+        }
+        if (!effective.startsWith("coder:")) {
+          // Fallback away from Coder. A PASSTHROUGH gateway fallback
+          // (mux-gateway:anthropic/x) must normalize to the canonical wire
+          // identity: getToolsForModel only runs Anthropic/OpenAI-specific
+          // assembly (native web tools, MCP schema sanitization) for direct
+          // provider prefixes, and passthrough gateways forward origin-shaped
+          // payloads. Transforming gateways (openrouter) keep their own
+          // identity, same as a direct selection of that gateway.
+          const separator = effective.indexOf(":");
+          const effectiveProvider = separator > 0 ? effective.slice(0, separator) : "";
+          const definition = Object.hasOwn(PROVIDER_DEFINITIONS, effectiveProvider)
+            ? PROVIDER_DEFINITIONS[effectiveProvider as ProviderName]
+            : undefined;
+          const passthroughGateway =
+            definition?.kind === "gateway" &&
+            "passthrough" in definition &&
+            definition.passthrough === true;
+          return {
+            modelString: passthroughGateway ? normalizeToCanonical(effective) : effective,
+          };
+        }
+        if (!coderWire) {
+          return { modelString: canonical };
+        }
+        // The factory creates Coder instances from the wire alone (openai
+        // type → provider.responses, openai-chat types → provider.chat), so
+        // BOTH OpenAI wire kinds must override any pre-existing wireFormat:
+        // a refusal chain that starts on direct OpenAI Chat Completions and
+        // falls back to an openai-typed Coder instance would otherwise build
+        // Chat Completions tools/options for a Responses request.
+        const wireProtocol = coderGatewayWireProtocol(coderWire.providerType);
+        return {
+          modelString: `${coderWire.origin}:${coderWire.modelId}`,
+          ...(wireProtocol === "openai-chat"
+            ? { openaiWireFormat: "chatCompletions" as const }
+            : wireProtocol === "openai-responses"
+              ? { openaiWireFormat: "responses" as const }
+              : {}),
+        };
+      };
+      const toolsIdentity = resolveToolsIdentity(
+        modelString,
+        effectiveModelString,
+        canonicalModelString,
+        modelResult.data.coderWire
+      );
+      const toolsModelString = toolsIdentity.modelString;
+      // Option/header builder identity: raw selections resolve via the
+      // pinned instance config (coder-routed requests need the wire), but a
+      // Coder selection whose routing FELL AWAY from the gateway must build
+      // options for the EFFECTIVE route. Example: coder:google/gemini-* with
+      // Coder unavailable routes through the passthrough mux-gateway and
+      // sends native Google bytes — resolving the raw string against the
+      // pinned instance would emit the gateway wire's OpenAI options and
+      // drop Google settings such as thinkingConfig. Tool assembly
+      // (toolsModelString) already follows the effective route; reuse it.
+      const optionsModelString =
+        modelString.startsWith("coder:") && !effectiveModelString.startsWith("coder:")
+          ? toolsModelString
+          : modelString;
+      // The user's own wireFormat, captured BEFORE wire injection: the
+      // refusal-fallback prepare() must reset to it when swapping to a model
+      // whose route is not an OpenAI-wire Coder instance.
+      const userOpenAIWireFormat = effectiveMuxProviderOptions.openai?.wireFormat;
+      if (toolsIdentity.openaiWireFormat != null) {
+        // Deliberate in-place update: every downstream consumer
+        // (buildProviderOptions, toolsForModelConfig.openaiWireFormat, header
+        // building, mid-turn thinking rebuilds) reads this object, and the
+        // actual request bytes go over Chat Completions.
+        effectiveMuxProviderOptions.openai = {
+          ...(effectiveMuxProviderOptions.openai ?? {}),
+          wireFormat: toolsIdentity.openaiWireFormat,
+        };
+      }
 
       // Dump original messages for debugging
       log.debug_obj(`${workspaceId}/1_original_messages.json`, messages);
 
       // Context Boundary request slicing happens before empty-assistant filtering so
       // provider-invisible reset rows can still bound the active context window.
+      // Message preparation keys on the WIRE provider (wireProviderName), not
+      // the config identity: a gateway-scoped coder:<instance>/<model> request
+      // sends Anthropic/OpenAI-shaped bytes, so wire-specific transforms must
+      // still run for it.
       const { activeContextMessages, providerRequestMessages, contextBoundarySlicedCount } =
-        prepareProviderRequestMessages(messages, canonicalProviderName, effectiveThinkingLevel);
+        prepareProviderRequestMessages(messages, wireProviderName, effectiveThinkingLevel);
       if (contextBoundarySlicedCount > 0) {
         log.debug("Prepared provider history window", {
           workspaceId,
@@ -1230,7 +1492,7 @@ export class AIService extends EventEmitter {
 
       // OpenAI-specific: Keep reasoning parts in history so each request can
       // carry forward reasoning context without relying on previous_response_id.
-      if (canonicalProviderName === "openai") {
+      if (wireProviderName === "openai") {
         log.debug("Keeping reasoning parts for OpenAI (managed via explicit history)");
       }
       // Add [CONTINUE] sentinel to partial messages (for model context)
@@ -1888,6 +2150,11 @@ export class AIService extends EventEmitter {
       // providerMetadata, so remember the resolved billing mode from model creation and
       // re-stamp it before converting usage into display/session costs.
       const toolModelCostsIncludedByModelString = new Map<string, boolean>();
+      // Creation-time pricing identity for tool-created models (advisor): a
+      // Coder catalog refresh can remove/retag the instance while the tool
+      // request runs, and resolving the identity from live config at
+      // completion would price/persist the usage under a different provider.
+      const toolModelMetadataModelByModelString = new Map<string, string>();
       // Normalize: undefined -> default, null -> unlimited, positive int -> exact cap.
       const advisorMaxUses =
         cfg.advisorMaxUsesPerTurn === null
@@ -2121,8 +2388,14 @@ export class AIService extends EventEmitter {
                     advisorModelString.length > 0,
                     "advisor model string must be non-empty when creating an advisor model"
                   );
+                  // ONE config snapshot for both SDK model creation and the
+                  // pinned pricing identity: two independent reads would let
+                  // a catalog refresh land between them, running the request
+                  // on one wire while recording usage under another type.
+                  const advisorProvidersConfig = this.config.loadProvidersConfig() ?? {};
                   const advisorModel = await this.createModel(advisorModelString, undefined, {
                     workspaceId,
+                    providersConfig: advisorProvidersConfig,
                   });
                   if (!advisorModel.success) {
                     throw new Error(
@@ -2133,7 +2406,59 @@ export class AIService extends EventEmitter {
                     advisorModelString,
                     modelCostsIncluded(advisorModel.data)
                   );
-                  return advisorModel.data;
+                  // Same effective-route rule as createModelWithPinnedMetadata:
+                  // a coder: selection whose gateway is unavailable falls away
+                  // to a direct provider inside createModel, and identity or
+                  // options derived from the raw selection (instance type)
+                  // would diverge from the model actually created.
+                  const advisorEffectiveModelString =
+                    this.providerModelFactory.resolveEffectiveModelString(
+                      advisorModelString,
+                      undefined,
+                      advisorProvidersConfig
+                    );
+                  const advisorOnCoderRoute = advisorEffectiveModelString.startsWith("coder:");
+                  // Creation-time identity from the SAME snapshot the model
+                  // was created from (see map declaration).
+                  toolModelMetadataModelByModelString.set(
+                    advisorModelString,
+                    resolveModelForMetadata(
+                      advisorOnCoderRoute
+                        ? advisorModelString
+                        : normalizeToCanonical(advisorEffectiveModelString),
+                      advisorProvidersConfig
+                    )
+                  );
+                  // Wire-resolved identity for option construction, same
+                  // snapshot: a raw coder: string carries no wire info, so
+                  // buildProviderOptions would emit the wrong (or no)
+                  // namespace for custom-named/cross-typed instances. Mirrors
+                  // resolveOptionsCanonicalModel's shadow + wire rules.
+                  const advisorOptionsModelString = (() => {
+                    if (!advisorModelString.startsWith("coder:")) {
+                      return advisorModelString;
+                    }
+                    const coderSection = advisorProvidersConfig.coder;
+                    if (isCustomOpenAICompatibleProviderConfig(coderSection)) {
+                      return advisorModelString;
+                    }
+                    if (!advisorOnCoderRoute) {
+                      // Fallback-away: options must target the route that
+                      // actually serves the request, not the instance's wire.
+                      return normalizeToCanonical(advisorEffectiveModelString);
+                    }
+                    const wire = resolveCoderWireCanonicalModel(
+                      advisorModelString.slice("coder:".length),
+                      coderSection as
+                        | { discoveredProviders?: unknown; additionalProviders?: unknown }
+                        | undefined
+                    );
+                    return wire ? `${wire.origin}:${wire.modelId}` : advisorModelString;
+                  })();
+                  return {
+                    model: advisorModel.data,
+                    optionsModelString: advisorOptionsModelString,
+                  };
                 },
                 abortSignal: combinedAbortSignal,
               },
@@ -2190,10 +2515,13 @@ export class AIService extends EventEmitter {
               event.providerMetadata,
               toolModelCostsIncludedByModelString.get(eventModel)
             );
-            const metadataModel = resolveModelForMetadata(
-              eventModel,
-              this.providerService.getConfig()
-            );
+            // Prefer the creation-time identity captured when the tool model
+            // was created; models not created through the tool runtime fall
+            // back to live resolution (their identity is not coder-scoped).
+            const pinnedMetadataModel = toolModelMetadataModelByModelString.get(eventModel);
+            const metadataModel =
+              pinnedMetadataModel ??
+              resolveModelForMetadata(eventModel, this.providerService.getConfig());
             this.streamManager.recordToolModelUsage(workspaceId, assistantMessageId, {
               toolName: event.toolName,
               toolCallId: event.toolCallId,
@@ -2217,7 +2545,15 @@ export class AIService extends EventEmitter {
                 if (!displayUsage) {
                   return;
                 }
-                const canonicalModel = normalizeToCanonical(eventModel);
+                // Ledger keys resolve Coder identities to their record-time
+                // metadata identity — the CREATION-TIME pin when available,
+                // mirroring StreamManager.recordSessionUsage. Non-coder
+                // models keep the canonical key (their metadata identity can
+                // be a mappedToModel pricing alias, not the ledger bucket).
+                const canonicalModel =
+                  eventModel.startsWith("coder:") && pinnedMetadataModel
+                    ? pinnedMetadataModel
+                    : normalizeUsageModelKey(eventModel, this.providerService.getConfig());
                 await this.sessionUsageService.recordUsage(
                   workspaceId,
                   canonicalModel,
@@ -2281,7 +2617,7 @@ export class AIService extends EventEmitter {
         trusted: sharedExecutionTrusted,
       };
       const allTools = await getToolsForModel(
-        modelString,
+        toolsModelString,
         toolsForModelConfig,
         workspaceId,
         this.initStateManager,
@@ -2387,10 +2723,7 @@ export class AIService extends EventEmitter {
         mcpWarningPrefix = `[Warning: ${mcpStats.failedServerCount} MCP server(s) failed to start: ${failedNames}. Tools from these servers are unavailable. Check MCP server configuration in Settings.]\n\n`;
         systemMessage = `${mcpWarningPrefix}${systemMessage}`;
         // Keep context-size estimation accurate after mutating the system prompt.
-        const metadataModel = resolveModelForMetadata(
-          modelString,
-          this.providerService.getConfig()
-        );
+        const metadataModel = resolveModelForMetadata(modelString, requestProvidersConfig);
         const tokenizer = await getTokenizerForModel(modelString, metadataModel);
         systemMessageTokens = await tokenizer.countTokens(systemMessage);
       }
@@ -2425,9 +2758,10 @@ export class AIService extends EventEmitter {
         runtime,
         workspacePath,
         abortSignal: combinedAbortSignal,
-        providerForMessages: canonicalProviderName,
+        providerForMessages: wireProviderName,
         effectiveThinkingLevel,
         modelString,
+        providersConfig: requestProvidersConfig,
         anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl,
         workspaceId,
       });
@@ -2513,14 +2847,14 @@ export class AIService extends EventEmitter {
       const buildProviderOptionsStartedAt = Date.now();
       const promptCacheScope = derivePromptCacheScope(metadata);
       const providerOptions = buildProviderOptions(
-        modelString,
+        optionsModelString,
         effectiveThinkingLevel,
         providerRequestMessages,
         (id) => this.streamManager.isResponseIdLost(id),
         effectiveMuxProviderOptions,
         workspaceId,
         truncationMode,
-        this.providerService.getConfig(),
+        requestProvidersConfig,
         routeProvider,
         promptCacheScope,
         reasoningMode
@@ -2533,19 +2867,91 @@ export class AIService extends EventEmitter {
       // identically.
       const buildRequestConfigStartedAt = Date.now();
       let requestHeaders = buildRequestHeaders(
-        modelString,
+        optionsModelString,
         effectiveMuxProviderOptions,
         workspaceId,
-        this.providerService.getConfig(),
+        requestProvidersConfig,
         routeProvider
       );
 
       // --- Model parameter overrides from providers.jsonc ---
-      const providersConfig = this.config.loadProvidersConfig();
+      // Raw file view pinned to the SAME factory-resolved instance identity
+      // as requestProvidersConfig: resolveModelParameterOverrides resolves
+      // mappedToModel aliases and sampling gates via resolveModelForMetadata
+      // internally, so a live raw load would let a concurrent instance retag
+      // derive those decisions from another type than the created SDK model.
+      const providersConfig = pinCoderInstanceRawProvidersConfig(
+        this.config.loadProvidersConfig(),
+        modelString,
+        modelResult.data.coderSelectedInstance
+      );
+      // Override config identity follows the Coder instance TYPE, not the
+      // name-canonicalized provider: a cross-typed instance ({name: "openai",
+      // type: "anthropic"}) canonicalizes to openai:<model>, which would apply
+      // the OpenAI block's wildcard/model settings to an Anthropic-wire
+      // request and ignore the intended anthropic block. KNOWN instances with
+      // no catalog identity ({name: "anthropic", type: "openai-compat"},
+      // vendor-less vercel) keep the RAW gateway-scoped identity — falling
+      // back to the name-canonical form would apply the name-alike provider's
+      // block (and merge its SDK-shaped extras) onto a different wire.
+      // Unknown instances and shadowed prefixes keep the canonical identity.
+      const resolveOverridesIdentity = (
+        rawModelString: string,
+        canonical: string,
+        canonicalProvider: string,
+        // The request's pinned snapshot (main or fallback) — never a fresh
+        // read, so the override identity matches the created model's wire.
+        currentProvidersConfig: ReturnType<ProviderService["getConfig"]>
+      ): { providerName: string; modelString: string; coderDerived: boolean } => {
+        if (rawModelString.startsWith("coder:")) {
+          const metadataCanonical = resolveCoderGatewayMetadataModel(
+            rawModelString,
+            currentProvidersConfig
+          );
+          if (metadataCanonical != null) {
+            const separator = metadataCanonical.indexOf(":");
+            return {
+              providerName:
+                separator > 0 ? metadataCanonical.slice(0, separator) : canonicalProvider,
+              modelString: metadataCanonical,
+              coderDerived: true,
+            };
+          }
+          const coderSection = currentProvidersConfig?.coder;
+          if (!isCustomOpenAICompatibleProviderConfig(coderSection)) {
+            const wire = resolveCoderWireCanonicalModel(
+              rawModelString.slice("coder:".length),
+              coderSection as
+                | { discoveredProviders?: unknown; additionalProviders?: unknown }
+                | undefined
+            );
+            if (wire) {
+              // Known but unmappable: same coder-scoped identity as
+              // non-canonical unmappable instances (coder:llm-proxy/x), whose
+              // canonical form is already the raw string. coderDerived stays
+              // false: coder-block extras are the user's explicit config for
+              // this exact gateway model and merge into the wire namespace.
+              return { providerName: "coder", modelString: rawModelString, coderDerived: false };
+            }
+          }
+        }
+        const separator = canonical.indexOf(":");
+        return {
+          providerName: separator > 0 ? canonical.slice(0, separator) : canonicalProvider,
+          modelString: canonical,
+          coderDerived: false,
+        };
+      };
+      const overridesIdentity = resolveOverridesIdentity(
+        modelString,
+        canonicalModelString,
+        canonicalProviderName,
+        requestProvidersConfig
+      );
       const resolvedOverrides = resolveModelParameterOverrides(
         providersConfig,
-        canonicalProviderName,
-        canonicalModelString,
+        overridesIdentity.providerName,
+        overridesIdentity.modelString,
         effectiveModelString
       );
 
@@ -2555,14 +2961,29 @@ export class AIService extends EventEmitter {
       // Mux-built values win on leaf conflicts for safety of thinking/reasoning/cache.
       // Shared by the initial build and mid-turn thinking-level rebuilds so both
       // produce identically-shaped options.
+      // Namespace key must match what buildProviderOptions computes internally
+      // (wire origin for gateway-scoped Coder models), or extras merge under a
+      // namespace the SDK never reads.
       const providerOptionsNamespaceKey = resolveProviderOptionsNamespaceKey(
-        canonicalProviderName,
+        wireProviderName,
         routeProvider
       );
+      // Wire-compat gate for provider extras: standard call settings
+      // (temperature, maxOutputTokens, ...) are SDK-agnostic, but extras are
+      // shaped for the override block's own SDK namespace. A type-derived
+      // Coder identity whose native provider differs from the wire SDK
+      // (coder:openrouter/... or coder:google/... speak OpenAI-chat on the
+      // wire) must not merge OpenRouter/Google-shaped extras into the OpenAI
+      // namespace, where the SDK would reject or silently drop them.
+      // Anthropic/openai-typed instances match their wire and keep extras;
+      // non-Coder identities keep existing behavior.
+      const extrasWireCompatible =
+        !overridesIdentity.coderDerived ||
+        overridesIdentity.providerName === providerOptionsNamespaceKey;
       const mergeModelParameterExtras = (
         builtOptions: Record<string, unknown>
       ): Record<string, unknown> => {
-        if (!resolvedOverrides.providerExtras) {
+        if (!resolvedOverrides.providerExtras || !extrasWireCompatible) {
           return builtOptions;
         }
         const muxProviderNamespace = builtOptions[providerOptionsNamespaceKey];
@@ -2591,7 +3012,7 @@ export class AIService extends EventEmitter {
       // to the model default so clamping never loosens below policy.
       const minThinkingLevel =
         providedMinThinkingLevel ??
-        resolveMinimumThinkingLevel(modelString, undefined, this.providerService.getConfig());
+        resolveMinimumThinkingLevel(modelString, undefined, requestProvidersConfig);
       // Rebuilds provider options for a new level using the exact same pipeline
       // as the initial build (policy clamp → resolveEffectiveThinkingLevel →
       // buildProviderOptions → providers.jsonc extras merge). Consumed by
@@ -2604,12 +3025,12 @@ export class AIService extends EventEmitter {
           modelString,
           level,
           minThinkingLevel,
-          this.providerService.getConfig()
+          requestProvidersConfig
         );
         const effective = resolveEffectiveThinkingLevel(
           modelString,
           clamped,
-          this.providerService.getConfig()
+          requestProvidersConfig
         );
         if (effective === currentEffectiveLevelRef.current) {
           return null;
@@ -2626,14 +3047,14 @@ export class AIService extends EventEmitter {
           return null;
         }
         const rebuilt = buildProviderOptions(
-          modelString,
+          optionsModelString,
           effective,
           providerRequestMessages,
           (id) => this.streamManager.isResponseIdLost(id),
           effectiveMuxProviderOptions,
           workspaceId,
           truncationMode,
-          this.providerService.getConfig(),
+          requestProvidersConfig,
           routeProvider,
           promptCacheScope,
           reasoningMode
@@ -2733,12 +3154,16 @@ export class AIService extends EventEmitter {
       }
 
       // --- Refusal fallback chain ---
-      // Resolved from app config by canonical source model; task children can
-      // opt out via taskOnRefusal: "fail" (see resolveWorkspaceModelFallbackChain).
+      // Resolved from app config by the RAW selection (metadata-aware inside):
+      // a cross-typed Coder instance (coder:openai/x, type anthropic) must use
+      // its own gateway-scoped chain, never the direct provider's. Task
+      // children can opt out via taskOnRefusal: "fail" (see
+      // resolveWorkspaceModelFallbackChain).
       const modelFallbackChain = resolveWorkspaceModelFallbackChain(
         this.config.loadConfigOrDefault(),
         workspaceId,
-        canonicalModelString
+        modelString,
+        this.providerService.getConfig()
       );
 
       // Lazily rebuilds the per-model slice of this pipeline (model creation,
@@ -2758,29 +3183,42 @@ export class AIService extends EventEmitter {
                     )
                   : messages;
 
-                // Re-clamp thinking for the fallback model: the source model's
-                // clamped level may violate the next model's policy/floor (the
-                // providerOptions builders require a policy-valid level, e.g. an
-                // "off" source level on a fixed-effort model like gpt-5-pro).
-                // A mid-turn thinking override folded in by StreamManager wins
-                // over the send-time level.
-                const nextMinThinkingLevel = resolveMinimumThinkingLevel(
+                // Preliminary thinking clamp for the factory call only (xAI
+                // variant swap; never Coder-metadata-dependent — same split
+                // as the main path). The FINAL level is recomputed below from
+                // the pinned nextProvidersConfig so a concurrent instance
+                // retag cannot leave the level derived from older metadata
+                // than the created SDK model.
+                const requestedNextThinkingLevel =
+                  prepareOptions?.thinkingLevelOverride ?? effectiveThinkingLevel;
+                const preliminaryNextThinkingLevel = enforceThinkingPolicy(
                   nextModelString,
-                  this.config.loadConfigOrDefault().minThinkingLevelByModel?.[
-                    normalizeToCanonical(nextModelString)
-                  ],
-                  this.providerService.getConfig()
-                );
-                const nextThinkingLevel = enforceThinkingPolicy(
-                  nextModelString,
-                  prepareOptions?.thinkingLevelOverride ?? effectiveThinkingLevel,
-                  nextMinThinkingLevel,
+                  requestedNextThinkingLevel,
+                  resolveMinimumThinkingLevel(
+                    nextModelString,
+                    lookupMinThinkingLevelOverride(
+                      this.config.loadConfigOrDefault().minThinkingLevelByModel,
+                      nextModelString
+                    ),
+                    this.providerService.getConfig()
+                  ),
                   this.providerService.getConfig()
                 );
 
+                // Reset the primary model's injected chat-wire format before
+                // resolving the fallback: the fallback's wire is decided by
+                // ITS effective route, and the factory's direct-OpenAI branch
+                // reads this knob for model selection.
+                if (effectiveMuxProviderOptions.openai?.wireFormat !== userOpenAIWireFormat) {
+                  effectiveMuxProviderOptions.openai = {
+                    ...(effectiveMuxProviderOptions.openai ?? {}),
+                    wireFormat: userOpenAIWireFormat,
+                  };
+                }
+
                 const nextModelResult = await this.providerModelFactory.resolveAndCreateModel(
                   nextModelString,
-                  nextThinkingLevel,
+                  preliminaryNextThinkingLevel,
                   effectiveMuxProviderOptions,
                   { agentInitiated, workspaceId }
                 );
@@ -2788,21 +3226,84 @@ export class AIService extends EventEmitter {
                   return Err(formatSendMessageError(nextModelResult.error).message);
                 }
                 const next = nextModelResult.data;
+                // Same single-snapshot rule as the main path, pinned to the
+                // fallback selection's factory-resolved instance.
+                const nextProvidersConfig = pinCoderInstanceProvidersConfig(
+                  this.providerService.getConfig(),
+                  nextModelString,
+                  next.coderSelectedInstance
+                );
+                // FINAL thinking clamp from the pinned snapshot: the message
+                // and option builders below must agree with the wire the
+                // factory created the fallback SDK model for. Re-clamps the
+                // source level against the fallback model's policy/floor (a
+                // mid-turn thinking override folded in by StreamManager wins
+                // over the send-time level).
+                const nextMinThinkingLevel = resolveMinimumThinkingLevel(
+                  nextModelString,
+                  lookupMinThinkingLevelOverride(
+                    this.config.loadConfigOrDefault().minThinkingLevelByModel,
+                    nextModelString
+                  ),
+                  nextProvidersConfig
+                );
+                const nextThinkingLevel = enforceThinkingPolicy(
+                  nextModelString,
+                  requestedNextThinkingLevel,
+                  nextMinThinkingLevel,
+                  nextProvidersConfig
+                );
+                const nextToolsIdentity = resolveToolsIdentity(
+                  nextModelString,
+                  next.effectiveModelString,
+                  next.canonicalModelString,
+                  next.coderWire
+                );
+                // Same effective-route rule as the main path's
+                // optionsModelString: a Coder fallback selection that itself
+                // fell away from the gateway must build options/headers for
+                // its effective route, not the pinned instance's wire.
+                const nextOptionsModelString =
+                  nextModelString.startsWith("coder:") &&
+                  !next.effectiveModelString.startsWith("coder:")
+                    ? nextToolsIdentity.modelString
+                    : nextModelString;
+                if (nextToolsIdentity.openaiWireFormat != null) {
+                  // Same in-place injection as the main path: the primary
+                  // stream is dead once a refusal fallback runs, so every
+                  // consumer (option/header rebuilds, mid-turn thinking
+                  // rebuild closures) must see the fallback's wire.
+                  effectiveMuxProviderOptions.openai = {
+                    ...(effectiveMuxProviderOptions.openai ?? {}),
+                    wireFormat: nextToolsIdentity.openaiWireFormat,
+                  };
+                }
 
                 try {
                   // Rebuild the toolset for the fallback model: provider-native
                   // web tools and MCP schema sanitization are provider-specific
                   // (reusing Anthropic-shaped tools on OpenAI 400s, and vice
                   // versa silently drops web tooling).
+                  // Same raw-identity rule as the main path's capability
+                  // lookup: cross-typed Coder instances need the raw string.
                   const nextCapabilityModelString = resolveModelForMetadata(
-                    next.canonicalModelString,
-                    this.providerService.getConfig()
+                    nextModelString.startsWith("coder:")
+                      ? nextModelString
+                      : next.canonicalModelString,
+                    nextProvidersConfig
                   );
                   const nextAllTools = await getToolsForModel(
-                    next.canonicalModelString,
+                    // Wire identity, mirroring the main path: provider-specific
+                    // tool branches (Anthropic native web tools, OpenAI MCP
+                    // schema sanitization) must key on the wire, not on the
+                    // "coder" prefix or the name-canonical form.
+                    nextToolsIdentity.modelString,
                     {
                       ...toolsForModelConfig,
                       capabilityModelString: nextCapabilityModelString,
+                      // Snapshot from the main path is stale here: the
+                      // fallback's wire decides Responses-only tool assembly.
+                      openaiWireFormat: effectiveMuxProviderOptions.openai?.wireFormat,
                       xaiNativeToolsEnabled: next.routeProvider === "xai",
                     },
                     workspaceId,
@@ -2850,9 +3351,13 @@ export class AIService extends EventEmitter {
                     computeActiveToolNames(toolSearchRuntime?.state) ?? Object.keys(nextTools)
                   ).sort();
                   const nextMemoryToolAvailable = nextTools.memory !== undefined;
+                  // Raw identity for prompt rebuilding too (the main path
+                  // passes its raw modelString): "Model:"-scoped instructions
+                  // and tokenizer-dependent memory budgeting must see the
+                  // instance-typed identity, not the name-canonicalized one.
                   const nextMemoryContext = await upgradeMemoryContextForModel(
                     nextMemoryToolAvailable,
-                    next.canonicalModelString
+                    nextModelString
                   );
 
                   // Rebuild the system prompt for the fallback model (tool
@@ -2863,19 +3368,18 @@ export class AIService extends EventEmitter {
                       advisorToolAvailable: nextTools.advisor !== undefined,
                       memoryToolAvailable: nextMemoryToolAvailable,
                     },
-                    next.canonicalModelString,
+                    nextModelString,
                     nextMemoryContext
                   );
                   let nextSystem = nextSystemContext.systemMessage;
                   let nextSystemTokens = nextSystemContext.systemMessageTokens;
                   if (mcpWarningPrefix != null) {
                     nextSystem = `${mcpWarningPrefix}${nextSystem}`;
+                    // nextCapabilityModelString already resolved the raw
+                    // coder identity; reuse it as the metadata model.
                     const nextTokenizer = await getTokenizerForModel(
-                      next.canonicalModelString,
-                      resolveModelForMetadata(
-                        next.canonicalModelString,
-                        this.providerService.getConfig()
-                      )
+                      nextModelString,
+                      nextCapabilityModelString
                     );
                     nextSystemTokens = await nextTokenizer.countTokens(nextSystem);
                   }
@@ -2883,7 +3387,7 @@ export class AIService extends EventEmitter {
                   const { providerRequestMessages: nextProviderRequestMessages } =
                     prepareProviderRequestMessages(
                       fallbackSourceMessages,
-                      next.canonicalProviderName,
+                      next.wireProviderName,
                       nextThinkingLevel
                     );
                   const nextFinalMessages = await prepareMessagesForProvider({
@@ -2897,22 +3401,28 @@ export class AIService extends EventEmitter {
                     runtime,
                     workspacePath,
                     abortSignal: combinedAbortSignal,
-                    providerForMessages: next.canonicalProviderName,
+                    providerForMessages: next.wireProviderName,
                     effectiveThinkingLevel: nextThinkingLevel,
-                    modelString: next.canonicalModelString,
+                    // RAW fallback identity, matching the main path's raw
+                    // modelString: canonicalization can rewrite cross-typed
+                    // Coder instances (coder:openai/x, type anthropic) to a
+                    // direct-provider string, hiding the instance metadata
+                    // from cache/option/header builders.
+                    modelString: nextModelString,
+                    providersConfig: nextProvidersConfig,
                     anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl,
                     workspaceId,
                   });
 
                   const nextProviderOptions = buildProviderOptions(
-                    next.canonicalModelString,
+                    nextOptionsModelString,
                     nextThinkingLevel,
                     nextProviderRequestMessages,
                     (id) => this.streamManager.isResponseIdLost(id),
                     effectiveMuxProviderOptions,
                     workspaceId,
                     truncationMode,
-                    this.providerService.getConfig(),
+                    nextProvidersConfig,
                     next.routeProvider,
                     promptCacheScope,
                     reasoningMode
@@ -2921,10 +3431,10 @@ export class AIService extends EventEmitter {
                   // buildProviderOptions re-gates pro mode for each fallback model,
                   // so the native option never leaks onto unsupported fallbacks.
                   let nextHeaders = buildRequestHeaders(
-                    next.canonicalModelString,
+                    nextOptionsModelString,
                     effectiveMuxProviderOptions,
                     workspaceId,
-                    this.providerService.getConfig(),
+                    nextProvidersConfig,
                     next.routeProvider
                   );
                   if (pendingRunMetadataId != null) {
@@ -2935,22 +3445,43 @@ export class AIService extends EventEmitter {
                     };
                   }
 
-                  const nextOverrides = resolveModelParameterOverrides(
-                    this.config.loadProvidersConfig(),
-                    next.canonicalProviderName,
+                  // Same type-derived override identity as the main path:
+                  // cross-typed Coder fallbacks must not read the name-alike
+                  // provider's override block.
+                  const nextOverridesIdentity = resolveOverridesIdentity(
+                    nextModelString,
                     next.canonicalModelString,
+                    next.canonicalProviderName,
+                    nextProvidersConfig
+                  );
+                  const nextOverrides = resolveModelParameterOverrides(
+                    // Same pinned-raw-view rule as the main path, keyed to
+                    // the fallback selection's own instance.
+                    pinCoderInstanceRawProvidersConfig(
+                      this.config.loadProvidersConfig(),
+                      nextModelString,
+                      next.coderSelectedInstance
+                    ),
+                    nextOverridesIdentity.providerName,
+                    nextOverridesIdentity.modelString,
                     next.effectiveModelString
                   );
                   const nextNamespaceKey = resolveProviderOptionsNamespaceKey(
-                    next.canonicalProviderName,
+                    next.wireProviderName,
                     next.routeProvider
                   );
+                  // Same wire-compat gate as the main path: type-derived
+                  // extras only merge when the override block's SDK matches
+                  // the wire namespace.
+                  const nextExtrasWireCompatible =
+                    !nextOverridesIdentity.coderDerived ||
+                    nextOverridesIdentity.providerName === nextNamespaceKey;
                   // Mirrors mergeModelParameterExtras for the fallback model;
                   // shared by this baseline build and mid-turn rebuilds below.
                   const mergeNextModelParameterExtras = (
                     builtOptions: Record<string, unknown>
                   ): Record<string, unknown> => {
-                    if (!nextOverrides.providerExtras) {
+                    if (!nextOverrides.providerExtras || !nextExtrasWireCompatible) {
                       return builtOptions;
                     }
                     const nextMuxNamespace = builtOptions[nextNamespaceKey];
@@ -2974,15 +3505,15 @@ export class AIService extends EventEmitter {
                   const rebuildNextProviderOptionsForThinkingLevel: RebuildProviderOptionsForThinkingLevel =
                     (level) => {
                       const clamped = enforceThinkingPolicy(
-                        next.canonicalModelString,
+                        nextModelString,
                         level,
                         nextMinThinkingLevel,
-                        this.providerService.getConfig()
+                        nextProvidersConfig
                       );
                       const effective = resolveEffectiveThinkingLevel(
-                        next.canonicalModelString,
+                        nextModelString,
                         clamped,
-                        this.providerService.getConfig()
+                        nextProvidersConfig
                       );
                       if (effective === nextCurrentEffectiveLevelRef.current) {
                         return null;
@@ -2997,14 +3528,14 @@ export class AIService extends EventEmitter {
                         return null;
                       }
                       const rebuilt = buildProviderOptions(
-                        next.canonicalModelString,
+                        nextOptionsModelString,
                         effective,
                         nextProviderRequestMessages,
                         (id) => this.streamManager.isResponseIdLost(id),
                         effectiveMuxProviderOptions,
                         workspaceId,
                         truncationMode,
-                        this.providerService.getConfig(),
+                        nextProvidersConfig,
                         next.routeProvider,
                         promptCacheScope,
                         reasoningMode
@@ -3018,7 +3549,12 @@ export class AIService extends EventEmitter {
 
                   return Ok({
                     model: next.model,
-                    modelString: next.canonicalModelString,
+                    // RAW identity (matching the main path's raw modelString):
+                    // StreamManager keys createCachedSystemMessage /
+                    // applyCacheControlToTools / metadata resolution on this,
+                    // and the canonical string hides cross-typed Coder
+                    // instance metadata from those lookups.
+                    modelString: nextModelString,
                     messages: nextFinalMessages,
                     system: nextSystem,
                     tools: nextTools,
@@ -3036,6 +3572,9 @@ export class AIService extends EventEmitter {
                         : undefined,
                     rebuildProviderOptionsForThinkingLevel:
                       rebuildNextProviderOptionsForThinkingLevel,
+                    // Pinned snapshot for the swap's request-config rebuild
+                    // and metadata resolution (see PreparedModelFallback).
+                    providersConfig: nextProvidersConfig,
                     initialMetadataPatch: {
                       routedThroughGateway: next.routedThroughGateway,
                       ...(next.routeProvider != null ? { routeProvider: next.routeProvider } : {}),
@@ -3115,7 +3654,8 @@ export class AIService extends EventEmitter {
         toolSearchRuntime?.state,
         activeTurnThinkingOverride,
         rebuildProviderOptionsForThinkingLevel,
-        forcedFirstStepToolNames
+        forcedFirstStepToolNames,
+        requestProvidersConfig
       );
       recordStartupPhaseTiming("startStreamMs", startStreamStartedAt);
 

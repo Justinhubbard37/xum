@@ -11,6 +11,7 @@ import type {
   ToolCallExecutionStartEvent,
   WorkflowRunAttachedEvent,
 } from "@/common/types/stream";
+import type { MuxMessage } from "@/common/types/message";
 import { Ok, Err } from "@/common/types/result";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import type { ToolSearchStreamState } from "@/common/utils/tools/toolCatalog";
@@ -652,6 +653,140 @@ describe("StreamManager - stopWhen configuration", () => {
     });
   }
 });
+describe("StreamManager - refusal usage attribution", () => {
+  test("terminal refusal records the raw Coder identity, not the name-canonical form", async () => {
+    // Cross-typed instance {name: "openai", type: "anthropic"}: the refusal
+    // path must hand the RAW coder string to usage recording so
+    // normalizeUsageModelKey can resolve the instance type — the canonical
+    // openai:<claude> form would attribute Anthropic tokens to OpenAI.
+    const rawModel = "coder:openai/claude-opus-4-5";
+    const providersConfig = {
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        discoveredProviders: [{ name: "openai", type: "anthropic" }],
+      },
+    };
+    const recordedKeys: string[] = [];
+    const sessionUsageService = {
+      recordUsage: (_workspaceId: string, model: string) => {
+        recordedKeys.push(model);
+        return Promise.resolve();
+      },
+    } as unknown as SessionUsageService;
+
+    const streamManager = new StreamManager(
+      historyService,
+      sessionUsageService,
+      () => providersConfig
+    );
+    const tryFallback = Reflect.get(streamManager, "tryModelFallbackAfterRefusal") as (
+      workspaceId: string,
+      streamInfo: Record<string, unknown>,
+      refusalFinishReason: string
+    ) => Promise<{ kind: string }>;
+    expect(typeof tryFallback).toBe("function");
+
+    const streamInfo = {
+      model: rawModel,
+      metadataModel: "anthropic:claude-opus-4-5",
+      cumulativeUsage: { inputTokens: 1200, outputTokens: 30, totalTokens: 1230 },
+      cumulativeProviderMetadata: undefined,
+      initialMetadata: undefined,
+      parts: [],
+      toolModelUsages: [],
+      // No fallback chain: the terminal-refusal recording path runs.
+      modelFallback: undefined,
+    };
+
+    const outcome = await tryFallback.call(streamManager, "ws-refusal-raw", streamInfo, "refusal");
+    expect(outcome.kind).toBe("terminal");
+    // The ledger key resolved through instance metadata (type anthropic).
+    expect(recordedKeys).toEqual(["anthropic:claude-opus-4-5"]);
+  });
+
+  test("ledger key uses the stream's pinned metadata identity when instance metadata is gone", async () => {
+    // A catalog refresh can remove/retag the instance while the turn is
+    // active: the LIVE config no longer resolves coder:prod/<claude>, so a
+    // live re-resolution would key the ledger under the raw string while
+    // createDisplayUsage priced with the pinned metadataModel — repricing
+    // would then strip the row. The stream's record-time metadataModel must
+    // key the ledger instead.
+    const rawModel = "coder:prod/claude-opus-4-5";
+    const recordedKeys: string[] = [];
+    const sessionUsageService = {
+      recordUsage: (_workspaceId: string, model: string) => {
+        recordedKeys.push(model);
+        return Promise.resolve();
+      },
+    } as unknown as SessionUsageService;
+
+    // Live config has NO metadata for the instance (removed mid-turn).
+    const streamManager = new StreamManager(historyService, sessionUsageService, () => ({}));
+    const recordSessionUsage = Reflect.get(streamManager, "recordSessionUsage") as (
+      workspaceId: string,
+      model: string,
+      usage: Record<string, number>,
+      providerMetadata: undefined,
+      logMessage: string,
+      logLevel: "warn" | "error",
+      streamInfo?: Record<string, unknown>
+    ) => Promise<void>;
+    expect(typeof recordSessionUsage).toBe("function");
+
+    await recordSessionUsage.call(
+      streamManager,
+      "ws-pinned-metadata",
+      rawModel,
+      { inputTokens: 100, outputTokens: 10, totalTokens: 110 },
+      undefined,
+      "test",
+      "warn",
+      { metadataModel: "anthropic:claude-opus-4-5" }
+    );
+    expect(recordedKeys).toEqual(["anthropic:claude-opus-4-5"]);
+  });
+
+  test("message metadata preserves the raw Coder identity", () => {
+    // WorkspaceStore live deltas and SessionUsageService history rebuilds
+    // re-key usage from metadata.model via normalizeUsageModelKey, which
+    // needs the raw identity to resolve the instance type — the canonical
+    // openai:<claude> form would accumulate under a second, wrongly priced
+    // key that diverges from the backend's ledger.
+    const streamManager = new StreamManager(historyService);
+    const buildPartial = Reflect.get(streamManager, "buildPartialAssistantMessage") as (
+      streamInfo: Record<string, unknown>,
+      options?: Record<string, unknown>
+    ) => MuxMessage;
+    expect(typeof buildPartial).toBe("function");
+
+    const message = buildPartial.call(streamManager, {
+      messageId: "msg-raw-coder",
+      historySequence: 3,
+      startTime: Date.now(),
+      model: "coder:openai/claude-opus-4-5",
+      metadataModel: "anthropic:claude-opus-4-5",
+      initialMetadata: undefined,
+      parts: [],
+      toolModelUsages: [],
+    });
+    expect(message.metadata?.model).toBe("coder:openai/claude-opus-4-5");
+    // Non-Coder gateway strings still canonicalize for display.
+    const canonicalMessage = buildPartial.call(streamManager, {
+      messageId: "msg-canonical",
+      historySequence: 4,
+      startTime: Date.now(),
+      model: "mux-gateway:anthropic/claude-opus-4-5",
+      metadataModel: "anthropic:claude-opus-4-5",
+      initialMetadata: undefined,
+      parts: [],
+      toolModelUsages: [],
+    });
+    expect(canonicalMessage.metadata?.model).toBe("anthropic:claude-opus-4-5");
+  });
+});
+
 describe("StreamManager - Anthropic cache TTL overrides", () => {
   interface StreamRequestConfigForTests {
     messages: ModelMessage[];
@@ -672,6 +807,10 @@ describe("StreamManager - Anthropic cache TTL overrides", () => {
     if (!buildRequestConfig) {
       throw new Error("Expected StreamManager.buildStreamRequestConfig to exist");
     }
+    // Rebind: buildStreamRequestConfig reads this.getProvidersConfig for
+    // cache-marker eligibility; a detached Reflect.get reference loses `this`.
+    const buildRequestConfigBound: BuildStreamRequestConfig = (...args) =>
+      buildRequestConfig.apply(streamManager, args);
 
     const model = createAnthropic({ apiKey: "test" })("claude-sonnet-4-5");
     const modelString = KNOWN_MODELS.SONNET.id;
@@ -695,7 +834,7 @@ describe("StreamManager - Anthropic cache TTL overrides", () => {
       }),
     };
 
-    const request = buildRequestConfig(
+    const request = buildRequestConfigBound(
       model,
       modelString,
       messages,
@@ -1006,7 +1145,9 @@ describe("StreamManager - sequential tool execution", () => {
     }
 
     return {
-      buildRequestConfig,
+      // .apply: buildStreamRequestConfig reads this.getProvidersConfig for
+      // cache-marker eligibility; a detached Reflect.get reference loses `this`.
+      buildRequestConfig: (...args) => buildRequestConfig.apply(streamManager, args),
       createStreamResult: (request, abortController) =>
         createStreamResultMethod.call(streamManager, request, abortController),
     };
@@ -1153,7 +1294,9 @@ describe("StreamManager - call settings overrides", () => {
     }
 
     return {
-      buildRequestConfig,
+      // .apply: buildStreamRequestConfig reads this.getProvidersConfig for
+      // cache-marker eligibility; a detached Reflect.get reference loses `this`.
+      buildRequestConfig: (...args) => buildRequestConfig.apply(streamManager, args),
       createStreamResult: (request, abortController) =>
         createStreamResultMethod.call(streamManager, request, abortController),
     };
@@ -5103,7 +5246,9 @@ describe("StreamManager - tool search activeTools scoping", () => {
     }
 
     return {
-      buildRequestConfig,
+      // .apply: buildStreamRequestConfig reads this.getProvidersConfig for
+      // cache-marker eligibility; a detached Reflect.get reference loses `this`.
+      buildRequestConfig: (...args) => buildRequestConfig.apply(streamManager, args),
       createStreamResult: (request, abortController) =>
         createStreamResultMethod.call(streamManager, request, abortController),
     };

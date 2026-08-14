@@ -87,7 +87,10 @@ import { MUX_GATEWAY_SESSION_EXPIRED_MESSAGE } from "@/common/constants/muxGatew
 import { getModelStats, getModelStatsResolved } from "@/common/utils/tokens/modelStats";
 import { withSequentialExecution } from "@/node/services/tools/withSequentialExecution";
 import type { ResolvedCallSettingsOverrides } from "@/common/config/schemas/modelParameters";
-import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
+import {
+  normalizeUsageModelKey,
+  resolveModelForMetadata,
+} from "@/common/utils/providers/modelEntries";
 import { getErrorMessage } from "@/common/utils/errors";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { shellQuote } from "@/common/utils/shell";
@@ -254,6 +257,15 @@ export interface PreparedModelFallback {
    */
   rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel;
   forcedFirstStepToolNames?: string[];
+  /**
+   * Pinned providers-config snapshot the fallback request was built from
+   * (see AIService's pinCoderWireProvidersConfig). The swap's request-config
+   * rebuild and metadata resolution must read THIS snapshot, not the live
+   * config: a catalog refresh between prepare() and the swap could retag the
+   * instance and hand the prepared SDK model another wire's cache wrappers,
+   * output limits, or usage identity.
+   */
+  providersConfig?: ProvidersConfigMap;
 }
 
 export interface ModelFallbackPrepareOptions {
@@ -288,6 +300,21 @@ export interface ModelFallbackOptions {
 
 function isKnownProviderName(provider: string): provider is keyof typeof PROVIDER_DEFINITIONS {
   return Object.hasOwn(PROVIDER_DEFINITIONS, provider);
+}
+
+/**
+ * Model identity persisted/emitted in message and stream metadata. Gateway
+ * strings canonicalize for display EXCEPT Coder identities, which stay RAW:
+ * name-based canonicalization rewrites a cross-typed instance
+ * (coder:openai/<claude>, type anthropic) to openai:<claude>, and usage
+ * recovery (WorkspaceStore live deltas, SessionUsageService history rebuilds)
+ * re-keys from this metadata via normalizeUsageModelKey — which needs the raw
+ * identity to resolve the instance type. Custom-named instances already stay
+ * gateway-scoped under normalizeToCanonical, so this only makes
+ * canonical-named instances consistent with them.
+ */
+function metadataModelIdentity(model: string): string {
+  return model.startsWith("coder:") ? model : normalizeToCanonical(model);
 }
 
 function getStreamProviderDisplayName(model: string): string {
@@ -657,9 +684,15 @@ export class StreamManager extends EventEmitter {
     }
     return log.withFields(fields);
   }
-  resolveMetadataModel(modelString: string): string {
+  resolveMetadataModel(modelString: string, providersConfigSnapshot?: ProvidersConfigMap): string {
     try {
-      return resolveModelForMetadata(modelString, this.getProvidersConfig());
+      // A caller's pinned request snapshot wins over the live config so the
+      // recorded identity matches the request that was actually built (a
+      // concurrent catalog refresh can retag/remove the instance mid-turn).
+      return resolveModelForMetadata(
+        modelString,
+        providersConfigSnapshot ?? this.getProvidersConfig()
+      );
     } catch (error) {
       log.debug("Failed to resolve metadata model override", {
         modelString,
@@ -1533,18 +1566,22 @@ export class StreamManager extends EventEmitter {
    */
   private async recordDroppedPartialUsageInSidecar(
     workspaceId: WorkspaceId,
-    streamInfo: Pick<WorkspaceStreamInfo, "model" | "toolModelUsages">,
+    streamInfo: Pick<WorkspaceStreamInfo, "model" | "metadataModel" | "toolModelUsages">,
     usage: LanguageModelV2Usage | undefined,
     providerMetadata: Record<string, unknown> | undefined,
     analyticsSource: "aborted_stream" | "errored_stream"
   ): Promise<void> {
+    // Thread the request-pinned metadata identities through the sidecar
+    // write: recordHeadlessUsage would otherwise re-resolve the raw model
+    // against the CURRENT config, so a Coder instance removed/retagged
+    // mid-turn would persist an unknown or repriced identity in analytics.
     if (usage !== undefined) {
       await this.sessionUsageService?.recordHeadlessUsage(
         workspaceId as string,
         streamInfo.model,
         cloneUsage(usage),
         providerMetadata,
-        { analyticsSource, skipSessionLedger: true }
+        { analyticsSource, skipSessionLedger: true, metadataModel: streamInfo.metadataModel }
       );
     }
     for (const toolUsage of streamInfo.toolModelUsages) {
@@ -1553,7 +1590,7 @@ export class StreamManager extends EventEmitter {
         toolUsage.model,
         cloneUsage(toolUsage.usage),
         toolUsage.providerMetadata,
-        { analyticsSource, skipSessionLedger: true }
+        { analyticsSource, skipSessionLedger: true, metadataModel: toolUsage.metadataModel }
       );
     }
   }
@@ -1580,12 +1617,20 @@ export class StreamManager extends EventEmitter {
       return;
     }
     const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
+    // Ledger key for Coder identities: the stream's PINNED record-time
+    // metadata identity (streamInfo.metadataModel), NOT a live re-resolution
+    // of the raw model. A catalog refresh can remove/retag the instance while
+    // the turn is active; re-resolving here would key the ledger differently
+    // from the pricing identity createDisplayUsage just used, and repricing
+    // would later change or strip the row. Non-Coder models keep the
+    // canonical key: their metadata identity can be a mappedToModel alias
+    // target — a pricing identity, deliberately not the ledger bucket.
+    const ledgerModel =
+      model.startsWith("coder:") && streamInfo?.metadataModel
+        ? streamInfo.metadataModel
+        : normalizeUsageModelKey(model, this.getProvidersConfig());
     try {
-      await this.sessionUsageService.recordUsage(
-        workspaceId as string,
-        normalizeToCanonical(model),
-        messageUsage
-      );
+      await this.sessionUsageService.recordUsage(workspaceId as string, ledgerModel, messageUsage);
     } catch (error) {
       (logLevel === "error" ? workspaceLog.error : workspaceLog.warn)(logMessage, { error });
     }
@@ -1614,8 +1659,14 @@ export class StreamManager extends EventEmitter {
     onToolExecutionStart?: (toolCallId: string) => void,
     thinkingOverrideState?: ActiveTurnThinkingOverride,
     rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel,
-    forcedFirstStepToolNames?: string[]
+    forcedFirstStepToolNames?: string[],
+    providersConfigSnapshot?: ProvidersConfigMap
   ): StreamRequestConfig {
+    // The request's pinned providers-config snapshot (when the caller has
+    // one): cache wrappers and type-derived output limits below must resolve
+    // Coder instance metadata against the SAME config that created the SDK
+    // model, or a mid-turn catalog retag applies another wire's treatment.
+    const requestProvidersConfig = providersConfigSnapshot ?? this.getProvidersConfig();
     // Mid-turn thinking overrides mutate providerOptions IN PLACE (the SDK's
     // per-step deep-merge reads the object passed at streamText() time, so
     // identity must stay stable). An initially-undefined value would make that
@@ -1631,7 +1682,12 @@ export class StreamManager extends EventEmitter {
       anthropicCacheTtlOverride ?? getAnthropicCacheTtl(finalProviderOptions);
 
     // For Anthropic models, convert system message to a cached message at the start
-    const cachedSystemMessage = createCachedSystemMessage(system, modelString, anthropicCacheTtl);
+    const cachedSystemMessage = createCachedSystemMessage(
+      system,
+      modelString,
+      anthropicCacheTtl,
+      requestProvidersConfig
+    );
     if (cachedSystemMessage) {
       // Prepend cached system message and set system parameter to undefined
       // Note: Must be undefined, not empty string, to avoid Anthropic API error
@@ -1649,7 +1705,7 @@ export class StreamManager extends EventEmitter {
         system,
         modelString,
         routeProvider,
-        this.getProvidersConfig()
+        requestProvidersConfig
       );
       if (openaiCachedSystem) {
         finalSystem = openaiCachedSystem;
@@ -1658,7 +1714,12 @@ export class StreamManager extends EventEmitter {
 
     // Apply cache control to tools for Anthropic models
     if (tools) {
-      finalTools = applyCacheControlToTools(tools, modelString, anthropicCacheTtl);
+      finalTools = applyCacheControlToTools(
+        tools,
+        modelString,
+        anthropicCacheTtl,
+        requestProvidersConfig
+      );
     }
 
     // Use the runtime model's max_output_tokens if available and caller didn't
@@ -1673,7 +1734,7 @@ export class StreamManager extends EventEmitter {
     const runtimeModelStats = getModelStats(modelString);
     // Fall back to resolved stats for custom aliases (e.g., provider alias mappedToModel).
     const resolvedModelStats =
-      runtimeModelStats ?? getModelStatsResolved(modelString, this.getProvidersConfig());
+      runtimeModelStats ?? getModelStatsResolved(modelString, requestProvidersConfig);
     const effectiveMaxOutputTokens =
       maxOutputTokens ?? configMaxOutputTokens ?? resolvedModelStats?.max_output_tokens;
 
@@ -1910,12 +1971,13 @@ export class StreamManager extends EventEmitter {
     toolSearchState?: ToolSearchStreamState,
     thinkingOverrideState?: ActiveTurnThinkingOverride,
     rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel,
-    forcedFirstStepToolNames?: string[]
+    forcedFirstStepToolNames?: string[],
+    providersConfigSnapshot?: ProvidersConfigMap
   ): WorkspaceStreamInfo {
     // abortController is created and linked to the caller-provided abortSignal in startStream().
 
     const stepTracker: StepMessageTracker = {};
-    const metadataModel = this.resolveMetadataModel(modelString);
+    const metadataModel = this.resolveMetadataModel(modelString, providersConfigSnapshot);
     const request = this.buildStreamRequestConfig(
       model,
       modelString,
@@ -1936,7 +1998,8 @@ export class StreamManager extends EventEmitter {
       (toolCallId) => this.handleToolExecutionStart(workspaceId, messageId, toolCallId),
       thinkingOverrideState,
       rebuildProviderOptionsForThinkingLevel,
-      forcedFirstStepToolNames
+      forcedFirstStepToolNames,
+      providersConfigSnapshot
     );
 
     // Start streaming - this can throw immediately if API key is missing
@@ -2255,7 +2318,7 @@ export class StreamManager extends EventEmitter {
   ): void {
     const streamStartAgentId = streamInfo.initialMetadata?.agentId;
     const streamStartMode = this.getStreamMode(streamInfo.initialMetadata);
-    const canonicalModel = normalizeToCanonical(streamInfo.model);
+    const canonicalModel = metadataModelIdentity(streamInfo.model);
     const routedThroughGateway =
       streamInfo.initialMetadata?.routedThroughGateway ??
       streamInfo.model.startsWith("mux-gateway:");
@@ -2267,6 +2330,10 @@ export class StreamManager extends EventEmitter {
       messageId: streamInfo.messageId,
       ...(options?.replay && { replay: true }),
       model: canonicalModel,
+      // Request-pinned identity so frontend live pricing/bucketing cannot
+      // diverge from the backend ledger when a Coder catalog refresh
+      // removes/retags the instance mid-stream.
+      metadataModel: streamInfo.metadataModel,
       routedThroughGateway,
       ...(routeProvider != null && { routeProvider }),
       historySequence,
@@ -2455,7 +2522,7 @@ export class StreamManager extends EventEmitter {
     streamInfo: WorkspaceStreamInfo,
     options: { metadata?: Partial<MuxMetadata>; parts?: MuxMessage["parts"] } = {}
   ): MuxMessage {
-    const canonicalModel = normalizeToCanonical(streamInfo.model);
+    const canonicalModel = metadataModelIdentity(streamInfo.model);
     const routedThroughGateway =
       streamInfo.initialMetadata?.routedThroughGateway ??
       streamInfo.model.startsWith("mux-gateway:");
@@ -2519,9 +2586,15 @@ export class StreamManager extends EventEmitter {
     const fallbackState = streamInfo.modelFallback;
     const preserveParts = options?.preserveParts === true;
     const refusedModel = normalizeToCanonical(streamInfo.model);
+    // Usage attribution keeps the RAW identity: canonicalization rewrites a
+    // cross-typed Coder instance (coder:openai/<claude>, type anthropic) to
+    // openai:<claude>, and recordSessionUsage / ledger rebuilds could then no
+    // longer recover the instance type for pricing. The canonical string is
+    // only for the display list / chain bookkeeping below.
+    const refusedModelForUsage = streamInfo.model;
 
     if (!fallbackState) {
-      await this.recordTerminalRefusalUsage(workspaceId, streamInfo, refusedModel);
+      await this.recordTerminalRefusalUsage(workspaceId, streamInfo, refusedModelForUsage);
       return { kind: "terminal" };
     }
 
@@ -2535,7 +2608,7 @@ export class StreamManager extends EventEmitter {
     };
 
     if (streamInfo.abortController.signal.aborted || streamInfo.softInterrupt.pending) {
-      await this.recordRefusedAttemptUsage(workspaceId, streamInfo, refusedModel);
+      await this.recordRefusedAttemptUsage(workspaceId, streamInfo, refusedModelForUsage);
       return { kind: "terminal" };
     }
 
@@ -2543,7 +2616,7 @@ export class StreamManager extends EventEmitter {
     // chain outcome (swap, exhaustion, unstartable fallback) before any state
     // reset. Chains that end in a terminal failure must not drop the final
     // hop's tokens from session usage / cost accounting.
-    await this.recordRefusedAttemptUsage(workspaceId, streamInfo, refusedModel);
+    await this.recordRefusedAttemptUsage(workspaceId, streamInfo, refusedModelForUsage);
 
     const nextModelString = fallbackState.options.chain[fallbackState.refusedModels.length - 1];
     if (nextModelString === undefined) {
@@ -2649,7 +2722,8 @@ export class StreamManager extends EventEmitter {
       // createStreamResult below in case the SDK eagerly prepares step 1.
       streamInfo.request.thinkingOverrideState,
       prepared.data.rebuildProviderOptionsForThinkingLevel,
-      prepared.data.forcedFirstStepToolNames
+      prepared.data.forcedFirstStepToolNames,
+      prepared.data.providersConfig
     );
     // createStreamResult may eagerly prepare the first fallback step and update
     // latestMessages. Clear stale source-step messages before starting it so a
@@ -2698,7 +2772,10 @@ export class StreamManager extends EventEmitter {
     streamInfo.reasoningBackfillStartIndex = preserveParts ? streamInfo.parts.length : undefined;
 
     streamInfo.model = prepared.data.modelString;
-    streamInfo.metadataModel = this.resolveMetadataModel(prepared.data.modelString);
+    streamInfo.metadataModel = this.resolveMetadataModel(
+      prepared.data.modelString,
+      prepared.data.providersConfig
+    );
     if (prepared.data.thinkingLevel !== undefined) {
       streamInfo.thinkingLevel = prepared.data.thinkingLevel;
     }
@@ -3379,7 +3456,7 @@ export class StreamManager extends EventEmitter {
               await this.getAggregatedProviderMetadata(streamInfo),
               streamInfo.initialMetadata?.costsIncluded
             );
-            const canonicalModel = normalizeToCanonical(streamInfo.model);
+            const canonicalModel = metadataModelIdentity(streamInfo.model);
             const routedThroughGateway =
               streamInfo.initialMetadata?.routedThroughGateway ??
               streamInfo.model.startsWith("mux-gateway:");
@@ -4169,7 +4246,11 @@ export class StreamManager extends EventEmitter {
     toolSearchState?: ToolSearchStreamState,
     thinkingOverrideState?: ActiveTurnThinkingOverride,
     rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel,
-    forcedFirstStepToolNames?: string[]
+    forcedFirstStepToolNames?: string[],
+    // Pinned providers-config snapshot the request was assembled from (see
+    // AIService's pinCoderWireProvidersConfig): request-config building and
+    // metadata resolution must not re-read live config after model creation.
+    providersConfigSnapshot?: ProvidersConfigMap
   ): Promise<Result<StreamToken, SendMessageError>> {
     const typedWorkspaceId = workspaceId as WorkspaceId;
 
@@ -4256,7 +4337,8 @@ export class StreamManager extends EventEmitter {
           toolSearchState,
           thinkingOverrideState,
           rebuildProviderOptionsForThinkingLevel,
-          forcedFirstStepToolNames
+          forcedFirstStepToolNames,
+          providersConfigSnapshot
         );
 
         // Guard against a narrow race:

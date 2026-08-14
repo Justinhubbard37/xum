@@ -42,12 +42,53 @@ import {
   resolveProviderOptionsNamespaceKey,
   supports1MContext,
 } from "./models";
+import { resolveCoderWireCanonicalModel } from "@/common/constants/coderOAuth";
+import { isCustomOpenAICompatibleProviderConfig } from "@/common/utils/providers/customProviders";
 
 // Re-export for existing consumers (aiService, providerModelFactory, tests):
 // the implementations moved to browser-safe modules because this module
 // imports node-only logging.
 export { resolveProviderOptionsNamespaceKey } from "./models";
 export { openaiProModeAvailable } from "./proMode";
+
+/**
+ * Canonical model string for OPTION/HEADER building. Same as
+ * normalizeToCanonical, except Coder gateway strings
+ * (coder:<instance>/<model>) are translated to the WIRE origin derived from
+ * the instance's type. The request bytes for coder:prod-anthropic/<model> are
+ * Anthropic-shaped, so thinking, cache, and beta-header decisions must run
+ * against anthropic:<model> — keying them on the "coder" prefix silently
+ * drops them, diverging from the identical model on a default-named instance.
+ * Routing identity is NOT affected: only the builders in this module use this
+ * translation.
+ *
+ * The RAW Coder identity is inspected BEFORE generic normalization: a valid
+ * instance can use a canonical route name with a different type (e.g.
+ * {name: "openai", type: "anthropic"}), and normalizeToCanonical would
+ * rewrite coder:openai/<model> to openai:<model> from the name alone —
+ * emitting OpenAI options for an Anthropic-wire request. Metadata-aware wire
+ * resolution must win over the name convention (which it still falls back to
+ * for unknown instances). Mirrors resolveAndCreateModel's raw-prefix shadow
+ * check: a custom OpenAI-compatible provider named "coder" owns the prefix,
+ * and its model IDs must not get gateway wire treatment.
+ */
+function resolveOptionsCanonicalModel(
+  modelString: string,
+  providersConfig?: ProvidersConfigMap | null
+): string {
+  const colonIndex = modelString.indexOf(":");
+  if (colonIndex === -1 || modelString.slice(0, colonIndex) !== "coder") {
+    return normalizeToCanonical(modelString);
+  }
+  if (isCustomOpenAICompatibleProviderConfig(providersConfig?.coder)) {
+    return modelString; // custom-provider shadowing wins; already canonical
+  }
+  const wire = resolveCoderWireCanonicalModel(
+    modelString.slice(colonIndex + 1),
+    providersConfig?.coder
+  );
+  return wire ? `${wire.origin}:${wire.modelId}` : normalizeToCanonical(modelString);
+}
 
 /**
  * OpenRouter reasoning options
@@ -117,7 +158,14 @@ function resolveAnthropic1MCapabilityModel(
   const normalizedModel = normalizeToCanonical(modelString);
   return {
     normalizedModel,
-    capabilityModel: resolveModelForMetadata(normalizedModel, providersConfig ?? null),
+    // Metadata resolves from the RAW identity for Coder strings: name-based
+    // canonicalization rewrites cross-typed instances (coder:openai/x, type
+    // anthropic) to a direct-provider string before the instance metadata
+    // can map them to their real upstream.
+    capabilityModel: resolveModelForMetadata(
+      modelString.startsWith("coder:") ? modelString : normalizedModel,
+      providersConfig ?? null
+    ),
   };
 }
 
@@ -161,8 +209,16 @@ export function isAnthropic1MEffectivelyEnabled(
     return false;
   }
 
+  // providersConfig also flows into the gate itself: an unmappable Coder
+  // instance keeps its gateway-scoped string, and only the config-aware gate
+  // rejects it conclusively instead of name-normalizing it to anthropic:*.
   const { capabilityModel } = resolveAnthropic1MCapabilityModel(modelString, providersConfig);
-  if (!supports1MContext(capabilityModel)) {
+  // Coder strings go through the gate RAW: getAnthropic1MContextMode resolves
+  // the instance conclusively AND rejects wires that cannot carry the
+  // anthropic-beta header (vercel/google-typed instances fronting Claude).
+  // The pre-resolved capabilityModel (anthropic:*) would bypass that wire gate.
+  const gateModel = modelString.startsWith("coder:") ? modelString : capabilityModel;
+  if (!supports1MContext(gateModel, providersConfig)) {
     return false;
   }
 
@@ -193,7 +249,7 @@ export function preserveAnthropic1MContextForFollowUp(
   }
 
   const { capabilityModel } = resolveAnthropic1MCapabilityModel(targetModelString, providersConfig);
-  if (!supports1MContext(capabilityModel)) {
+  if (!supports1MContext(capabilityModel, providersConfig)) {
     return muxProviderOptions;
   }
 
@@ -245,7 +301,7 @@ export function buildProviderOptions(
   // agentSession.ts is the canonical enforcement point.
   const effectiveThinking = thinkingLevel;
   // Parse origin from normalized model string
-  const normalizedModel = normalizeToCanonical(modelString);
+  const normalizedModel = resolveOptionsCanonicalModel(modelString, providersConfig);
   const [origin, modelName] = normalizedModel.split(":", 2);
 
   if (!origin || !modelName) {
@@ -691,7 +747,7 @@ export function buildRequestHeaders(
     headers[MUX_WORKSPACE_ID_HEADER] = toWorkspaceHeaderValue(workspaceId);
   }
 
-  const normalized = normalizeToCanonical(modelString);
+  const normalized = resolveOptionsCanonicalModel(modelString, providersConfig);
   const [origin] = normalized.split(":", 2);
 
   // 1M context header — only when origin supports it AND route is passthrough (or direct)
@@ -701,6 +757,13 @@ export function buildRequestHeaders(
   if (
     origin === "anthropic" &&
     routePassesHeaders &&
+    // Wire origin gates WHICH header can be attached; capability is
+    // evaluated on the RAW identity. The wire-canonical string mangles
+    // metadata-divergent instances (coder:bedrock/anthropic.claude-* becomes
+    // anthropic:anthropic.claude-*, which the anchored Claude patterns
+    // reject), while the raw string resolves through the provider-type-aware
+    // metadata identity — matching the UI/compaction gates AND the raw-keyed
+    // per-model 1M intent toggles.
     isAnthropic1MEffectivelyEnabled(modelString, muxProviderOptions, providersConfig)
   ) {
     headers["anthropic-beta"] = ANTHROPIC_1M_CONTEXT_HEADER;

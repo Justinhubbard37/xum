@@ -58,7 +58,11 @@ import {
   coerceThinkingLevel,
   type ThinkingLevel,
 } from "@/common/types/thinking";
-import { enforceThinkingPolicy, resolveMinimumThinkingLevel } from "@/common/utils/thinking/policy";
+import {
+  enforceThinkingPolicy,
+  lookupMinThinkingLevelOverride,
+  resolveMinimumThinkingLevel,
+} from "@/common/utils/thinking/policy";
 import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
 import {
   createMuxMessage,
@@ -115,6 +119,7 @@ import { getModelCapabilitiesResolved } from "@/common/utils/ai/modelCapabilitie
 import {
   getExplicitGatewayPrefix,
   normalizeToCanonical,
+  normalizeSelectedModel,
   isValidModelFormat,
   supports1MContext,
 } from "@/common/utils/ai/models";
@@ -1267,7 +1272,12 @@ export class AgentSession {
       return undefined;
     }
 
-    const normalized = normalizeToCanonical(trimmed);
+    // Preserve explicit gateway identities (coder:, mux-gateway:, ...) just
+    // like normal send-option normalization: normalizeToCanonical would
+    // rewrite a cross-typed canonical-name instance such as
+    // coder:openai/<claude> (type anthropic) to openai:<claude>, sending the
+    // recovered turn through direct OpenAI instead of the selected gateway.
+    const normalized = normalizeSelectedModel(trimmed);
     if (!isValidModelFormat(normalized)) {
       return undefined;
     }
@@ -3660,7 +3670,10 @@ export class AgentSession {
         return { model: null, thinkingLevel };
       }
 
-      const normalized = normalizeToCanonical(compactModelString.trim());
+      // Gateway-preserving: a cross-typed Coder compaction default
+      // (coder:openai/<claude>, type anthropic) must not persist as direct
+      // openai:<claude>, which would bypass the explicitly selected route.
+      const normalized = normalizeSelectedModel(compactModelString.trim());
       if (!isValidModelFormat(normalized)) {
         return { model: null, thinkingLevel };
       }
@@ -4016,11 +4029,15 @@ export class AgentSession {
         minThinkingLevelByModel?: Record<string, ThinkingLevel>;
       } | null;
     };
+    // Gateway-preserving key first (an explicit coder:<instance>/<model>
+    // floor stays distinct from a direct model with the same ID), with a
+    // legacy name-canonical fallback for floors persisted by older versions.
     const minThinkingOverride =
       typeof maybeConfig.loadConfigOrDefault === "function"
-        ? maybeConfig.loadConfigOrDefault()?.minThinkingLevelByModel?.[
-            normalizeToCanonical(modelString)
-          ]
+        ? lookupMinThinkingLevelOverride(
+            maybeConfig.loadConfigOrDefault()?.minThinkingLevelByModel,
+            modelString
+          )
         : undefined;
     // Pass providersConfig so mapped aliases (mappedToModel -> e.g. GPT-5.6)
     // clamp against the target model's policy — otherwise a capability level
@@ -4210,7 +4227,7 @@ export class AgentSession {
   }
 
   private supports1MContextRetry(modelString: string): boolean {
-    return supports1MContext(modelString);
+    return supports1MContext(modelString, this.getProvidersConfigSafe());
   }
 
   private withAnthropic1MContext(
@@ -4230,7 +4247,15 @@ export class AgentSession {
         },
       };
 
-      if (!isAnthropic1MEffectivelyEnabled(modelString, nextProviderOptions)) {
+      // Providers config resolves Coder gateway instances (the raw
+      // coder:<instance>/<model> prefix is opaque without instance metadata).
+      if (
+        !isAnthropic1MEffectivelyEnabled(
+          modelString,
+          nextProviderOptions,
+          this.getProvidersConfigSafe()
+        )
+      ) {
         return null;
       }
 
@@ -4247,7 +4272,13 @@ export class AgentSession {
       },
     };
 
-    if (!isAnthropic1MEffectivelyEnabled(modelString, nextProviderOptions)) {
+    if (
+      !isAnthropic1MEffectivelyEnabled(
+        modelString,
+        nextProviderOptions,
+        this.getProvidersConfigSafe()
+      )
+    ) {
       return null;
     }
 

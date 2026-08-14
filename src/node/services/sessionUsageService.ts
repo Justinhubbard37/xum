@@ -17,8 +17,10 @@ import type { RolledUpChildEntry } from "@/common/orpc/schemas/chatStats";
 import type { TokenConsumer } from "@/common/types/chatStats";
 import { HEADLESS_USAGE_FILE_NAME } from "@/common/constants/paths";
 import type { MuxMessage, PersistedToolModelUsage } from "@/common/types/message";
-import { normalizeToCanonical } from "@/common/utils/ai/models";
-import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
+import {
+  normalizeUsageModelKey,
+  resolveModelForMetadata,
+} from "@/common/utils/providers/modelEntries";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { log } from "./log";
 
@@ -162,7 +164,8 @@ export class SessionUsageService {
   /**
    * Record usage from a completed stream. Accumulates with existing usage
    * AND updates lastRequest in a single atomic write.
-   * Model should already be normalized via normalizeToCanonical().
+   * Model should already be normalized via normalizeUsageModelKey() (raw
+   * Coder identities are preserved so repricing resolves instance metadata).
    */
   async recordUsage(
     workspaceId: string,
@@ -224,6 +227,13 @@ export class SessionUsageService {
        * (StreamManager's abort handler) and only need the analytics sidecar.
        */
       skipSessionLedger?: boolean;
+      /**
+       * Request-pinned pricing identity resolved when the stream/tool call
+       * started. When set, it overrides the live re-resolution below so a
+       * Coder catalog refresh that removes/retags the instance mid-turn
+       * cannot corrupt the persisted analytics identity.
+       */
+      metadataModel?: string;
     }
   ): Promise<{ model: string; usage: ChatUsageDisplay } | undefined> {
     if (!usage) return undefined;
@@ -234,15 +244,28 @@ export class SessionUsageService {
       // callers that already normalized.
       providerMetadata = withCacheWriteMetadata(providerMetadata, usage);
       usage = normalizeUsage(usage);
-      const canonicalModel = normalizeToCanonical(modelString);
+      // Attribution key mirrors StreamManager.recordSessionUsage: Coder
+      // identities use the caller's request-pinned metadata identity so a
+      // catalog refresh mid-turn cannot re-key the row; all others keep the
+      // canonical key (their metadataModel can be a mappedToModel pricing
+      // alias, deliberately not the attribution bucket).
+      const canonicalModel =
+        modelString.startsWith("coder:") && options?.metadataModel
+          ? options.metadataModel
+          : normalizeUsageModelKey(modelString, this.getProvidersConfig());
       // Resolve mappedToModel aliases for pricing (mirrors StreamManager's
       // resolveMetadataModel): custom provider models would otherwise price
-      // against the raw custom ID (unknown → $0).
+      // against the raw custom ID (unknown → $0). A caller-pinned identity
+      // takes precedence over live re-resolution.
       let metadataModel: string;
-      try {
-        metadataModel = resolveModelForMetadata(modelString, this.getProvidersConfig());
-      } catch {
-        metadataModel = modelString;
+      if (options?.metadataModel) {
+        metadataModel = options.metadataModel;
+      } else {
+        try {
+          metadataModel = resolveModelForMetadata(modelString, this.getProvidersConfig());
+        } catch {
+          metadataModel = modelString;
+        }
       }
       const existingMux = providerMetadata?.mux;
       const effectiveProviderMetadata = options?.costsIncluded
@@ -580,8 +603,25 @@ export class SessionUsageService {
     const result: SessionUsageFile = this.createEmptyUsageFile();
     let lastAssistantUsage: { model: string; usage: ChatUsageDisplay } | undefined;
 
-    const mergeUsageForModel = (rawModel: string, usage: ChatUsageDisplay): void => {
-      const model = normalizeToCanonical(rawModel);
+    // Recovery bucket key: rebuilds run AFTER mutable Coder instance metadata
+    // may have changed (provider removed, retagged), so a raw coder: history
+    // model can no longer be re-resolved against the current config. The
+    // history already persists the record-time identity (metadataModel) and
+    // prices with it below — key the bucket with it too, or the raw/incorrect
+    // key gets repriced as unknown and its costs stripped. Non-Coder models
+    // keep the canonical key: their metadataModel can be a mappedToModel
+    // alias target (pricing identity, not the ledger bucket).
+    const usageBucketKey = (rawModel: string, metadataModel: string | undefined): string =>
+      rawModel.startsWith("coder:") && metadataModel
+        ? metadataModel
+        : normalizeUsageModelKey(rawModel, this.getProvidersConfig());
+
+    const mergeUsageForModel = (
+      rawModel: string,
+      usage: ChatUsageDisplay,
+      metadataModel?: string
+    ): void => {
+      const model = usageBucketKey(rawModel, metadataModel);
       const existing = result.byModel[model];
       result.byModel[model] = existing ? sumUsageHistory([existing, usage])! : usage;
     };
@@ -613,7 +653,7 @@ export class SessionUsageService {
         return;
       }
 
-      mergeUsageForModel(rawModel, usage);
+      mergeUsageForModel(rawModel, usage, metadataModel);
     };
 
     for (const msg of messages) {
@@ -641,8 +681,11 @@ export class SessionUsageService {
           );
 
           if (usage) {
-            mergeUsageForModel(rawModel, usage);
-            lastAssistantUsage = { model: normalizeToCanonical(rawModel), usage };
+            mergeUsageForModel(rawModel, usage, msg.metadata.metadataModel);
+            lastAssistantUsage = {
+              model: usageBucketKey(rawModel, msg.metadata.metadataModel),
+              usage,
+            };
           }
         }
 

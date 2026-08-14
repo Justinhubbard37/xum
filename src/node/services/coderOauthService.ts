@@ -7,11 +7,15 @@ import {
   buildCoderRefreshBody,
   buildCoderTokenExchangeBody,
   coderAibridgeBaseUrl,
-  CODER_AIBRIDGE_ORIGINS,
+  CODER_AI_PROVIDERS_PATH,
   CODER_BUILDINFO_PATH,
+  CODER_GATEWAY_DEFAULT_PROVIDER_NAMES,
+  coderGatewayWireProtocol,
+  parseCoderGatewayProviders,
   CODER_OAUTH_CALLBACK_PATH,
   CODER_OAUTH_DISCOVERY_PATH,
   normalizeCoderDeploymentUrl,
+  type CoderGatewayProvider,
 } from "@/common/constants/coderOAuth";
 import type { Config } from "@/node/config";
 import type { PolicyService } from "@/node/services/policyService";
@@ -129,17 +133,17 @@ function parseOptionalNumber(value: unknown): number | null {
 }
 
 /**
- * Normalize a persisted coderDisconnectGeneration to a non-negative safe
- * integer, treating anything else as 0. providers.jsonc is hand-editable, and
- * a finite-but-unsafe value such as Number.MAX_VALUE would freeze the
- * tombstone (MAX_VALUE + 1 === MAX_VALUE): Disconnect could no longer advance
- * it, so an in-flight login in another process would see its unchanged
- * start-time snapshot and commit AFTER the credential was cleared — silently
- * reconnecting the account. Every reader and the disconnect incrementer MUST
- * share this normalization, or their generation comparison would diverge on
- * malformed input.
+ * Normalize a persisted generation counter (coderDisconnectGeneration,
+ * coderCatalogGeneration) to a non-negative safe integer, treating anything
+ * else as 0. providers.jsonc is hand-editable, and a finite-but-unsafe value
+ * such as Number.MAX_VALUE would freeze the counter (MAX_VALUE + 1 ===
+ * MAX_VALUE): the incrementer could no longer advance it, so an in-flight
+ * flow in another process would see its unchanged start-time snapshot and
+ * commit stale state (a login after disconnect, a stale catalog over a newer
+ * one). Every reader and every incrementer MUST share this normalization, or
+ * their generation comparison would diverge on malformed input.
  */
-function sanitizeDisconnectGeneration(value: unknown): number {
+function sanitizeGenerationCounter(value: unknown): number {
   const parsed = parseOptionalNumber(value);
   return parsed != null && Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0;
 }
@@ -192,10 +196,15 @@ function manualModelEntries(section: Record<string, unknown> | undefined): Provi
   if (!Array.isArray(section?.models)) {
     return [];
   }
+  // Discovered classification unions the authoritative catalog with the
+  // stale marker (entries retained in `models` while the catalog was
+  // inconclusive). Without the marker, an inconclusive refresh would
+  // reclassify retained catalog entries as manual — surviving disconnect and
+  // resurrecting across refreshes as if the user had added them.
   const discovered = new Set(
-    Array.isArray(section.discoveredModels)
-      ? section.discoveredModels.filter((id): id is string => typeof id === "string")
-      : []
+    [section.discoveredModels, section.staleDiscoveredModels].flatMap((value) =>
+      Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : []
+    )
   );
   return normalizeProviderModelEntries(section.models).filter((entry) => {
     if (typeof entry !== "string") {
@@ -209,6 +218,12 @@ function manualModelEntries(section: Record<string, unknown> | undefined): Provi
 export class CoderOauthService {
   private readonly desktopFlows = new OAuthFlowManager();
   private readonly refreshMutex = new AsyncMutex();
+  // Serializes whole catalog refresh runs (fetch + locked commit). Automatic
+  // post-login discovery and the Settings/command-palette refresh are
+  // independently concurrent entry points, and the locked write predicate
+  // only verifies the credential — a slower, older run could otherwise
+  // commit last and overwrite newer provider/model results.
+  private readonly catalogRefreshMutex = new AsyncMutex();
   // Serializes desktop-login persist -> commit/rollback critical sections
   // across overlapping flows (see commitDesktopLogin for the invariant).
   private readonly loginCommitMutex = new AsyncMutex();
@@ -347,14 +362,17 @@ export class CoderOauthService {
           // flow starts. Kept in the section permanently — later logins
           // snapshot the new value and commit normally.
           next.coderDisconnectGeneration =
-            sanitizeDisconnectGeneration(section?.coderDisconnectGeneration) + 1;
-          // Discovered models were fetched from the deployment's AI Bridge at
-          // login time; they are meaningless without credentials and are refetched
-          // on the next login. discoveredModels stays PRESENT (as []) so the
-          // catalog reads as authoritatively empty, while manually added entries
-          // are user-managed data and survive the disconnect.
+            sanitizeGenerationCounter(section?.coderDisconnectGeneration) + 1;
+          // Discovered models/providers were fetched from the deployment's AI
+          // Gateway at login time; they are meaningless without credentials and
+          // are refetched on the next login. discoveredModels stays PRESENT
+          // (as []) so the catalog reads as authoritatively empty, while
+          // manually added entries (and additionalProviders) are user-managed
+          // data and survive the disconnect.
           next.models = manualModelEntries(section);
           next.discoveredModels = [];
+          next.discoveredProviders = [];
+          delete next.staleDiscoveredModels;
           return { value: next };
         });
         this.cachedAuth = null;
@@ -719,7 +737,7 @@ export class CoderOauthService {
     const section = this.config.loadProvidersConfig()?.coder as
       | { coderDisconnectGeneration?: unknown }
       | undefined;
-    return sanitizeDisconnectGeneration(section?.coderDisconnectGeneration);
+    return sanitizeGenerationCounter(section?.coderDisconnectGeneration);
   }
 
   /** True (and consumes the record) when `flowId` was cancelled before the flow registered. */
@@ -1264,9 +1282,7 @@ export class CoderOauthService {
         // disconnected. A counter comparison, not wall-clock ordering: clock
         // skew must neither let a pre-disconnect flow slip through nor lock
         // out every post-disconnect login.
-        const disconnectGeneration = sanitizeDisconnectGeneration(
-          section?.coderDisconnectGeneration
-        );
+        const disconnectGeneration = sanitizeGenerationCounter(section?.coderDisconnectGeneration);
         if (disconnectGeneration !== flowStartPersistedGeneration) {
           commitRefusalMessage = "Login was superseded by a disconnect";
           return null;
@@ -1300,7 +1316,12 @@ export class CoderOauthService {
         } else {
           delete next.models;
         }
+        // Fresh login: the previous deployment's catalog and provider set are
+        // meaningless; discovery (running right after commit) repopulates
+        // them. Deleted, not emptied, so routing fails open until then.
         delete next.discoveredModels;
+        delete next.discoveredProviders;
+        delete next.staleDiscoveredModels;
         return { value: next };
       });
       this.cachedAuth = null;
@@ -1623,33 +1644,101 @@ export class CoderOauthService {
   }
 
   // -------------------------------------------------------------------------
-  // Model list refresh (AI Bridge passthrough catalogs)
+  // Model list refresh (AI Gateway per-provider catalogs)
   // -------------------------------------------------------------------------
 
   /**
-   * One origin catalog request, classified:
-   * - "ok": 2xx with a valid payload — the origin's model list.
-   * - "unavailable": conclusive non-2xx (e.g. 404 when AI Bridge is not
-   *   entitled) — the origin serves nothing.
-   * - "error": network error, timeout, 5xx/408/429, auth failures (401/403),
-   *   or invalid payload — the origin's state is UNKNOWN and must not become
-   *   authoritative. Auth failures are transient by nature here: the access
-   *   token can expire or rotate between exchange and discovery, and a
-   *   catalog persisted from a rejected request would hide valid models
-   *   until the next login even after authentication recovers.
+   * List the deployment's configured AI Gateway provider instances, classified:
+   * - "ok": authoritative list of enabled, non-Copilot instances.
+   * - "unavailable": 403 (the endpoint requires site-wide AIProvider read,
+   *   which regular members lack) or 404 (older coderd without the endpoint)
+   *   — fall back to probing default provider names.
+   * - "error": transient failure; the provider set is unknown.
    */
-  private async fetchOriginCatalog(
-    auth: CoderOauthAuth,
-    origin: (typeof CODER_AIBRIDGE_ORIGINS)[number]
-  ): Promise<{ kind: "ok"; ids: string[] } | { kind: "unavailable" } | { kind: "error" }> {
+  private async fetchGatewayProviders(
+    auth: CoderOauthAuth
+  ): Promise<
+    { kind: "ok"; providers: CoderGatewayProvider[] } | { kind: "unavailable" } | { kind: "error" }
+  > {
     try {
-      const response = await fetch(`${coderAibridgeBaseUrl(auth.deploymentUrl, origin)}/models`, {
+      const response = await fetch(`${auth.deploymentUrl}${CODER_AI_PROVIDERS_PATH}`, {
         headers: {
           Authorization: `Bearer ${auth.access}`,
           Accept: "application/json",
         },
         signal: AbortSignal.timeout(CATALOG_FETCH_TIMEOUT_MS),
       });
+      if (!response.ok) {
+        if (response.status === 403 || response.status === 404) {
+          log.debug(`[Coder OAuth] Provider listing unavailable (${response.status})`);
+          return { kind: "unavailable" };
+        }
+        log.debug(`[Coder OAuth] Provider listing failed transiently (${response.status})`);
+        return { kind: "error" };
+      }
+      const json = (await response.json()) as unknown;
+      if (!Array.isArray(json)) {
+        log.debug("[Coder OAuth] Provider listing returned an invalid payload");
+        return { kind: "error" };
+      }
+      const providers: CoderGatewayProvider[] = [];
+      for (const entry of json) {
+        if (!isPlainObject(entry) || typeof entry.name !== "string" || !entry.name) {
+          continue;
+        }
+        const type = typeof entry.type === "string" ? entry.type : "";
+        // Disabled instances are unroutable; Copilot instances need
+        // request-time tokens only an official Copilot client can mint.
+        if (entry.enabled === false || type === "copilot") {
+          continue;
+        }
+        providers.push({ name: entry.name, type });
+      }
+      return { kind: "ok", providers };
+    } catch (error) {
+      log.debug(`[Coder OAuth] Failed to list gateway providers: ${getErrorMessage(error)}`);
+      return { kind: "error" };
+    }
+  }
+
+  /**
+   * One provider catalog request (GET <gateway>/<name>/v1/models), classified:
+   * - "ok": 2xx with a valid payload — the provider's model list.
+   * - "unavailable": conclusive non-2xx (404 when the provider instance does
+   *   not exist on the gateway, or AI Gateway is not entitled) — the provider
+   *   serves nothing.
+   * - "error": network error, timeout, 5xx/408/429, auth failures (401/403),
+   *   or invalid payload — the provider's state is UNKNOWN and must not become
+   *   authoritative. Auth failures are transient by nature here: the access
+   *   token can expire or rotate between exchange and discovery, and a
+   *   catalog persisted from a rejected request would hide valid models
+   *   until the next refresh even after authentication recovers. Upstreams
+   *   without a real /models route (e.g. AWS Bedrock behind the passthrough)
+   *   also land here and simply never contribute discovered entries.
+   */
+  private async fetchProviderCatalog(
+    auth: CoderOauthAuth,
+    provider: CoderGatewayProvider
+  ): Promise<{ kind: "ok"; ids: string[] } | { kind: "unavailable" } | { kind: "error" }> {
+    const providerName = provider.name;
+    try {
+      const headers: Record<string, string> = {
+        Authorization: `Bearer ${auth.access}`,
+        Accept: "application/json",
+      };
+      // /v1/models is a passthrough: Anthropic-wire upstreams reject requests
+      // without the required anthropic-version header with a conclusive 400,
+      // which would read as "no models" and hide every Anthropic model.
+      if (coderGatewayWireProtocol(provider.type) === "anthropic") {
+        headers["anthropic-version"] = "2023-06-01";
+      }
+      const response = await fetch(
+        `${coderAibridgeBaseUrl(auth.deploymentUrl, providerName)}/models`,
+        {
+          headers,
+          signal: AbortSignal.timeout(CATALOG_FETCH_TIMEOUT_MS),
+        }
+      );
 
       if (!response.ok) {
         if (
@@ -1659,68 +1748,130 @@ export class CoderOauthService {
           response.status === 401 ||
           response.status === 403
         ) {
-          log.debug(`[Coder OAuth] ${origin} model list failed transiently (${response.status})`);
+          log.debug(
+            `[Coder OAuth] ${providerName} model list failed transiently (${response.status})`
+          );
           return { kind: "error" };
         }
-        log.debug(`[Coder OAuth] ${origin} model list unavailable (${response.status})`);
+        log.debug(`[Coder OAuth] ${providerName} model list unavailable (${response.status})`);
         return { kind: "unavailable" };
       }
 
       const json = (await response.json()) as unknown;
       if (!isPlainObject(json) || !Array.isArray(json.data)) {
-        log.debug(`[Coder OAuth] ${origin} model list returned an invalid payload`);
+        log.debug(`[Coder OAuth] ${providerName} model list returned an invalid payload`);
         return { kind: "error" };
       }
       const ids: string[] = [];
       for (const entry of json.data) {
         if (isPlainObject(entry) && typeof entry.id === "string" && entry.id) {
-          ids.push(`${origin}/${entry.id}`);
+          ids.push(`${providerName}/${entry.id}`);
         }
       }
       return { kind: "ok", ids };
     } catch (error) {
-      log.debug(`[Coder OAuth] Failed to fetch ${origin} models: ${getErrorMessage(error)}`);
+      log.debug(`[Coder OAuth] Failed to fetch ${providerName} models: ${getErrorMessage(error)}`);
       return { kind: "error" };
     }
   }
 
-  private async refreshBridgeModels(auth: CoderOauthAuth): Promise<void> {
-    // Origin catalogs are independent: fetch them concurrently and bound each
-    // request, so one stalled origin can neither delay nor starve a healthy
-    // one — otherwise users would see an empty catalog indefinitely despite
-    // an available upstream. Per-origin results keep the deterministic
-    // CODER_AIBRIDGE_ORIGINS ordering. Transient failures are retried.
-    const perOrigin = await Promise.all(
-      CODER_AIBRIDGE_ORIGINS.map(async (origin) => {
-        for (let attempt = 0; ; attempt++) {
-          const result = await this.fetchOriginCatalog(auth, origin);
-          if (result.kind !== "error" || attempt >= CATALOG_FETCH_RETRIES) {
-            return result;
-          }
-          await new Promise((resolve) => setTimeout(resolve, CATALOG_RETRY_DELAY_MS));
-        }
-      })
+  /** Retry the transient ("error") outcomes of a discovery request. */
+  private async retryTransient<T extends { kind: string }>(
+    fetchOnce: () => Promise<T>
+  ): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+      const result = await fetchOnce();
+      if (result.kind !== "error" || attempt >= CATALOG_FETCH_RETRIES) {
+        return result;
+      }
+      await new Promise((resolve) => setTimeout(resolve, CATALOG_RETRY_DELAY_MS));
+    }
+  }
+
+  /**
+   * Re-discover the deployment's AI Gateway providers and model catalogs with
+   * the stored credential. Runs automatically after login; exposed to the UI
+   * as the Settings "Refresh models" action so new providers/models don't
+   * require a re-login.
+   */
+  async refreshModels(): Promise<Result<void, string>> {
+    const authResult = await this.getValidAuth();
+    if (!authResult.success) {
+      return Err(authResult.error);
+    }
+    return this.refreshBridgeModels(authResult.data);
+  }
+
+  private async refreshBridgeModels(auth: CoderOauthAuth): Promise<Result<void, string>> {
+    await using _lock = await this.catalogRefreshMutex.acquire();
+    // `return await` is load-bearing: a bare `return` would run the lock
+    // disposal before the returned promise settles, releasing the mutex
+    // while the refresh is still in flight.
+    return await this.refreshBridgeModelsSerialized(auth);
+  }
+
+  private async refreshBridgeModelsSerialized(auth: CoderOauthAuth): Promise<Result<void, string>> {
+    // Cross-process refresh ordering: catalogRefreshMutex serializes only
+    // THIS process's refreshes, but multiple Mux processes share
+    // providers.jsonc (Config.withProvidersFileLock exists for exactly that).
+    // Snapshot the persisted catalog generation BEFORE any fetch; the locked
+    // commit below refuses when it moved, so a refresh that captured an
+    // older provider list can never overwrite a catalog another process
+    // committed mid-flight. A stale snapshot read here is safe: it can only
+    // cause a conservative refusal, never a stale commit.
+    const refreshStartGeneration = sanitizeGenerationCounter(
+      (this.config.loadProvidersConfig()?.coder as { coderCatalogGeneration?: unknown } | undefined)
+        ?.coderCatalogGeneration
+    );
+    // The deployment's configured provider instances decide which gateway
+    // routes exist (each is mounted at /<name>/...), so list them first.
+    const listing = await this.retryTransient(() => this.fetchGatewayProviders(auth));
+    if (listing.kind === "error") {
+      // The provider set is unknown; keep the catalog in its current state
+      // (fail-open after login) rather than guessing.
+      log.debug("[Coder OAuth] Skipping catalog write: provider listing failed");
+      return Err("Failed to list the deployment's AI Gateway providers");
+    }
+
+    // When the admin-only listing is unavailable (regular members, older
+    // coderd), probe instead: the default type-named routes plus every name
+    // already known from earlier discovery or user config. Absent routes 404
+    // conclusively, so probing converges on the configured set for
+    // default-named deployments; custom-named instances stay reachable via
+    // the user-managed additionalProviders escape hatch.
+    const authoritative = listing.kind === "ok";
+    let providers: CoderGatewayProvider[];
+    if (authoritative) {
+      providers = listing.providers;
+    } else {
+      const section = this.config.loadProvidersConfig()?.coder as
+        | Record<string, unknown>
+        | undefined;
+      const known = new Map<string, CoderGatewayProvider>();
+      for (const name of CODER_GATEWAY_DEFAULT_PROVIDER_NAMES) {
+        known.set(name, { name, type: name });
+      }
+      for (const provider of [
+        ...parseCoderGatewayProviders(section?.discoveredProviders),
+        ...parseCoderGatewayProviders(section?.additionalProviders),
+      ]) {
+        known.set(provider.name, provider);
+      }
+      providers = [...known.values()];
+    }
+
+    // Provider catalogs are independent: fetch them concurrently and bound
+    // each request, so one stalled provider can neither delay nor starve a
+    // healthy one. Transient failures are retried per provider.
+    const results = await Promise.all(
+      providers.map(async (provider) => ({
+        provider,
+        result: await this.retryTransient(() => this.fetchProviderCatalog(auth, provider)),
+      }))
     );
 
-    // The persisted catalog is authoritative for routing (see
-    // gatewayModelCatalog.ts), so it may only be written when every origin's
-    // state is conclusive. If any origin still errors after retries, keep the
-    // catalog in its post-login "unknown" state (models key absent, routing
-    // fails open) rather than persisting a partial list that would block the
-    // failed origin's models until the next login even after the bridge
-    // recovers.
-    if (perOrigin.some((result) => result.kind === "error")) {
-      log.debug("[Coder OAuth] Skipping catalog write: discovery failed for at least one origin");
-      return;
-    }
-    // The COMPLETE discovered catalog is persisted, deliberately without
-    // policy filtering: policies refresh remotely, so a temporarily
-    // restrictive policy must not carve models out of the durable catalog
-    // (they would stay unroutable until the next login even after the policy
-    // broadens). Policy is applied at exposure time instead — getConfig()
-    // filters the reported lists, routing checks the current policy, and the
-    // factory enforces it per model at creation.
-    const modelIds = perOrigin.flatMap((result) => (result.kind === "ok" ? result.ids : []));
+    const everyFetchFailed =
+      results.length > 0 && results.every(({ result }) => result.kind === "error");
 
     // Discovery races logins/disconnects: the flow resolves before this runs,
     // so a newer login (or a disconnect) may replace or clear the stored
@@ -1728,17 +1879,143 @@ export class CoderOauthService {
     // catalog write happen in ONE locked mutation, so only the login whose
     // tokens are still current can commit — a stale discovery can never
     // repopulate models over a disconnect or a newer deployment's catalog.
-    // The catalog is always overwritten — including with an empty list — so a
-    // re-login against a different deployment (whose catalogs may be empty or
-    // unentitled) never keeps offering the previous deployment's models.
+    // The credential check also pins the deployment, so per-provider
+    // carry-forward below can only resurrect entries from THIS deployment.
     // `models` stays the user-visible union: manually added entries (those
     // not recorded in discoveredModels) are carried forward ahead of the
     // fresh catalog, so discovery never clobbers user-managed data.
+    let catalogInconclusive = false;
+    let supersededByConcurrentRefresh = false;
     const setResult = await this.providerService.updateProviderSection("coder", (section) => {
       const stored = parseCoderOauthAuth(section?.coderOauth);
-      if (!stored || stored.access !== auth.access || stored.deploymentUrl !== auth.deploymentUrl) {
+      // Compare the stable login-session lineage, not the access token:
+      // ordinary requests rotate the token while catalogs are fetched
+      // (rotations preserve sessionId — see refreshTokens), and rejecting a
+      // same-session rotation would silently discard the fetched catalog.
+      // A new login mints a fresh sessionId, so stale discoveries still lose.
+      if (
+        !stored ||
+        stored.sessionId !== auth.sessionId ||
+        stored.deploymentUrl !== auth.deploymentUrl
+      ) {
         return null;
       }
+      // Same counter-comparison pattern as coderDisconnectGeneration, checked
+      // inside the providers-file lock so compare + increment are atomic
+      // ACROSS processes: a catalog commit anywhere since this refresh began
+      // means these results were fetched against a superseded provider
+      // list/catalog — refuse rather than let the older refresh win.
+      const currentCatalogGeneration = sanitizeGenerationCounter(section?.coderCatalogGeneration);
+      if (currentCatalogGeneration !== refreshStartGeneration) {
+        supersededByConcurrentRefresh = true;
+        return null;
+      }
+      // Prior catalog state must be read INSIDE the locked mutation (a
+      // concurrent login/refresh may have changed it since discovery began).
+      const previousKnown = Array.isArray(section?.discoveredModels);
+      const previousDiscovered = Array.isArray(section?.discoveredModels)
+        ? section.discoveredModels.filter((id): id is string => typeof id === "string")
+        : [];
+      // Display state retained through an earlier inconclusive refresh (the
+      // authoritative catalog was deleted then; this marker is all that
+      // remains of it). Never authoritative prior state — it only keeps
+      // entries user-visible across consecutive failed refreshes.
+      const staleDiscovered = Array.isArray(section?.staleDiscoveredModels)
+        ? section.staleDiscoveredModels.filter((id): id is string => typeof id === "string")
+        : [];
+      const previousProviders = parseCoderGatewayProviders(section?.discoveredProviders);
+
+      // Per-provider conclusiveness: "ok" replaces the provider's entries,
+      // "unavailable" (404) conclusively clears them, and a transient "error"
+      // carries the provider's previous entries forward — one provider whose
+      // upstream rejects /models (Bedrock) or merely flaked must not poison
+      // every other provider's refresh, and a recovered provider heals on the
+      // next refresh instead of the next login. Carry-forward requires PRIOR
+      // STATE for that provider (a prior catalog naming it, or prior entries
+      // under its prefix): an errored provider without prior state — fresh
+      // login, or an instance the admin just added — makes the whole catalog
+      // inconclusive, because persisting the other providers' lists would
+      // read as an authoritative catalog that blocks every model of the
+      // failed provider until a later successful refresh.
+      // The COMPLETE discovered catalog is persisted, deliberately without
+      // policy filtering: policies refresh remotely, so a temporarily
+      // restrictive policy must not carve models out of the durable catalog.
+      // Policy is applied at exposure time instead — getConfig() filters the
+      // reported lists, routing checks the current policy, and the factory
+      // enforces it per model at creation.
+      const modelIds: string[] = [];
+      const nextProviders: CoderGatewayProvider[] = [];
+      for (const { provider, result } of results) {
+        const previous = previousProviders.find((prev) => prev.name === provider.name);
+        // Prior state must also TYPE-match under an authoritative listing:
+        // when the admin changes an instance's type (same name), the old
+        // type's model IDs are not valid carry-forward state — the write
+        // persists the NEW type, so carried entries would stay selectable and
+        // be sent over the new wire protocol until a successful refresh.
+        // A name with no stored metadata previously resolved via the
+        // name === type default, so that default is its effective prior type.
+        // The probe path persists `previous` (not the probe default), so no
+        // type change can occur there and the check is skipped.
+        const previousType = previous?.type ?? provider.name;
+        const typeUnchanged = !authoritative || previousType === provider.type;
+        const hasPriorState =
+          previousKnown &&
+          typeUnchanged &&
+          (previous !== undefined ||
+            previousDiscovered.some((id) => id.startsWith(`${provider.name}/`)));
+        if (result.kind === "ok") {
+          modelIds.push(...result.ids);
+          if (!authoritative) {
+            // The probe confirmed the route exists; prefer previously stored
+            // metadata (its type may come from an earlier authoritative
+            // listing) over the probe-derived name === type default.
+            nextProviders.push(previous ?? provider);
+          }
+        } else if (result.kind === "error") {
+          if (!hasPriorState) {
+            catalogInconclusive = true;
+            // Consecutive failed refreshes: after an inconclusive refresh the
+            // authoritative catalog is gone (previousKnown false), so a
+            // transiently failing provider has no carry-forward state — but
+            // its stale display entries must stay user-visible instead of
+            // vanishing from Settings/the selector. The catalog stays
+            // inconclusive, so these IDs land back in models +
+            // staleDiscoveredModels, never in discoveredModels. Type-gated
+            // like authoritative carry-forward.
+            if (typeUnchanged) {
+              modelIds.push(...staleDiscovered.filter((id) => id.startsWith(`${provider.name}/`)));
+            }
+            continue;
+          }
+          modelIds.push(...previousDiscovered.filter((id) => id.startsWith(`${provider.name}/`)));
+          if (!authoritative && previous) {
+            nextProviders.push(previous);
+          }
+        } else if (!authoritative && previous !== undefined) {
+          // "unavailable" on the PROBE path for an instance recorded by an
+          // earlier authoritative listing: the 404 proves only that the
+          // upstream serves no /models route — not that the admin removed
+          // the gateway instance (only an authoritative listing can say
+          // that). Dropping it would leave manually configured
+          // coder:<custom>/<model> entries unresolvable until a listing
+          // succeeds again, so keep the metadata and carry prior entries
+          // forward like a transient error.
+          nextProviders.push(previous);
+          if (previousKnown) {
+            modelIds.push(...previousDiscovered.filter((id) => id.startsWith(`${provider.name}/`)));
+          } else {
+            // No authoritative prior catalog: stale display entries must not
+            // be promoted into a conclusive write.
+            catalogInconclusive = true;
+            modelIds.push(...staleDiscovered.filter((id) => id.startsWith(`${provider.name}/`)));
+          }
+        }
+        // "unavailable" otherwise: the authoritative listing already names
+        // every existing instance (a listed instance whose /models 404s
+        // conclusively serves no catalog), and probe-default names carry no
+        // recorded metadata — the route is conclusively absent; drop it.
+      }
+
       const manual = manualModelEntries(section);
       const manualIds = new Set(manual.map((entry) => maybeGetProviderModelEntryId(entry)));
       // User-removed discovered models (recorded by setModels) stay excluded:
@@ -1749,19 +2026,101 @@ export class CoderOauthService {
           ? section.removedModels.filter((id): id is string => typeof id === "string")
           : []
       );
-      const merged = [
-        ...manual,
-        ...modelIds.filter((id) => !manualIds.has(id) && !removed.has(id)),
-      ];
-      return {
-        value: { ...(section ?? {}), models: merged, discoveredModels: modelIds },
+      // User-visible union: manual entries first, then discovered/carried IDs.
+      const retainedDiscovered = modelIds.filter((id) => !manualIds.has(id) && !removed.has(id));
+      const merged = [...manual, ...retainedDiscovered];
+
+      if (catalogInconclusive) {
+        // The catalog cannot be written as authoritative. Keep/flip it to
+        // UNKNOWN so routing fails open (the failed provider's models stay
+        // reachable), losing at worst one refresh's worth of catalog data —
+        // the next successful refresh rebuilds it. The healthy providers'
+        // fetched and carried-forward entries STAY user-visible in `models`
+        // (only the authoritative `discoveredModels` marker is dropped):
+        // wiping them would empty Settings and the model selector until a
+        // later fully successful refresh. The authoritative admin listing is
+        // conclusive independently of the catalog fetches, so it is still
+        // persisted: custom-named instances must stay resolvable (e.g. for
+        // manually added models). Probe-derived metadata is just the
+        // name === type default that resolveCoderGatewayProvider already
+        // applies without persistence, so the probe path persists nothing
+        // new and keeps any previously stored metadata.
+        const next = { ...(section ?? {}) };
+        if (merged.length > 0) {
+          next.models = merged;
+        } else {
+          delete next.models;
+        }
+        delete next.discoveredModels;
+        // Record which retained entries came from discovery so
+        // manualModelEntries keeps classifying them as catalog data (cleared
+        // by disconnect/login, excluded from manual carry-forward) while the
+        // authoritative marker is absent.
+        if (retainedDiscovered.length > 0) {
+          next.staleDiscoveredModels = retainedDiscovered;
+        } else {
+          delete next.staleDiscoveredModels;
+        }
+        if (authoritative) {
+          next.discoveredProviders = providers;
+        }
+        // Even an inconclusive write is a catalog commit: a slower concurrent
+        // refresh must re-fetch rather than overwrite the retained state.
+        next.coderCatalogGeneration = currentCatalogGeneration + 1;
+        return { value: next };
+      }
+
+      if (authoritative) {
+        // The admin listing is authoritative metadata: every listed instance
+        // is persisted (routable for manually added models even when its
+        // catalog fetch failed), and deleted/disabled instances drop out.
+        nextProviders.length = 0;
+        nextProviders.push(...providers);
+      }
+      // Conclusive catalog: the stale marker's entries are either re-listed
+      // in discoveredModels or conclusively gone.
+      const conclusive: Record<string, unknown> = {
+        ...(section ?? {}),
+        models: merged,
+        discoveredModels: modelIds,
+        discoveredProviders: nextProviders,
+        coderCatalogGeneration: currentCatalogGeneration + 1,
       };
+      delete conclusive.staleDiscoveredModels;
+      return { value: conclusive };
     });
     if (!setResult.success) {
       log.debug(`[Coder OAuth] Failed to persist bridge models: ${setResult.error}`);
-    } else if (!setResult.data.applied) {
-      log.debug("[Coder OAuth] Skipping stale model catalog write (login superseded)");
+      return Err(setResult.error);
     }
+    if (catalogInconclusive || everyFetchFailed) {
+      // The catalog itself was not conclusively refreshed (at most provider
+      // metadata and carried-forward entries were persisted): surface the
+      // failure so the user knows to refresh again.
+      log.debug("[Coder OAuth] Catalog refresh inconclusive: provider fetches failed transiently");
+      return Err(
+        everyFetchFailed
+          ? "Model discovery failed for every AI Gateway provider"
+          : "Model discovery failed for at least one AI Gateway provider; try refreshing again"
+      );
+    }
+    if (!setResult.data.applied) {
+      // Nothing was persisted — report failure so Settings/palette callers
+      // don't claim models were refreshed when the fetched catalog was
+      // discarded (login superseded, disconnected mid-refresh, or another
+      // process committed a newer catalog first).
+      log.debug(
+        supersededByConcurrentRefresh
+          ? "[Coder OAuth] Skipping stale model catalog write (concurrent refresh committed first)"
+          : "[Coder OAuth] Skipping stale model catalog write (login superseded)"
+      );
+      return Err(
+        supersededByConcurrentRefresh
+          ? "Model refresh superseded by a concurrent refresh; try again"
+          : "Model refresh superseded by a newer login; try again"
+      );
+    }
+    return Ok(undefined);
   }
 
   // -------------------------------------------------------------------------

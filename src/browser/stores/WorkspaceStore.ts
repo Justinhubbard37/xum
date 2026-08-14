@@ -73,7 +73,7 @@ import { WorkspaceConsumerManager } from "./WorkspaceConsumerManager";
 import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
 import { sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
 import type { TokenConsumer } from "@/common/types/chatStats";
-import { normalizeToCanonical } from "@/common/utils/ai/models";
+import { normalizeUsageModelKey } from "@/common/utils/providers/modelEntries";
 import type { z } from "zod";
 import type { SessionUsageFileSchema } from "@/common/orpc/schemas/chatStats";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
@@ -296,6 +296,12 @@ export interface WorkspaceUsageState {
   liveUsage?: ChatUsageDisplay;
   /** Live cost usage during streaming (cumulative across all steps) */
   liveCostUsage?: ChatUsageDisplay;
+  /**
+   * Request-pinned metadata identity of the active stream (backend-stamped
+   * at stream start). Consumers keying/pricing live Coder usage must prefer
+   * it over re-resolving the raw model against a refreshed providers config.
+   */
+  liveMetadataModel?: string;
 }
 
 /**
@@ -909,15 +915,28 @@ export class WorkspaceStore {
       const model = streamEndData.metadata?.model;
       const rawUsage = streamEndData.metadata?.usage;
       const providerMetadata = streamEndData.metadata?.providerMetadata;
+      // Request-pinned metadata identity stamped by the backend at stream
+      // start. A Coder catalog refresh can remove/retag the instance while
+      // the request is active; resolving the raw model against the browser's
+      // freshly refreshed config here would price and bucket the delta
+      // differently from the backend ledger until reload.
+      const pinnedMetadataModel = streamEndData.metadata?.metadataModel;
       if (model && rawUsage) {
         const usage = createDisplayUsage(
           rawUsage,
           model,
           providerMetadata,
-          this.resolveMetadataModel(model)
+          pinnedMetadataModel ?? this.resolveMetadataModel(model)
         );
         if (usage) {
-          const normalizedModel = normalizeToCanonical(model);
+          // Must match the backend's ledger keys (recordSessionUsage): Coder
+          // identities use the stream's pinned record-time metadata identity,
+          // all others the canonical normalizeUsageModelKey, so the live
+          // delta accumulates under the same key.
+          const normalizedModel =
+            model.startsWith("coder:") && pinnedMetadataModel
+              ? pinnedMetadataModel
+              : normalizeUsageModelKey(model, this.providersConfig);
           const current = this.sessionUsage.get(workspaceId) ?? {
             byModel: {},
             version: 1 as const,
@@ -2730,6 +2749,11 @@ export class WorkspaceStore {
 
       // Live streaming data (unchanged)
       const activeStreamId = aggregator.getActiveStreamMessageId();
+      // Request-pinned identity stamped by the backend at stream start: a
+      // Coder catalog refresh can remove/retag the instance mid-stream, and
+      // re-resolving the raw model against the refreshed config would price
+      // and bucket live usage differently from the backend ledger.
+      const liveMetadataModel = aggregator.getActiveStreamMetadataModel();
       const rawContextUsage = activeStreamId
         ? aggregator.getActiveStreamUsage(activeStreamId)
         : undefined;
@@ -2742,7 +2766,7 @@ export class WorkspaceStore {
               rawContextUsage,
               model,
               rawStepProviderMetadata,
-              this.resolveMetadataModel(model)
+              liveMetadataModel ?? this.resolveMetadataModel(model)
             )
           : undefined;
 
@@ -2758,7 +2782,7 @@ export class WorkspaceStore {
               rawCumulativeUsage,
               model,
               rawCumulativeProviderMetadata,
-              this.resolveMetadataModel(model)
+              liveMetadataModel ?? this.resolveMetadataModel(model)
             )
           : undefined;
 
@@ -2770,6 +2794,7 @@ export class WorkspaceStore {
         totalTokens,
         liveUsage,
         liveCostUsage,
+        liveMetadataModel,
       };
     });
   }

@@ -364,6 +364,8 @@ function stubCommonStreamMessageDependencies(args: {
           canonicalProviderName:
             args.canonicalProviderName ?? providerNameFromModelString(canonicalModelString),
           canonicalModelId: args.canonicalModelId ?? modelIdFromModelString(canonicalModelString),
+          wireProviderName:
+            args.canonicalProviderName ?? providerNameFromModelString(canonicalModelString),
           routedThroughGateway: false,
           ...(args.routeProvider != null ? { routeProvider: args.routeProvider } : {}),
         },
@@ -1113,6 +1115,30 @@ describe("AIService.createModel (Codex OAuth routing)", () => {
   });
 });
 
+describe("AIService.createModelWithPinnedMetadata", () => {
+  it("derives the pinned identity from the effective route when a coder selection falls away", async () => {
+    using muxHome = new DisposableTempDir("pinned-metadata-fallback-away");
+
+    // Cross-typed canonical-named instance (name openai, type anthropic) with
+    // NO coder credential: the gateway is not routable, so createModel falls
+    // away to direct OpenAI. The pinned identity must follow that effective
+    // route — resolving the raw selection would price/bucket this spend as
+    // anthropic:<model> despite the request being served by OpenAI.
+    await writeProvidersConfig(muxHome.path, {
+      coder: { additionalProviders: [{ name: "openai", type: "anthropic" }] },
+      openai: { apiKey: "sk-test-key" },
+    });
+
+    const service = createBasicAIService(muxHome.path).service;
+    const result = await service.createModelWithPinnedMetadata("coder:openai/claude-opus-4-1");
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.metadataModel).toBe("openai:claude-opus-4-1");
+    }
+  });
+});
+
 describe("AIService.streamMessage compaction boundary slicing", () => {
   interface StreamMessageHarness {
     config: Config;
@@ -1613,6 +1639,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
             canonicalModelString,
             canonicalProviderName: "openai" as ProviderName,
             canonicalModelId: canonicalModelString.split(":")[1] ?? canonicalModelString,
+            wireProviderName: "openai",
             routedThroughGateway: isGateway,
             routeProvider: (isGateway ? "mux-gateway" : "openai") as ProviderName,
           },
@@ -1731,6 +1758,473 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(preparedOpenAIOptions.promptCacheKey).toStartWith("mux-v1-");
     expect(preparedMetadataPatch.routeProvider).toBe("openai");
     expect(preparedMetadataPatch.routedThroughGateway).toBe(false);
+  });
+
+  it("keeps the raw Coder identity when rebuilding fallback provider options", async () => {
+    // A cross-typed canonical-name instance ({name: "openai", type:
+    // "anthropic"}) canonicalizes coder:openai/x to openai:x by NAME while the
+    // wire is Anthropic. The fallback rebuild must hand the RAW coder string
+    // to option/header/cache builders (like the main path does) so they can
+    // recover the instance metadata — the canonical string would emit OpenAI
+    // options for an Anthropic-wire request.
+    using muxHome = new DisposableTempDir("ai-service-fallback-coder-raw-identity");
+    const workspaceId = "workspace-fallback-coder-raw";
+    const projectPath = path.join(muxHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const sourceModel = "openai:gpt-5.2";
+    const fallbackModel = "coder:openai/claude-opus-4-5";
+    await writeMainConfig(muxHome.path, {
+      modelFallbacks: { [sourceModel]: { models: [fallbackModel] } },
+    });
+
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    const harness = createHarness(muxHome.path, metadata, { useRequestedModelString: true });
+    // Model parameter overrides must resolve from the instance TYPE
+    // (anthropic), not the name-canonicalized provider (openai): the OpenAI
+    // wildcard here must NOT leak into the Anthropic-wire request.
+    harness.config.saveProvidersConfig({
+      anthropic: { modelParameters: { "claude-opus-4-5": { anthropicKnob: "yes" } } },
+      openai: { modelParameters: { "*": { openaiKnob: "no" } } },
+    });
+
+    const providerModelFactory = Reflect.get(harness.service, "providerModelFactory") as
+      | ProviderModelFactory
+      | undefined;
+    if (!providerModelFactory) {
+      throw new Error("Expected AIService.providerModelFactory in fallback test");
+    }
+    // Mirror the real factory: name-based canonicalization rewrites the coder
+    // string, while the wire comes from instance metadata.
+    spyOn(providerModelFactory, "resolveAndCreateModel").mockImplementation(
+      (requestedModelString) => {
+        const isCoder = requestedModelString.startsWith("coder:");
+        return Promise.resolve({
+          success: true,
+          data: {
+            model: Object.create(null) as LanguageModel,
+            effectiveModelString: requestedModelString,
+            canonicalModelString: isCoder ? "openai:claude-opus-4-5" : requestedModelString,
+            canonicalProviderName: "openai",
+            canonicalModelId: isCoder
+              ? "claude-opus-4-5"
+              : (requestedModelString.split(":")[1] ?? requestedModelString),
+            wireProviderName: isCoder ? "anthropic" : "openai",
+            ...(isCoder
+              ? {
+                  coderWire: {
+                    origin: "anthropic" as const,
+                    modelId: "claude-opus-4-5",
+                    providerType: "anthropic",
+                  },
+                }
+              : {}),
+            routedThroughGateway: false,
+            ...(isCoder ? { routeProvider: "coder" as ProviderName } : {}),
+          },
+        });
+      }
+    );
+    const providerService = Reflect.get(harness.service, "providerService") as
+      | ProviderService
+      | undefined;
+    if (!providerService) {
+      throw new Error("Expected AIService.providerService in fallback test");
+    }
+    spyOn(providerService, "getConfig").mockReturnValue({
+      openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        discoveredProviders: [{ name: "openai", type: "anthropic" }],
+      },
+    });
+
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("latest-user", "user", "fix the issue")],
+      workspaceId,
+      modelString: sourceModel,
+      thinkingLevel: "high",
+    });
+    expect(result.success).toBe(true);
+
+    const modelFallback = harness.startStreamCalls[0]?.[START_STREAM_MODEL_FALLBACK_INDEX] as
+      | ModelFallbackOptions
+      | undefined;
+    if (!modelFallback) {
+      throw new Error("Expected modelFallback options on startStream");
+    }
+    const prepared = await modelFallback.prepare(fallbackModel);
+    expect(prepared.success).toBe(true);
+    if (!prepared.success) {
+      throw new Error(prepared.error);
+    }
+
+    // Anthropic-wire options, not OpenAI: the builders saw the raw coder
+    // string and resolved the instance's type from providersConfig.
+    expect(prepared.data.providerOptions).toHaveProperty("anthropic");
+    expect(prepared.data.providerOptions).not.toHaveProperty("openai");
+
+    // Override identity followed the instance type: the anthropic block's
+    // model entry applied; the OpenAI wildcard did not leak in.
+    const preparedAnthropicNamespace = (
+      prepared.data.providerOptions as Record<string, Record<string, unknown>>
+    ).anthropic;
+    expect(preparedAnthropicNamespace.anthropicKnob).toBe("yes");
+    expect(preparedAnthropicNamespace).not.toHaveProperty("openaiKnob");
+
+    // The returned request keeps the RAW identity: StreamManager keys
+    // system/tool cache-control and metadata resolution on this string, and
+    // the canonical openai:* form would drop Anthropic cache markers.
+    expect(prepared.data.modelString).toBe(fallbackModel);
+
+    // Capability lookups saw the raw identity too: the fallback toolset was
+    // built for the instance's Claude upstream, not for canonical "openai:".
+    const fallbackToolConfig = harness.getToolsForModelSpy.mock.calls.at(-1)?.[1] as
+      | { capabilityModelString?: string }
+      | undefined;
+    expect(fallbackToolConfig?.capabilityModelString).toBe("anthropic:claude-opus-4-5");
+
+    // Tool assembly keys on the WIRE identity (anthropic:<model>): the raw
+    // coder string would parse as provider "coder" and skip the Anthropic
+    // tool branch, while canonical "openai:" selects the wrong family.
+    expect(harness.getToolsForModelSpy.mock.calls.at(-1)?.[0]).toBe("anthropic:claude-opus-4-5");
+  });
+
+  it("derives the main-path capability model from the raw Coder identity", async () => {
+    // aiService's capabilityModelString must resolve from the RAW selection:
+    // canonicalization rewrites coder:openai/x (type anthropic) to openai:x,
+    // which can no longer consult the instance metadata — tool/instruction
+    // decisions would treat a Claude model as OpenAI.
+    using muxHome = new DisposableTempDir("ai-service-main-coder-raw-capability");
+    const workspaceId = "workspace-main-coder-raw";
+    const projectPath = path.join(muxHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const modelString = "coder:openai/claude-opus-4-5";
+
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    const harness = createHarness(muxHome.path, metadata, { useRequestedModelString: true });
+
+    const providerModelFactory = Reflect.get(harness.service, "providerModelFactory") as
+      | ProviderModelFactory
+      | undefined;
+    if (!providerModelFactory) {
+      throw new Error("Expected AIService.providerModelFactory in capability test");
+    }
+    spyOn(providerModelFactory, "resolveAndCreateModel").mockResolvedValue({
+      success: true,
+      data: {
+        model: Object.create(null) as LanguageModel,
+        effectiveModelString: modelString,
+        canonicalModelString: "openai:claude-opus-4-5",
+        canonicalProviderName: "openai",
+        canonicalModelId: "claude-opus-4-5",
+        wireProviderName: "anthropic",
+        coderWire: {
+          origin: "anthropic" as const,
+          modelId: "claude-opus-4-5",
+          providerType: "anthropic",
+        },
+        routedThroughGateway: false,
+        routeProvider: "coder",
+      },
+    });
+    const providerService = Reflect.get(harness.service, "providerService") as
+      | ProviderService
+      | undefined;
+    if (!providerService) {
+      throw new Error("Expected AIService.providerService in capability test");
+    }
+    spyOn(providerService, "getConfig").mockReturnValue({
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        discoveredProviders: [{ name: "openai", type: "anthropic" }],
+      },
+    });
+
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("latest-user", "user", "fix the issue")],
+      workspaceId,
+      modelString,
+      thinkingLevel: "off",
+    });
+    expect(result.success).toBe(true);
+
+    const toolConfig = harness.getToolsForModelSpy.mock.calls[0]?.[1] as
+      | { capabilityModelString?: string }
+      | undefined;
+    expect(toolConfig?.capabilityModelString).toBe("anthropic:claude-opus-4-5");
+    // Tool assembly gets the WIRE identity so provider-specific branches
+    // (Anthropic native web tools) fire; raw "coder:" would skip them.
+    expect(harness.getToolsForModelSpy.mock.calls[0]?.[0]).toBe("anthropic:claude-opus-4-5");
+  });
+
+  it("normalizes passthrough-gateway fallbacks to the canonical wire identity for tools", async () => {
+    // A coder: selection whose route fell back to mux-gateway (Coder
+    // disconnected / catalog rejection): the passthrough gateway forwards
+    // origin-shaped payloads, so tool assembly must key on the canonical
+    // wire identity — the mux-gateway:* prefix would skip the Anthropic
+    // tool branch entirely.
+    using muxHome = new DisposableTempDir("ai-service-main-coder-passthrough-fallback");
+    const workspaceId = "workspace-main-coder-passthrough";
+    const projectPath = path.join(muxHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const modelString = "coder:prod-anthropic/claude-opus-4-5";
+
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    const harness = createHarness(muxHome.path, metadata, { useRequestedModelString: true });
+
+    const providerModelFactory = Reflect.get(harness.service, "providerModelFactory") as
+      | ProviderModelFactory
+      | undefined;
+    if (!providerModelFactory) {
+      throw new Error("Expected AIService.providerModelFactory in passthrough-fallback test");
+    }
+    spyOn(providerModelFactory, "resolveAndCreateModel").mockResolvedValue({
+      success: true,
+      data: {
+        model: Object.create(null) as LanguageModel,
+        effectiveModelString: "mux-gateway:anthropic/claude-opus-4-5",
+        canonicalModelString: "coder:prod-anthropic/claude-opus-4-5",
+        canonicalProviderName: "coder",
+        canonicalModelId: "prod-anthropic/claude-opus-4-5",
+        wireProviderName: "anthropic",
+        routedThroughGateway: true,
+        routeProvider: "mux-gateway",
+      },
+    });
+    const providerService = Reflect.get(harness.service, "providerService") as
+      | ProviderService
+      | undefined;
+    if (!providerService) {
+      throw new Error("Expected AIService.providerService in passthrough-fallback test");
+    }
+    spyOn(providerService, "getConfig").mockReturnValue({
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        discoveredProviders: [{ name: "prod-anthropic", type: "anthropic" }],
+      },
+    });
+
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("latest-user", "user", "fix the issue")],
+      workspaceId,
+      modelString,
+      thinkingLevel: "off",
+    });
+    expect(result.success).toBe(true);
+
+    expect(harness.getToolsForModelSpy.mock.calls[0]?.[0]).toBe("anthropic:claude-opus-4-5");
+  });
+
+  it("marks openai-chat Coder instances as Chat Completions for tools and options", async () => {
+    // coder:openrouter/... is created via provider.chat(...): tool assembly
+    // must not add Responses-only native web_search, and providerOptions
+    // must build for the Chat Completions wire (via the wireFormat knob).
+    using muxHome = new DisposableTempDir("ai-service-main-coder-chat-wire");
+    const workspaceId = "workspace-main-coder-chat-wire";
+    const projectPath = path.join(muxHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const modelString = "coder:openrouter/openai/gpt-5.2";
+
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    const harness = createHarness(muxHome.path, metadata, { useRequestedModelString: true });
+
+    const providerModelFactory = Reflect.get(harness.service, "providerModelFactory") as
+      | ProviderModelFactory
+      | undefined;
+    if (!providerModelFactory) {
+      throw new Error("Expected AIService.providerModelFactory in chat-wire test");
+    }
+    spyOn(providerModelFactory, "resolveAndCreateModel").mockResolvedValue({
+      success: true,
+      data: {
+        model: Object.create(null) as LanguageModel,
+        effectiveModelString: modelString,
+        canonicalModelString: modelString,
+        canonicalProviderName: "coder",
+        canonicalModelId: "openrouter/openai/gpt-5.2",
+        wireProviderName: "openai",
+        coderWire: {
+          origin: "openai" as const,
+          modelId: "openai/gpt-5.2",
+          providerType: "openrouter",
+        },
+        routedThroughGateway: false,
+        routeProvider: "coder",
+      },
+    });
+    const providerService = Reflect.get(harness.service, "providerService") as
+      | ProviderService
+      | undefined;
+    if (!providerService) {
+      throw new Error("Expected AIService.providerService in chat-wire test");
+    }
+    spyOn(providerService, "getConfig").mockReturnValue({
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        discoveredProviders: [{ name: "openrouter", type: "openrouter" }],
+      },
+    });
+
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("latest-user", "user", "fix the issue")],
+      workspaceId,
+      modelString,
+      thinkingLevel: "off",
+    });
+    expect(result.success).toBe(true);
+
+    // Tools got the wire identity plus the Chat Completions marker.
+    expect(harness.getToolsForModelSpy.mock.calls[0]?.[0]).toBe("openai:openai/gpt-5.2");
+    const toolConfig = harness.getToolsForModelSpy.mock.calls[0]?.[1] as
+      | { openaiWireFormat?: string }
+      | undefined;
+    expect(toolConfig?.openaiWireFormat).toBe("chatCompletions");
+  });
+
+  it("forces the Responses format for openai-typed Coder instances", async () => {
+    // The factory always creates provider.responses(...) for type "openai",
+    // ignoring the wireFormat knob. A pre-existing chatCompletions setting
+    // (user option, or a refusal chain that started on direct OpenAI Chat
+    // Completions) must be overridden, or tools/options build Chat
+    // Completions payloads for a Responses request.
+    using muxHome = new DisposableTempDir("ai-service-main-coder-responses-wire");
+    const workspaceId = "workspace-main-coder-responses-wire";
+    const projectPath = path.join(muxHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const modelString = "coder:prod-openai/gpt-5.2";
+
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    const harness = createHarness(muxHome.path, metadata, { useRequestedModelString: true });
+
+    const providerModelFactory = Reflect.get(harness.service, "providerModelFactory") as
+      | ProviderModelFactory
+      | undefined;
+    if (!providerModelFactory) {
+      throw new Error("Expected AIService.providerModelFactory in responses-wire test");
+    }
+    spyOn(providerModelFactory, "resolveAndCreateModel").mockResolvedValue({
+      success: true,
+      data: {
+        model: Object.create(null) as LanguageModel,
+        effectiveModelString: modelString,
+        canonicalModelString: modelString,
+        canonicalProviderName: "coder",
+        canonicalModelId: "prod-openai/gpt-5.2",
+        wireProviderName: "openai",
+        coderWire: { origin: "openai" as const, modelId: "gpt-5.2", providerType: "openai" },
+        routedThroughGateway: false,
+        routeProvider: "coder",
+      },
+    });
+    const providerService = Reflect.get(harness.service, "providerService") as
+      | ProviderService
+      | undefined;
+    if (!providerService) {
+      throw new Error("Expected AIService.providerService in responses-wire test");
+    }
+    spyOn(providerService, "getConfig").mockReturnValue({
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        discoveredProviders: [{ name: "prod-openai", type: "openai" }],
+      },
+    });
+
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("latest-user", "user", "fix the issue")],
+      workspaceId,
+      modelString,
+      thinkingLevel: "off",
+      muxProviderOptions: { openai: { wireFormat: "chatCompletions" } },
+    });
+    expect(result.success).toBe(true);
+
+    expect(harness.getToolsForModelSpy.mock.calls[0]?.[0]).toBe("openai:gpt-5.2");
+    const toolConfig = harness.getToolsForModelSpy.mock.calls[0]?.[1] as
+      | { openaiWireFormat?: string }
+      | undefined;
+    expect(toolConfig?.openaiWireFormat).toBe("responses");
+  });
+
+  it("keeps unmappable cross-typed Coder overrides gateway-scoped", async () => {
+    // {name: "anthropic", type: "openai-compat"}: the instance is KNOWN but
+    // has no catalog identity (openai-compat fronts an arbitrary upstream).
+    // The override identity must stay coder-scoped — falling back to the
+    // name-canonical anthropic:<model> would apply the anthropic block's
+    // wildcard/model settings to an OpenAI-chat request and merge
+    // Anthropic-shaped extras into the OpenAI SDK namespace.
+    using muxHome = new DisposableTempDir("ai-service-main-coder-unmappable-overrides");
+    const workspaceId = "workspace-main-coder-unmappable-overrides";
+    const projectPath = path.join(muxHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const modelString = "coder:anthropic/gpt-5";
+
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    const harness = createHarness(muxHome.path, metadata, { useRequestedModelString: true });
+    harness.config.saveProvidersConfig({
+      anthropic: { modelParameters: { "*": { anthropicKnob: "yes" } } },
+      coder: { modelParameters: { "*": { coderKnob: "yes" } } },
+    });
+
+    const providerModelFactory = Reflect.get(harness.service, "providerModelFactory") as
+      | ProviderModelFactory
+      | undefined;
+    if (!providerModelFactory) {
+      throw new Error("Expected AIService.providerModelFactory in unmappable-overrides test");
+    }
+    spyOn(providerModelFactory, "resolveAndCreateModel").mockResolvedValue({
+      success: true,
+      data: {
+        model: Object.create(null) as LanguageModel,
+        effectiveModelString: modelString,
+        // Name-based canonicalization rewrites the canonical-route name even
+        // though the instance type is openai-compat.
+        canonicalModelString: "anthropic:gpt-5",
+        canonicalProviderName: "anthropic",
+        canonicalModelId: "gpt-5",
+        wireProviderName: "openai",
+        coderWire: { origin: "openai" as const, modelId: "gpt-5", providerType: "openai-compat" },
+        routedThroughGateway: false,
+        routeProvider: "coder",
+      },
+    });
+    const providerService = Reflect.get(harness.service, "providerService") as
+      | ProviderService
+      | undefined;
+    if (!providerService) {
+      throw new Error("Expected AIService.providerService in unmappable-overrides test");
+    }
+    spyOn(providerService, "getConfig").mockReturnValue({
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        discoveredProviders: [{ name: "anthropic", type: "openai-compat" }],
+      },
+    });
+
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("latest-user", "user", "fix the issue")],
+      workspaceId,
+      modelString,
+      thinkingLevel: "off",
+    });
+    expect(result.success).toBe(true);
+
+    // The anthropic block's extras never reach the OpenAI wire namespace;
+    // the coder block's own extras (explicit config for this gateway model) do.
+    const openaiOptions = openAIOptionsFromStartStreamCall(harness.startStreamCalls[0]);
+    expect(openaiOptions).not.toHaveProperty("anthropicKnob");
+    expect(openaiOptions.coderKnob).toBe("yes");
   });
 
   it("drops reasoning-only continuations before adding interrupted sentinels for non-Anthropic fallbacks", () => {
@@ -3426,6 +3920,7 @@ describe("AIService.streamMessage model parameter overrides", () => {
         canonicalModelString: "openai:gpt-5.2",
         canonicalProviderName: "openai",
         canonicalModelId: "gpt-5.2",
+        wireProviderName: "openai",
         routedThroughGateway: false,
         routeProvider: "openrouter",
       },
@@ -3465,6 +3960,77 @@ describe("AIService.streamMessage model parameter overrides", () => {
           exclude: false,
         },
       },
+    });
+  });
+
+  it("keeps type-derived standard settings but drops wire-mismatched extras for Coder instances", async () => {
+    // coder:google/<model> resolves overrides from the google block (instance
+    // TYPE), but the request speaks OpenAI-chat on the wire: standard call
+    // settings are SDK-agnostic and must apply, while Google-SDK-shaped
+    // extras must NOT merge into the OpenAI namespace.
+    using muxHome = new DisposableTempDir("ai-service-model-overrides-coder-wire-mismatch");
+    const projectPath = path.join(muxHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const workspaceId = "workspace-model-overrides-coder-wire-mismatch";
+    const modelString = "coder:google/gemini-3-pro";
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    const harness = createHarness(muxHome.path, metadata, { routeProvider: "coder" });
+
+    const providerModelFactory = Reflect.get(
+      harness.service,
+      "providerModelFactory"
+    ) as ProviderModelFactory;
+    const fakeModel = Object.create(null) as LanguageModel;
+    spyOn(providerModelFactory, "resolveAndCreateModel").mockResolvedValue({
+      success: true,
+      data: {
+        model: fakeModel,
+        effectiveModelString: modelString,
+        canonicalModelString: modelString,
+        canonicalProviderName: "coder",
+        canonicalModelId: "google/gemini-3-pro",
+        wireProviderName: "openai",
+        routedThroughGateway: false,
+        routeProvider: "coder",
+      },
+    });
+
+    const providersConfig = {
+      google: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        modelParameters: {
+          "*": {
+            max_output_tokens: 2048,
+            googleRoutingHint: { region: "us" },
+          },
+        },
+      },
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        discoveredProviders: [{ name: "google", type: "google" }],
+      },
+    };
+    spyOn(harness.config, "loadProvidersConfig").mockReturnValue(providersConfig);
+    const providerService = Reflect.get(harness.service, "providerService") as ProviderService;
+    spyOn(providerService, "getConfig").mockReturnValue(providersConfig);
+
+    spyOn(providerOptionsModule, "buildProviderOptions").mockReturnValue({
+      openai: { reasoningEffort: "low" },
+    });
+
+    const startStreamArgs = await streamAndGetStartStreamArgs(harness, workspaceId, modelString);
+    // Standard settings from the google block still apply (SDK-agnostic).
+    expect(callSettingsOverridesFromStartStreamCall(startStreamArgs)).toEqual({
+      maxOutputTokens: 2048,
+    });
+    // The Google-shaped extra did not leak into the OpenAI wire namespace.
+    expect(providerOptionsFromStartStreamCall(startStreamArgs)).toEqual({
+      openai: { reasoningEffort: "low" },
     });
   });
 
@@ -3543,6 +4109,7 @@ describe("AIService.streamMessage model parameter overrides", () => {
         canonicalModelString: "openrouter:deepseek/deepseek-r1",
         canonicalProviderName: "openrouter",
         canonicalModelId: "deepseek/deepseek-r1",
+        wireProviderName: "openrouter",
         routedThroughGateway: false,
       },
     });
@@ -3607,6 +4174,7 @@ describe("AIService.streamMessage model parameter overrides", () => {
         canonicalModelString: "openrouter:deepseek/deepseek-r1",
         canonicalProviderName: "openrouter",
         canonicalModelId: "deepseek/deepseek-r1",
+        wireProviderName: "openrouter",
         routedThroughGateway: false,
       },
     });
@@ -3646,6 +4214,77 @@ describe("AIService.streamMessage model parameter overrides", () => {
         },
       },
     });
+  });
+
+  it("builds options for the effective route when a Coder selection falls away to a passthrough gateway", async () => {
+    using muxHome = new DisposableTempDir("ai-service-coder-fallback-options");
+    const projectPath = path.join(muxHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const workspaceId = "workspace-coder-fallback-options";
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    const { config, historyService, initStateManager, service } = createBasicAIService(
+      muxHome.path
+    );
+    const startStreamCalls: unknown[][] = [];
+    stubCommonStreamMessageDependencies({
+      service,
+      config,
+      historyService,
+      initStateManager,
+      metadata,
+      startStreamCalls,
+    });
+    // The google-typed instance metadata is present: resolving the RAW
+    // coder: selection against it yields the gateway's OpenAI-chat wire —
+    // but this request FELL AWAY to the passthrough mux-gateway, which
+    // forwards native Google bytes, so the options must use the google
+    // namespace (thinkingConfig), not OpenAI reasoning options.
+    spyOn(config, "loadProvidersConfig").mockReturnValue({
+      coder: {
+        deploymentUrl: "https://coder.example.com",
+        discoveredProviders: [{ name: "google", type: "google" }],
+      },
+    } as ReturnType<Config["loadProvidersConfig"]>);
+    const providerModelFactory = Reflect.get(service, "providerModelFactory") as
+      | ProviderModelFactory
+      | undefined;
+    if (!providerModelFactory) {
+      throw new Error("Expected AIService.providerModelFactory in test harness");
+    }
+    spyOn(providerModelFactory, "resolveAndCreateModel").mockImplementation(() =>
+      Promise.resolve({
+        success: true,
+        data: {
+          model: Object.create(null) as LanguageModel,
+          effectiveModelString: "mux-gateway:google/gemini-2.5-pro",
+          canonicalModelString: "coder:google/gemini-2.5-pro",
+          canonicalProviderName: "coder" as ProviderName,
+          canonicalModelId: "google/gemini-2.5-pro",
+          wireProviderName: "google" as ProviderName,
+          coderSelectedInstance: { name: "google", type: "google" },
+          routedThroughGateway: true,
+          routeProvider: "mux-gateway" as ProviderName,
+        },
+      })
+    );
+
+    const result = await service.streamMessage({
+      messages: [createMuxMessage("user-message", "user", "hello")],
+      workspaceId,
+      modelString: "coder:google/gemini-2.5-pro",
+      thinkingLevel: "medium",
+    });
+    expect(result.success).toBe(true);
+    expect(startStreamCalls).toHaveLength(1);
+    const startStreamCall = startStreamCalls[0];
+    if (!startStreamCall) {
+      throw new Error("Expected streamManager.startStream call arguments");
+    }
+    const providerOptions = providerOptionsFromStartStreamCall(startStreamCall);
+    expect(providerOptions.google).toBeDefined();
+    expect(providerOptions.google).toHaveProperty("thinkingConfig");
+    expect(providerOptions.openai).toBeUndefined();
   });
 });
 

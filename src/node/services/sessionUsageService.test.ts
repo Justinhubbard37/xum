@@ -592,6 +592,38 @@ describe("SessionUsageService", () => {
       expect(record.model).toBe("mycustom:my-alias");
       expect(record.metadataModel).toBe("anthropic:claude-sonnet-4-20250514");
     });
+
+    it("uses the caller-pinned metadataModel for coder models over live re-resolution", async () => {
+      // Dropped-partial sidecar writes happen after the turn's Coder instance
+      // may have been removed/retagged by a catalog refresh: the default
+      // service config knows nothing about this instance, so live resolution
+      // would persist the raw (unpriceable) coder ID.
+      const workspaceId = "test-workspace";
+      const recorded = await service.recordHeadlessUsage(
+        workspaceId,
+        "coder:prod-anthropic/claude-sonnet-4-20250514",
+        { inputTokens: 1000, outputTokens: 500, totalTokens: 1500 },
+        undefined,
+        {
+          analyticsSource: "aborted_stream",
+          skipSessionLedger: true,
+          metadataModel: "anthropic:claude-sonnet-4-20250514",
+        }
+      );
+
+      // Priced via the pinned identity — the raw coder ID has no pricing
+      // entry and would leave cost_usd undefined.
+      expect(recorded?.model).toBe("anthropic:claude-sonnet-4-20250514");
+      expect(recorded?.usage.input.cost_usd).toBeGreaterThan(0);
+
+      const sidecarPath = path.join(config.getSessionDir(workspaceId), "headless-usage.jsonl");
+      const record = JSON.parse((await fs.readFile(sidecarPath, "utf-8")).trim()) as Record<
+        string,
+        unknown
+      >;
+      expect(record.model).toBe("anthropic:claude-sonnet-4-20250514");
+      expect(record.metadataModel).toBe("anthropic:claude-sonnet-4-20250514");
+    });
   });
 
   describe("resetSessionUsage", () => {
@@ -786,6 +818,44 @@ describe("SessionUsageService", () => {
         getTotalCost(expectedMergedUsage) ?? 0,
         12
       );
+    });
+
+    it("keys recovered Coder usage by the persisted metadata model", async () => {
+      // Recovery runs AFTER mutable instance metadata may have changed: here
+      // the custom instance is gone from providers config entirely, so
+      // re-resolving the raw coder: model would produce an unresolvable raw
+      // key that repricing later strips. The persisted record-time
+      // metadataModel must key the bucket instead — for the assistant usage
+      // AND the tool usage.
+      const workspaceId = "coder-metadata-model-rebuild";
+      const rawModel = "coder:prod-anthropic/claude-opus-4-5";
+      const metadataModel = "anthropic:claude-opus-4-5";
+      const toolUsage = {
+        toolName: "advisor",
+        toolCallId: "tool-call-coder-1",
+        timestamp: Date.now(),
+        model: rawModel,
+        metadataModel,
+        usage: { inputTokens: 30, outputTokens: 10, totalTokens: 40 },
+      };
+      const assistantMessage = createMuxMessage("msg-coder-rebuild", "assistant", "Hello", {
+        historySequence: 1,
+        timestamp: Date.now(),
+        model: rawModel,
+        metadataModel,
+        usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+      });
+      Object.assign((assistantMessage.metadata ??= {}), {
+        toolModelUsages: [toolUsage],
+      });
+
+      await service.rebuildFromMessages(workspaceId, [assistantMessage]);
+
+      const result = await service.getSessionUsage(workspaceId);
+      expect(result).toBeDefined();
+      expect(Object.keys(result?.byModel ?? {})).toEqual([metadataModel]);
+      expect(result?.byModel[metadataModel]?.input.tokens).toBe(130);
+      expect(result?.lastRequest?.model).toBe(metadataModel);
     });
 
     it("should skip malformed tool model usage entries during rebuild", async () => {

@@ -528,10 +528,11 @@ export function ModelsSection() {
                         minThinking.setMinThinkingLevel(model.fullId, level)
                       }
                       onToggle1MContext={
-                        supports1MContext(model.fullId)
+                        supports1MContext(model.fullId, config)
                           ? () => toggle1MContext(model.fullId)
                           : undefined
                       }
+                      providersConfig={config}
                     />
                   );
                 })}
@@ -577,10 +578,11 @@ export function ModelsSection() {
                     minThinking.setMinThinkingLevel(model.fullId, level)
                   }
                   onToggle1MContext={
-                    supports1MContext(model.fullId)
+                    supports1MContext(model.fullId, config)
                       ? () => toggle1MContext(model.fullId)
                       : undefined
                   }
+                  providersConfig={config}
                 />
               ))}
             </tbody>

@@ -42,7 +42,14 @@ import type { PolicyService } from "@/node/services/policyService";
 import type { ProviderService } from "@/node/services/providerService";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
 import type { CoderOauthService } from "@/node/services/coderOauthService";
-import { coderAibridgeBaseUrl, isCoderAibridgeOrigin } from "@/common/constants/coderOAuth";
+import {
+  coderAibridgeBaseUrl,
+  coderGatewayWireProtocol,
+  parseCoderGatewayProviders,
+  resolveCoderGatewayProvider,
+  resolveCoderWireCanonicalModel,
+} from "@/common/constants/coderOAuth";
+import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
 import type { DevToolsService } from "@/node/services/devToolsService";
 import { captureAndStripDevToolsHeader } from "@/node/services/devToolsHeaderCapture";
 import { createDevToolsMiddleware } from "@/node/services/devToolsMiddleware";
@@ -1018,6 +1025,17 @@ export class ProviderModelFactory {
       agentInitiated?: boolean;
       workspaceId?: string;
       routeContext?: RouteContext;
+      /**
+       * Providers-config snapshot to create the model from. Passed by
+       * resolveAndCreateModel so routing, the returned coderWire snapshot,
+       * and SDK model creation all read ONE config: another Mux process can
+       * rewrite providers.jsonc between those steps (e.g. an authoritative
+       * catalog refresh changing an instance's type), and a fresh reload
+       * here would create a model on the new wire while the caller
+       * assembles tools/options for the old one. Direct createModel callers
+       * omit it and keep loading the current config.
+       */
+      providersConfig?: ProvidersConfig;
     }
   ): Promise<Result<LanguageModel, SendMessageError>> {
     const result = await this._createModelCore(modelString, muxProviderOptions, opts);
@@ -1049,17 +1067,20 @@ export class ProviderModelFactory {
   private async _createModelCore(
     modelString: string,
     muxProviderOptions?: MuxProviderOptions,
-    opts?: { agentInitiated?: boolean; routeContext?: RouteContext }
+    opts?: {
+      agentInitiated?: boolean;
+      routeContext?: RouteContext;
+      providersConfig?: ProvidersConfig;
+    }
   ): Promise<Result<LanguageModel, SendMessageError>> {
     try {
       // Route resolution is centralized here so every caller gets identical,
       // provider-agnostic dispatch behavior. resolveGatewayModelString is idempotent,
       // so already-routed strings pass through unchanged.
-      const explicitGateway = getExplicitGatewayProvider(modelString);
-      modelString = this.resolveGatewayModelString(
+      modelString = this.resolveEffectiveModelString(
         modelString,
         opts?.routeContext,
-        explicitGateway
+        opts?.providersConfig
       );
 
       // Parse model string (format: "provider:model-id")
@@ -1072,8 +1093,10 @@ export class ProviderModelFactory {
         });
       }
 
-      // Load providers configuration - the ONLY source of truth
-      const providersConfig = this.config.loadProvidersConfig() ?? {};
+      // Load providers configuration - the ONLY source of truth. A caller's
+      // snapshot (resolveAndCreateModel) wins so the created model matches
+      // the wire/route identity that snapshot produced (see createModel).
+      const providersConfig = opts?.providersConfig ?? this.config.loadProvidersConfig() ?? {};
       const providerConfigEntry = providersConfig[providerName];
       const providerIsBuiltIn = isBuiltInProvider(providerName);
       const providerIsCustomOpenAICompatible =
@@ -1116,8 +1139,24 @@ export class ProviderModelFactory {
       // openrouter:anthropic/*). We still allow request-level values when config
       // is unset for backward compatibility with older clients.
       const configAnthropicCacheTtl = parseAnthropicCacheTtl(providersConfig.anthropic?.cacheTtl);
-      const isAnthropicRoutedModel =
-        providerName === "anthropic" || modelId.startsWith("anthropic/");
+      // Coder gateway instances classify by their resolved WIRE type, not the
+      // route name: a custom-named Anthropic instance (coder:prod-anthropic/x)
+      // is an Anthropic request that must honor the backend's authoritative
+      // disableBetaFeatures/cacheTtl, while a cross-typed canonical name
+      // (coder:anthropic/x fronting an OpenAI-compatible upstream) must not.
+      const isCoderGatewayModel =
+        providerName === "coder" && !isCustomOpenAICompatibleProviderConfig(providersConfig.coder);
+      const coderWire = isCoderGatewayModel
+        ? resolveCoderWireCanonicalModel(
+            modelId,
+            providersConfig.coder as
+              | { discoveredProviders?: unknown; additionalProviders?: unknown }
+              | undefined
+          )
+        : null;
+      const isAnthropicRoutedModel = isCoderGatewayModel
+        ? coderWire?.origin === "anthropic"
+        : providerName === "anthropic" || modelId.startsWith("anthropic/");
 
       // Anthropic-specific: merge global disableBetaFeatures into muxProviderOptions.
       const configDisableBeta = providersConfig.anthropic?.disableBetaFeatures;
@@ -1139,7 +1178,13 @@ export class ProviderModelFactory {
         muxProviderOptions?.anthropic?.cacheTtl ?? configAnthropicCacheTtl;
 
       // OpenAI-specific: merge global store setting into muxProviderOptions.
-      const isOpenAIRoutedModel = providerName === "openai" || modelId.startsWith("openai/");
+      // Coder instances classify by the instance's exact TYPE ("openai" =
+      // the real OpenAI Responses upstream, where ZDR store applies): a
+      // custom-named openai instance must honor providers.openai.store,
+      // while a cross-typed openai-named instance must not.
+      const isOpenAIRoutedModel = isCoderGatewayModel
+        ? coderWire?.providerType === "openai"
+        : providerName === "openai" || modelId.startsWith("openai/");
       const configOpenAIStore = providersConfig.openai?.store;
       if (isOpenAIRoutedModel && typeof configOpenAIStore === "boolean") {
         muxProviderOptions ??= {};
@@ -1981,16 +2026,40 @@ export class ProviderModelFactory {
           });
         }
 
-        // Model IDs are <origin>/<modelId> (mux-gateway style) because the
-        // bridge has no cross-provider routing: Anthropic models must use
-        // /anthropic/v1/messages, OpenAI models /openai/v1/*.
+        // Model IDs are <providerName>/<modelId> (mux-gateway style) because
+        // the gateway has no cross-provider routing: each configured provider
+        // instance is mounted at /<name>/... and only serves its own wire
+        // format. The FIRST slash separates the instance name (names cannot
+        // contain slashes) from the upstream model ID (which can — e.g.
+        // OpenRouter's vendor/model IDs). The instance's type — from the
+        // discovered provider list, the user-managed additionalProviders
+        // escape hatch, or the default name === type convention — selects the
+        // wire protocol to speak.
         const separatorIndex = modelId.indexOf("/");
-        const origin = separatorIndex > 0 ? modelId.slice(0, separatorIndex) : "";
+        const gatewayProviderName = separatorIndex > 0 ? modelId.slice(0, separatorIndex) : "";
         const originModelId = separatorIndex > 0 ? modelId.slice(separatorIndex + 1) : "";
-        if (!isCoderAibridgeOrigin(origin) || !originModelId) {
+        const gatewayProvider = gatewayProviderName
+          ? resolveCoderGatewayProvider(
+              gatewayProviderName,
+              parseCoderGatewayProviders(
+                (providerConfig as { discoveredProviders?: unknown }).discoveredProviders
+              ),
+              parseCoderGatewayProviders(
+                (providerConfig as { additionalProviders?: unknown }).additionalProviders
+              )
+            )
+          : null;
+        if (!gatewayProvider || !originModelId) {
           return Err({
             type: "invalid_model_string",
-            message: `Invalid Coder model "${modelId}". Expected coder:anthropic/<model> or coder:openai/<model>.`,
+            message: `Invalid Coder model "${modelId}". Expected coder:<provider>/<model> where <provider> is an AI Gateway provider on the deployment (e.g. coder:anthropic/<model>). Unknown provider names can be declared under the coder provider's additionalProviders setting.`,
+          });
+        }
+        const wire = coderGatewayWireProtocol(gatewayProvider.type);
+        if (!wire) {
+          return Err({
+            type: "invalid_model_string",
+            message: `The Coder AI Gateway provider "${gatewayProvider.name}" (type ${gatewayProvider.type}) is not supported by Mux.`,
           });
         }
 
@@ -2055,7 +2124,8 @@ export class ProviderModelFactory {
         };
         const coderFetch = Object.assign(coderFetchFn, baseFetch) as typeof fetch;
 
-        if (origin === "anthropic") {
+        const gatewayBaseUrl = coderAibridgeBaseUrl(deploymentUrl, gatewayProvider.name);
+        if (wire === "anthropic") {
           const disableBeta = muxProviderOptions?.anthropic?.disableBetaFeatures === true;
           // Same cache_control normalization as direct Anthropic / mux-gateway:
           // the bridge forwards origin-shaped payloads to the real Anthropic API.
@@ -2067,7 +2137,7 @@ export class ProviderModelFactory {
           const { createAnthropic } = await PROVIDER_REGISTRY.anthropic();
           const provider = createAnthropic({
             apiKey: "coder", // placeholder; real auth injected by the fetch wrapper
-            baseURL: coderAibridgeBaseUrl(deploymentUrl, origin),
+            baseURL: gatewayBaseUrl,
             fetch: providerFetch,
           });
           return Ok(provider(originModelId));
@@ -2076,12 +2146,19 @@ export class ProviderModelFactory {
         const { createOpenAI } = await PROVIDER_REGISTRY.openai();
         const provider = createOpenAI({
           apiKey: "coder", // placeholder; real auth injected by the fetch wrapper
-          baseURL: coderAibridgeBaseUrl(deploymentUrl, origin),
+          baseURL: gatewayBaseUrl,
           fetch: coderFetch,
         });
-        // The bridge intercepts both /responses and /chat/completions; use the
-        // Responses API to match Mux's default OpenAI wire format.
-        return Ok(provider.responses(originModelId));
+        // The gateway intercepts both /responses and /chat/completions. Real
+        // OpenAI upstreams get the Responses API to match Mux's default OpenAI
+        // wire format; the other OpenAI-wire provider types front
+        // OpenAI-compatible upstreams where only /chat/completions can be
+        // assumed (see coderGatewayWireProtocol).
+        return Ok(
+          wire === "openai-responses"
+            ? provider.responses(originModelId)
+            : provider.chat(originModelId)
+        );
       }
 
       // Generic handler for simple providers (standard API key + factory pattern)
@@ -2161,6 +2238,36 @@ export class ProviderModelFactory {
         canonicalProviderName: string;
         /** Model ID from the canonical model string. */
         canonicalModelId: string;
+        /**
+         * Provider whose WIRE format the request actually speaks. Differs from
+         * canonicalProviderName only for gateway-scoped Coder strings
+         * (coder:<instance>/<model>), where the wire is derived from the
+         * instance's type. Drives message preparation (Anthropic reasoning
+         * transforms, PDF-filename sanitization) and providerOptions namespace
+         * selection; canonicalProviderName remains the config identity for
+         * providers.jsonc lookups.
+         */
+        wireProviderName: string;
+        /**
+         * Coder gateway wire snapshot (instance origin/type + gateway-local
+         * model ID), resolved from the SAME providers-config read that
+         * produced wireProviderName. Present only when the effective route
+         * goes through the Coder gateway. Callers assembling tools/options
+         * for this request MUST consume this snapshot instead of re-reading
+         * the providers config: an authoritative catalog refresh can change
+         * the instance's type mid-request, and a fresh read would assemble
+         * another wire's tools/options for the already-created SDK model.
+         */
+        coderWire?: { origin: "anthropic" | "openai"; modelId: string; providerType: string };
+        /**
+         * The Coder instance addressed by a raw coder: selection, resolved
+         * from the SAME providers-config read — present even when routing
+         * fell away from the gateway (unlike coderWire). Callers that pin a
+         * request providers-config snapshot must pin THIS identity so
+         * builders resolving the raw model string cannot see a concurrently
+         * retagged instance type diverging from the created fallback model.
+         */
+        coderSelectedInstance?: { name: string; type: string };
         /** Whether the request is being routed through the Mux gateway. */
         routedThroughGateway: boolean;
         /** Route provider chosen by backend routing (direct provider or gateway). */
@@ -2172,11 +2279,10 @@ export class ProviderModelFactory {
     // Shadow check on the RAW prefix, BEFORE the first normalization: a custom
     // OpenAI-compatible provider can shadow a built-in gateway id (an upgraded
     // install may already have one named "coder"). normalizeToCanonical would
-    // rewrite e.g. coder:google/gemini-2.5-pro to google:gemini-2.5-pro, and —
-    // because the built-in Coder definition routes only OpenAI/Anthropic — the
-    // explicit-prefix restoration below could never recover the custom model,
-    // silently bypassing the user's custom endpoint. The equivalent guard in
-    // resolveGatewayModelString only protects callers that pass raw strings.
+    // rewrite e.g. coder:openai/foo to openai:foo and silently route it
+    // through the built-in machinery instead of the user's custom endpoint.
+    // The equivalent guard in resolveGatewayModelString only protects callers
+    // that pass raw strings.
     const providersConfigForShadowCheck = this.config.loadProvidersConfig() ?? {};
     const [rawProviderName] = parseModelString(modelString);
     const rawPrefixShadowedByCustomProvider =
@@ -2200,12 +2306,122 @@ export class ProviderModelFactory {
       effectiveModelString = `xai:${variant}`;
     }
 
-    const routeContext = this.resolveModelRoute(canonicalModelString);
-    effectiveModelString = this.resolveGatewayModelString(
-      effectiveModelString,
-      routeContext,
-      explicitGateway
+    // Coder selections resolve routes in two metadata-aware steps, because
+    // name-based canonicalization misidentifies instances whose name and
+    // type diverge ({name: "openai", type: "anthropic"}):
+    // 1. The explicit gateway restore checks accessibility with the RAW
+    //    instance-name gateway ID — the static toGatewayModelId
+    //    reconstruction cannot restore instance-name prefixes
+    //    (prod-anthropic) and would rebuild cross-typed names under the
+    //    wrong origin.
+    // 2. The FALLBACK identity (coder unavailable, or model excluded by the
+    //    authoritative catalog) is seeded from the instance TYPE via
+    //    provider metadata: an anthropic-typed instance falls back to
+    //    direct Anthropic, not to whatever provider its name resembles.
+    const rawCoderGatewayModelId =
+      rawProviderName === "coder" && !rawPrefixShadowedByCustomProvider
+        ? modelString.slice(modelString.indexOf(":") + 1)
+        : null;
+    const coderMetadataCanonical =
+      rawCoderGatewayModelId != null
+        ? resolveCoderGatewayMetadataModel(modelString, providersConfigForShadowCheck)
+        : null;
+    const routeSeedModelString = (() => {
+      if (
+        coderMetadataCanonical != null &&
+        Object.hasOwn(
+          PROVIDER_REGISTRY,
+          coderMetadataCanonical.slice(0, coderMetadataCanonical.indexOf(":"))
+        )
+      ) {
+        return coderMetadataCanonical;
+      }
+      if (rawCoderGatewayModelId != null) {
+        const wire = resolveCoderWireCanonicalModel(
+          rawCoderGatewayModelId,
+          providersConfigForShadowCheck.coder as
+            | { discoveredProviders?: unknown; additionalProviders?: unknown }
+            | undefined
+        );
+        if (wire) {
+          // Known but UNMAPPABLE instance (openai-compat fronts arbitrary
+          // upstreams; vendor-less vercel IDs carry no catalog identity):
+          // keep the raw gateway-scoped seed. A canonical-named cross-typed
+          // instance ({name: "anthropic", type: "openai-compat"}) would
+          // otherwise seed the name-derived anthropic:<model> identity and
+          // silently fall back to direct Anthropic when Coder is
+          // disconnected or the catalog rejects the model — the equivalent
+          // custom-named instance (coder:llm-proxy/x) is rejected instead.
+          return modelString;
+        }
+      }
+      return canonicalModelString;
+    })();
+
+    const routeContext = this.resolveModelRoute(
+      routeSeedModelString,
+      providersConfigForShadowCheck
     );
+    if (rawCoderGatewayModelId != null) {
+      const appConfig = this.config.loadConfigOrDefault();
+      const isGatewayModelAccessible = createGatewayModelAccessibilityChecker(
+        providersConfigForShadowCheck,
+        this.policyService
+      );
+      const coderProviderRoutable = this.isProviderAvailableForRouting(
+        "coder",
+        providersConfigForShadowCheck,
+        appConfig
+      );
+      const coderModelAccessible = isGatewayModelAccessible("coder", rawCoderGatewayModelId);
+      if (coderProviderRoutable && coderModelAccessible) {
+        effectiveModelString = modelString;
+      } else if (routeSeedModelString.startsWith("coder:")) {
+        // The instance type has no distinct canonical fallback identity
+        // (openai-compat and copilot front arbitrary upstreams; vendor-less
+        // vercel IDs are unmappable), so falling away from the gateway is
+        // never valid for this selection.
+        if (coderProviderRoutable) {
+          // The authoritative catalog / removedModels tombstone / policy
+          // conclusively rejected this gateway model. Feeding the rejected
+          // coder: identity back into route resolution would land on the
+          // last-resort direct Coder route and send the request through the
+          // gateway anyway, bypassing the rejection.
+          return Err({
+            type: "model_not_available",
+            provider: "coder",
+            modelId: rawCoderGatewayModelId,
+          });
+        }
+        // Coder disconnected/disabled: surface the coder route's own
+        // unavailability directly. Letting routing continue would
+        // name-canonicalize the selection (createModel re-resolves the
+        // gateway string) and silently send e.g. {name: "anthropic",
+        // type: "openai-compat"} to direct Anthropic when direct
+        // credentials exist.
+        return Err(
+          isProviderDisabledInConfig(
+            (providersConfigForShadowCheck.coder ?? {}) as { enabled?: unknown }
+          )
+            ? { type: "provider_disabled", provider: "coder" }
+            : { type: "api_key_not_found", provider: "coder" }
+        );
+      } else {
+        effectiveModelString = this.resolveGatewayModelString(
+          routeSeedModelString,
+          routeContext,
+          undefined,
+          providersConfigForShadowCheck
+        );
+      }
+    } else {
+      effectiveModelString = this.resolveGatewayModelString(
+        effectiveModelString,
+        routeContext,
+        explicitGateway,
+        providersConfigForShadowCheck
+      );
+    }
 
     // Stream result normalization currently only understands Mux gateway responses,
     // so keep this flag mux-gateway-specific until the downstream normalization path
@@ -2216,13 +2432,95 @@ export class ProviderModelFactory {
       ? (effectiveRouteProvider as ProviderName)
       : routeContext.routeProvider;
 
+    // Wire-canonical provider for message preparation and options namespaces:
+    // a Coder gateway request sends instance-type-shaped bytes (e.g.
+    // Anthropic messages), so Anthropic-only reasoning transforms, PDF
+    // sanitization, and namespace merging must key on the wire — keying them
+    // on "coder" silently skips them. Derived from the EFFECTIVE route, not
+    // the raw selection: instance metadata applies only when the request
+    // actually goes through the Coder gateway. A cross-typed canonical name
+    // (coder:openai/<model>, type anthropic) resolves to the Anthropic wire
+    // while routed through Coder, but when the catalog gate rejects the
+    // instance and routing falls back to direct OpenAI, the wire must be
+    // OpenAI — Anthropic transforms against a direct OpenAI request would be
+    // invalid. Shadowed prefixes keep the custom provider's identity.
+    let wireProviderName = canonicalProviderName;
+    let coderWire:
+      | { origin: "anthropic" | "openai"; modelId: string; providerType: string }
+      | undefined;
+    if (
+      effectiveRouteProvider === "coder" &&
+      !isCustomOpenAICompatibleProviderConfig(providersConfigForShadowCheck.coder)
+    ) {
+      const wire = resolveCoderWireCanonicalModel(
+        effectiveModelString.slice(effectiveModelString.indexOf(":") + 1),
+        providersConfigForShadowCheck.coder as
+          | { discoveredProviders?: unknown; additionalProviders?: unknown }
+          | undefined
+      );
+      if (wire) {
+        wireProviderName = wire.origin;
+        coderWire = wire;
+      }
+    } else if (
+      rawCoderGatewayModelId != null &&
+      routeSeedModelString !== canonicalModelString &&
+      // Known-but-unmappable instances keep a raw coder:-scoped seed; its
+      // name-canonical origin says nothing about the wire (the instance type
+      // does), and the first branch already resolved the wire when the
+      // request stayed on the coder route.
+      !routeSeedModelString.startsWith("coder:")
+    ) {
+      // A Coder selection that fell back to its type-derived route: the wire
+      // follows the fallback identity, not the name-based canonical string —
+      // a cross-typed coder:openai/<claude> routed to direct Anthropic must
+      // get Anthropic transforms. The seed can itself be gateway-scoped
+      // (a bedrock-typed instance seeds bedrock:anthropic.<model>), so take
+      // the seed's CANONICAL origin — the same identity a direct selection
+      // of that seed would prepare with (bedrock → anthropic) — instead of
+      // its prefix, which would skip Anthropic-specific transforms for the
+      // Anthropic-shaped bytes behind the fallback route.
+      const [seedOrigin] = parseModelString(normalizeToCanonical(routeSeedModelString));
+      if (seedOrigin) {
+        wireProviderName = seedOrigin;
+      }
+    }
+
     const modelResult = await this.createModel(effectiveModelString, muxProviderOptions, {
       ...opts,
       routeContext,
+      // ONE config snapshot for the whole resolve+create: the wire snapshot
+      // above and the SDK model must come from the same providers.jsonc read,
+      // or a concurrent instance-type change makes them describe different
+      // wires.
+      providersConfig: providersConfigForShadowCheck,
     });
     if (!modelResult.success) {
       return Err(modelResult.error);
     }
+
+    // Selected-instance snapshot for raw coder: selections, resolved from
+    // the same config read as routing — independent of the effective route,
+    // so fallback-away requests can also pin the instance type.
+    const coderSelectedInstance = (() => {
+      if (rawCoderGatewayModelId == null) {
+        return undefined;
+      }
+      const separator = rawCoderGatewayModelId.indexOf("/");
+      if (separator <= 0) {
+        return undefined;
+      }
+      const coderSection = providersConfigForShadowCheck.coder as
+        | { discoveredProviders?: unknown; additionalProviders?: unknown }
+        | undefined;
+      return (
+        resolveCoderGatewayProvider(
+          rawCoderGatewayModelId.slice(0, separator),
+          parseCoderGatewayProviders(coderSection?.discoveredProviders),
+          parseCoderGatewayProviders(coderSection?.additionalProviders)
+        ) ?? undefined
+      );
+    })();
 
     return Ok({
       model: modelResult.data,
@@ -2230,14 +2528,23 @@ export class ProviderModelFactory {
       canonicalModelString,
       canonicalProviderName,
       canonicalModelId,
+      wireProviderName,
+      coderWire,
+      coderSelectedInstance,
       routedThroughGateway,
       routeProvider,
     });
   }
 
-  private resolveModelRoute(canonicalModel: string): RouteContext {
+  private resolveModelRoute(
+    canonicalModel: string,
+    providersConfigSnapshot?: ProvidersConfig
+  ): RouteContext {
     const config = this.config.loadConfigOrDefault();
-    const providersConfig = this.config.loadProvidersConfig?.() ?? {};
+    // resolveAndCreateModel passes its snapshot so route availability,
+    // accessibility, the wire snapshot, and model creation all read one
+    // providers.jsonc state (see createModel's providersConfig option).
+    const providersConfig = providersConfigSnapshot ?? this.config.loadProvidersConfig?.() ?? {};
     const isGatewayModelAccessible = createGatewayModelAccessibilityChecker(
       providersConfig,
       this.policyService
@@ -2261,10 +2568,33 @@ export class ProviderModelFactory {
     );
   }
 
+  /**
+   * The route-resolution preamble used by createModel, exposed so callers can
+   * recompute the EFFECTIVE model string the factory dispatched on (from the
+   * same providers-config snapshot). Needed for identity decisions such as
+   * headless usage metadata: a coder: selection can fall away to a direct
+   * provider when the gateway is unavailable, and identities derived from the
+   * raw selection would then diverge from the model actually created.
+   */
+  resolveEffectiveModelString(
+    modelString: string,
+    routeContext?: RouteContext,
+    providersConfig?: ProvidersConfig
+  ): string {
+    const explicitGateway = getExplicitGatewayProvider(modelString);
+    return this.resolveGatewayModelString(
+      modelString,
+      routeContext,
+      explicitGateway,
+      providersConfig
+    );
+  }
+
   resolveGatewayModelString(
     modelString: string,
     modelKeyOrRouteContext?: string | RouteContext,
-    explicitGatewayOrLegacyFlag?: ProviderName | boolean
+    explicitGatewayOrLegacyFlag?: ProviderName | boolean,
+    providersConfigSnapshot?: ProvidersConfig
   ): string {
     // Legacy callers may still pass boolean true to mean an explicit mux-gateway request.
     const explicitGateway: ProviderName | undefined =
@@ -2274,7 +2604,9 @@ export class ProviderModelFactory {
           ? explicitGatewayOrLegacyFlag
           : undefined;
 
-    const providersConfig = this.config.loadProvidersConfig() ?? {};
+    // Same single-snapshot rule as resolveModelRoute: callers holding one
+    // providers.jsonc read pass it so routing cannot diverge from it.
+    const providersConfig = providersConfigSnapshot ?? this.config.loadProvidersConfig() ?? {};
 
     // Shadow check on the RAW prefix, BEFORE gateway canonicalization: a
     // custom OpenAI-compatible provider can shadow a built-in gateway id

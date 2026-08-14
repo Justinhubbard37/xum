@@ -339,6 +339,249 @@ describe("buildProviderOptions - mappedToModel resolution", () => {
   });
 });
 
+describe("Coder gateway-scoped models (wire-canonical option building)", () => {
+  // coder:<instance>/<model> strings that stay gateway-scoped (custom-named
+  // instances, non-canonical types) must build the same options/headers as
+  // the identical model on a default-named instance: the wire is derived
+  // from the instance's TYPE, not the "coder" prefix.
+  const coderProvidersConfig: ProvidersConfigMap = {
+    coder: {
+      apiKeySet: false,
+      isEnabled: true,
+      isConfigured: true,
+      discoveredProviders: [
+        { name: "prod-anthropic", type: "anthropic" },
+        { name: "llm-proxy", type: "openai-compat" },
+      ],
+    },
+  };
+
+  test("custom-named anthropic instance gets Anthropic thinking options", () => {
+    const viaCustom = buildProviderOptions(
+      "coder:prod-anthropic/claude-opus-4-5",
+      "high",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      coderProvidersConfig,
+      "coder"
+    );
+    const viaDefault = buildProviderOptions(
+      "coder:anthropic/claude-opus-4-5",
+      "high",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      coderProvidersConfig,
+      "coder"
+    );
+    expect(viaCustom).toEqual(viaDefault);
+    expect(viaCustom).toHaveProperty("anthropic");
+  });
+
+  test("openai-compat instance gets OpenAI-shaped options, not none", () => {
+    const options = buildProviderOptions(
+      "coder:llm-proxy/gpt-5",
+      "medium",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      coderProvidersConfig,
+      "coder"
+    );
+    expect(options).toHaveProperty("openai");
+  });
+
+  test("user-declared additionalProviders resolve the wire too", () => {
+    const options = buildProviderOptions(
+      "coder:wif-anthropic/claude-opus-4-5",
+      "high",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        coder: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: true,
+          additionalProviders: [{ name: "wif-anthropic", type: "anthropic" }],
+        },
+      },
+      "coder"
+    );
+    expect(options).toHaveProperty("anthropic");
+  });
+
+  test("unknown instance names build no options", () => {
+    const options = buildProviderOptions(
+      "coder:mystery/some-model",
+      "medium",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      coderProvidersConfig,
+      "coder"
+    );
+    expect(options).toEqual({});
+  });
+
+  test("custom-named anthropic instance gets the 1M beta header", () => {
+    const headers = buildRequestHeaders(
+      "coder:prod-anthropic/claude-sonnet-4-5",
+      { anthropic: { use1MContext: true } },
+      undefined,
+      coderProvidersConfig,
+      "coder"
+    );
+    expect(headers).toEqual({ "anthropic-beta": ANTHROPIC_1M_CONTEXT_HEADER });
+  });
+
+  test("bedrock-typed instance resolves 1M capability through its metadata identity", () => {
+    // The wire-canonical string mangles metadata-divergent instances
+    // (anthropic:anthropic.claude-* fails the anchored Claude patterns);
+    // capability must resolve from the raw identity via the instance type
+    // (bedrock:anthropic.claude-* → anthropic:claude-*), with intent keyed
+    // by the raw string like the UI's per-model toggles.
+    const config: ProvidersConfigMap = {
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        discoveredProviders: [{ name: "bedrock", type: "bedrock" }],
+      },
+    };
+    const headers = buildRequestHeaders(
+      "coder:bedrock/anthropic.claude-sonnet-4-5",
+      {
+        anthropic: { use1MContextModels: ["coder:bedrock/anthropic.claude-sonnet-4-5"] },
+      },
+      undefined,
+      config,
+      "coder"
+    );
+    expect(headers).toEqual({ "anthropic-beta": ANTHROPIC_1M_CONTEXT_HEADER });
+  });
+
+  test("non-Anthropic wires never get the 1M beta header", () => {
+    // A vercel-typed instance maps Claude vendor models to anthropic:* for
+    // metadata, but speaks openai-chat on the wire: the anthropic-beta header
+    // cannot be carried, so 1M intent must not attach it.
+    const config: ProvidersConfigMap = {
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        discoveredProviders: [{ name: "vercel", type: "vercel" }],
+      },
+    };
+    const headers = buildRequestHeaders(
+      "coder:vercel/anthropic/claude-sonnet-4-5",
+      {
+        anthropic: { use1MContextModels: ["coder:vercel/anthropic/claude-sonnet-4-5"] },
+      },
+      undefined,
+      config,
+      "coder"
+    );
+    expect(headers).toBeUndefined();
+  });
+
+  // Discovered metadata must win over the instance NAME: a valid instance can
+  // use a canonical route name with a different type, and normalizing the name
+  // before consulting metadata would emit options for the wrong wire.
+  describe("canonical-named instance with a different type", () => {
+    const crossTypedConfig: ProvidersConfigMap = {
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        discoveredProviders: [
+          { name: "openai", type: "anthropic" },
+          { name: "anthropic", type: "openai-compat" },
+        ],
+      },
+    };
+
+    test("anthropic-typed instance named openai gets Anthropic options", () => {
+      const options = buildProviderOptions(
+        "coder:openai/claude-opus-4-5",
+        "high",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        crossTypedConfig,
+        "coder"
+      );
+      expect(options).toHaveProperty("anthropic");
+      expect(options).not.toHaveProperty("openai");
+    });
+
+    test("anthropic-typed instance named openai gets the 1M beta header", () => {
+      const headers = buildRequestHeaders(
+        "coder:openai/claude-sonnet-4-5",
+        { anthropic: { use1MContext: true } },
+        undefined,
+        crossTypedConfig,
+        "coder"
+      );
+      expect(headers).toEqual({ "anthropic-beta": ANTHROPIC_1M_CONTEXT_HEADER });
+    });
+
+    test("openai-compat-typed instance named anthropic gets OpenAI options", () => {
+      const options = buildProviderOptions(
+        "coder:anthropic/gpt-5",
+        "medium",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        crossTypedConfig,
+        "coder"
+      );
+      expect(options).toHaveProperty("openai");
+      expect(options).not.toHaveProperty("anthropic");
+    });
+  });
+
+  test("custom OpenAI-compatible provider named coder shadows gateway wire treatment", () => {
+    const options = buildProviderOptions(
+      "coder:anthropic/claude-opus-4-5",
+      "high",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        coder: {
+          apiKeySet: true,
+          isEnabled: true,
+          isConfigured: true,
+          providerType: "openai-compatible",
+          baseUrl: "https://proxy.example.com/v1",
+        },
+      },
+      "coder"
+    );
+    // The string is the custom provider's identity; it must not be rewritten
+    // to anthropic:<model> by name convention or gateway metadata.
+    expect(options).not.toHaveProperty("anthropic");
+  });
+});
+
 describe("isAnthropic1MEffectivelyEnabled", () => {
   test("returns true for beta-only Sonnet models with global 1M flag", () => {
     expect(

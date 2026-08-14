@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { generateText, type Tool } from "ai";
 import { xai } from "@ai-sdk/xai";
 import { writeFile } from "node:fs/promises";
@@ -6,6 +6,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { Config } from "@/node/config";
+import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { CODEX_ENDPOINT } from "@/common/constants/codexOAuth";
 import { PROVIDER_REGISTRY } from "@/common/constants/providers";
@@ -2076,6 +2077,472 @@ describe("ProviderModelFactory Coder", () => {
         expect((result.data as { provider?: unknown }).provider).toBe("openai.responses");
       } finally {
         PROVIDER_REGISTRY.openai = originalOpenAIRegistry;
+      }
+    });
+  });
+
+  it("routes custom-named provider instances using the discovered type", async () => {
+    await withTempConfig(async (config, factory) => {
+      const originalOpenAIRegistry = PROVIDER_REGISTRY.openai;
+      let capturedBaseURL: string | undefined;
+
+      // A deployment with a custom-named OpenAI provider instance: the model
+      // prefix is the instance name (gateway route segment), not a type.
+      saveCoderConfig(config, {
+        discoveredProviders: [{ name: "prod-openai", type: "openai" }],
+      });
+      factory.coderOauthService = stubCoderOauthService();
+
+      PROVIDER_REGISTRY.openai = async () => {
+        const module = await originalOpenAIRegistry();
+        return {
+          ...module,
+          createOpenAI: (options) => {
+            capturedBaseURL = options?.baseURL;
+            return module.createOpenAI(options);
+          },
+        };
+      };
+
+      try {
+        const result = await factory.createModel("coder:prod-openai/gpt-5.2");
+        expect(result.success).toBe(true);
+        if (!result.success) {
+          return;
+        }
+
+        expect(capturedBaseURL).toBe(`${CODER_DEPLOYMENT_URL}/api/v2/aibridge/prod-openai/v1`);
+        expect((result.data as { modelId?: unknown }).modelId).toBe("gpt-5.2");
+        expect((result.data as { provider?: unknown }).provider).toBe("openai.responses");
+      } finally {
+        PROVIDER_REGISTRY.openai = originalOpenAIRegistry;
+      }
+    });
+  });
+
+  it("speaks chat completions to OpenAI-compatible provider types and honors additionalProviders", async () => {
+    await withTempConfig(async (config, factory) => {
+      // additionalProviders is the user-managed escape hatch for deployments
+      // where the member cannot list providers; openai-compat upstreams only
+      // guarantee /chat/completions, not the Responses API.
+      saveCoderConfig(config, {
+        additionalProviders: [{ name: "llm-proxy", type: "openai-compat" }],
+      });
+      factory.coderOauthService = stubCoderOauthService();
+
+      const result = await factory.createModel("coder:llm-proxy/llama-3.3-70b");
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        return;
+      }
+      expect((result.data as { modelId?: unknown }).modelId).toBe("llama-3.3-70b");
+      expect((result.data as { provider?: unknown }).provider).toBe("openai.chat");
+    });
+  });
+
+  it("speaks the Anthropic wire protocol to bedrock-type provider instances", async () => {
+    await withTempConfig(async (config, factory) => {
+      // The gateway serves Bedrock through its Anthropic client (/v1/messages).
+      saveCoderConfig(config);
+      factory.coderOauthService = stubCoderOauthService();
+
+      const result = await factory.createModel("coder:bedrock/claude-sonnet-4-5");
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        return;
+      }
+      expect((result.data as { provider?: unknown }).provider).toBe("anthropic.messages");
+    });
+  });
+
+  it("keeps instances named after other direct providers routed through Coder", async () => {
+    await withTempConfig(async (config, factory) => {
+      // A default-named google instance: canonicalization must NOT rewrite
+      // coder:google/x to google:x (which would route to the direct Google
+      // provider, bypassing the gateway the user selected — or fail without
+      // direct Google credentials). The string stays gateway-scoped and the
+      // instance type (google → OpenAI-compatible wire) picks the SDK.
+      saveCoderConfig(config, {
+        discoveredProviders: [{ name: "google", type: "google" }],
+        models: ["google/gemini-3-pro"],
+        discoveredModels: ["google/gemini-3-pro"],
+      });
+      config.saveProvidersConfig({
+        ...config.loadProvidersConfig(),
+        // Direct Google credentials exist: they must NOT capture the request.
+        google: { apiKey: "g-key" },
+      } as Parameters<Config["saveProvidersConfig"]>[0]);
+      factory.coderOauthService = stubCoderOauthService();
+
+      const result = await factory.resolveAndCreateModel("coder:google/gemini-3-pro", "off");
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        return;
+      }
+      expect(result.data.effectiveModelString).toBe("coder:google/gemini-3-pro");
+      expect(result.data.canonicalModelString).toBe("coder:google/gemini-3-pro");
+      expect(result.data.routeProvider).toBe("coder");
+      expect((result.data.model as { provider?: unknown }).provider).toBe("openai.chat");
+      // Message preparation and options namespaces key on the wire the
+      // request speaks (google → OpenAI-compatible), not the "coder" prefix.
+      expect(result.data.wireProviderName).toBe("openai");
+    });
+  });
+
+  it("reports the wire provider from instance metadata, not the instance name", async () => {
+    await withTempConfig(async (config, factory) => {
+      // {name: "openai", type: "anthropic"}: the request speaks Anthropic on
+      // the wire, so message preparation (reasoning transforms, PDF-filename
+      // sanitization) must key on anthropic even though the name says openai.
+      saveCoderConfig(config, {
+        discoveredProviders: [{ name: "openai", type: "anthropic" }],
+        models: ["openai/claude-opus-4-5"],
+        discoveredModels: ["openai/claude-opus-4-5"],
+      });
+      factory.coderOauthService = stubCoderOauthService();
+
+      const result = await factory.resolveAndCreateModel("coder:openai/claude-opus-4-5", "off");
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        return;
+      }
+      // Name-based canonicalization still applies (the explicit-gateway
+      // restore keeps routing on the gateway), but the WIRE comes from the
+      // instance metadata, and the SDK selection matches it.
+      expect(result.data.canonicalProviderName).toBe("openai");
+      expect(result.data.effectiveModelString).toBe("coder:openai/claude-opus-4-5");
+      expect(result.data.wireProviderName).toBe("anthropic");
+      expect((result.data.model as { provider?: unknown }).provider).toBe("anthropic.messages");
+    });
+  });
+
+  it("merges backend disableBetaFeatures for custom-named Anthropic-wire instances", async () => {
+    await withTempConfig(async (config, factory) => {
+      // The wire (instance type), not the route name, classifies the request
+      // as Anthropic: without wire-based classification the authoritative
+      // providers.anthropic.disableBetaFeatures never merges and cache_control
+      // is injected despite the user disabling beta features.
+      saveCoderConfig(config, {
+        discoveredProviders: [{ name: "prod-anthropic", type: "anthropic" }],
+        models: ["prod-anthropic/claude-opus-4-5"],
+        discoveredModels: ["prod-anthropic/claude-opus-4-5"],
+      });
+      config.saveProvidersConfig({
+        ...config.loadProvidersConfig(),
+        anthropic: { disableBetaFeatures: true },
+      } as Parameters<Config["saveProvidersConfig"]>[0]);
+      factory.coderOauthService = stubCoderOauthService();
+
+      const muxOptions: MuxProviderOptions = {};
+      const result = await factory.createModel("coder:prod-anthropic/claude-opus-4-5", muxOptions);
+      expect(result.success).toBe(true);
+      expect(muxOptions.anthropic?.disableBetaFeatures).toBe(true);
+    });
+  });
+
+  it("does not merge Anthropic beta config for cross-typed anthropic-named instances", async () => {
+    await withTempConfig(async (config, factory) => {
+      // {name: "anthropic", type: "openai-compat"}: the model ID starts with
+      // "anthropic/" but the wire is NOT Anthropic — name-based classification
+      // would wrongly merge Anthropic-only config into the request options.
+      saveCoderConfig(config, {
+        discoveredProviders: [{ name: "anthropic", type: "openai-compat" }],
+        models: ["anthropic/gpt-5"],
+        discoveredModels: ["anthropic/gpt-5"],
+      });
+      config.saveProvidersConfig({
+        ...config.loadProvidersConfig(),
+        anthropic: { disableBetaFeatures: true },
+      } as Parameters<Config["saveProvidersConfig"]>[0]);
+      factory.coderOauthService = stubCoderOauthService();
+
+      const muxOptions: MuxProviderOptions = {};
+      const result = await factory.createModel("coder:anthropic/gpt-5", muxOptions);
+      expect(result.success).toBe(true);
+      expect(muxOptions.anthropic).toBeUndefined();
+    });
+  });
+
+  it("merges the OpenAI ZDR store setting for custom-named openai-typed instances", async () => {
+    await withTempConfig(async (config, factory) => {
+      // Type "openai" = the real OpenAI Responses upstream, where the ZDR
+      // store flag applies. Name-based classification (modelId startsWith
+      // "openai/") misses custom names entirely.
+      saveCoderConfig(config, {
+        discoveredProviders: [{ name: "prod-openai", type: "openai" }],
+        models: ["prod-openai/gpt-5.2"],
+        discoveredModels: ["prod-openai/gpt-5.2"],
+      });
+      config.saveProvidersConfig({
+        ...config.loadProvidersConfig(),
+        openai: { store: false },
+      } as Parameters<Config["saveProvidersConfig"]>[0]);
+      factory.coderOauthService = stubCoderOauthService();
+
+      const muxOptions: MuxProviderOptions = {};
+      const result = await factory.createModel("coder:prod-openai/gpt-5.2", muxOptions);
+      expect(result.success).toBe(true);
+      expect(muxOptions.openai?.store).toBe(false);
+    });
+  });
+
+  it("does not merge the OpenAI store setting for cross-typed openai-named instances", async () => {
+    await withTempConfig(async (config, factory) => {
+      // {name: "openai", type: "openai-compat"}: the model ID starts with
+      // "openai/" but the upstream is NOT the real OpenAI — the ZDR store
+      // flag must not leak onto arbitrary compat upstreams.
+      saveCoderConfig(config, {
+        discoveredProviders: [{ name: "openai", type: "openai-compat" }],
+        models: ["openai/gpt-5"],
+        discoveredModels: ["openai/gpt-5"],
+      });
+      config.saveProvidersConfig({
+        ...config.loadProvidersConfig(),
+        openai: { store: false },
+      } as Parameters<Config["saveProvidersConfig"]>[0]);
+      factory.coderOauthService = stubCoderOauthService();
+
+      const muxOptions: MuxProviderOptions = {};
+      const result = await factory.createModel("coder:openai/gpt-5", muxOptions);
+      expect(result.success).toBe(true);
+      expect(muxOptions.openai).toBeUndefined();
+    });
+  });
+
+  it("falls back to the type-derived provider when the catalog excludes the model", async () => {
+    await withTempConfig(async (config, factory) => {
+      // Cross-typed instance {name: "openai", type: "anthropic"} whose
+      // catalog does NOT contain the requested model: the explicit coder
+      // route cannot be restored, and the fallback identity comes from the
+      // instance TYPE (anthropic) — not from the provider its name
+      // resembles. The wire follows the effective route.
+      saveCoderConfig(config, {
+        discoveredProviders: [{ name: "openai", type: "anthropic" }],
+        models: ["openai/claude-opus-4-5"],
+        discoveredModels: ["openai/claude-opus-4-5"],
+      });
+      config.saveProvidersConfig({
+        ...config.loadProvidersConfig(),
+        // Both direct providers configured: the NAME-alike (openai) must
+        // not capture the request; the TYPE-derived provider wins.
+        openai: { apiKey: "sk-openai" },
+        anthropic: { apiKey: "sk-anthropic" },
+      } as Parameters<Config["saveProvidersConfig"]>[0]);
+      factory.coderOauthService = stubCoderOauthService();
+
+      const result = await factory.resolveAndCreateModel("coder:openai/claude-sonnet-4-5", "off");
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        return;
+      }
+      expect(result.data.effectiveModelString).toBe("anthropic:claude-sonnet-4-5");
+      expect(result.data.routeProvider).toBe("anthropic");
+      expect(result.data.wireProviderName).toBe("anthropic");
+      // Fallback-away requests still report the selected instance so callers
+      // can pin its type into the request's providers-config snapshot.
+      expect(result.data.coderSelectedInstance).toEqual({ name: "openai", type: "anthropic" });
+    });
+  });
+
+  it("creates the SDK model from the same config snapshot as the wire report", async () => {
+    await withTempConfig(async (config, factory) => {
+      // Another Mux process rewrites providers.jsonc between route/wire
+      // resolution and model creation (an authoritative refresh changing the
+      // instance's type). The created SDK model must follow the SAME
+      // snapshot as the returned coderWire — a fresh reload inside
+      // createModel would produce an OpenAI-chat model while the caller
+      // assembles Anthropic tools/options from the reported wire.
+      saveCoderConfig(config, {
+        discoveredProviders: [{ name: "prod", type: "anthropic" }],
+        models: ["prod/claude-opus-4-5"],
+        discoveredModels: ["prod/claude-opus-4-5"],
+      });
+      factory.coderOauthService = stubCoderOauthService();
+
+      const realLoad = config.loadProvidersConfig.bind(config);
+      let loads = 0;
+      const loadSpy = spyOn(config, "loadProvidersConfig").mockImplementation(() => {
+        loads++;
+        // realLoad parses a fresh object per call, so mutating it here never
+        // leaks into other reads.
+        const current = realLoad();
+        if (loads > 1 && current?.coder) {
+          // Every read after resolveAndCreateModel's snapshot sees the
+          // concurrently rewritten type.
+          current.coder.discoveredProviders = [{ name: "prod", type: "openai-compat" }];
+        }
+        return current;
+      });
+      try {
+        const result = await factory.resolveAndCreateModel("coder:prod/claude-opus-4-5", "off");
+        expect(result.success).toBe(true);
+        if (!result.success) {
+          return;
+        }
+        expect(loads).toBeGreaterThan(1);
+        expect(result.data.wireProviderName).toBe("anthropic");
+        expect(result.data.coderWire?.providerType).toBe("anthropic");
+        // The SDK model matches the reported wire, not the rewritten config.
+        expect((result.data.model as { provider?: unknown }).provider).toBe("anthropic.messages");
+      } finally {
+        loadSpy.mockRestore();
+      }
+    });
+  });
+
+  it("canonicalizes gateway-scoped type-derived fallback seeds for the wire identity", async () => {
+    await withTempConfig(async (config, factory) => {
+      // A bedrock-typed instance whose catalog excludes the requested model
+      // seeds its fallback from the instance type: bedrock:anthropic.<model>.
+      // The seed is itself gateway-scoped — the wire identity must be its
+      // CANONICAL origin (anthropic), matching what a direct selection of
+      // that Bedrock string prepares with; reporting "bedrock" would skip
+      // Anthropic reasoning/PDF transforms for Anthropic-shaped bytes.
+      saveCoderConfig(config, {
+        discoveredProviders: [{ name: "bedrock", type: "bedrock" }],
+        models: ["bedrock/anthropic.claude-opus-4-5"],
+        discoveredModels: ["bedrock/anthropic.claude-opus-4-5"],
+      });
+      config.saveProvidersConfig({
+        ...config.loadProvidersConfig(),
+        bedrock: { region: "us-east-1" },
+      } as Parameters<Config["saveProvidersConfig"]>[0]);
+      factory.coderOauthService = stubCoderOauthService();
+
+      const result = await factory.resolveAndCreateModel(
+        "coder:bedrock/anthropic.claude-sonnet-4-5",
+        "off"
+      );
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        return;
+      }
+      expect(result.data.effectiveModelString).toBe("bedrock:anthropic.claude-sonnet-4-5");
+      expect(result.data.routeProvider).toBe("bedrock");
+      expect(result.data.wireProviderName).toBe("anthropic");
+    });
+  });
+
+  it("rejects catalog-excluded models on instances without a canonical fallback", async () => {
+    await withTempConfig(async (config, factory) => {
+      // openai-compat fronts an arbitrary upstream, so a catalog-excluded
+      // model has NO distinct canonical identity to fall back to. Feeding the
+      // rejected coder: string back into routing would resolve the last-resort
+      // direct Coder route and bypass the catalog decision entirely.
+      saveCoderConfig(config, {
+        discoveredProviders: [{ name: "llm-proxy", type: "openai-compat" }],
+        models: ["llm-proxy/allowed-model"],
+        discoveredModels: ["llm-proxy/allowed-model"],
+      });
+      factory.coderOauthService = stubCoderOauthService();
+
+      const result = await factory.resolveAndCreateModel("coder:llm-proxy/excluded-model", "off");
+      expect(result.success).toBe(false);
+      if (result.success) {
+        return;
+      }
+      expect(result.error).toEqual({
+        type: "model_not_available",
+        provider: "coder",
+        modelId: "llm-proxy/excluded-model",
+      });
+    });
+  });
+
+  it("rejects catalog-excluded models on canonical-named instances without a canonical fallback", async () => {
+    await withTempConfig(async (config, factory) => {
+      // {name: "anthropic", type: "openai-compat"}: metadata resolution is
+      // null (arbitrary upstream), so the fallback must not adopt the
+      // name-derived anthropic:<model> identity — the rejection applies
+      // exactly like the equivalent custom-named openai-compat instance.
+      saveCoderConfig(config, {
+        discoveredProviders: [{ name: "anthropic", type: "openai-compat" }],
+        models: ["anthropic/allowed-model"],
+        discoveredModels: ["anthropic/allowed-model"],
+      });
+      // Direct Anthropic credentials exist: a name-derived fallback would
+      // silently send the rejected gateway selection to direct Anthropic.
+      config.saveProvidersConfig({
+        ...config.loadProvidersConfig(),
+        anthropic: { apiKey: "sk-ant-test" },
+      } as Parameters<Config["saveProvidersConfig"]>[0]);
+      factory.coderOauthService = stubCoderOauthService();
+
+      const result = await factory.resolveAndCreateModel("coder:anthropic/excluded-model", "off");
+      expect(result.success).toBe(false);
+      if (result.success) {
+        return;
+      }
+      expect(result.error).toEqual({
+        type: "model_not_available",
+        provider: "coder",
+        modelId: "anthropic/excluded-model",
+      });
+    });
+  });
+
+  it("rejects disconnected unmappable canonical-named instances instead of name-canonicalizing", async () => {
+    await withTempConfig(async (config, factory) => {
+      // Coder disconnected (no coderOauth) + {name: "anthropic",
+      // type: "openai-compat"} + direct Anthropic credentials: the seed has
+      // no canonical fallback identity, so the request must fail on the
+      // coder route's own credentials — not name-canonicalize to direct
+      // Anthropic.
+      saveCoderConfig(config, {
+        coderOauth: undefined,
+        discoveredProviders: [{ name: "anthropic", type: "openai-compat" }],
+        models: ["anthropic/some-model"],
+        discoveredModels: ["anthropic/some-model"],
+      });
+      config.saveProvidersConfig({
+        ...config.loadProvidersConfig(),
+        anthropic: { apiKey: "sk-ant-test" },
+      } as Parameters<Config["saveProvidersConfig"]>[0]);
+      factory.coderOauthService = stubCoderOauthService();
+
+      const result = await factory.resolveAndCreateModel("coder:anthropic/some-model", "off");
+      expect(result.success).toBe(false);
+      if (result.success) {
+        return;
+      }
+      expect(result.error.type).toBe("api_key_not_found");
+    });
+  });
+
+  it("rejects unknown provider names with an actionable error", async () => {
+    await withTempConfig(async (config, factory) => {
+      saveCoderConfig(config);
+      factory.coderOauthService = stubCoderOauthService();
+
+      const result = await factory.createModel("coder:mystery-provider/some-model");
+      expect(result.success).toBe(false);
+      if (result.success) {
+        return;
+      }
+      expect(result.error.type).toBe("invalid_model_string");
+      if (result.error.type === "invalid_model_string") {
+        expect(result.error.message).toContain("additionalProviders");
+      }
+    });
+  });
+
+  it("rejects copilot-type provider instances as unsupported", async () => {
+    await withTempConfig(async (config, factory) => {
+      // Copilot gateway routes need request-time tokens only an official
+      // Copilot client can mint; Mux's Coder OAuth token is not enough.
+      saveCoderConfig(config, {
+        discoveredProviders: [{ name: "copilot", type: "copilot" }],
+      });
+      factory.coderOauthService = stubCoderOauthService();
+
+      const result = await factory.createModel("coder:copilot/gpt-5.2");
+      expect(result.success).toBe(false);
+      if (result.success) {
+        return;
+      }
+      expect(result.error.type).toBe("invalid_model_string");
+      if (result.error.type === "invalid_model_string") {
+        expect(result.error.message).toContain("not supported");
       }
     });
   });

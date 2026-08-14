@@ -1121,6 +1121,38 @@ export function ProvidersSection() {
   const coderDeploymentUrl = config?.coder?.deploymentUrl ?? "";
   const coderLoginInProgress = coderLoginStatus === "starting" || coderLoginStatus === "waiting";
 
+  // Manual AI Gateway model re-discovery: newly configured providers/models
+  // on the deployment otherwise only appear after a re-login.
+  const [coderModelRefreshState, setCoderModelRefreshState] = useState<
+    { kind: "idle" } | { kind: "refreshing" } | { kind: "error"; message: string }
+  >({ kind: "idle" });
+
+  // Synchronous reentrancy guard: the button's disabled={refreshing} prop
+  // lags a render behind, so repeated or programmatic activation could start
+  // overlapping refreshes whose state updates race. The ref flips before the
+  // first await, making the second activation a deterministic no-op.
+  const coderModelRefreshInFlightRef = useRef(false);
+  const refreshCoderModels = async () => {
+    if (!api || coderModelRefreshInFlightRef.current) {
+      return;
+    }
+    coderModelRefreshInFlightRef.current = true;
+    setCoderModelRefreshState({ kind: "refreshing" });
+    try {
+      const result = await api.coderOauth.refreshModels();
+      if (!result.success) {
+        setCoderModelRefreshState({ kind: "error", message: result.error });
+        return;
+      }
+      setCoderModelRefreshState({ kind: "idle" });
+      await refresh();
+    } catch (err) {
+      setCoderModelRefreshState({ kind: "error", message: getErrorMessage(err) });
+    } finally {
+      coderModelRefreshInFlightRef.current = false;
+    }
+  };
+
   const cancelCoderLogin = async () => {
     coderLoginAttemptRef.current++;
     // Await backend cancellation BEFORE dismissing the attempt: Cancel can
@@ -2311,6 +2343,34 @@ export function ProvidersSection() {
                                   </Button>
                                 )}
 
+                                {coderOauthIsConnected && (
+                                  <Button
+                                    variant="secondary"
+                                    size="sm"
+                                    onClick={() => {
+                                      // Not fire-and-forget: failures stay observable by
+                                      // settling into coderModelRefreshState. The body
+                                      // handles its own errors; this catch surfaces any
+                                      // unexpected rejection in the same error state.
+                                      refreshCoderModels().catch((err: unknown) => {
+                                        setCoderModelRefreshState({
+                                          kind: "error",
+                                          message: getErrorMessage(err),
+                                        });
+                                      });
+                                    }}
+                                    disabled={
+                                      !api ||
+                                      coderLoginInProgress ||
+                                      coderModelRefreshState.kind === "refreshing"
+                                    }
+                                  >
+                                    {coderModelRefreshState.kind === "refreshing"
+                                      ? "Refreshing..."
+                                      : "Refresh models"}
+                                  </Button>
+                                )}
+
                                 {coderOauthCredentialStored && (
                                   <Button
                                     variant="ghost"
@@ -2335,6 +2395,12 @@ export function ProvidersSection() {
                               {coderLoginStatus === "error" && coderLoginError && (
                                 <p className="text-destructive text-xs">
                                   Login failed: {coderLoginError}
+                                </p>
+                              )}
+
+                              {coderModelRefreshState.kind === "error" && (
+                                <p className="text-destructive text-xs">
+                                  Model refresh failed: {coderModelRefreshState.message}
                                 </p>
                               )}
                             </div>

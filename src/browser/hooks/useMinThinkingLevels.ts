@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useOptionalAPI } from "@/browser/contexts/API";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
-import { normalizeToCanonical } from "@/common/utils/ai/models";
+import { normalizeSelectedModel } from "@/common/utils/ai/models";
 import {
   getAvailableThinkingLevels,
   getDefaultMinimumThinkingLevel,
+  lookupMinThinkingLevelOverride,
   resolveMinimumThinkingLevel,
 } from "@/common/utils/thinking/policy";
 import type { ThinkingLevel } from "@/common/types/thinking";
@@ -97,9 +98,11 @@ export function useMinThinkingLevels(): MinThinkingLevelsState {
     };
   }, [api, fetchConfig]);
 
+  // Lookups go through lookupMinThinkingLevelOverride so floors persisted by
+  // older versions under the name-canonical key keep applying (see helper).
   const getMinOverride = useCallback(
     (modelString: string): ThinkingLevel | undefined =>
-      minThinkingLevelByModel[normalizeToCanonical(modelString)],
+      lookupMinThinkingLevelOverride(minThinkingLevelByModel, modelString),
     [minThinkingLevelByModel]
   );
 
@@ -107,7 +110,7 @@ export function useMinThinkingLevels(): MinThinkingLevelsState {
     (modelString: string): ThinkingLevel =>
       resolveMinimumThinkingLevel(
         modelString,
-        minThinkingLevelByModel[normalizeToCanonical(modelString)],
+        lookupMinThinkingLevelOverride(minThinkingLevelByModel, modelString),
         providersConfig
       ),
     [minThinkingLevelByModel, providersConfig]
@@ -115,7 +118,7 @@ export function useMinThinkingLevels(): MinThinkingLevelsState {
 
   const setMinThinkingLevel = useCallback(
     (modelString: string, level: ThinkingLevel | null) => {
-      const key = normalizeToCanonical(modelString);
+      const key = normalizeSelectedModel(modelString);
       const next = { ...minThinkingLevelByModel };
       // Keep the persisted map sparse: clear the override when it has the same effect as the
       // built-in default floor. We compare effective lowest-available levels so models whose
