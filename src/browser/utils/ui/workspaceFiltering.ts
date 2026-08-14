@@ -205,6 +205,14 @@ function getIsWorkspaceLiveActive(workspaceId: string, options: DelegatedActivit
   }
 }
 
+/** Queued task work that has not yet produced a completed report. */
+function isWorkspaceDelegatedActivityQueued(workspace: FrontendWorkspaceMetadata): boolean {
+  return (
+    workspace.taskExecutionStatus === "queued" ||
+    (!hasCompletedAgentReport(workspace) && workspace.taskStatus === "queued")
+  );
+}
+
 export function isWorkspaceDelegatedActivityActive(
   workspace: FrontendWorkspaceMetadata,
   options: DelegatedActivityOptions = {}
@@ -293,10 +301,7 @@ export function computeDelegatedActivityByWorkspaceId(
         if (childWorkflowOwned) {
           descendantActivity.workflowActiveCount += 1;
         }
-      } else if (
-        child.taskExecutionStatus === "queued" ||
-        (!hasCompletedAgentReport(child) && child.taskStatus === "queued")
-      ) {
+      } else if (isWorkspaceDelegatedActivityQueued(child)) {
         descendantActivity.queuedCount += 1;
         if (childWorkflowOwned) {
           descendantActivity.workflowQueuedCount += 1;
@@ -319,6 +324,233 @@ export function computeDelegatedActivityByWorkspaceId(
   }
 
   return activityByWorkspaceId;
+}
+
+/**
+ * Drop rows whose ancestry reaches a root in the list (the opt-in "hide
+ * sub-agents in sidebar" setting). Orphans keep rendering as promoted roots,
+ * and members of malformed parent cycles stay visible so corrupted metadata
+ * cannot make workspaces inaccessible.
+ */
+export function excludeSubAgentRows(
+  workspaces: FrontendWorkspaceMetadata[]
+): FrontendWorkspaceMetadata[] {
+  const byId = new Map(workspaces.map((workspace) => [workspace.id, workspace] as const));
+  const reachesRootById = new Map<string, boolean>();
+
+  const reachesRoot = (workspace: FrontendWorkspaceMetadata, path: Set<string>): boolean => {
+    const cached = reachesRootById.get(workspace.id);
+    if (cached !== undefined) {
+      return cached;
+    }
+    if (path.has(workspace.id)) {
+      return false;
+    }
+
+    path.add(workspace.id);
+    const parentId = workspace.parentWorkspaceId;
+    const parent = parentId != null ? byId.get(parentId) : undefined;
+    const result = parent == null ? true : reachesRoot(parent, path);
+    path.delete(workspace.id);
+
+    reachesRootById.set(workspace.id, result);
+    return result;
+  };
+
+  return workspaces.filter((workspace) => {
+    const parentId = workspace.parentWorkspaceId;
+    if (parentId == null || !byId.has(parentId)) {
+      return true;
+    }
+    return !reachesRoot(workspace, new Set());
+  });
+}
+
+/**
+ * Descendant census a parent row shows while its sub-agent rows are hidden,
+ * mirroring the transcript's sub-agent decoration: workflow workers are
+ * counted separately from user-owned sub-agents.
+ */
+export interface WorkspaceSubAgentsSummary {
+  /** All user-owned (non-workflow) descendants, active or not. */
+  subAgentCount: number;
+  /** Running user-owned descendants. */
+  runningSubAgentCount: number;
+  /** Queued user-owned descendants. */
+  queuedSubAgentCount: number;
+  /** Distinct workflow runs with at least one running descendant worker. */
+  runningWorkflowRunCount: number;
+  /** Distinct workflow runs whose descendant workers are all queued. */
+  queuedWorkflowRunCount: number;
+  /** Running workflow-owned descendant workers across runs. */
+  runningWorkflowAgentCount: number;
+  /** Queued workflow-owned descendant workers across runs. */
+  queuedWorkflowAgentCount: number;
+  /**
+   * IDs of the runs behind the run counts, so a parent's own active runs
+   * that currently have no live worker can be reconciled instead of hidden
+   * behind a concurrent run's workers.
+   */
+  workflowRunIds: ReadonlySet<string>;
+  /** Name of the first running workflow run, or first queued run when none run. */
+  workflowName?: string;
+}
+
+interface SubAgentsSummaryOptions extends DelegatedActivityOptions {
+  /**
+   * Active workflow run IDs owned by a workspace, from live sidebar state.
+   * Lets the rollup keep a hidden descendant's run visible while it is
+   * between sequential steps and has no countable workers.
+   */
+  getActiveWorkflowRunIds?: (workspaceId: string) => readonly string[];
+}
+
+/** Roll a hidden-descendant census up to each ancestor workspace. */
+export function computeSubAgentsSummaryByWorkspaceId(
+  workspaces: readonly FrontendWorkspaceMetadata[],
+  options: SubAgentsSummaryOptions = {}
+): Map<string, WorkspaceSubAgentsSummary> {
+  const workspaceById = new Map<string, FrontendWorkspaceMetadata>();
+  for (const workspace of workspaces) {
+    workspaceById.set(workspace.id, workspace);
+  }
+
+  const childrenByParentId = new Map<string, FrontendWorkspaceMetadata[]>();
+  const roots: FrontendWorkspaceMetadata[] = [];
+  for (const workspace of workspaceById.values()) {
+    const parentId = workspace.parentWorkspaceId;
+    if (!parentId || !workspaceById.has(parentId)) {
+      roots.push(workspace);
+      continue;
+    }
+
+    const children = childrenByParentId.get(parentId) ?? [];
+    children.push(workspace);
+    childrenByParentId.set(parentId, children);
+  }
+
+  interface WorkflowRunRollup {
+    hasRunning: boolean;
+    name?: string;
+  }
+
+  interface MutableSummary {
+    subAgentCount: number;
+    runningSubAgentCount: number;
+    queuedSubAgentCount: number;
+    runningWorkflowAgentCount: number;
+    queuedWorkflowAgentCount: number;
+    workflowRunsById: Map<string, WorkflowRunRollup>;
+  }
+
+  const result = new Map<string, WorkspaceSubAgentsSummary>();
+
+  // Each workspace has at most one parent, so traversal from roots reaches
+  // every node at most once; nodes inside parent cycles are never roots and
+  // stay unreachable, so no cycle guard is needed.
+  const traverse = (
+    workspace: FrontendWorkspaceMetadata,
+    ancestorWorkflowRunId: string | undefined
+  ): MutableSummary => {
+    const summary: MutableSummary = {
+      subAgentCount: 0,
+      runningSubAgentCount: 0,
+      queuedSubAgentCount: 0,
+      runningWorkflowAgentCount: 0,
+      queuedWorkflowAgentCount: 0,
+      workflowRunsById: new Map(),
+    };
+
+    const mergeWorkflowRun = (runId: string, rollup: WorkflowRunRollup): void => {
+      const run = summary.workflowRunsById.get(runId) ?? { hasRunning: false };
+      run.hasRunning ||= rollup.hasRunning;
+      run.name ??= rollup.name;
+      summary.workflowRunsById.set(runId, run);
+    };
+
+    for (const child of childrenByParentId.get(workspace.id) ?? []) {
+      // Descendants of a workflow worker stay workflow-owned, matching the
+      // delegated-activity rollup.
+      const childWorkflowRunId = child.workflowTask?.runId ?? ancestorWorkflowRunId;
+      const isRunning = isWorkspaceDelegatedActivityActive(child, options);
+      const isQueued = !isRunning && isWorkspaceDelegatedActivityQueued(child);
+
+      if (childWorkflowRunId == null) {
+        summary.subAgentCount += 1;
+        if (isRunning) {
+          summary.runningSubAgentCount += 1;
+        } else if (isQueued) {
+          summary.queuedSubAgentCount += 1;
+        }
+      } else if (isRunning || isQueued) {
+        if (isRunning) {
+          summary.runningWorkflowAgentCount += 1;
+        } else {
+          summary.queuedWorkflowAgentCount += 1;
+        }
+        mergeWorkflowRun(childWorkflowRunId, {
+          hasRunning: isRunning,
+          name: child.workflowTask?.workflowName,
+        });
+      }
+
+      const childSummary = traverse(child, childWorkflowRunId);
+      summary.subAgentCount += childSummary.subAgentCount;
+      summary.runningSubAgentCount += childSummary.runningSubAgentCount;
+      summary.queuedSubAgentCount += childSummary.queuedSubAgentCount;
+      summary.runningWorkflowAgentCount += childSummary.runningWorkflowAgentCount;
+      summary.queuedWorkflowAgentCount += childSummary.queuedWorkflowAgentCount;
+      for (const [runId, rollup] of childSummary.workflowRunsById) {
+        mergeWorkflowRun(runId, rollup);
+      }
+
+      // A run the child owns that has no tracked worker (between sequential
+      // steps) is still in progress and must count as running; runs already
+      // tracked by workers keep their worker-derived state, mirroring the
+      // displayed row's own-run reconciliation.
+      for (const runId of options.getActiveWorkflowRunIds?.(child.id) ?? []) {
+        if (!summary.workflowRunsById.has(runId)) {
+          summary.workflowRunsById.set(runId, { hasRunning: true });
+        }
+      }
+    }
+
+    if (summary.subAgentCount > 0 || summary.workflowRunsById.size > 0) {
+      let runningWorkflowRunCount = 0;
+      let queuedWorkflowRunCount = 0;
+      let runningWorkflowName: string | undefined;
+      let queuedWorkflowName: string | undefined;
+      for (const run of summary.workflowRunsById.values()) {
+        if (run.hasRunning) {
+          runningWorkflowRunCount += 1;
+          runningWorkflowName ??= run.name;
+        } else {
+          queuedWorkflowRunCount += 1;
+          queuedWorkflowName ??= run.name;
+        }
+      }
+
+      result.set(workspace.id, {
+        subAgentCount: summary.subAgentCount,
+        runningSubAgentCount: summary.runningSubAgentCount,
+        queuedSubAgentCount: summary.queuedSubAgentCount,
+        runningWorkflowRunCount,
+        queuedWorkflowRunCount,
+        runningWorkflowAgentCount: summary.runningWorkflowAgentCount,
+        queuedWorkflowAgentCount: summary.queuedWorkflowAgentCount,
+        workflowRunIds: new Set(summary.workflowRunsById.keys()),
+        // A queued-only run must never lend its name to the running label.
+        workflowName: runningWorkflowRunCount > 0 ? runningWorkflowName : queuedWorkflowName,
+      });
+    }
+    return summary;
+  };
+
+  for (const root of roots) {
+    traverse(root, root.workflowTask?.runId);
+  }
+
+  return result;
 }
 
 export interface AgentRowRenderMeta {

@@ -9,6 +9,8 @@ import {
   computeAgentRowRenderMeta,
   computeDelegatedActivityByWorkspaceId,
   computeRowMetaForVisibleNodes,
+  computeSubAgentsSummaryByWorkspaceId,
+  excludeSubAgentRows,
   filterVisibleAgentRows,
   type AgentRowRenderMeta,
   type SidebarVisibleRowNode,
@@ -920,6 +922,189 @@ describe("delegated workspace activity roll-up", () => {
     });
 
     expect(activityByWorkspaceId.get("parent")?.activeCount).toBe(1);
+  });
+});
+
+describe("excludeSubAgentRows", () => {
+  it("drops rows whose parent chain is present but keeps promoted orphans", () => {
+    const workspaces = [
+      createWorkspace("root"),
+      createWorkspace("child", { parentWorkspaceId: "root", taskStatus: "running" }),
+      createWorkspace("grandchild", { parentWorkspaceId: "child", taskStatus: "running" }),
+      createWorkspace("orphan", { parentWorkspaceId: "missing-parent", taskStatus: "running" }),
+    ];
+
+    expect(excludeSubAgentRows(workspaces).map((workspace) => workspace.id)).toEqual([
+      "root",
+      "orphan",
+    ]);
+  });
+
+  it("keeps members of malformed parent cycles visible", () => {
+    const workspaces = [
+      createWorkspace("root"),
+      createWorkspace("hidden-child", { parentWorkspaceId: "root", taskStatus: "running" }),
+      createWorkspace("cycle-a", { parentWorkspaceId: "cycle-b" }),
+      createWorkspace("cycle-b", { parentWorkspaceId: "cycle-a" }),
+      createWorkspace("cycle-descendant", { parentWorkspaceId: "cycle-a" }),
+    ];
+
+    expect(excludeSubAgentRows(workspaces).map((workspace) => workspace.id)).toEqual([
+      "root",
+      "cycle-a",
+      "cycle-b",
+      "cycle-descendant",
+    ]);
+  });
+});
+
+describe("hidden sub-agents summary roll-up", () => {
+  it("counts user-owned descendants at every level with active/queued split", () => {
+    const workspaces = [
+      createWorkspace("parent"),
+      createWorkspace("running-child", { parentWorkspaceId: "parent", taskStatus: "running" }),
+      createWorkspace("queued-child", { parentWorkspaceId: "parent", taskStatus: "queued" }),
+      createWorkspace("reported-child", { parentWorkspaceId: "parent", taskStatus: "reported" }),
+      createWorkspace("grandchild", {
+        parentWorkspaceId: "running-child",
+        taskStatus: "reported",
+      }),
+    ];
+
+    expect(computeSubAgentsSummaryByWorkspaceId(workspaces).get("parent")).toEqual({
+      subAgentCount: 4,
+      runningSubAgentCount: 1,
+      queuedSubAgentCount: 1,
+      runningWorkflowRunCount: 0,
+      queuedWorkflowRunCount: 0,
+      runningWorkflowAgentCount: 0,
+      queuedWorkflowAgentCount: 0,
+      workflowRunIds: new Set(),
+      workflowName: undefined,
+    });
+  });
+
+  it("counts workflow workers separately with distinct runs and the run name", () => {
+    const workspaces = [
+      createWorkspace("parent"),
+      createWorkspace("worker-a", {
+        parentWorkspaceId: "parent",
+        taskStatus: "running",
+        workflowTask: { runId: "run-1", stepId: "step-1", workflowName: "Deep Research" },
+      }),
+      createWorkspace("worker-b", {
+        parentWorkspaceId: "parent",
+        taskStatus: "running",
+        workflowTask: { runId: "run-1", stepId: "step-2", workflowName: "Deep Research" },
+      }),
+      createWorkspace("worker-other-run", {
+        parentWorkspaceId: "parent",
+        taskStatus: "queued",
+        workflowTask: { runId: "run-2", stepId: "step-1" },
+      }),
+      createWorkspace("finished-worker", {
+        parentWorkspaceId: "parent",
+        taskStatus: "reported",
+        workflowTask: { runId: "run-3", stepId: "step-1" },
+      }),
+      createWorkspace("user-child", { parentWorkspaceId: "parent", taskStatus: "running" }),
+    ];
+
+    expect(computeSubAgentsSummaryByWorkspaceId(workspaces).get("parent")).toEqual({
+      subAgentCount: 1,
+      runningSubAgentCount: 1,
+      queuedSubAgentCount: 0,
+      runningWorkflowRunCount: 1,
+      queuedWorkflowRunCount: 1,
+      runningWorkflowAgentCount: 2,
+      queuedWorkflowAgentCount: 1,
+      workflowRunIds: new Set(["run-1", "run-2"]),
+      workflowName: "Deep Research",
+    });
+  });
+
+  it("treats descendants of workflow workers as workflow-owned", () => {
+    const workspaces = [
+      createWorkspace("parent"),
+      createWorkspace("worker", {
+        parentWorkspaceId: "parent",
+        taskStatus: "running",
+        workflowTask: { runId: "run-1", stepId: "step-1" },
+      }),
+      createWorkspace("worker-child", { parentWorkspaceId: "worker", taskStatus: "running" }),
+    ];
+
+    expect(computeSubAgentsSummaryByWorkspaceId(workspaces).get("parent")).toEqual({
+      subAgentCount: 0,
+      runningSubAgentCount: 0,
+      queuedSubAgentCount: 0,
+      runningWorkflowRunCount: 1,
+      queuedWorkflowRunCount: 0,
+      runningWorkflowAgentCount: 2,
+      queuedWorkflowAgentCount: 0,
+      workflowRunIds: new Set(["run-1"]),
+      workflowName: undefined,
+    });
+  });
+
+  it("omits workspaces without descendants and uses the live-active fallback", () => {
+    const workspaces = [
+      createWorkspace("parent"),
+      createWorkspace("leaf"),
+      createWorkspace("lagging-child", { parentWorkspaceId: "parent" }),
+    ];
+
+    const summaryByWorkspaceId = computeSubAgentsSummaryByWorkspaceId(workspaces, {
+      isWorkspaceLiveActive: (workspaceId) => workspaceId === "lagging-child",
+    });
+
+    expect(summaryByWorkspaceId.has("leaf")).toBe(false);
+    expect(summaryByWorkspaceId.get("parent")).toEqual({
+      subAgentCount: 1,
+      runningSubAgentCount: 1,
+      queuedSubAgentCount: 0,
+      runningWorkflowRunCount: 0,
+      queuedWorkflowRunCount: 0,
+      runningWorkflowAgentCount: 0,
+      queuedWorkflowAgentCount: 0,
+      workflowRunIds: new Set(),
+      workflowName: undefined,
+    });
+  });
+
+  it("counts a hidden owner's workerless active run as running", () => {
+    const workspaces = [
+      createWorkspace("parent"),
+      createWorkspace("owner-child", { parentWorkspaceId: "parent", taskStatus: "running" }),
+    ];
+
+    const summary = computeSubAgentsSummaryByWorkspaceId(workspaces, {
+      getActiveWorkflowRunIds: (workspaceId) => (workspaceId === "owner-child" ? ["run-gap"] : []),
+    }).get("parent");
+
+    expect(summary?.runningWorkflowRunCount).toBe(1);
+    expect(summary?.runningWorkflowAgentCount).toBe(0);
+    expect(summary?.workflowRunIds).toEqual(new Set(["run-gap"]));
+  });
+
+  it("keeps a queued-worker run queued even when its owner lists it as active", () => {
+    const workspaces = [
+      createWorkspace("parent"),
+      createWorkspace("owner-child", { parentWorkspaceId: "parent", taskStatus: "running" }),
+      createWorkspace("queued-worker", {
+        parentWorkspaceId: "owner-child",
+        taskStatus: "queued",
+        workflowTask: { runId: "run-1", stepId: "step-1" },
+      }),
+    ];
+
+    const summary = computeSubAgentsSummaryByWorkspaceId(workspaces, {
+      getActiveWorkflowRunIds: (workspaceId) => (workspaceId === "owner-child" ? ["run-1"] : []),
+    }).get("parent");
+
+    expect(summary?.runningWorkflowRunCount).toBe(0);
+    expect(summary?.queuedWorkflowRunCount).toBe(1);
+    expect(summary?.queuedWorkflowAgentCount).toBe(1);
   });
 });
 

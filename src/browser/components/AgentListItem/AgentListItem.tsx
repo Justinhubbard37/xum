@@ -15,6 +15,7 @@ import {
   isSidebarSubAgentRunning,
   type AgentRowRenderMeta,
   type WorkspaceDelegatedActivity,
+  type WorkspaceSubAgentsSummary,
 } from "@/browser/utils/ui/workspaceFiltering";
 import assert from "@/common/utils/assert";
 import { cn } from "@/common/lib/utils";
@@ -47,6 +48,7 @@ import {
   type SubAgentConnectorLayout,
 } from "../sidebarItemLayout";
 import {
+  Bot,
   Trash2,
   Trash,
   EllipsisVertical,
@@ -59,7 +61,9 @@ import {
   ChevronDown,
   HeartPulse,
   Pin,
+  Workflow,
 } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
 import { WorkspaceStatusIndicator } from "../WorkspaceStatusIndicator/WorkspaceStatusIndicator";
 import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
@@ -130,6 +134,7 @@ export interface AgentListItemProps extends AgentListItemBaseProps {
   /** Live fallback used while task metadata is catching up to a still-running stream. */
   isWorkspaceLiveActive?: boolean;
   delegatedActivity?: WorkspaceDelegatedActivity;
+  hiddenSubAgentsSummary?: WorkspaceSubAgentsSummary;
   completedChildrenExpanded?: boolean;
   onToggleCompletedChildren?: (workspaceId: string) => void;
   onSelectWorkspace: (selection: WorkspaceSelection) => void;
@@ -233,6 +238,81 @@ function formatDelegatedActivityText(activity: WorkspaceDelegatedActivity): stri
   return parts.length > 0 ? parts.join(" · ") : null;
 }
 
+const EMPTY_WORKFLOW_RUN_IDS: readonly string[] = [];
+/**
+ * Status line for a parent whose sub-agent rows are hidden, styled after the
+ * transcript's sub-agent decoration. Workflow and user-owned segments are both
+ * rendered when both have activity, since the hidden rows leave no other
+ * surface for either; the running family leads.
+ */
+function formatHiddenSubAgentsPresentation(
+  summary: WorkspaceSubAgentsSummary,
+  ownActiveWorkflowRunIds: readonly string[]
+): { icon: LucideIcon; text: string } | null {
+  // An own active run without a live worker (between sequential steps, or
+  // before its first worker spawns) is still in progress; count it as running
+  // so a concurrent run's workers cannot make it look finished while its rows
+  // are hidden.
+  const gapRunCount = ownActiveWorkflowRunIds.filter(
+    (runId) => !summary.workflowRunIds.has(runId)
+  ).length;
+  const runningRunCount = summary.runningWorkflowRunCount + gapRunCount;
+
+  let workflowText: string | null = null;
+  if (runningRunCount > 0 || summary.queuedWorkflowRunCount > 0) {
+    // Queued-only runs must not read as running (parallelism limits can park
+    // every worker), mirroring the delegated-status running/queued split.
+    const hasRunningRun = runningRunCount > 0;
+    const verb = hasRunningRun ? "running" : "queued";
+    const runCount = hasRunningRun ? runningRunCount : summary.queuedWorkflowRunCount;
+    // With no running worker, summary.workflowName is a queued run's name; a
+    // gap-only running label must not borrow it.
+    const workflowName =
+      hasRunningRun && summary.runningWorkflowRunCount === 0 ? undefined : summary.workflowName;
+    const base =
+      runCount === 1 ? `${workflowName ?? "Workflow"} ${verb}` : `${runCount} workflows ${verb}`;
+    const agentCount = hasRunningRun
+      ? summary.runningWorkflowAgentCount
+      : summary.queuedWorkflowAgentCount;
+    // Gap-only runs have no countable workers; skip the "(0 agents)" noise.
+    const agentSuffix =
+      agentCount > 0 ? ` (${agentCount} agent${agentCount === 1 ? "" : "s"})` : "";
+    const queuedSuffix =
+      hasRunningRun && summary.queuedWorkflowAgentCount > 0
+        ? ` · ${summary.queuedWorkflowAgentCount} queued`
+        : "";
+    workflowText = `${base}${agentSuffix}${queuedSuffix}`;
+  }
+
+  let subAgentText: string | null = null;
+  if (summary.runningSubAgentCount > 0 || summary.queuedSubAgentCount > 0) {
+    const parts = [`${summary.subAgentCount} sub-agent${summary.subAgentCount === 1 ? "" : "s"}`];
+    if (summary.runningSubAgentCount > 0) {
+      parts.push(`${summary.runningSubAgentCount} active`);
+    }
+    if (summary.queuedSubAgentCount > 0) {
+      parts.push(`${summary.queuedSubAgentCount} queued`);
+    }
+    subAgentText = parts.join(" · ");
+  }
+
+  if (workflowText != null && subAgentText != null) {
+    // Running activity must not hide behind a queued-only family; ties keep
+    // the workflow first as the more specific signal.
+    const subAgentsLead = summary.runningSubAgentCount > 0 && runningRunCount === 0;
+    return subAgentsLead
+      ? { icon: Bot, text: `${subAgentText} · ${workflowText}` }
+      : { icon: Workflow, text: `${workflowText} · ${subAgentText}` };
+  }
+  if (workflowText != null) {
+    return { icon: Workflow, text: workflowText };
+  }
+  if (subAgentText != null) {
+    return { icon: Bot, text: subAgentText };
+  }
+  return null;
+}
+
 function formatWorkflowRunCount(count: number): string {
   assert(count > 0, "formatWorkflowRunCount requires a positive count");
   return count === 1 ? "Workflow running" : `${count} workflows running`;
@@ -243,13 +323,16 @@ function formatBashMonitorCount(count: number): string {
   return count === 1 ? "Watching background bash" : `Watching ${count} background bashes`;
 }
 
-function SidebarActivityIndicator(props: { text: string; testId: string }) {
+function SidebarActivityIndicator(props: { text: string; testId: string; icon?: LucideIcon }) {
+  const Icon = props.icon;
   return (
     <div
       className="text-muted flex min-w-0 items-center gap-1.5 text-xs leading-4"
       data-testid={props.testId}
     >
-      <span className="min-w-0 truncate">{props.text}</span>
+      {Icon != null && <Icon className="h-3 w-3 shrink-0" strokeWidth={1.8} aria-hidden="true" />}
+      {/* Activity texts embed live counts; tabular figures stop width jitter. */}
+      <span className="counter-nums min-w-0 truncate">{props.text}</span>
     </div>
   );
 }
@@ -467,6 +550,7 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
     sectionId,
     rowRenderMeta,
     delegatedActivity,
+    hiddenSubAgentsSummary,
     completedChildrenExpanded,
     onToggleCompletedChildren,
     onSelectWorkspace,
@@ -631,6 +715,7 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
     awaitingUserQuestion,
     isStarting,
     agentStatus,
+    activeWorkflowRunIds,
     activeWorkflowRunCount,
     activeBashMonitorCount,
     terminalActiveCount,
@@ -673,6 +758,21 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
     // coordinator waiting on an armed monitor still surfaces the watching state.
     shouldShowBashMonitorStatus;
   const shouldShowDelegatedStatus = hasDelegatedStatusText && !hasOwnLiveStatusText && !hasError;
+  const hiddenSubAgentsPresentation = hiddenSubAgentsSummary
+    ? formatHiddenSubAgentsPresentation(
+        hiddenSubAgentsSummary,
+        activeWorkflowRunIds ?? EMPTY_WORKFLOW_RUN_IDS
+      )
+    : null;
+  // The summary supersedes the plain delegated/workflow lines; questions,
+  // streaming, deletion, an armed bash monitor, and errors still win.
+  const shouldShowHiddenSubAgentsStatus =
+    hiddenSubAgentsPresentation != null &&
+    !awaitingUserQuestion &&
+    displayStreamingStatusPhase === null &&
+    !isRemoving &&
+    !shouldShowBashMonitorStatus &&
+    !hasError;
   const visualState = getVisualState({
     awaitingUserQuestion,
     isInitializing,
@@ -689,6 +789,7 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
   const isSubAgentRow = rowRenderMeta?.rowKind === "subagent";
   const showsVisibleStatusDot = isStatusDotVisible(visualState, false, isSubAgentRow);
   const hasStatusText =
+    shouldShowHiddenSubAgentsStatus ||
     shouldShowDelegatedStatus ||
     Boolean(agentStatus) ||
     awaitingUserQuestion ||
@@ -1260,6 +1361,12 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                   <MessageCircleQuestionMark className="h-3 w-3 shrink-0" strokeWidth={1.8} />
                   <span className="min-w-0 truncate">Mux has a few questions</span>
                 </div>
+              ) : shouldShowHiddenSubAgentsStatus && hiddenSubAgentsPresentation ? (
+                <SidebarActivityIndicator
+                  icon={hiddenSubAgentsPresentation.icon}
+                  text={hiddenSubAgentsPresentation.text}
+                  testId={`workspace-hidden-subagents-${workspaceId}`}
+                />
               ) : shouldShowDelegatedStatus && delegatedActivity ? (
                 <DelegatedActivityIndicator
                   workspaceId={workspaceId}
