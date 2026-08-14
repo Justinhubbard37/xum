@@ -51,6 +51,7 @@ import { formatProjectHierarchyLabel } from "@/common/utils/subProjects";
 import { forkWorkspace } from "@/browser/utils/chatCommands";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
+import { isMultiProject } from "@/common/utils/multiProject";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX } from "@/constants/layout";
 import type { AgentSkillDescriptor, AgentSkillIssue } from "@/common/types/agentSkill";
@@ -127,7 +128,10 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const workspaceEntry = workspaceMetadata.get(workspaceId);
   const hasRepository = hasWorkspaceRepository(workspaceEntry);
   // Do not offer a setting that cannot poll without starting remote infrastructure.
-  const githubReviewNotificationsSupported = supportsGitHubReviewNotifications(runtimeConfig);
+  const githubReviewNotificationsSupported = supportsGitHubReviewNotifications(
+    runtimeConfig,
+    workspaceEntry != null && isMultiProject(workspaceEntry)
+  );
   // The workspace's metadata.projectName is the parent project (since worktrees
   // are owned by the top-most parent). When the workspace is scoped to a
   // sub-project we surface the hierarchy as "parent / child" so the menu bar

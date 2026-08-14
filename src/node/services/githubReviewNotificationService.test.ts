@@ -480,6 +480,18 @@ test("does not wake stopped or remote runtimes during polling", async () => {
       image: "ubuntu:24.04",
     },
   } satisfies FrontendWorkspaceMetadata;
+  const multiProjectDevcontainerWorkspace = {
+    ...workspace,
+    id: "workspace-multi-project-devcontainer",
+    runtimeConfig: {
+      type: "devcontainer",
+      configPath: ".devcontainer/devcontainer.json",
+    },
+    projects: [
+      { projectPath: "/tmp/project-a", projectName: "project-a" },
+      { projectPath: "/tmp/project-b", projectName: "project-b" },
+    ],
+  } satisfies FrontendWorkspaceMetadata;
   let executeBashCalls = 0;
 
   const workspaceService = {
@@ -489,6 +501,7 @@ test("does not wake stopped or remote runtimes during polling", async () => {
         runningDevcontainerWorkspace,
         sshWorkspace,
         dockerWorkspace,
+        multiProjectDevcontainerWorkspace,
       ]),
     executeBash: (
       ..._args: WorkspaceServiceExecuteBashArgs

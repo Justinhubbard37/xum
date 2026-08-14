@@ -3233,20 +3233,28 @@ export class AgentSession {
           goalKind,
           turnThinkingOverride
         );
-        if (streamResult.success && preparedTurnAbortController.signal.aborted) {
-          await notifyAcceptedPreStreamFailure(
-            createUnknownSendMessageError(
-              "Accepted stream startup was canceled during preparation."
-            )
-          );
-        } else if (streamResult.success && !this.disposed) {
-          try {
-            await internal?.onStreamStarted?.();
-          } catch (error: unknown) {
-            log.error("Accepted stream start callback failed", {
-              workspaceId: this.workspaceId,
-              error: getErrorMessage(error),
-            });
+        if (streamResult.success) {
+          const streamRegistered =
+            !preparedTurnAbortController.signal.aborted &&
+            !this.disposed &&
+            this.aiService.isStreaming(this.workspaceId);
+          if (!streamRegistered) {
+            await notifyAcceptedPreStreamFailure(
+              createUnknownSendMessageError(
+                preparedTurnAbortController.signal.aborted
+                  ? "Accepted stream startup was canceled during preparation."
+                  : "Accepted stream startup ended before provider stream registration."
+              )
+            );
+          } else {
+            try {
+              await internal?.onStreamStarted?.();
+            } catch (error: unknown) {
+              log.error("Accepted stream start callback failed", {
+                workspaceId: this.workspaceId,
+                error: getErrorMessage(error),
+              });
+            }
           }
         }
         return streamResult;

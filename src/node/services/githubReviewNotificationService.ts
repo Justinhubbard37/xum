@@ -5,6 +5,7 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { isDevcontainerRuntime, supportsGitHubReviewNotifications } from "@/common/types/runtime";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import { isMultiProject } from "@/common/utils/multiProject";
 import { GITHUB_REVIEW_NOTIFICATION_QUEUE_DEDUPE_PREFIX } from "@/constants/githubReviewNotifications";
 import type { Config } from "@/node/config";
 import type { ExperimentsService } from "@/node/services/experimentsService";
@@ -449,7 +450,7 @@ export class GitHubReviewNotificationService {
       return true;
     }
 
-    if (!supportsGitHubReviewNotifications(runtimeConfig)) {
+    if (!supportsGitHubReviewNotifications(runtimeConfig, isMultiProject(workspace))) {
       // Do not call executeBash for remote or container runtimes without a passive status probe.
       // executeBash calls ensureReady(), which can start stopped infrastructure.
       log.debug("Skipping GitHub review notification runtime without passive status", {
