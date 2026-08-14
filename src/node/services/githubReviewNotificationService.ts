@@ -3,11 +3,7 @@ import path from "node:path";
 
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import {
-  isDevcontainerRuntime,
-  isLocalProjectRuntime,
-  isWorktreeRuntime,
-} from "@/common/types/runtime";
+import { isDevcontainerRuntime, supportsGitHubReviewNotifications } from "@/common/types/runtime";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { GITHUB_REVIEW_NOTIFICATION_QUEUE_DEDUPE_PREFIX } from "@/constants/githubReviewNotifications";
 import type { Config } from "@/node/config";
@@ -449,15 +445,11 @@ export class GitHubReviewNotificationService {
 
   private async shouldPollWorkspaceRuntime(workspace: FrontendWorkspaceMetadata): Promise<boolean> {
     const runtimeConfig = workspace.runtimeConfig;
-    if (
-      runtimeConfig == null ||
-      isWorktreeRuntime(runtimeConfig) ||
-      isLocalProjectRuntime(runtimeConfig)
-    ) {
+    if (runtimeConfig == null) {
       return true;
     }
 
-    if (!isDevcontainerRuntime(runtimeConfig)) {
+    if (!supportsGitHubReviewNotifications(runtimeConfig)) {
       // Do not call executeBash for remote or container runtimes without a passive status probe.
       // executeBash calls ensureReady(), which can start stopped infrastructure.
       log.debug("Skipping GitHub review notification runtime without passive status", {
@@ -465,6 +457,10 @@ export class GitHubReviewNotificationService {
         runtimeType: runtimeConfig.type,
       });
       return false;
+    }
+
+    if (!isDevcontainerRuntime(runtimeConfig)) {
+      return true;
     }
 
     const statuses = await this.workspaceService.getRuntimeStatuses([workspace.id]);
@@ -641,11 +637,11 @@ export class GitHubReviewNotificationService {
           startStreamInBackground: true,
           queueDedupeKey: dedupeKey,
           removableQueueDedupeKey: true,
-          onAccepted: async () => {
+          onStreamStarted: async () => {
             await this.acceptBatch(workspace.id, batch.batch);
           },
           onAcceptedPreStreamFailure: async () => {
-            await this.rollbackAcceptedBatch(workspace.id, batch.batch);
+            await this.releaseBatch(workspace.id, batch.batch);
           },
           onCanceled: async () => {
             await this.releaseBatch(workspace.id, batch.batch);
@@ -699,50 +695,6 @@ export class GitHubReviewNotificationService {
         });
       }
       this.inFlightBatches.delete(workspaceId);
-    });
-  }
-
-  private async rollbackAcceptedBatch(
-    workspaceId: string,
-    batch: GitHubReviewNotificationBatch
-  ): Promise<void> {
-    await this.withCheckpointLock(workspaceId, async () => {
-      if (
-        this.lifecycleVersion !== batch.lifecycleVersion ||
-        this.getWorkspaceGeneration(workspaceId) !== batch.workspaceGeneration
-      ) {
-        return;
-      }
-
-      const checkpoint = await this.loadCheckpoint(workspaceId);
-      if (checkpoint?.prKey !== batch.prKey) {
-        return;
-      }
-
-      const batchReviewIds = new Set(batch.reviewIds);
-      const knownReviewIds = checkpoint.knownReviewIds.filter(
-        (reviewId) => !batchReviewIds.has(reviewId)
-      );
-      const knownReviewIdSet = new Set(knownReviewIds);
-      const pendingById = new Map(checkpoint.pendingReviews.map((review) => [review.id, review]));
-      for (const review of batch.reviews) {
-        if (!knownReviewIdSet.has(review.id)) {
-          pendingById.set(review.id, review);
-        }
-      }
-
-      // onAccepted runs before provider/runtime preparation. Restore the durable reservation when
-      // preparation fails so the next poll can deliver the review instead of suppressing it.
-      await this.saveCheckpoint(workspaceId, {
-        ...checkpoint,
-        knownReviewIds,
-        pendingReviews: [...pendingById.values()],
-      });
-
-      const currentBatch = this.inFlightBatches.get(workspaceId);
-      if (currentBatch?.token === batch.token) {
-        this.inFlightBatches.delete(workspaceId);
-      }
     });
   }
 

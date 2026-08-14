@@ -300,6 +300,15 @@ export function isLocalProjectRuntime(
 }
 
 /**
+ * Return whether review notifications can poll this runtime without starting infrastructure.
+ */
+export function supportsGitHubReviewNotifications(config: RuntimeConfig | undefined): boolean {
+  return (
+    isWorktreeRuntime(config) || isLocalProjectRuntime(config) || isDevcontainerRuntime(config)
+  );
+}
+
+/**
  * Type guard to check if a runtime config has srcBaseDir (worktree-style runtimes).
  * This narrows the type to allow safe access to srcBaseDir.
  */

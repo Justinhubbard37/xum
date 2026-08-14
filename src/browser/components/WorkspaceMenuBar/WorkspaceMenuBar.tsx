@@ -20,7 +20,11 @@ import { formatKeybind, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keyb
 import { useRuntimeStatus, useRuntimeStatusStoreRaw } from "@/browser/stores/RuntimeStatusStore";
 import { useWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
 import { Button } from "@/browser/components/Button/Button";
-import { isDevcontainerRuntime, type RuntimeConfig } from "@/common/types/runtime";
+import {
+  isDevcontainerRuntime,
+  supportsGitHubReviewNotifications,
+  type RuntimeConfig,
+} from "@/common/types/runtime";
 import { useTutorial } from "@/browser/contexts/TutorialContext";
 
 import type { TerminalSessionCreateOptions } from "@/browser/utils/terminal";
@@ -122,6 +126,8 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const runtimeStatus = useRuntimeStatus(workspaceId);
   const workspaceEntry = workspaceMetadata.get(workspaceId);
   const hasRepository = hasWorkspaceRepository(workspaceEntry);
+  // Do not offer a setting that cannot poll without starting remote infrastructure.
+  const githubReviewNotificationsSupported = supportsGitHubReviewNotifications(runtimeConfig);
   // The workspace's metadata.projectName is the parent project (since worktrees
   // are owned by the top-most parent). When the workspace is scoped to a
   // sub-project we surface the hierarchy as "parent / child" so the menu bar
@@ -477,7 +483,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   }, [setNotifyOnResponse]);
 
   useEffect(() => {
-    if (!githubReviewNotificationsExperimentEnabled || !hasRepository) {
+    if (
+      !githubReviewNotificationsExperimentEnabled ||
+      !hasRepository ||
+      !githubReviewNotificationsSupported
+    ) {
       return;
     }
 
@@ -496,6 +506,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   }, [
     githubReviewNotificationsExperimentEnabled,
     hasRepository,
+    githubReviewNotificationsSupported,
     workspaceEntry?.githubReviewNotificationsEnabled,
   ]);
 
@@ -691,18 +702,20 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
                     </span>
                   </span>
                 </label>
-                {githubReviewNotificationsExperimentEnabled && hasRepository && (
-                  <GitHubReviewNotificationsOption
-                    checked={workspaceEntry?.githubReviewNotificationsEnabled === true}
-                    disabled={githubReviewNotificationsUpdatePending}
-                    shortcutLabel={
-                      isTouchMobileScreen
-                        ? undefined
-                        : formatKeybind(KEYBINDS.TOGGLE_GITHUB_REVIEW_NOTIFICATIONS)
-                    }
-                    onCheckedChange={handleGitHubReviewNotificationsChange}
-                  />
-                )}
+                {githubReviewNotificationsExperimentEnabled &&
+                  hasRepository &&
+                  githubReviewNotificationsSupported && (
+                    <GitHubReviewNotificationsOption
+                      checked={workspaceEntry?.githubReviewNotificationsEnabled === true}
+                      disabled={githubReviewNotificationsUpdatePending}
+                      shortcutLabel={
+                        isTouchMobileScreen
+                          ? undefined
+                          : formatKeybind(KEYBINDS.TOGGLE_GITHUB_REVIEW_NOTIFICATIONS)
+                      }
+                      onCheckedChange={handleGitHubReviewNotificationsChange}
+                    />
+                  )}
                 <label className="flex cursor-pointer items-start gap-2">
                   <Checkbox
                     checked={autoEnableNotifications}
@@ -745,18 +758,20 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
                   </span>
                 </span>
               </label>
-              {githubReviewNotificationsExperimentEnabled && hasRepository && (
-                <GitHubReviewNotificationsOption
-                  checked={workspaceEntry?.githubReviewNotificationsEnabled === true}
-                  disabled={githubReviewNotificationsUpdatePending}
-                  shortcutLabel={
-                    isTouchMobileScreen
-                      ? undefined
-                      : formatKeybind(KEYBINDS.TOGGLE_GITHUB_REVIEW_NOTIFICATIONS)
-                  }
-                  onCheckedChange={handleGitHubReviewNotificationsChange}
-                />
-              )}
+              {githubReviewNotificationsExperimentEnabled &&
+                hasRepository &&
+                githubReviewNotificationsSupported && (
+                  <GitHubReviewNotificationsOption
+                    checked={workspaceEntry?.githubReviewNotificationsEnabled === true}
+                    disabled={githubReviewNotificationsUpdatePending}
+                    shortcutLabel={
+                      isTouchMobileScreen
+                        ? undefined
+                        : formatKeybind(KEYBINDS.TOGGLE_GITHUB_REVIEW_NOTIFICATIONS)
+                    }
+                    onCheckedChange={handleGitHubReviewNotificationsChange}
+                  />
+                )}
               <label className="flex cursor-pointer items-start gap-2">
                 <Checkbox
                   checked={autoEnableNotifications}

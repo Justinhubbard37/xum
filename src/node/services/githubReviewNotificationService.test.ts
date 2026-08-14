@@ -91,7 +91,7 @@ async function createNotificationServiceHarness() {
     },
   };
 
-  const service = new GitHubReviewNotificationService({
+  const dependencies = {
     config: {
       getSessionDir: () => sessionDir,
     },
@@ -99,10 +99,12 @@ async function createNotificationServiceHarness() {
       isExperimentEnabled: () => true,
     },
     workspaceService,
-  });
+  };
+  const createService = () => new GitHubReviewNotificationService(dependencies);
 
   return {
-    service,
+    service: createService(),
+    createService,
     sends,
     setNotificationsEnabled(enabled: boolean) {
       notificationsEnabled = enabled;
@@ -311,7 +313,7 @@ test("re-baselines after notifications are disabled and re-enabled", async () =>
   }
 });
 
-test("rolls back accepted reviews after a pre-stream failure", async () => {
+test("keeps reviews pending after a pre-stream failure", async () => {
   const harness = await createNotificationServiceHarness();
   const existingReview = review("existing-review");
   const newReview = review("new-review");
@@ -325,12 +327,54 @@ test("rolls back accepted reviews after a pre-stream failure", async () => {
     expect(harness.sends).toHaveLength(1);
 
     const internal = harness.sends[0]?.internal;
-    await internal?.onAccepted?.();
     await internal?.onAcceptedPreStreamFailure?.({ type: "unknown", raw: "startup failed" });
 
     await harness.service.pollOnce();
     expect(harness.sends).toHaveLength(2);
     expect(harness.sends[1]?.message).toContain("new-review body");
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("retries pending reviews after the service restarts before stream startup", async () => {
+  const harness = await createNotificationServiceHarness();
+  const existingReview = review("existing-review");
+  const newReview = review("new-review");
+
+  try {
+    harness.setReviews([existingReview]);
+    await harness.service.pollOnce();
+
+    harness.setReviews([existingReview, newReview]);
+    await harness.service.pollOnce();
+    expect(harness.sends).toHaveLength(1);
+
+    const restartedService = harness.createService();
+    await restartedService.pollOnce();
+    expect(harness.sends).toHaveLength(2);
+    expect(harness.sends[1]?.message).toContain("new-review body");
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("does not retry a review after stream startup confirms delivery", async () => {
+  const harness = await createNotificationServiceHarness();
+  const existingReview = review("existing-review");
+  const newReview = review("new-review");
+
+  try {
+    harness.setReviews([existingReview]);
+    await harness.service.pollOnce();
+
+    harness.setReviews([existingReview, newReview]);
+    await harness.service.pollOnce();
+    await harness.sends[0]?.internal?.onStreamStarted?.();
+
+    const restartedService = harness.createService();
+    await restartedService.pollOnce();
+    expect(harness.sends).toHaveLength(1);
   } finally {
     await harness.cleanup();
   }
@@ -428,11 +472,24 @@ test("does not wake stopped or remote runtimes during polling", async () => {
       srcBaseDir: "/tmp/src",
     },
   } satisfies FrontendWorkspaceMetadata;
+  const dockerWorkspace = {
+    ...workspace,
+    id: "workspace-docker",
+    runtimeConfig: {
+      type: "docker",
+      image: "ubuntu:24.04",
+    },
+  } satisfies FrontendWorkspaceMetadata;
   let executeBashCalls = 0;
 
   const workspaceService = {
     list: (): Promise<FrontendWorkspaceMetadata[]> =>
-      Promise.resolve([devcontainerWorkspace, runningDevcontainerWorkspace, sshWorkspace]),
+      Promise.resolve([
+        devcontainerWorkspace,
+        runningDevcontainerWorkspace,
+        sshWorkspace,
+        dockerWorkspace,
+      ]),
     executeBash: (
       ..._args: WorkspaceServiceExecuteBashArgs
     ): Promise<WorkspaceServiceExecuteBashResult> => {
@@ -482,7 +539,7 @@ test("does not wake stopped or remote runtimes during polling", async () => {
   }
 });
 
-test("keeps queued reviews pending until acceptance and retries canceled batches", async () => {
+test("keeps queued reviews pending until stream startup and retries canceled batches", async () => {
   const harness = await createNotificationServiceHarness();
   const existingReview = review("existing-review");
   const newReview = review("new-review", "reviewer");
@@ -503,8 +560,8 @@ test("keeps queued reviews pending until acceptance and retries canceled batches
 
     // A later review stays pending while the earlier batch is in flight.
     const firstInternal = harness.sends[0]?.internal;
-    expect(firstInternal?.onAccepted).toBeDefined();
-    await firstInternal?.onAccepted?.();
+    expect(firstInternal?.onStreamStarted).toBeDefined();
+    await firstInternal?.onStreamStarted?.();
     await harness.service.pollOnce();
     expect(harness.sends).toHaveLength(2);
 
@@ -516,8 +573,8 @@ test("keeps queued reviews pending until acceptance and retries canceled batches
     expect(harness.sends).toHaveLength(3);
 
     const thirdInternal = harness.sends[2]?.internal;
-    expect(thirdInternal?.onAccepted).toBeDefined();
-    await thirdInternal?.onAccepted?.();
+    expect(thirdInternal?.onStreamStarted).toBeDefined();
+    await thirdInternal?.onStreamStarted?.();
     await harness.service.pollOnce();
     expect(harness.sends).toHaveLength(3);
   } finally {

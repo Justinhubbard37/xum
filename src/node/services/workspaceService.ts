@@ -8533,6 +8533,7 @@ export class WorkspaceService extends EventEmitter {
       /** Force Copilot billing classification to "agent" for internal sends. */
       agentInitiated?: boolean;
       onAccepted?: () => Promise<void> | void;
+      onStreamStarted?: () => Promise<void> | void;
       onCanceled?: (reason: string) => Promise<void> | void;
       onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
       cancelState?: { canceledBeforeAcceptance: boolean };
@@ -8664,6 +8665,7 @@ export class WorkspaceService extends EventEmitter {
             cancelSignal: internal?.cancelSignal,
             onCanceled: internal?.onCanceled,
             onAccepted: internal?.onAccepted,
+            onStreamStarted: internal?.onStreamStarted,
             onAcceptedPreStreamFailure: internal?.onAcceptedPreStreamFailure,
             startStreamInBackground: internal?.startStreamInBackground,
             goalContinuation: internal?.goalContinuation,
@@ -8755,6 +8757,7 @@ export class WorkspaceService extends EventEmitter {
           cancelSignal: internal?.cancelSignal,
           onCanceled: internal?.onCanceled,
           onAccepted: internal?.onAccepted,
+          onStreamStarted: internal?.onStreamStarted,
           onAcceptedPreStreamFailure: internal?.onAcceptedPreStreamFailure,
         });
 
@@ -8833,6 +8836,7 @@ export class WorkspaceService extends EventEmitter {
         cancelSignal: internal?.cancelSignal,
         onCanceled: internal?.onCanceled,
         onAccepted: internal?.onAccepted,
+        onStreamStarted: internal?.onStreamStarted,
         onAcceptedPreStreamFailure,
       });
       if (!result.success) {

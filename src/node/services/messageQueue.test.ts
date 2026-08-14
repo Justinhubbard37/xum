@@ -481,13 +481,20 @@ describe("MessageQueue", () => {
 
     it("should preserve internal workspace-turn callbacks", () => {
       const onAccepted = () => undefined;
+      const onStreamStarted = () => undefined;
       const onAcceptedPreStreamFailure = () => undefined;
       const onCanceled = () => undefined;
 
       queue.add(
         "Follow up",
         { model: "gpt-4", agentId: "exec", muxMetadata: metadata },
-        { agentInitiated: true, onAccepted, onAcceptedPreStreamFailure, onCanceled }
+        {
+          agentInitiated: true,
+          onAccepted,
+          onStreamStarted,
+          onAcceptedPreStreamFailure,
+          onCanceled,
+        }
       );
 
       const clearCallbacks = queue.getClearCallbacks();
@@ -497,6 +504,7 @@ describe("MessageQueue", () => {
       const { internal } = queue.dequeueNext();
       expect(internal?.agentInitiated).toBe(true);
       expect(internal?.onAccepted).toBe(onAccepted);
+      expect(internal?.onStreamStarted).toBe(onStreamStarted);
       expect(internal?.onAcceptedPreStreamFailure).toBe(onAcceptedPreStreamFailure);
       expect(internal?.onCanceled).toBe(onCanceled);
     });

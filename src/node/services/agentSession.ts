@@ -2493,6 +2493,7 @@ export class AgentSession {
       goalKind?: GoalSyntheticMessageKind;
       startStreamInBackground?: boolean;
       onAccepted?: () => Promise<void> | void;
+      onStreamStarted?: () => Promise<void> | void;
       onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
       onCanceled?: (reason: string) => Promise<void> | void;
       cancelState?: { canceledBeforeAcceptance: boolean };
@@ -3238,6 +3239,15 @@ export class AgentSession {
               "Accepted stream startup was canceled during preparation."
             )
           );
+        } else if (streamResult.success && !this.disposed) {
+          try {
+            await internal?.onStreamStarted?.();
+          } catch (error: unknown) {
+            log.error("Accepted stream start callback failed", {
+              workspaceId: this.workspaceId,
+              error: getErrorMessage(error),
+            });
+          }
         }
         return streamResult;
       } finally {
@@ -5244,6 +5254,7 @@ export class AgentSession {
       /** Isolate this keyed message so it can be selectively superseded later. */
       removableDedupeKey?: boolean;
       onAccepted?: () => Promise<void> | void;
+      onStreamStarted?: () => Promise<void> | void;
       onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
       onCanceled?: (reason: string) => Promise<void> | void;
       cancelState?: { canceledBeforeAcceptance: boolean };
