@@ -10,6 +10,7 @@ import type { WorkspaceService } from "./workspaceService";
 import {
   GitHubReviewNotificationService,
   formatGitHubReviewNotification,
+  isGitHubNoPullRequestOutput,
   parseGitHubReviewCommandOutput,
   reconcileGitHubReviewCheckpoint,
   type GitHubPullRequestReview,
@@ -38,6 +39,9 @@ type WorkspaceServiceSendMessageInternal = NonNullable<WorkspaceServiceSendMessa
 type WorkspaceServiceSendMessageResult = Awaited<ReturnType<WorkspaceService["sendMessage"]>>;
 type WorkspaceServiceExecuteBashArgs = Parameters<WorkspaceService["executeBash"]>;
 type WorkspaceServiceExecuteBashResult = Awaited<ReturnType<WorkspaceService["executeBash"]>>;
+type WorkspaceServiceSendOptions = NonNullable<
+  ReturnType<WorkspaceService["getGoalContinuationKickoffSendOptions"]>
+>;
 
 function githubReviewCommandOutput(reviews: GitHubPullRequestReview[]): string {
   return JSON.stringify({
@@ -55,7 +59,12 @@ function githubReviewCommandOutput(reviews: GitHubPullRequestReview[]): string {
 
 async function createNotificationServiceHarness() {
   const sessionDir = await mkdtemp(join(tmpdir(), "mux-github-review-notifications-"));
-  let commandOutput = githubReviewCommandOutput([]);
+  let commandResult: WorkspaceServiceExecuteBashResult = Ok({
+    success: true as const,
+    output: githubReviewCommandOutput([]),
+    exitCode: 0,
+    wall_duration_ms: 1,
+  });
   const sends: Array<{
     message: string;
     internal: WorkspaceServiceSendMessageInternal | undefined;
@@ -65,15 +74,11 @@ async function createNotificationServiceHarness() {
     list: (): Promise<FrontendWorkspaceMetadata[]> => Promise.resolve([workspace]),
     executeBash: (
       ..._args: WorkspaceServiceExecuteBashArgs
-    ): Promise<WorkspaceServiceExecuteBashResult> =>
-      Promise.resolve(
-        Ok({
-          success: true as const,
-          output: commandOutput,
-          exitCode: 0,
-          wall_duration_ms: 1,
-        })
-      ),
+    ): Promise<WorkspaceServiceExecuteBashResult> => Promise.resolve(commandResult),
+    getGoalContinuationKickoffSendOptions: (): WorkspaceServiceSendOptions => ({
+      model: "openai:gpt-5.6-luna",
+      agentId: "exec",
+    }),
     sendMessage: (
       ...args: WorkspaceServiceSendMessageArgs
     ): Promise<WorkspaceServiceSendMessageResult> => {
@@ -96,7 +101,21 @@ async function createNotificationServiceHarness() {
     service,
     sends,
     setReviews(reviews: GitHubPullRequestReview[]) {
-      commandOutput = githubReviewCommandOutput(reviews);
+      commandResult = Ok({
+        success: true as const,
+        output: githubReviewCommandOutput(reviews),
+        exitCode: 0,
+        wall_duration_ms: 1,
+      });
+    },
+    setCommandFailure(output: string) {
+      commandResult = Ok({
+        success: false as const,
+        output,
+        exitCode: 1,
+        error: "Command exited with code 1",
+        wall_duration_ms: 1,
+      });
     },
     async cleanup() {
       await rm(sessionDir, { recursive: true, force: true });
@@ -158,6 +177,12 @@ describe("GitHub review notification parsing", () => {
 
   test("recognizes the no-pull-request response", () => {
     expect(parseGitHubReviewCommandOutput('{"no_pr":true}')).toEqual({ kind: "no-pr" });
+  });
+  test("only treats an explicit no-pull-request error as no pull request", () => {
+    expect(isGitHubNoPullRequestOutput("no pull requests found for branch feature/reviews")).toBe(
+      true
+    );
+    expect(isGitHubNoPullRequestOutput("authentication failed")).toBe(false);
   });
 });
 
@@ -233,6 +258,94 @@ describe("GitHub review notification checkpoints", () => {
     expect(result.checkpoint.knownReviewIds).toEqual(["review-on-new-pr"]);
     expect(result.checkpoint.pendingReviews).toEqual([]);
   });
+});
+
+test("preserves the checkpoint when the GitHub query fails", async () => {
+  const harness = await createNotificationServiceHarness();
+  const existingReview = review("existing-review");
+  const newReview = review("new-review");
+
+  try {
+    harness.setReviews([existingReview]);
+    await harness.service.pollOnce();
+    expect(harness.sends).toHaveLength(0);
+
+    harness.setCommandFailure("temporary network failure");
+    await harness.service.pollOnce();
+
+    harness.setReviews([existingReview, newReview]);
+    await harness.service.pollOnce();
+    expect(harness.sends).toHaveLength(1);
+    expect(harness.sends[0]?.message).toContain("new-review body");
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("continues polling later workspaces after one workspace fails", async () => {
+  const sessionDir = await mkdtemp(join(tmpdir(), "mux-github-review-notifications-"));
+  const firstWorkspace = workspace;
+  const secondWorkspace = {
+    ...workspace,
+    id: "workspace-2",
+    name: "feature/reviews-2",
+  } satisfies FrontendWorkspaceMetadata;
+  const existingReview = review("second-existing");
+  const newReview = review("second-new");
+  let secondOutput = githubReviewCommandOutput([existingReview]);
+  const sends: string[] = [];
+
+  const workspaceService = {
+    list: (): Promise<FrontendWorkspaceMetadata[]> =>
+      Promise.resolve([firstWorkspace, secondWorkspace]),
+    executeBash: (
+      ...args: WorkspaceServiceExecuteBashArgs
+    ): Promise<WorkspaceServiceExecuteBashResult> => {
+      const workspaceId = args[0];
+      if (workspaceId === firstWorkspace.id) {
+        return Promise.reject(new Error("checkpoint runtime failed"));
+      }
+      return Promise.resolve(
+        Ok({
+          success: true as const,
+          output: secondOutput,
+          exitCode: 0,
+          wall_duration_ms: 1,
+        })
+      );
+    },
+    getGoalContinuationKickoffSendOptions: (): WorkspaceServiceSendOptions => ({
+      model: "openai:gpt-5.6-luna",
+      agentId: "exec",
+    }),
+    sendMessage: (
+      ...args: WorkspaceServiceSendMessageArgs
+    ): Promise<WorkspaceServiceSendMessageResult> => {
+      sends.push(args[1]);
+      return Promise.resolve(Ok(undefined));
+    },
+  };
+  const service = new GitHubReviewNotificationService({
+    config: {
+      getSessionDir: (workspaceId: string) => join(sessionDir, workspaceId),
+    },
+    experimentsService: {
+      isExperimentEnabled: () => true,
+    },
+    workspaceService,
+  });
+
+  try {
+    await service.pollOnce();
+    expect(sends).toHaveLength(0);
+
+    secondOutput = githubReviewCommandOutput([existingReview, newReview]);
+    await service.pollOnce();
+    expect(sends).toHaveLength(1);
+    expect(sends[0]).toContain("second-new body");
+  } finally {
+    await rm(sessionDir, { recursive: true, force: true });
+  }
 });
 
 test("keeps queued reviews pending until acceptance and retries canceled batches", async () => {

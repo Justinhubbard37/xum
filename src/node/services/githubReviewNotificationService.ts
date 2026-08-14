@@ -3,7 +3,6 @@ import path from "node:path";
 
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import type { Config } from "@/node/config";
 import type { ExperimentsService } from "@/node/services/experimentsService";
@@ -133,6 +132,11 @@ export function parseGitHubReviewCommandOutput(output: string): GitHubReviewComm
   }
 }
 
+/** Return true only when `gh` explicitly reports that the branch has no pull request. */
+export function isGitHubNoPullRequestOutput(output: string): boolean {
+  return /\bno pull requests? found\b/i.test(output);
+}
+
 function normalizeCheckpoint(value: unknown): GitHubReviewNotificationCheckpoint | null {
   if (!isRecord(value) || value.version !== CHECKPOINT_VERSION) {
     return null;
@@ -228,7 +232,10 @@ export function formatGitHubReviewNotification(
 interface ReviewNotificationDependencies {
   config: Pick<Config, "getSessionDir">;
   experimentsService: Pick<ExperimentsService, "isExperimentEnabled">;
-  workspaceService: Pick<WorkspaceService, "list" | "executeBash" | "sendMessage">;
+  workspaceService: Pick<
+    WorkspaceService,
+    "list" | "executeBash" | "sendMessage" | "getGoalContinuationKickoffSendOptions"
+  >;
 }
 
 interface GitHubReviewNotificationBatch {
@@ -322,7 +329,14 @@ export class GitHubReviewNotificationService {
         continue;
       }
 
-      await this.pollWorkspace(workspace, lifecycleVersion);
+      try {
+        await this.pollWorkspace(workspace, lifecycleVersion);
+      } catch (error) {
+        log.warn("GitHub review notification workspace poll failed", {
+          workspaceId: workspace.id,
+          error,
+        });
+      }
     }
   }
 
@@ -412,7 +426,7 @@ export class GitHubReviewNotificationService {
   ): Promise<void> {
     const commandResult = await this.workspaceService.executeBash(
       workspace.id,
-      "gh pr view --json number,url,reviews 2>/dev/null || echo '{\"no_pr\":true}'",
+      "gh pr view --json number,url,reviews",
       {
         timeout_secs: GH_REVIEW_QUERY_TIMEOUT_SECONDS,
         cwdMode: "repo-root",
@@ -428,15 +442,23 @@ export class GitHubReviewNotificationService {
       });
       return;
     }
+
+    let parsed: GitHubReviewCommandOutput | null;
     if (!commandResult.data.success) {
-      log.debug("GitHub review notification query failed", {
-        workspaceId: workspace.id,
-        error: commandResult.data.error,
-      });
-      return;
+      const output = commandResult.data.output ?? "";
+      if (!isGitHubNoPullRequestOutput(output)) {
+        log.debug("GitHub review notification query failed", {
+          workspaceId: workspace.id,
+          error: commandResult.data.error,
+          output,
+        });
+        return;
+      }
+      parsed = { kind: "no-pr" };
+    } else {
+      parsed = parseGitHubReviewCommandOutput(commandResult.data.output);
     }
 
-    const parsed = parseGitHubReviewCommandOutput(commandResult.data.output);
     if (!parsed) {
       log.debug("GitHub review notification query returned invalid JSON", {
         workspaceId: workspace.id,
@@ -511,14 +533,21 @@ export class GitHubReviewNotificationService {
 
     const reviewIds = batch.batch.reviewIds;
     const dedupeKey = `${QUEUE_DEDUPE_PREFIX}${batch.batch.prKey}:${reviewIds.join(",")}`;
+    const sendOptions = this.workspaceService.getGoalContinuationKickoffSendOptions(workspace.id);
+    if (sendOptions == null) {
+      await this.releaseBatch(workspace.id, batch.batch);
+      log.debug("GitHub review notification send skipped without workspace AI settings", {
+        workspaceId: workspace.id,
+      });
+      return;
+    }
     let sendResult;
     try {
       sendResult = await this.workspaceService.sendMessage(
         workspace.id,
         formatGitHubReviewNotification(batch.snapshot, batch.reviews),
         {
-          model: workspace.aiSettings?.model ?? WORKSPACE_DEFAULTS.model,
-          agentId: workspace.agentId ?? WORKSPACE_DEFAULTS.agentId,
+          ...sendOptions,
           queueDispatchMode: "turn-end",
           skipAiSettingsPersistence: true,
           muxMetadata: {

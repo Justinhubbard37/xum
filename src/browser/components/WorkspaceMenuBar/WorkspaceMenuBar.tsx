@@ -77,6 +77,7 @@ const COLLAPSED_LEFT_SIDEBAR_MENU_BAR_STYLE = {
 function GitHubReviewNotificationsOption(props: {
   checked: boolean;
   disabled: boolean;
+  shortcutLabel?: string;
   onCheckedChange: (checked: boolean) => void;
 }) {
   return (
@@ -86,7 +87,12 @@ function GitHubReviewNotificationsOption(props: {
         disabled={props.disabled}
         onCheckedChange={(checked) => props.onCheckedChange(checked === true)}
       />
-      <span className="text-muted-foreground">Notify when a GitHub PR review is posted</span>
+      <span className="text-muted-foreground">
+        Notify when a GitHub PR review is posted
+        {props.shortcutLabel != null && (
+          <span className="text-muted-foreground"> ({props.shortcutLabel})</span>
+        )}
+      </span>
     </label>
   );
 }
@@ -377,42 +383,39 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     }
   }, [api, getMoreMenuAnchor, runtimeStatusStore, stopRuntimeError, workspaceId]);
 
-  const handleGitHubReviewNotificationsChange = useCallback(
-    (enabled: boolean): void => {
-      if (!api) {
-        githubReviewNotificationsError.showError(
-          workspaceId,
-          "Not connected to server",
-          getMoreMenuAnchor()
-        );
-        return;
-      }
+  const handleGitHubReviewNotificationsChange = (enabled: boolean): void => {
+    if (!api) {
+      githubReviewNotificationsError.showError(
+        workspaceId,
+        "Not connected to server",
+        getMoreMenuAnchor()
+      );
+      return;
+    }
 
-      setGithubReviewNotificationsUpdatePending(true);
-      api.workspace.githubReviewNotifications
-        .set({ workspaceId, enabled })
-        .then((result) => {
-          if (!result.success) {
-            githubReviewNotificationsError.showError(
-              workspaceId,
-              result.error ?? "Failed to update GitHub review notifications",
-              getMoreMenuAnchor()
-            );
-          }
-        })
-        .catch((error: unknown) => {
+    setGithubReviewNotificationsUpdatePending(true);
+    api.workspace.githubReviewNotifications
+      .set({ workspaceId, enabled })
+      .then((result) => {
+        if (!result.success) {
           githubReviewNotificationsError.showError(
             workspaceId,
-            getErrorMessage(error),
+            result.error ?? "Failed to update GitHub review notifications",
             getMoreMenuAnchor()
           );
-        })
-        .finally(() => {
-          setGithubReviewNotificationsUpdatePending(false);
-        });
-    },
-    [api, getMoreMenuAnchor, githubReviewNotificationsError, workspaceId]
-  );
+        }
+      })
+      .catch((error: unknown) => {
+        githubReviewNotificationsError.showError(
+          workspaceId,
+          getErrorMessage(error),
+          getMoreMenuAnchor()
+        );
+      })
+      .finally(() => {
+        setGithubReviewNotificationsUpdatePending(false);
+      });
+  };
 
   const loadSkills = useCallback(async () => {
     const requestId = ++skillsRequestIdRef.current;
@@ -441,6 +444,10 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     }
   }, [api, workspaceId, disableWorkspaceAgents]);
 
+  const githubReviewNotificationsChangeRef = useRef<(enabled: boolean) => void>(() => undefined);
+  // Keep the global shortcut listener stable while it reads the latest API and workspace state.
+  githubReviewNotificationsChangeRef.current = handleGitHubReviewNotificationsChange;
+
   // Start workspace tutorial on first entry
   useEffect(() => {
     // Small delay to ensure UI is rendered
@@ -468,6 +475,29 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, [setNotifyOnResponse]);
+
+  useEffect(() => {
+    if (!githubReviewNotificationsExperimentEnabled || !hasRepository) {
+      return;
+    }
+
+    const handler = (e: KeyboardEvent) => {
+      if (!matchesKeybind(e, KEYBINDS.TOGGLE_GITHUB_REVIEW_NOTIFICATIONS)) {
+        return;
+      }
+
+      e.preventDefault();
+      githubReviewNotificationsChangeRef.current(
+        workspaceEntry?.githubReviewNotificationsEnabled !== true
+      );
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [
+    githubReviewNotificationsExperimentEnabled,
+    hasRepository,
+    workspaceEntry?.githubReviewNotificationsEnabled,
+  ]);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -665,9 +695,12 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
                   <GitHubReviewNotificationsOption
                     checked={workspaceEntry?.githubReviewNotificationsEnabled === true}
                     disabled={githubReviewNotificationsUpdatePending}
-                    onCheckedChange={(checked) => {
-                      handleGitHubReviewNotificationsChange(checked);
-                    }}
+                    shortcutLabel={
+                      isTouchMobileScreen
+                        ? undefined
+                        : formatKeybind(KEYBINDS.TOGGLE_GITHUB_REVIEW_NOTIFICATIONS)
+                    }
+                    onCheckedChange={handleGitHubReviewNotificationsChange}
                   />
                 )}
                 <label className="flex cursor-pointer items-start gap-2">
@@ -716,9 +749,12 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
                 <GitHubReviewNotificationsOption
                   checked={workspaceEntry?.githubReviewNotificationsEnabled === true}
                   disabled={githubReviewNotificationsUpdatePending}
-                  onCheckedChange={(checked) => {
-                    handleGitHubReviewNotificationsChange(checked);
-                  }}
+                  shortcutLabel={
+                    isTouchMobileScreen
+                      ? undefined
+                      : formatKeybind(KEYBINDS.TOGGLE_GITHUB_REVIEW_NOTIFICATIONS)
+                  }
+                  onCheckedChange={handleGitHubReviewNotificationsChange}
                 />
               )}
               <label className="flex cursor-pointer items-start gap-2">
