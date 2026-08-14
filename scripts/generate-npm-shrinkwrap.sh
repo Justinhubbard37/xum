@@ -12,7 +12,8 @@ echo "Generating npm-shrinkwrap.json (production dependencies only)..."
 
 rm -f package-lock.json npm-shrinkwrap.json
 
-npm install --package-lock-only --omit=dev --ignore-scripts --no-audit --no-fund --legacy-peer-deps
+# Publish waves (e.g. AWS SDK) can transiently request sibling versions not yet visible on the registry.
+"$ROOT_DIR/scripts/retry.sh" 5 60 npm install --package-lock-only --omit=dev --ignore-scripts --no-audit --no-fund --legacy-peer-deps
 
 if [[ ! -f package-lock.json ]]; then
   echo "package-lock.json was not generated." >&2
