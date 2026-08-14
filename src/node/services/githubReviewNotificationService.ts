@@ -3,7 +3,13 @@ import path from "node:path";
 
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import {
+  isDevcontainerRuntime,
+  isLocalProjectRuntime,
+  isWorktreeRuntime,
+} from "@/common/types/runtime";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import { GITHUB_REVIEW_NOTIFICATION_QUEUE_DEDUPE_PREFIX } from "@/constants/githubReviewNotifications";
 import type { Config } from "@/node/config";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import type { WorkspaceService } from "@/node/services/workspaceService";
@@ -14,7 +20,6 @@ const CHECK_INTERVAL_MS = 30 * 1000;
 const GH_REVIEW_QUERY_TIMEOUT_SECONDS = 15;
 const CHECKPOINT_VERSION = 1 as const;
 const CHECKPOINT_FILENAME = "github-review-notifications.json";
-const QUEUE_DEDUPE_PREFIX = "github-pr-review:";
 
 export interface GitHubPullRequestReview {
   id: string;
@@ -234,7 +239,11 @@ interface ReviewNotificationDependencies {
   experimentsService: Pick<ExperimentsService, "isExperimentEnabled">;
   workspaceService: Pick<
     WorkspaceService,
-    "list" | "executeBash" | "sendMessage" | "getGoalContinuationKickoffSendOptions"
+    | "list"
+    | "executeBash"
+    | "sendMessage"
+    | "getGoalContinuationKickoffSendOptions"
+    | "getRuntimeStatuses"
   >;
 }
 
@@ -420,10 +429,47 @@ export class GitHubReviewNotificationService {
     this.checkpoints.set(workspaceId, checkpoint);
   }
 
+  private async shouldPollWorkspaceRuntime(workspace: FrontendWorkspaceMetadata): Promise<boolean> {
+    const runtimeConfig = workspace.runtimeConfig;
+    if (
+      runtimeConfig == null ||
+      isWorktreeRuntime(runtimeConfig) ||
+      isLocalProjectRuntime(runtimeConfig)
+    ) {
+      return true;
+    }
+
+    if (!isDevcontainerRuntime(runtimeConfig)) {
+      // Do not call executeBash for remote or container runtimes without a passive status probe.
+      // executeBash calls ensureReady(), which can start stopped infrastructure.
+      log.debug("Skipping GitHub review notification runtime without passive status", {
+        workspaceId: workspace.id,
+        runtimeType: runtimeConfig.type,
+      });
+      return false;
+    }
+
+    const statuses = await this.workspaceService.getRuntimeStatuses([workspace.id]);
+    const status = statuses[workspace.id];
+    if (status !== "running") {
+      log.debug("Skipping GitHub review notification for stopped runtime", {
+        workspaceId: workspace.id,
+        status,
+      });
+      return false;
+    }
+
+    return true;
+  }
+
   private async pollWorkspace(
     workspace: FrontendWorkspaceMetadata,
     lifecycleVersion: number
   ): Promise<void> {
+    if (!(await this.shouldPollWorkspaceRuntime(workspace))) {
+      return;
+    }
+
     const commandResult = await this.workspaceService.executeBash(
       workspace.id,
       "gh pr view --json number,url,reviews",
@@ -532,7 +578,7 @@ export class GitHubReviewNotificationService {
     }
 
     const reviewIds = batch.batch.reviewIds;
-    const dedupeKey = `${QUEUE_DEDUPE_PREFIX}${batch.batch.prKey}:${reviewIds.join(",")}`;
+    const dedupeKey = `${GITHUB_REVIEW_NOTIFICATION_QUEUE_DEDUPE_PREFIX}${batch.batch.prKey}:${reviewIds.join(",")}`;
     const sendOptions = this.workspaceService.getGoalContinuationKickoffSendOptions(workspace.id);
     if (sendOptions == null) {
       await this.releaseBatch(workspace.id, batch.batch);

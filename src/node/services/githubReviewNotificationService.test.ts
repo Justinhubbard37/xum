@@ -79,6 +79,8 @@ async function createNotificationServiceHarness() {
       model: "openai:gpt-5.6-luna",
       agentId: "exec",
     }),
+    getRuntimeStatuses: (workspaceIds: string[]) =>
+      Promise.resolve(Object.fromEntries(workspaceIds.map((id) => [id, "running" as const]))),
     sendMessage: (
       ...args: WorkspaceServiceSendMessageArgs
     ): Promise<WorkspaceServiceSendMessageResult> => {
@@ -318,6 +320,8 @@ test("continues polling later workspaces after one workspace fails", async () =>
       model: "openai:gpt-5.6-luna",
       agentId: "exec",
     }),
+    getRuntimeStatuses: (workspaceIds: string[]) =>
+      Promise.resolve(Object.fromEntries(workspaceIds.map((id) => [id, "running" as const]))),
     sendMessage: (
       ...args: WorkspaceServiceSendMessageArgs
     ): Promise<WorkspaceServiceSendMessageResult> => {
@@ -343,6 +347,82 @@ test("continues polling later workspaces after one workspace fails", async () =>
     await service.pollOnce();
     expect(sends).toHaveLength(1);
     expect(sends[0]).toContain("second-new body");
+  } finally {
+    await rm(sessionDir, { recursive: true, force: true });
+  }
+});
+
+test("does not wake stopped or remote runtimes during polling", async () => {
+  const sessionDir = await mkdtemp(join(tmpdir(), "mux-github-review-notifications-"));
+  const devcontainerWorkspace = {
+    ...workspace,
+    id: "workspace-devcontainer",
+    runtimeConfig: {
+      type: "devcontainer",
+      configPath: ".devcontainer/devcontainer.json",
+    },
+  } satisfies FrontendWorkspaceMetadata;
+  const runningDevcontainerWorkspace = {
+    ...devcontainerWorkspace,
+    id: "workspace-devcontainer-running",
+  } satisfies FrontendWorkspaceMetadata;
+  const sshWorkspace = {
+    ...workspace,
+    id: "workspace-ssh",
+    runtimeConfig: {
+      type: "ssh",
+      host: "example.com",
+      srcBaseDir: "/tmp/src",
+    },
+  } satisfies FrontendWorkspaceMetadata;
+  let executeBashCalls = 0;
+
+  const workspaceService = {
+    list: (): Promise<FrontendWorkspaceMetadata[]> =>
+      Promise.resolve([devcontainerWorkspace, runningDevcontainerWorkspace, sshWorkspace]),
+    executeBash: (
+      ..._args: WorkspaceServiceExecuteBashArgs
+    ): Promise<WorkspaceServiceExecuteBashResult> => {
+      executeBashCalls += 1;
+      return Promise.resolve(
+        Ok({
+          success: true as const,
+          output: githubReviewCommandOutput([]),
+          exitCode: 0,
+          wall_duration_ms: 1,
+        })
+      );
+    },
+    getGoalContinuationKickoffSendOptions: (): WorkspaceServiceSendOptions => ({
+      model: "openai:gpt-5.6-luna",
+      agentId: "exec",
+    }),
+    getRuntimeStatuses: (workspaceIds: string[]) =>
+      Promise.resolve(
+        Object.fromEntries(
+          workspaceIds.map((id) => [
+            id,
+            id === runningDevcontainerWorkspace.id ? ("running" as const) : ("stopped" as const),
+          ])
+        )
+      ),
+    sendMessage: (
+      ..._args: WorkspaceServiceSendMessageArgs
+    ): Promise<WorkspaceServiceSendMessageResult> => Promise.resolve(Ok(undefined)),
+  };
+  const service = new GitHubReviewNotificationService({
+    config: {
+      getSessionDir: (workspaceId: string) => join(sessionDir, workspaceId),
+    },
+    experimentsService: {
+      isExperimentEnabled: () => true,
+    },
+    workspaceService,
+  });
+
+  try {
+    await service.pollOnce();
+    expect(executeBashCalls).toBe(1);
   } finally {
     await rm(sessionDir, { recursive: true, force: true });
   }

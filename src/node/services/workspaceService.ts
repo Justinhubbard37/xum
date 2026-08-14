@@ -204,6 +204,7 @@ import {
   type HeartbeatContextMode,
   type HeartbeatSchedulePolicy,
 } from "@/constants/heartbeat";
+import { GITHUB_REVIEW_NOTIFICATION_QUEUE_DEDUPE_PREFIX } from "@/constants/githubReviewNotifications";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import {
   GOAL_BUDGET_LIMIT_KIND,
@@ -5519,6 +5520,20 @@ export class WorkspaceService extends EventEmitter {
       await this.config.updateWorkspaceMetadata(normalizedWorkspaceId, {
         githubReviewNotificationsEnabled: enabled,
       });
+      if (!enabled) {
+        // A queued review turn must not dispatch after the user disables this setting.
+        const removalResult = this.removeQueuedMessagesByDedupeKeyPrefix(
+          normalizedWorkspaceId,
+          GITHUB_REVIEW_NOTIFICATION_QUEUE_DEDUPE_PREFIX,
+          { cancelReason: "GitHub review notifications were disabled." }
+        );
+        if (!removalResult.success) {
+          log.warn("Failed to remove queued GitHub review notifications", {
+            workspaceId: normalizedWorkspaceId,
+            error: removalResult.error,
+          });
+        }
+      }
       await this.emitCurrentWorkspaceMetadata(normalizedWorkspaceId);
       return Ok(undefined);
     } catch (error) {
