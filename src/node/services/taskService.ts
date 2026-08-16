@@ -5254,18 +5254,6 @@ export class TaskService {
       const interruptionError = new Error("Parent workspace interrupted");
 
       for (const id of descendants) {
-        // Workflow workers can leave long-running bash processes behind even after their AI stream
-        // stops. Cleanup is best-effort: a disposal failure must not leave an interrupted workflow
-        // with agent streams and task statuses still active.
-        try {
-          await options?.cleanupWorkspaceBackgroundProcesses?.(id);
-        } catch (error: unknown) {
-          log.warn("terminateAllDescendantAgentTasks: background cleanup failed", {
-            taskId: id,
-            error: getErrorMessage(error),
-          });
-        }
-
         // Best-effort: clear queue first. AgentSession stream-end cleanup auto-flushes
         // queued messages, so descendants must not keep pending input after a hard interrupt.
         try {
@@ -5289,6 +5277,18 @@ export class TaskService {
           }
         } catch (error: unknown) {
           log.debug("terminateAllDescendantAgentTasks: stopStream threw", { taskId: id, error });
+        }
+
+        // Stop the worker stream before taking the final process snapshot: a background bash tool
+        // can register its process while the stream is still winding down. Cleanup remains
+        // best-effort so a disposal failure cannot block task status teardown.
+        try {
+          await options?.cleanupWorkspaceBackgroundProcesses?.(id);
+        } catch (error: unknown) {
+          log.warn("terminateAllDescendantAgentTasks: background cleanup failed", {
+            taskId: id,
+            error: getErrorMessage(error),
+          });
         }
 
         let preservedCompletedDescendant = false;

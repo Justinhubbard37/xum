@@ -13980,15 +13980,20 @@ describe("TaskService", () => {
       testTaskSettings()
     );
 
-    const { aiService } = createAIServiceMocks(config);
+    const lifecycleEvents: string[] = [];
+    const stopStream = mock((workspaceId: string): Promise<Result<void>> => {
+      lifecycleEvents.push(`stop:${workspaceId}`);
+      return Promise.resolve(Ok(undefined));
+    });
+    const { aiService } = createAIServiceMocks(config, { stopStream });
     const { workspaceService } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
-    const cleanupWorkspaceBackgroundProcesses = mock(
-      (workspaceId: string): Promise<void> =>
-        workspaceId === workflowChildTaskId
-          ? Promise.reject(new Error("background cleanup failed"))
-          : Promise.resolve()
-    );
+    const cleanupWorkspaceBackgroundProcesses = mock((workspaceId: string): Promise<void> => {
+      lifecycleEvents.push(`cleanup:${workspaceId}`);
+      return workspaceId === workflowChildTaskId
+        ? Promise.reject(new Error("background cleanup failed"))
+        : Promise.resolve();
+    });
 
     const interruptedTaskIds = await taskService.terminateAllDescendantAgentTasks(rootWorkspaceId, {
       workflowRunId: "wfr_target",
@@ -13996,6 +14001,12 @@ describe("TaskService", () => {
     });
 
     expect(interruptedTaskIds).toEqual([workflowChildTaskId, workflowTaskId]);
+    expect(lifecycleEvents).toEqual([
+      `stop:${workflowChildTaskId}`,
+      `cleanup:${workflowChildTaskId}`,
+      `stop:${workflowTaskId}`,
+      `cleanup:${workflowTaskId}`,
+    ]);
     expect(cleanupWorkspaceBackgroundProcesses.mock.calls.map((call) => call[0])).toEqual([
       workflowChildTaskId,
       workflowTaskId,
