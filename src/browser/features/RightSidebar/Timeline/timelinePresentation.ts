@@ -10,16 +10,21 @@ import {
   CircleX,
   ClipboardCheck,
   Forward,
+  Handshake,
   HeartPulse,
   Inbox,
   Layers,
   ListTodo,
   Map,
   MessageSquare,
+  Milestone,
+  OctagonAlert,
   PackageCheck,
+  PackageOpen,
   Radar,
   RefreshCcw,
   RotateCcw,
+  Scale,
   Send,
   Settings2,
   Sparkles,
@@ -113,6 +118,61 @@ const MACHINERY_KINDS: ReadonlySet<string> = new Set<TimelineEventKind>([
 
 export function isMachineryKind(kind: string): boolean {
   return MACHINERY_KINDS.has(kind);
+}
+
+interface TimelineRowTint {
+  row: string;
+  icon: string;
+  badge: string;
+}
+
+const DEFAULT_AGENT_TINT: TimelineRowTint = {
+  row: "border-ask-mode/25 bg-ask-mode-alpha",
+  icon: "border-ask-mode/40 text-ask-mode",
+  badge: "border-ask-mode/30 text-ask-mode",
+};
+
+// Attention-worthy categories get their own hue so a blocker reads differently from a milestone at
+// a glance. Routine categories (picked_up) and uncategorized events keep the generic agent tint.
+const AGENT_EVENT_TINTS: Partial<Record<string, TimelineRowTint>> = {
+  milestone: {
+    row: "border-success/25 bg-success/10",
+    icon: "border-success/40 text-success",
+    badge: "border-success/30 text-success",
+  },
+  decision: {
+    row: "border-info/25 bg-info/10",
+    icon: "border-info/40 text-info",
+    badge: "border-info/30 text-info",
+  },
+  blocker: {
+    row: "border-danger/25 bg-danger/10",
+    icon: "border-danger/40 text-danger",
+    badge: "border-danger/30 text-danger",
+  },
+  handoff: {
+    row: "border-warning/25 bg-warning/10",
+    icon: "border-warning/40 text-warning",
+    badge: "border-warning/30 text-warning",
+  },
+};
+
+export function getAgentEventTint(category: string | undefined): TimelineRowTint {
+  return (category != null ? AGENT_EVENT_TINTS[category] : undefined) ?? DEFAULT_AGENT_TINT;
+}
+
+// Category glyphs pair with the tints above; events without a recognized category keep the
+// generic agent.event icon.
+const AGENT_EVENT_ICONS: Partial<Record<string, LucideIcon>> = {
+  milestone: Milestone,
+  decision: Scale,
+  blocker: OctagonAlert,
+  handoff: Handshake,
+  picked_up: PackageOpen,
+};
+
+export function getAgentEventIcon(category: string | undefined): LucideIcon | undefined {
+  return category != null ? AGENT_EVENT_ICONS[category] : undefined;
 }
 
 const knownKinds = new Set<string>(TIMELINE_EVENT_KINDS);

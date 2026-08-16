@@ -12,7 +12,7 @@ import {
   type WorkspaceTimelineSnapshot,
 } from "@/browser/stores/WorkspaceStore";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
-import type { TimelineEvent } from "@/common/orpc/schemas/timeline";
+import type { TimelineEvent, TimelinePreview } from "@/common/orpc/schemas/timeline";
 import { BACKGROUND_WORK_WAKE_OPENINGS } from "@/common/utils/machineTurnPrompts";
 
 import { installDom } from "../dom";
@@ -64,6 +64,7 @@ function renderTimeline(params: {
   loadOlderHistory?: jest.Mock<Promise<"loaded">, [string]>;
   snapshot?: Partial<WorkspaceTimelineSnapshot>;
   hasOlderHistory?: boolean;
+  preview?: TimelinePreview;
 }) {
   const loadOlderHistory = params.loadOlderHistory ?? jest.fn().mockResolvedValue("loaded");
   const workspaceState: { messages: unknown[]; muxMessages: unknown[]; hasOlderHistory: boolean } =
@@ -88,10 +89,12 @@ function renderTimeline(params: {
   const api = {
     workspace: {
       timeline: {
-        preview: jest.fn().mockResolvedValue({
-          role: "assistant",
-          textExcerpt: "Preview fixture",
-        }),
+        preview: jest.fn().mockResolvedValue(
+          params.preview ?? {
+            role: "assistant",
+            textExcerpt: "Preview fixture",
+          }
+        ),
       },
     },
   };
@@ -366,6 +369,157 @@ describe("TimelinePanel", () => {
 
     expect(view.container.querySelector('[data-timeline-event-id="wake"]')).not.toBeNull();
     expect(view.container.querySelector('[data-timeline-event-id="continuation"]')).not.toBeNull();
+  });
+
+  test("drops the sub-agent started row once a newer row for its task lands", () => {
+    const events = [
+      makeEvent("done-report", "task.reported", 3, {
+        source: { system: "task", key: "task-report:task-a" },
+        status: "completed",
+        data: { title: "Auditor finished", digest: "Found two issues" },
+        anchor: { taskId: "task-a", childWorkspaceId: "task-a" },
+      }),
+      makeEvent("done-start", "task.created", 2, {
+        source: { system: "task", key: "task-created:task-a" },
+        status: "started",
+        anchor: { taskId: "task-a", toolCallId: "call-a", childWorkspaceId: "task-a" },
+      }),
+      makeEvent("inflight-start", "task.created", 1, {
+        source: { system: "task", key: "task-created:task-b" },
+        status: "started",
+        anchor: { taskId: "task-b", toolCallId: "call-b", childWorkspaceId: "task-b" },
+      }),
+    ];
+
+    const view = renderTimeline({ events });
+
+    expect(view.container.querySelector('[data-timeline-event-id="done-start"]')).toBeNull();
+    expect(view.container.querySelector('[data-timeline-event-id="done-report"]')).not.toBeNull();
+    expect(
+      view.container.querySelector('[data-timeline-event-id="inflight-start"]')
+    ).not.toBeNull();
+  });
+
+  test("shows a single representation when the preview excerpt duplicates the digest", async () => {
+    // Mirror the producer: a >120-char prompt is digested to a 117-char cut plus "...".
+    const longPrompt = "alpha beta gamma delta epsilon ".repeat(8).trim();
+    const truncatedDigest = `${longPrompt.slice(0, 117)}...`;
+    const view = renderTimeline({
+      events: [
+        makeEvent("prompt", "turn.user", 1, {
+          data: { digest: truncatedDigest },
+          anchor: { messageId: "user-1" },
+        }),
+      ],
+      preview: { role: "user", textExcerpt: longPrompt },
+    });
+
+    fireEvent.click(view.container.querySelector('[data-timeline-event-id="prompt"]')!);
+    await waitFor(() => view.getByText(longPrompt));
+
+    // The digest still renders in the row detail; the card itself shows only the excerpt.
+    expect(view.getAllByText(truncatedDigest)).toHaveLength(1);
+  });
+
+  test("keeps the reveal path when the retained task row lacks a transcript anchor", async () => {
+    const events = [
+      makeEvent("report", "task.reported", 2, {
+        source: { system: "task", key: "task-report:task-a" },
+        status: "completed",
+        data: { title: "Auditor finished" },
+        anchor: { taskId: "task-a", childWorkspaceId: "task-a" },
+      }),
+      makeEvent("start", "task.created", 1, {
+        source: { system: "task", key: "task-created:task-a" },
+        status: "started",
+        anchor: { taskId: "task-a", toolCallId: "spawn-call", childWorkspaceId: "task-a" },
+      }),
+    ];
+
+    const view = renderTimeline({ events });
+    expect(view.container.querySelector('[data-timeline-event-id="start"]')).toBeNull();
+
+    fireEvent.click(view.container.querySelector('[data-timeline-event-id="report"]')!);
+
+    // The report row inherited the started row's spawning tool-call anchor, so the reveal
+    // action stays available even though TaskService recorded the report without one.
+    await waitFor(() => view.getByTestId("timeline-reveal"));
+  });
+
+  test("does not hide the excerpt behind a generic title the prompt happens to open with", async () => {
+    const view = renderTimeline({
+      events: [
+        makeEvent("prompt", "turn.user", 1, {
+          data: { digest: "User prompt: reproduce the issue" },
+          anchor: { messageId: "user-1" },
+        }),
+      ],
+      preview: {
+        role: "user",
+        textExcerpt: "User prompt: reproduce the issue with the beta build",
+      },
+    });
+
+    fireEvent.click(view.container.querySelector('[data-timeline-event-id="prompt"]')!);
+
+    await waitFor(() => view.getByText("User prompt: reproduce the issue with the beta build"));
+  });
+
+  test("keeps a digest whose natural trailing ellipsis is not a truncation marker", async () => {
+    const view = renderTimeline({
+      events: [
+        makeEvent("prompt", "turn.user", 1, {
+          data: { digest: "Investigate..." },
+          anchor: { messageId: "user-1" },
+        }),
+      ],
+      preview: { role: "user", textExcerpt: "Investigate the logs" },
+    });
+
+    fireEvent.click(view.container.querySelector('[data-timeline-event-id="prompt"]')!);
+    await waitFor(() => view.getByText("Investigate the logs"));
+
+    expect(view.getAllByText("Investigate...")).toHaveLength(2);
+  });
+
+  test("hides an excerpt that only repeats an agent event's description", async () => {
+    const view = renderTimeline({
+      events: [
+        makeEvent("agent-note", "agent.event", 1, {
+          source: { system: "agent", key: "timeline-event:note" },
+          data: { description: "Pushed the branch and opened the PR", category: "handoff" },
+          anchor: { toolCallId: "tool-1" },
+        }),
+      ],
+      preview: { role: "assistant", textExcerpt: "Pushed the branch and opened the PR" },
+    });
+
+    fireEvent.click(view.container.querySelector('[data-timeline-event-id="agent-note"]')!);
+    await waitFor(() => view.getByTestId("timeline-reveal"));
+    await waitFor(() => {
+      if (view.queryByText("Loading preview…")) throw new Error("Preview still loading");
+    });
+
+    expect(view.getAllByText("Pushed the branch and opened the PR")).toHaveLength(2);
+  });
+
+  test("keeps a digest the preview excerpt does not cover", async () => {
+    const view = renderTimeline({
+      events: [
+        makeEvent("report", "task.reported", 1, {
+          source: { system: "task", key: "task-report:task-c" },
+          status: "completed",
+          data: { digest: "Report digest text" },
+          anchor: { messageId: "report-1", taskId: "task-c" },
+        }),
+      ],
+      preview: { role: "assistant", textExcerpt: "Unrelated transcript excerpt" },
+    });
+
+    fireEvent.click(view.container.querySelector('[data-timeline-event-id="report"]')!);
+    await waitFor(() => view.getByText("Unrelated transcript excerpt"));
+
+    expect(view.getAllByText("Report digest text")).toHaveLength(2);
   });
 
   test("drops the abandoned-retry row that duplicates an adjacent interruption", () => {
