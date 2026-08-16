@@ -320,7 +320,7 @@ export function buildTaskToolDescription(runtimeMode: RuntimeMode | undefined): 
     "\n\nWhen the user explicitly asks for best-of-n work, the parent should begin with light preliminary analysis to extract shared context, constraints, or evaluation criteria that would otherwise be duplicated across children. " +
     "Keep that pre-work lightweight: frame the task and provide useful starting points, but do not pre-solve the problem or over-constrain how the children reason about it. Then delegate the substantive analysis to the spawned sub-agents. " +
     "Do not also do a full parallel analysis in the parent. Call task_await when you are ready to act on child output; do not await reflexively just because tasks are running. " +
-    "task_await returns as soon as the first awaited task completes by default (min_completed), so you can start dependent work on each result as it lands instead of blocking on the whole batch. Pass returned camelCase IDs through task_await's snake_case input: task_await({ task_ids: [result.taskId] }) for one handle, or task_await({ task_ids: result.taskIds, min_completed: result.taskIds.length }) when every grouped result is required (or use a foreground grouped spawn, below). " +
+    "task_await returns as soon as the first awaited task completes by default (min_completed), so you can start dependent work on each result as it lands instead of blocking on the whole batch. Pass returned camelCase IDs through task_await's snake_case input: `task_await({ task_ids: [result.taskId] })` for one handle, or `task_await({ task_ids: result.taskIds, min_completed: result.taskIds.length })` when every grouped result is required (or use a foreground grouped spawn, below). " +
     "\n\nWhen delegating, include a compact task brief (Task / Background / Scope / Starting points / Acceptance / Deliverables / Constraints). " +
     "For now, persisted sub-agent goals are not supported; pass sub-agent objectives, success criteria, and deliverables directly in the prompt. " +
     "Sub-agents observe the same system instructions as the parent (project/global AGENTS.md and custom instructions), so do not restate that shared context in the prompt; spend the prompt on task-specific information the sub-agent cannot infer from those instructions. " +
@@ -725,7 +725,7 @@ const TaskAwaitToolArtifactsSchema = z
  * and can be re-fetched by ID after context compaction instead of re-running the work.
  */
 export const COMPLETED_REPORT_REFETCH_NOTE =
-  'Report persisted on disk; re-fetch anytime (even after context compaction) with task_await({ task_ids: ["<id>"], timeout_secs: 0 }).';
+  'Report persisted on disk; re-fetch anytime (even after context compaction) with `task_await({ task_ids: ["<id>"], timeout_secs: 0 })`.';
 
 export const TaskAwaitToolCompletedResultSchema = z
   .object({
@@ -1406,7 +1406,7 @@ export const WorkflowRunToolArgsSchema = z
       .default(false)
       .describe(
         "Defaults to false. Prefer foreground mode for a single workflow; when the returned status is completed, the result is available directly. " +
-          "Set true only when you will start another workflow/task or do independent work while it runs. If workflow_run returns status=running or status=backgrounded, await it with task_await({ task_ids: [result.runId] }) before using the result."
+          "Set true only when you will start another workflow/task or do independent work while it runs. If workflow_run returns status=running or status=backgrounded, await it with `task_await({ task_ids: [result.runId] })` before using the result."
       ),
   })
   .strict()
@@ -1449,7 +1449,7 @@ export const WorkflowResumeToolArgsSchema = z
       .default(false)
       .describe(
         "Defaults to false (foreground): waits until the run reaches a terminal status and returns its result. " +
-          "Set true to resume in the background and continue other work; await it with task_await({ task_ids: [result.runId] }) when you need the result."
+          "Set true to resume in the background and continue other work; await it with `task_await({ task_ids: [result.runId] })` when you need the result."
       ),
     mode: WorkflowResumeModeSchema.nullish().describe(
       "Defaults to 'resume', which continues interrupted or crash-orphaned runs from durable state and never re-executes completed steps. " +
@@ -1682,8 +1682,8 @@ export const TOOL_DEFINITIONS = {
                 "Do NOT use for quick commands (<5s), interactive processes (no stdin support), " +
                 "or processes requiring real-time output (use foreground with larger timeout instead). " +
                 "Returns immediately with a taskId (bash:<processId>) and backgroundProcessId. " +
-                "Read output with task_await({ task_ids: [result.taskId] }) (returns only new output since last check). " +
-                "Stop with task_stop({ task_ids: [result.taskId] }). " +
+                "Read output with `task_await({ task_ids: [result.taskId] })` (returns only new output since last check). " +
+                "Stop with `task_stop({ task_ids: [result.taskId] })`. " +
                 "List active tasks with task_list. " +
                 "Process persists until timeout_secs expires, terminated, or workspace is removed." +
                 "\\n\\nFor long-running tasks like builds or compilations, prefer background mode to continue productive work in parallel. " +
@@ -2244,7 +2244,7 @@ export const TOOL_DEFINITIONS = {
       "When a terminal wake-up says a sub-agent report or failure is already injected into context, integrate it directly — do NOT call task_await for it. When a wake-up asks you to retrieve a workspace turn's terminal output, call task_await with the listed IDs and timeout_secs: 0 (a one-shot retrieval, not a wait). " +
       "\n\nIMPORTANT: Do not call task_await in the same parallel tool-call batch as task, bash, or workflow_run — " +
       "the taskId/runId is not available until the spawning tool returns. " +
-      "Always wait for the task/bash/workflow_run tool result first, then call task_await in a subsequent step. Map returned result fields explicitly: task_await({ task_ids: [result.taskId] }) or task_await({ task_ids: result.taskIds }). " +
+      "Always wait for the task/bash/workflow_run tool result first, then call task_await in a subsequent step. Map returned result fields explicitly: `task_await({ task_ids: [result.taskId] })` or `task_await({ task_ids: result.taskIds })`. " +
       "When omitting task_ids to await active tasks/workflows, ensure at least one background task or workflow was already spawned in a prior step. Omitted task_ids discover active in-scope descendant agent tasks, public workspace turns, background bash tasks, and top-level workflow runs, while excluding workflow-owned internal workers because their results are consumed through parent workflow runs. " +
       "\n\nAgent tasks and workflow runs return reports when completed. " +
       "Completed reports are persisted on disk and survive context compaction: calling task_await on an already-completed task/workflow run ID (timeout_secs: 0 for non-blocking) re-fetches the full report instead of re-running the work. " +
@@ -2303,7 +2303,7 @@ export const TOOL_DEFINITIONS = {
       "the conductor follows the documented phases more faithfully and gains durable checkpoints, resume, and fresh delegated context per phase. " +
       "Use agent_skill_read / agent_skill_read_file to discover and inspect skill-packaged workflows; non-skill workflow files must be addressed by an explicit known path and can be inspected with normal file tools. " +
       "Prefer the default foreground mode (`run_in_background` omitted or false) so completed workflows return their result without an extra task_await round-trip. " +
-      "If workflow_run returns status=running or status=backgrounded, await it with task_await({ task_ids: [result.runId] }) before using or reporting the workflow output. " +
+      "If workflow_run returns status=running or status=backgrounded, await it with `task_await({ task_ids: [result.runId] })` before using or reporting the workflow output. " +
       "After a previous workflow_run error, abort, timeout, or uncertain result, do not start a fresh run until you rediscover existing workflow runs: either omit task_list statuses first, or query pending/running/backgrounded/interrupted/failed/completed together. " +
       "Use task_await for running/backgrounded runs, workflow_resume for pending/interrupted runs, workflow_resume({ mode: 'retry_from_checkpoint' }) only for eligible failed runs, and inspect/refetch completed results instead of rerunning. " +
       "Use background mode only when you intend to start another workflow/task or do independent work while the workflow runs; a background run is non-blocking and Mux wakes this workspace with the terminal workflow result, so call task_await only when the current request depends on the output before you can answer.",
@@ -2317,7 +2317,7 @@ export const TOOL_DEFINITIONS = {
       "For failed runs, pass mode='retry_from_checkpoint' explicitly; it re-executes work after the last checkpoint, so only use it when that is acceptable, and start a fresh workflow_run when it is rejected as unsafe. " +
       "Calling this on a completed run returns its existing result without re-running anything. " +
       "Prefer foreground mode (run_in_background omitted or false) to get the final result directly; " +
-      "if the returned status is running or backgrounded, await it with task_await({ task_ids: [result.runId] }) before using the result.",
+      "if the returned status is running or backgrounded, await it with `task_await({ task_ids: [result.runId] })` before using the result.",
     schema: WorkflowResumeToolArgsSchema,
   },
   agent_report: {
