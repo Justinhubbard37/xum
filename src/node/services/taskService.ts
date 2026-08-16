@@ -2109,10 +2109,10 @@ export class TaskService {
       {
         await using _lock = await this.mutex.acquire();
         const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
-        if (
-          entry != null &&
-          isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)
-        ) {
+        if (entry == null) {
+          throw new Error("Cannot start workflow work from a missing workspace");
+        }
+        if (isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)) {
           throw new Error("Cannot start workflow work from an archived workspace");
         }
         if (

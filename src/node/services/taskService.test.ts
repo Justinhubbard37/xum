@@ -13170,6 +13170,25 @@ describe("TaskService", () => {
     expect(nestedTasks.every((workspace) => workspace.taskStatus === "queued")).toBe(true);
   });
 
+  test("withWorkspaceOwnedWorkStartLock rejects missing workspaces", async () => {
+    const config = await createTestConfig(rootDir);
+    const { taskService } = createTaskServiceHarness(config);
+    const operation = mock(() => Promise.resolve("started"));
+
+    let startError: unknown;
+    try {
+      await taskService.withWorkspaceOwnedWorkStartLock("removed-workspace", operation);
+    } catch (error: unknown) {
+      startError = error;
+    }
+
+    expect(startError).toBeInstanceOf(Error);
+    expect((startError as Error).message).toBe(
+      "Cannot start workflow work from a missing workspace"
+    );
+    expect(operation).not.toHaveBeenCalled();
+  });
+
   test("task tree lifecycle locks serialize descendants with their ancestor", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
