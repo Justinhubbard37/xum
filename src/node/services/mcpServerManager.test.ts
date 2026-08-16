@@ -3,6 +3,12 @@ import { createServer } from "http";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
+import {
+  MCP_PROMPT_MAX_ARGUMENTS,
+  MCP_PROMPT_MAX_DESCRIPTION_CHARS,
+  MCP_PROMPT_MAX_TEXT_BYTES,
+  MCP_PROMPT_TRUNCATION_MARKER,
+} from "@/common/constants/toolLimits";
 import * as mcpSdk from "@/node/services/mcpClient";
 import {
   MCPServerManager,
@@ -83,7 +89,13 @@ function testInstance(
     prompts: options.prompts ?? [],
     getPrompt: options.getPrompt ?? mock(() => Promise.resolve({ messages: [] })),
     ...(options.refreshTools !== undefined ? { refreshTools: options.refreshTools } : {}),
-    ...(options.refreshPrompts !== undefined ? { refreshPrompts: options.refreshPrompts } : {}),
+    // Prompt fixtures need a refresher because production stores catalogs
+    // only through refreshInstancePrompts.
+    ...(options.refreshPrompts !== undefined
+      ? { refreshPrompts: options.refreshPrompts }
+      : options.prompts !== undefined
+        ? { refreshPrompts: mock(() => Promise.resolve(options.prompts)) }
+        : {}),
     isClosed: options.isClosed ?? false,
     close: options.close ?? mock(() => Promise.resolve(undefined)),
   };
@@ -717,6 +729,312 @@ describe("MCPServerManager", () => {
     expect(result.stats.failedServerNames).toContain("broken-server");
   });
 
+  test("getToolsForWorkspace suffixes MCP tools that collide with built-in tool names", async () => {
+    const workspaceId = "ws-builtin-collision";
+    configService.listServers = mock(() => Promise.resolve({ mcp: stdioConfig("cmd") }));
+    access.startServers = mock(() =>
+      Promise.resolve(
+        startResult([["mcp", { tools: { prompt_get: testTool(), other_tool: testTool() } }]])
+      )
+    );
+
+    const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+
+    const names = Object.keys(result.tools);
+    // "mcp" + "prompt_get" normalizes to the built-in mcp_prompt_get name.
+    expect(names).not.toContain("mcp_prompt_get");
+    expect(names.some((name) => name.startsWith("mcp_prompt_get_"))).toBe(true);
+    expect(names).toContain("mcp_other_tool");
+  });
+
+  test("getToolsForWorkspace drops prompts whose argument names cannot round-trip", async () => {
+    const workspaceId = "ws-oversized-arg-name";
+    configService.listServers = mock(() => Promise.resolve({ coder: stdioConfig("cmd") }));
+    access.startServers = mock(() =>
+      Promise.resolve(
+        startResult([
+          [
+            "coder",
+            {
+              prompts: [
+                { name: "usable", arguments: [{ name: "pr", required: true }] },
+                { name: "stuck", arguments: [{ name: "a".repeat(5_000), required: true }] },
+                {
+                  name: "partial",
+                  arguments: [
+                    { name: "ok", required: true },
+                    { name: "b".repeat(5_000), required: false },
+                  ],
+                },
+              ],
+            },
+          ],
+        ])
+      )
+    );
+
+    const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+
+    // Both oversized-name prompts are dropped, not rewritten: composer slash
+    // invocation maps tokens positionally, so a stripped argument would
+    // silently misassign the remaining tokens.
+    expect(result.promptDescriptors.map((descriptor) => descriptor.promptName)).toEqual(["usable"]);
+  });
+
+  test("getToolsForWorkspace drops oversized prompt names and clamps descriptions at refresh", async () => {
+    const workspaceId = "ws-oversized-prompt-fields";
+    configService.listServers = mock(() => Promise.resolve({ coder: stdioConfig("cmd") }));
+    access.startServers = mock(() =>
+      Promise.resolve(
+        startResult([
+          [
+            "coder",
+            {
+              prompts: [
+                { name: "n".repeat(1024 * 1024) },
+                {
+                  name: "wordy",
+                  description: "d".repeat(1024 * 1024),
+                  arguments: [{ name: "pr", description: "a".repeat(1024 * 1024), required: true }],
+                },
+              ],
+            },
+          ],
+        ])
+      )
+    );
+
+    const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+
+    expect(result.promptDescriptors.map((descriptor) => descriptor.promptName)).toEqual(["wordy"]);
+    const wordy = result.promptDescriptors[0];
+    expect(wordy?.description?.length).toBe(MCP_PROMPT_MAX_DESCRIPTION_CHARS);
+    expect(wordy?.arguments?.[0]?.description?.length).toBe(MCP_PROMPT_MAX_DESCRIPTION_CHARS);
+  });
+
+  test("getToolsForWorkspace advertises no prompts for a server whose name cannot round-trip", async () => {
+    const workspaceId = "ws-oversized-server-name";
+    const hugeName = "s".repeat(1024 * 1024);
+    configService.listServers = mock(() =>
+      Promise.resolve({ [hugeName]: stdioConfig("cmd-huge"), coder: stdioConfig("cmd") })
+    );
+    access.startServers = mock(() =>
+      Promise.resolve(
+        startResult([
+          [hugeName, { prompts: [{ name: "hidden" }] }],
+          ["coder", { prompts: [{ name: "visible" }] }],
+        ])
+      )
+    );
+
+    const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+
+    // The oversized server name would otherwise prefix every prompt key and
+    // rerun Unicode/regex normalization over it per prompt.
+    expect(result.promptDescriptors.map((descriptor) => descriptor.promptName)).toEqual([
+      "visible",
+    ]);
+  });
+
+  test("prompt catalogs are normalized once at refresh, off the per-send rebuild path", async () => {
+    const workspaceId = "ws-hostile-arg-count";
+    let rawElementReads = 0;
+    const hostileArguments = new Proxy(
+      Array.from({ length: 100_000 }, (_, index) => ({
+        name: `arg_${index}`,
+        required: index === 90_000,
+      })),
+      {
+        get(target, property, receiver): unknown {
+          if (typeof property === "string" && /^\d+$/.test(property)) {
+            rawElementReads++;
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      }
+    );
+    let refreshCalls = 0;
+    const oneShotRefresh = mock(() => {
+      refreshCalls += 1;
+      return refreshCalls === 1
+        ? Promise.resolve([
+            { name: "hostile", arguments: hostileArguments },
+            {
+              name: "usable",
+              arguments: Array.from({ length: MCP_PROMPT_MAX_ARGUMENTS }, (_, index) => ({
+                name: `arg_${index}`,
+                required: index === 0,
+              })),
+            },
+          ])
+        : new Promise<never>(() => undefined);
+    });
+    configService.listServers = mock(() => Promise.resolve({ coder: stdioConfig("cmd") }));
+    access.startServers = mock(() =>
+      Promise.resolve(startResult([["coder", { refreshPrompts: oneShotRefresh }]]))
+    );
+
+    const first = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    // The over-cap prompt is dropped by the length gate without reading a
+    // single element, and no per-send path revisits the raw array.
+    expect(rawElementReads).toBe(0);
+    const second = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+
+    expect(rawElementReads).toBe(0);
+    expect(second.promptDescriptors).toBe(first.promptDescriptors);
+    for (const result of [first, second]) {
+      expect(result.promptDescriptors.map((descriptor) => descriptor.promptName)).toEqual([
+        "usable",
+      ]);
+      expect(result.promptDescriptors[0]?.arguments).toHaveLength(MCP_PROMPT_MAX_ARGUMENTS);
+    }
+  });
+
+  test("getToolsForWorkspace returns prompt descriptors alongside tools", async () => {
+    const workspaceId = "ws-tool-prompts";
+    configService.listServers = mock(() => Promise.resolve({ coder: stdioConfig("cmd") }));
+    access.startServers = mock(() =>
+      Promise.resolve(
+        startResult([
+          [
+            "coder",
+            {
+              prompts: [
+                {
+                  name: "review",
+                  description: "Review a PR",
+                  arguments: [{ name: "pr", required: true }],
+                },
+              ],
+            },
+          ],
+        ])
+      )
+    );
+
+    const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+
+    expect(result.promptDescriptors).toHaveLength(1);
+    expect(result.promptDescriptors[0]).toMatchObject({
+      serverName: "coder",
+      promptName: "review",
+      description: "Review a PR",
+      arguments: [{ name: "pr", required: true }],
+    });
+  });
+
+  test("getToolsForWorkspace re-polls legacy and modern prompt catalogs each stream", async () => {
+    const workspaceId = "ws-prompt-freshness";
+    configService.listServers = mock(() =>
+      Promise.resolve({ legacy: stdioConfig("cmd-legacy"), modern: stdioConfig("cmd-modern") })
+    );
+    const legacy = testInstance("legacy");
+    let legacyFetches = 0;
+    const legacyRefresh = mock(() => {
+      legacyFetches += 1;
+      return Promise.resolve([{ name: `legacy-v${legacyFetches}` }]);
+    });
+    (legacy as { refreshPrompts?: typeof legacyRefresh }).refreshPrompts = legacyRefresh;
+    const modern = testInstance("modern", { refreshTools: mock(() => Promise.resolve()) });
+    let modernFetches = 0;
+    const modernRefresh = mock(() => {
+      modernFetches += 1;
+      return Promise.resolve([{ name: `modern-v${modernFetches}` }]);
+    });
+    (modern as { refreshPrompts?: typeof modernRefresh }).refreshPrompts = modernRefresh;
+    access.startServers = mock(() =>
+      Promise.resolve({
+        instances: new Map([
+          ["legacy", legacy],
+          ["modern", modern],
+        ]),
+        failedServerNames: [],
+        timedOutServerNames: [],
+      })
+    );
+
+    const first = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    const second = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    // Let the second send's background refresh land before the third send.
+    await Bun.sleep(0);
+    const third = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+
+    expect(legacyRefresh).toHaveBeenCalledTimes(3);
+    expect(modernRefresh).toHaveBeenCalledTimes(3);
+    expect(first.promptDescriptors.map((descriptor) => descriptor.promptName).sort()).toEqual([
+      "legacy-v1",
+      "modern-v1",
+    ]);
+    expect(second.promptDescriptors.map((descriptor) => descriptor.promptName).sort()).toEqual([
+      "legacy-v1",
+      "modern-v1",
+    ]);
+    expect(third.promptDescriptors.map((descriptor) => descriptor.promptName).sort()).toEqual([
+      "legacy-v2",
+      "modern-v2",
+    ]);
+  });
+
+  test("an older prompt refresh completing late never overwrites a newer catalog", async () => {
+    const workspaceId = "ws-refresh-race";
+    configService.listServers = mock(() => Promise.resolve({ coder: stdioConfig("cmd") }));
+    let calls = 0;
+    let resolveStale!: (prompts: Array<{ name: string }>) => void;
+    const refreshPrompts = mock(() => {
+      calls += 1;
+      // Call 1 seeds the cache, call 2 is held stale, and call 3 wins through
+      // direct discovery. Later calls hang.
+      if (calls === 1) return Promise.resolve([{ name: "initial" }]);
+      if (calls === 2)
+        return new Promise<Array<{ name: string }>>((resolve) => {
+          resolveStale = resolve;
+        });
+      if (calls === 3) return Promise.resolve([{ name: "newer" }]);
+      return new Promise<Array<{ name: string }>>(() => undefined);
+    });
+    access.startServers = mock(() => Promise.resolve(startResult([["coder", { refreshPrompts }]])));
+
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    const discovered = await manager.getPromptsForWorkspace(workspaceRequest(workspaceId));
+    expect(discovered.map((descriptor) => descriptor.promptName)).toEqual(["newer"]);
+
+    resolveStale([{ name: "stale" }]);
+    await Bun.sleep(0);
+
+    const final = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(final.promptDescriptors.map((descriptor) => descriptor.promptName)).toEqual(["newer"]);
+  });
+
+  test("getToolsForWorkspace does not block sends on a hung prompt refresh", async () => {
+    const workspaceId = "ws-hung-prompt-refresh";
+    configService.listServers = mock(() => Promise.resolve({ hung: stdioConfig("cmd") }));
+    const hung = testInstance("hung", { prompts: [{ name: "cached" }] });
+    let refreshCalls = 0;
+    const neverSettles = mock(() => {
+      refreshCalls += 1;
+      return refreshCalls === 1
+        ? Promise.resolve([{ name: "cached" }])
+        : new Promise<Array<{ name: string }>>(() => undefined);
+    });
+    (hung as { refreshPrompts?: typeof neverSettles }).refreshPrompts = neverSettles;
+    access.startServers = mock(() =>
+      Promise.resolve({
+        instances: new Map([["hung", hung]]),
+        failedServerNames: [],
+        timedOutServerNames: [],
+      })
+    );
+
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    const second = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    const third = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+
+    expect(second.promptDescriptors.map((descriptor) => descriptor.promptName)).toEqual(["cached"]);
+    expect(third.promptDescriptors.map((descriptor) => descriptor.promptName)).toEqual(["cached"]);
+    expect(refreshCalls).toBe(2);
+  });
+
   test("getToolsForWorkspace retries timed-out servers from cached workspace state", async () => {
     const workspaceId = "ws-timeout-retry";
     configService.listServers = mock(() =>
@@ -802,6 +1120,7 @@ describe("MCPServerManager", () => {
         slow: { transport: "stdio", command: "cmd-slow", args: null, env: null, cwd: null },
       }),
       instances: new Map(),
+      enabledServerNames: new Set(["slow"]),
       stats: cachedStats(),
       timedOutServerNames: ["slow"],
       lastActivity: Date.now(),
@@ -1105,6 +1424,73 @@ describe("MCPServerManager", () => {
     expect(await manager.getPrompt(workspaceId, "stable", "review", {})).toEqual({ text: "hi" });
   });
 
+  test("background prompt refresh never targets servers revoked by a concurrent mutation", async () => {
+    const workspaceId = "ws-refresh-after-repair";
+    // Revocation lands inside the cached send's config derivation, after the
+    // trust overlay was read but before enablement repair runs.
+    let revokeOnNextTrustedList = false;
+    configService.listServers = mock((_projectPath: string, trusted: boolean) => {
+      if (revokeOnNextTrustedList && trusted) {
+        revokeOnNextTrustedList = false;
+        manager.applyProjectTrust([{ projectPath: PROJECT_PATH, trusted: false }]);
+      }
+      return Promise.resolve(
+        trusted
+          ? { server: stdioConfig("cmd-1"), stable: stdioConfig("cmd-stable") }
+          : { stable: stdioConfig("cmd-stable") }
+      );
+    });
+    const revokedRefresh = mock(() => Promise.resolve([]));
+    const stableRefresh = mock(() => Promise.resolve([]));
+    access.startServers = mock(() =>
+      Promise.resolve(
+        startResult([
+          ["server", { refreshPrompts: revokedRefresh }],
+          ["stable", { refreshPrompts: stableRefresh }],
+        ])
+      )
+    );
+
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId, { trusted: true }));
+    expect(revokedRefresh).toHaveBeenCalledTimes(1);
+
+    revokeOnNextTrustedList = true;
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId, { trusted: true }));
+    await Bun.sleep(0);
+
+    expect(revokedRefresh).toHaveBeenCalledTimes(1);
+    expect(stableRefresh).toHaveBeenCalledTimes(2);
+  });
+
+  test("cold-start prompt refresh never targets servers revoked while startup was in flight", async () => {
+    const workspaceId = "ws-cold-refresh-after-repair";
+    configService.listServers = mock((_projectPath: string, trusted: boolean) =>
+      Promise.resolve(
+        trusted
+          ? { server: stdioConfig("cmd-1"), stable: stdioConfig("cmd-stable") }
+          : { stable: stdioConfig("cmd-stable") }
+      )
+    );
+    const revokedRefresh = mock(() => Promise.resolve([]));
+    const stableRefresh = mock(() => Promise.resolve([]));
+    access.startServers = mock(() => {
+      // Revocation lands while startServers is still in flight, before the
+      // cold path caches the entry and refreshes prompts.
+      manager.applyProjectTrust([{ projectPath: PROJECT_PATH, trusted: false }]);
+      return Promise.resolve(
+        startResult([
+          ["server", { refreshPrompts: revokedRefresh }],
+          ["stable", { refreshPrompts: stableRefresh }],
+        ])
+      );
+    });
+
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId, { trusted: true }));
+
+    expect(revokedRefresh).not.toHaveBeenCalled();
+    expect(stableRefresh).toHaveBeenCalledTimes(1);
+  });
+
   test("applies overrides recorded before the first workspace request (cold mutation)", async () => {
     const workspaceId = "ws-cold-overrides";
     configService.listServers = mock(() =>
@@ -1288,12 +1674,13 @@ describe("MCPServerManager", () => {
       })
     );
 
-    const refreshPrompts = mock(() => Promise.resolve());
+    const staleRefresh = mock(() => Promise.resolve([{ name: "review" }]));
+    const stableRefresh = mock(() => Promise.resolve([{ name: "status" }]));
     access.startServers = mock(() =>
       Promise.resolve(
         startResult([
-          ["server", { prompts: [{ name: "review" }], refreshPrompts }],
-          ["stable", { prompts: [{ name: "status" }], refreshPrompts }],
+          ["server", { prompts: [{ name: "review" }], refreshPrompts: staleRefresh }],
+          ["stable", { prompts: [{ name: "status" }], refreshPrompts: stableRefresh }],
         ])
       )
     );
@@ -1304,12 +1691,14 @@ describe("MCPServerManager", () => {
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
 
     try {
-      refreshPrompts.mockClear();
+      staleRefresh.mockClear();
+      stableRefresh.mockClear();
       const descriptors = await manager.getPromptsForWorkspace(workspaceRequest(workspaceId));
       expect(descriptors.map((descriptor) => descriptor.serverName)).toEqual(["stable"]);
       // The stale instance still points at the old endpoint; discovery must
       // not send prompts/list there with potentially obsolete credentials.
-      expect(refreshPrompts).toHaveBeenCalledTimes(1);
+      expect(staleRefresh).not.toHaveBeenCalled();
+      expect(stableRefresh).toHaveBeenCalledTimes(1);
     } finally {
       manager.releaseLease(workspaceId);
     }
@@ -1329,18 +1718,31 @@ describe("MCPServerManager", () => {
     // already taken when the mutation lands, so only a post-refresh counter
     // recheck can drop the now-disabled server's descriptors.
     let revokeOnFirstRefresh = true;
-    const refreshPrompts = mock(() => {
-      if (revokeOnFirstRefresh) {
-        revokeOnFirstRefresh = false;
-        manager.applyProjectTrust([{ projectPath: PROJECT_PATH, trusted: false }]);
-      }
-      return Promise.resolve();
-    });
+    const revokingRefresh = (list: Array<{ name: string }>) =>
+      mock(() => {
+        if (revokeOnFirstRefresh) {
+          revokeOnFirstRefresh = false;
+          manager.applyProjectTrust([{ projectPath: PROJECT_PATH, trusted: false }]);
+        }
+        return Promise.resolve(list);
+      });
     access.startServers = mock(() =>
       Promise.resolve(
         startResult([
-          ["server", { prompts: [{ name: "review" }], refreshPrompts }],
-          ["stable", { prompts: [{ name: "status" }], refreshPrompts }],
+          [
+            "server",
+            {
+              prompts: [{ name: "review" }],
+              refreshPrompts: revokingRefresh([{ name: "review" }]),
+            },
+          ],
+          [
+            "stable",
+            {
+              prompts: [{ name: "status" }],
+              refreshPrompts: revokingRefresh([{ name: "status" }]),
+            },
+          ],
         ])
       )
     );
@@ -1356,7 +1758,7 @@ describe("MCPServerManager", () => {
   test("prompt discovery forwards the abort signal to prompt refreshes", async () => {
     const workspaceId = "ws-discovery-signal";
     configService.listServers = mock(() => Promise.resolve({ server: stdioConfig("cmd-1") }));
-    const refreshPrompts = mock((_options?: { signal?: AbortSignal }) => Promise.resolve());
+    const refreshPrompts = mock((_options?: { signal?: AbortSignal }) => Promise.resolve([]));
     access.startServers = mock(() =>
       Promise.resolve(startResult([["server", { refreshPrompts }]]))
     );
@@ -2013,6 +2415,107 @@ describe("MCPServerManager", () => {
     expect(getPrompt).toHaveBeenCalledTimes(1);
   });
 
+  test("getPrompt caps expansion bytes for non-ASCII content shared with the composer path", async () => {
+    // 64k "€" chars encode to ~192KB UTF-8, triple the nominal cap.
+    const getPrompt = mock(() =>
+      Promise.resolve({
+        messages: [
+          {
+            role: "user" as const,
+            content: { type: "text" as const, text: "€".repeat(64 * 1024) },
+          },
+        ],
+      })
+    );
+    configService.listServers = mock(() => Promise.resolve({ coder: stdioConfig("cmd") }));
+    access.startServers = mock(() => Promise.resolve(startResult([["coder", { getPrompt }]])));
+    await manager.getToolsForWorkspace(workspaceRequest("workspace"));
+
+    const result = await manager.getPrompt("workspace", "coder", "status", {});
+
+    expect(Buffer.byteLength(result.text, "utf8")).toBeLessThanOrEqual(
+      MCP_PROMPT_MAX_TEXT_BYTES + MCP_PROMPT_TRUNCATION_MARKER.length
+    );
+    expect(result.text).toEndWith(MCP_PROMPT_TRUNCATION_MARKER);
+    expect(result.text).not.toContain("\uFFFD");
+  });
+
+  test("getPrompt rejects an oversized whitespace-only expansion instead of passing the marker off as content", async () => {
+    const getPrompt = mock(() =>
+      Promise.resolve({
+        messages: [
+          {
+            role: "user" as const,
+            content: { type: "text" as const, text: " ".repeat(2 * MCP_PROMPT_MAX_TEXT_BYTES) },
+          },
+        ],
+      })
+    );
+    configService.listServers = mock(() => Promise.resolve({ coder: stdioConfig("cmd") }));
+    access.startServers = mock(() => Promise.resolve(startResult([["coder", { getPrompt }]])));
+    await manager.getToolsForWorkspace(workspaceRequest("workspace"));
+
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(manager.getPrompt("workspace", "coder", "status", {})).rejects.toThrow(
+      "returned no text content"
+    );
+  });
+
+  test("getPrompt never encodes more than the byte budget for a huge expansion", async () => {
+    const getPrompt = mock(() =>
+      Promise.resolve({
+        messages: [
+          {
+            role: "user" as const,
+            content: { type: "text" as const, text: "a".repeat(10 * 1024 * 1024) },
+          },
+        ],
+      })
+    );
+    configService.listServers = mock(() => Promise.resolve({ coder: stdioConfig("cmd") }));
+    access.startServers = mock(() => Promise.resolve(startResult([["coder", { getPrompt }]])));
+    await manager.getToolsForWorkspace(workspaceRequest("workspace"));
+    const fromSpy = spyOn(Buffer, "from");
+
+    try {
+      const result = await manager.getPrompt("workspace", "coder", "status", {});
+
+      expect(result.text).toEndWith(MCP_PROMPT_TRUNCATION_MARKER);
+      // The transient encoding copy is bounded by the budget, not input size.
+      for (const call of fromSpy.mock.calls) {
+        const input = call[0];
+        if (typeof input === "string") {
+          expect(input.length).toBeLessThanOrEqual(MCP_PROMPT_MAX_TEXT_BYTES);
+        }
+      }
+    } finally {
+      fromSpy.mockRestore();
+    }
+  });
+
+  test("getPrompt emits a single truncation marker when flattening also truncated", async () => {
+    const block = "a".repeat(40 * 1024);
+    const getPrompt = mock(() =>
+      Promise.resolve({
+        messages: [
+          { role: "user" as const, content: { type: "text" as const, text: block } },
+          { role: "user" as const, content: { type: "text" as const, text: block } },
+        ],
+      })
+    );
+    configService.listServers = mock(() => Promise.resolve({ coder: stdioConfig("cmd") }));
+    access.startServers = mock(() => Promise.resolve(startResult([["coder", { getPrompt }]])));
+    await manager.getToolsForWorkspace(workspaceRequest("workspace"));
+
+    const result = await manager.getPrompt("workspace", "coder", "status", {});
+
+    expect(Buffer.byteLength(result.text, "utf8")).toBeLessThanOrEqual(
+      MCP_PROMPT_MAX_TEXT_BYTES + MCP_PROMPT_TRUNCATION_MARKER.length
+    );
+    expect(result.text.split("[Prompt text truncated]")).toHaveLength(2);
+    expect(result.text).toEndWith(MCP_PROMPT_TRUNCATION_MARKER);
+  });
+
   test("applyProjectTrust flips recorded trust so getPrompt refreshes untrusted", async () => {
     const request = workspaceRequest("workspace", { trusted: true });
     const otherRequest = workspaceRequest("other-workspace", {
@@ -2124,6 +2627,26 @@ describe("MCPServerManager", () => {
         ],
       })
     ).toBe("[Audio content omitted]\n\n[Resource content omitted]");
+  });
+
+  test("flattenMcpPrompt accumulates only a bounded prefix of oversized expansions", () => {
+    const block = "a".repeat(40 * 1024);
+    const flattened = flattenMcpPrompt({
+      messages: [
+        { role: "user", content: { type: "text", text: block } },
+        { role: "assistant", content: { type: "text", text: block } },
+        { role: "user", content: { type: "text", text: block } },
+      ],
+    });
+
+    expect(flattened.endsWith(MCP_PROMPT_TRUNCATION_MARKER)).toBe(true);
+    // Pre-marker text must exceed the byte cap so the tool-level truncation
+    // always fires and replaces the marker at a clean boundary.
+    const preMarker = flattened.length - MCP_PROMPT_TRUNCATION_MARKER.length;
+    expect(preMarker).toBeGreaterThan(MCP_PROMPT_MAX_TEXT_BYTES);
+    expect(preMarker).toBeLessThanOrEqual(MCP_PROMPT_MAX_TEXT_BYTES + 2);
+    expect(flattened.startsWith(block)).toBe(true);
+    expect(flattened).toContain("[assistant]\n");
   });
 
   test("test() includes oauthChallenge when server responds 401 + WWW-Authenticate Bearer", async () => {
@@ -2248,6 +2771,7 @@ describe("MCPServerManager", () => {
         resolvedTransport: "stdio" as const,
         autoFallbackUsed: false,
         tools,
+        prompts: [],
         isClosed: false,
         close: mock(() => Promise.resolve(undefined)),
       };

@@ -2718,6 +2718,35 @@ CREATE TABLE IF NOT EXISTS delegation_rollups (
       })
       .strict(),
   },
+  mcp_prompt_get: {
+    description:
+      "Fetch a prompt template from a connected MCP server, expanded with the given arguments. " +
+      "MCP prompts are reusable instructions or workflows the user has made available through MCP servers. " +
+      "The result contains the prompt text; follow it as task guidance in the current conversation. " +
+      "Available prompts are listed in this description when connected servers advertise them.",
+    schema: z
+      .object({
+        name: z
+          .string()
+          .min(1)
+          .describe('Prompt name from the available list, e.g. "mcp__server__prompt"'),
+        arguments: z
+          .record(z.string(), z.string())
+          .nullish()
+          .describe(
+            "Prompt argument values by argument name. Arguments marked with ? are optional; all others are required."
+          ),
+        list_offset: z
+          .number()
+          .int()
+          .min(0)
+          .nullish()
+          .describe(
+            "When an unknown-name error truncates the prompt listing, repeat the call with the suggested list_offset to page through the remaining prompt names."
+          ),
+      })
+      .strict(),
+  },
 } as const;
 
 // -----------------------------------------------------------------------------
@@ -3018,6 +3047,25 @@ export const AgentSkillReadToolResultSchema = z.union([
 export const AgentSkillReadFileToolResultSchema = FileReadToolResultSchema;
 
 /**
+ * MCP prompt get tool result - flattened prompt text or error.
+ */
+export const MCPPromptGetToolResultSchema = z.union([
+  z
+    .object({
+      success: z.literal(true),
+      text: z.string(),
+      description: z.string().optional(),
+    })
+    .strict(),
+  z
+    .object({
+      success: z.literal(false),
+      error: z.string(),
+    })
+    .strict(),
+]);
+
+/**
  * File edit insert tool result - diff or error.
  */
 export const FileEditInsertToolResultSchema = z.union([
@@ -3143,7 +3191,8 @@ export type BridgeableToolName =
   | "task_stop"
   | "task_remove"
   | "heartbeat"
-  | "memory";
+  | "memory"
+  | "mcp_prompt_get";
 
 /**
  * Lookup map for result schemas by tool name.
@@ -3173,6 +3222,7 @@ export const RESULT_SCHEMAS: Record<BridgeableToolName, z.ZodType> = {
   task_remove: TaskRemoveToolResultSchema,
   heartbeat: HeartbeatToolResultSchema,
   memory: MemoryToolResultSchema,
+  mcp_prompt_get: MCPPromptGetToolResultSchema,
 };
 
 /**
@@ -3225,6 +3275,8 @@ export function getAvailableTools(
     enableTimelineEvent?: boolean;
     /** Whether tool_catalog_search is available (tool-search experiment + deferred MCP tools present). */
     enableToolSearch?: boolean;
+    /** Whether mcp_prompt_get is available (connected MCP servers advertise prompts). */
+    enableMcpPromptGet?: boolean;
     /**
      * Whether the Review pane tools (review_pane_update/review_pane_get) are
      * available. The Review pane belongs to the user-facing parent workspace,
@@ -3244,6 +3296,7 @@ export function getAvailableTools(
   const enableMemory = options?.enableMemory ?? false;
   const enableTimelineEvent = options?.enableTimelineEvent ?? false;
   const enableToolSearch = options?.enableToolSearch ?? false;
+  const enableMcpPromptGet = options?.enableMcpPromptGet ?? false;
   const enableReviewPane = options?.enableReviewPane ?? true;
 
   // Base tools available for all models
@@ -3277,6 +3330,7 @@ export function getAvailableTools(
     ...(enableTimelineEvent ? ["timeline_event"] : []),
     ...(enableAdvisor ? ["advisor"] : []),
     ...(enableToolSearch ? ["tool_catalog_search"] : []),
+    ...(enableMcpPromptGet ? ["mcp_prompt_get"] : []),
     "ask_user_question",
     "propose_plan",
     "bash",

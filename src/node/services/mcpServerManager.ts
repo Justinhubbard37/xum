@@ -44,6 +44,16 @@ import {
   buildMcpPromptStableKey,
   buildMcpToolName,
 } from "@/common/utils/tools/mcpToolName";
+import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
+import {
+  MCP_PROMPT_MAX_ARGUMENTS,
+  MCP_PROMPT_MAX_ARGUMENT_NAME_CHARS,
+  MCP_PROMPT_MAX_DESCRIPTION_CHARS,
+  MCP_PROMPT_MAX_NAME_CHARS,
+  MCP_PROMPT_MAX_SERVER_NAME_CHARS,
+  MCP_PROMPT_MAX_TEXT_BYTES,
+  MCP_PROMPT_TRUNCATION_MARKER,
+} from "@/common/constants/toolLimits";
 import { getErrorMessage } from "@/common/utils/errors";
 import { AsyncSemaphore } from "@/node/utils/concurrency/asyncSemaphore";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
@@ -788,14 +798,126 @@ function flattenPromptContent(content: MCPPromptContent): string {
   }
 }
 
+// Enforce the expansion budget on UTF-8 bytes; non-ASCII text can use up to
+// three bytes per UTF-16 code unit. Backs up to a UTF-8 sequence boundary
+// before decoding.
+function truncateUtf8Bytes(text: string, maxBytes: number, marker: string): string {
+  // Encoding at most maxBytes UTF-16 code units bounds the temporary buffer
+  // while still covering maxBytes UTF-8 bytes.
+  const prefix = text.length > maxBytes ? text.slice(0, maxBytes) : text;
+  const bytes = Buffer.from(prefix, "utf8");
+  if (prefix === text && bytes.length <= maxBytes) {
+    return text;
+  }
+  let end = maxBytes;
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) {
+    end--;
+  }
+  return bytes.subarray(0, end).toString("utf8") + marker;
+}
+
+// Accumulates at most the cap plus one body code unit and fixed
+// separator/role prefixes, so many large message blocks never materialize a
+// full-size combined string. Whenever content is dropped, the pre-marker text
+// exceeds the cap, so getPrompt's byte truncation always fires and replaces
+// the marker cleanly instead of cutting it mid-string.
 export function flattenMcpPrompt(result: MCPGetPromptResult): string {
-  return result.messages
-    .map((message) => {
-      const text = flattenPromptContent(message.content);
-      return message.role === "user" ? text : `[${message.role}]\n${text}`;
-    })
-    .filter((message) => message.length > 0)
-    .join("\n\n");
+  const parts: string[] = [];
+  let length = 0;
+  let truncated = false;
+  for (const message of result.messages) {
+    if (length > MCP_PROMPT_MAX_TEXT_BYTES) {
+      truncated = true;
+      break;
+    }
+    const text = flattenPromptContent(message.content);
+    const prefix = message.role === "user" ? "" : `[${message.role}]\n`;
+    if (prefix.length === 0 && text.length === 0) {
+      continue;
+    }
+    const separator = parts.length > 0 ? 2 : 0;
+    const allowed = Math.max(1, MCP_PROMPT_MAX_TEXT_BYTES + 1 - length - separator - prefix.length);
+    const body = text.length > allowed ? text.slice(0, allowed) : text;
+    parts.push(prefix + body);
+    length += separator + prefix.length + body.length;
+    if (body.length < text.length) {
+      truncated = true;
+      break;
+    }
+  }
+  const flattened = parts.join("\n\n");
+  // Skip the marker when the accumulated text is whitespace-only: the marker
+  // would otherwise be the only content and let an oversized meaningless
+  // expansion slip past getPrompt's emptiness rejection.
+  return truncated && flattened.trim().length > 0
+    ? flattened + MCP_PROMPT_TRUNCATION_MARKER
+    : flattened;
+}
+
+function clampDescription(description: string | undefined): string | undefined {
+  return description !== undefined && description.length > MCP_PROMPT_MAX_DESCRIPTION_CHARS
+    ? description.slice(0, MCP_PROMPT_MAX_DESCRIPTION_CHARS)
+    : description;
+}
+
+/**
+ * Bounds prompt fields once per refresh: drops prompts with oversized prompt
+ * names, oversized argument names, or too many arguments (retained argument
+ * arrays keep their positional shape), and clamps catalog descriptions.
+ */
+export function normalizePromptCatalog(prompts: MCPPrompt[], serverName: string): MCPPrompt[] {
+  // The server name prefixes every prompt key, so descriptor building would
+  // rerun Unicode and regex normalization over an oversized name per prompt.
+  if (serverName.length > MCP_PROMPT_MAX_SERVER_NAME_CHARS) {
+    log.debug("[MCP] Dropping prompt catalog for server with oversized name", {
+      server: serverName.slice(0, MCP_PROMPT_MAX_SERVER_NAME_CHARS),
+      promptCount: prompts.length,
+    });
+    return [];
+  }
+  const normalized: MCPPrompt[] = [];
+  for (const prompt of prompts) {
+    // Gate length before key normalization, which runs Unicode normalization
+    // and regex replacements on the name.
+    if (prompt.name.length > MCP_PROMPT_MAX_NAME_CHARS) {
+      log.debug("[MCP] Dropping prompt with oversized name", {
+        server: serverName,
+        prompt: prompt.name.slice(0, MCP_PROMPT_MAX_NAME_CHARS),
+      });
+      continue;
+    }
+    const args = prompt.arguments;
+    if (args === undefined) {
+      normalized.push({ ...prompt, description: clampDescription(prompt.description) });
+      continue;
+    }
+    // Composer maps slash arguments positionally (mapPromptArguments), so
+    // advertise the exact server list or drop the prompt. Check length first
+    // to reject over-cap arrays without reading their elements.
+    if (args.length > MCP_PROMPT_MAX_ARGUMENTS) {
+      log.debug("[MCP] Dropping prompt with too many arguments", {
+        server: serverName,
+        prompt: prompt.name,
+      });
+      continue;
+    }
+    if (args.some((argument) => argument.name.length > MCP_PROMPT_MAX_ARGUMENT_NAME_CHARS)) {
+      log.debug("[MCP] Dropping prompt with oversized argument name", {
+        server: serverName,
+        prompt: prompt.name,
+      });
+      continue;
+    }
+    normalized.push({
+      ...prompt,
+      description: clampDescription(prompt.description),
+      arguments: args.map((argument) => ({
+        ...argument,
+        description: clampDescription(argument.description),
+      })),
+    });
+  }
+  return normalized;
 }
 
 interface MCPServerInstance {
@@ -817,7 +939,8 @@ interface MCPServerInstance {
    * results carry no freshness hints).
    */
   refreshTools?: () => Promise<void>;
-  refreshPrompts?: (options?: { signal?: AbortSignal }) => Promise<void>;
+  /** Fetches prompts/list without mutating instance state; refreshInstancePrompts alone normalizes and stores the catalog. */
+  refreshPrompts?: (options?: { signal?: AbortSignal }) => Promise<MCPPrompt[]>;
   close: () => Promise<void>;
 }
 
@@ -855,6 +978,8 @@ export type MCPWorkspaceSecretsResolver = (
 interface MCPToolsForWorkspaceResult {
   tools: Record<string, Tool>;
   stats: MCPWorkspaceStats;
+  /** Prompt descriptors for model-facing discovery, from the same enabled/stale gates as getPromptsForWorkspace. */
+  promptDescriptors: MCPPromptDescriptor[];
 }
 interface WorkspaceServers {
   configSignature: string;
@@ -867,6 +992,12 @@ interface WorkspaceServers {
   retryingTimedOutServerNames: Set<string>;
   /** Blocks prompt invocation on stale clients while an active lease defers restart. */
   stalePromptServerNames?: Set<string>;
+  /** Dedupes send-path background prompt refreshes so streams never stack them. */
+  promptRefreshInFlight?: Promise<void>;
+  promptDescriptorCache?: {
+    sources: Array<{ instance: MCPServerInstance; prompts: MCPPrompt[] }>;
+    descriptors: MCPPromptDescriptor[];
+  };
   lastActivity: number;
 }
 
@@ -894,6 +1025,11 @@ export class MCPServerManager {
   private readonly latestWorkspaceOverrides = new Map<string, WorkspaceMCPOverrides | undefined>();
   private readonly latestProjectTrust = new Map<string, boolean>();
   private readonly workspaceRestartLocks = new MutexMap<string>();
+  /** Orders racing prompt refresh completions per instance; see refreshInstancePrompts. */
+  private readonly promptRefreshSequences = new WeakMap<
+    MCPServerInstance,
+    { started: number; applied: number }
+  >();
   // Bumped by removal-style stops (stopServers without retainRestartOptions).
   // Startups run outside any lock shared with removal, so an abort-abandoned
   // startup can finish after the workspace is gone; the epoch check makes it
@@ -985,6 +1121,24 @@ export class MCPServerManager {
     );
   }
 
+  /**
+   * Send-path prompt freshness is stale-while-revalidate: prompts/list can
+   * hang for its full timeout on servers that ignore prompt requests, and a
+   * message send must never wait on it. Streams serve the cached catalog and
+   * the refreshed one lands for the next stream.
+   */
+  private refreshInstancePromptsInBackground(entry: WorkspaceServers): void {
+    if (entry.promptRefreshInFlight !== undefined) {
+      return;
+    }
+    const refresh = this.refreshInstancePrompts(this.promptEligibleInstances(entry)).finally(() => {
+      if (entry.promptRefreshInFlight === refresh) {
+        entry.promptRefreshInFlight = undefined;
+      }
+    });
+    entry.promptRefreshInFlight = refresh;
+  }
+
   private async refreshInstancePrompts(
     instances: Map<string, MCPServerInstance>,
     signal?: AbortSignal
@@ -992,8 +1146,22 @@ export class MCPServerManager {
     await Promise.all(
       [...instances.values()].map(async (instance) => {
         if (instance.isClosed || !instance.refreshPrompts) return;
+        // Discovery can race the deduped background refresh. Apply only
+        // tokens newer than the last applied one so an older completion
+        // cannot overwrite a newer catalog.
+        let sequence = this.promptRefreshSequences.get(instance);
+        if (!sequence) {
+          sequence = { started: 0, applied: 0 };
+          this.promptRefreshSequences.set(instance, sequence);
+        }
+        const token = ++sequence.started;
         try {
-          await instance.refreshPrompts(signal !== undefined ? { signal } : undefined);
+          const fetched = await instance.refreshPrompts(
+            signal !== undefined ? { signal } : undefined
+          );
+          if (token <= sequence.applied) return;
+          sequence.applied = token;
+          instance.prompts = normalizePromptCatalog(fetched, instance.name);
         } catch (error) {
           log.debug("[MCP] Prompt list refresh failed; keeping cached prompts", {
             name: instance.name,
@@ -1493,9 +1661,16 @@ export class MCPServerManager {
         configGenerationUsed
       );
 
+      // Spawned after the repair: a detached refresh cannot be cancelled, so
+      // it must never target servers a concurrent mutation just revoked.
+      if (refreshToolCatalogs) {
+        this.refreshInstancePromptsInBackground(existing);
+      }
+
       return {
         tools: this.collectTools(existing.instances, fullServerInfo, overrides),
         stats: existing.stats,
+        promptDescriptors: this.promptDescriptorsFor(existing),
       };
     }
 
@@ -1630,12 +1805,14 @@ export class MCPServerManager {
 
       if (refreshToolCatalogs) {
         // Honor SEP-2549 freshness hints instead of caching tool lists for the instance lifetime.
+        this.refreshInstancePromptsInBackground(existing);
         await this.refreshModernInstanceTools(instancesForTools);
       }
 
       return {
         tools: this.collectTools(instancesForTools, fullServerInfo, overrides),
         stats: leasedStats,
+        promptDescriptors: this.promptDescriptorsFor(existing),
       };
     }
 
@@ -1661,9 +1838,15 @@ export class MCPServerManager {
             current,
             configGenerationUsed
           );
+          // Spawned after the repair so the uncancellable detached refresh
+          // cannot target servers a concurrent mutation just revoked.
+          if (refreshToolCatalogs) {
+            this.refreshInstancePromptsInBackground(current);
+          }
           return {
             tools: this.collectTools(current.instances, fullServerInfo, overrides),
             stats: current.stats,
+            promptDescriptors: this.promptDescriptorsFor(current),
           };
         }
       }
@@ -1714,7 +1897,7 @@ export class MCPServerManager {
             });
           }
         }
-        return { tools: {}, stats };
+        return { tools: {}, stats, promptDescriptors: [] };
       }
 
       const entry: WorkspaceServers = {
@@ -1727,16 +1910,30 @@ export class MCPServerManager {
         lastActivity: Date.now(),
       };
       this.workspaceServers.set(workspaceId, entry);
+
+      // Repair first so the awaited refresh never queries a server revoked
+      // during startup, then again after it so mutations landing during the
+      // slow refresh cannot leak stale descriptors.
       await this.repairEnablementAfterConcurrentMutation(
         workspaceId,
         options,
         entry,
         configGenerationUsed
       );
+      if (refreshToolCatalogs) {
+        await this.refreshInstancePrompts(this.promptEligibleInstances(entry));
+        await this.repairEnablementAfterConcurrentMutation(
+          workspaceId,
+          options,
+          entry,
+          configGenerationUsed
+        );
+      }
 
       return {
         tools: this.collectTools(instances, fullServerInfo, overrides),
         stats,
+        promptDescriptors: this.promptDescriptorsFor(entry),
       };
     });
   }
@@ -1752,7 +1949,7 @@ export class MCPServerManager {
     // participate in the check because rotation bumps neither counter. Abort
     // returns promptly while a losing startup may finish into the cache for
     // idle cleanup.
-    let enabledInstances: Map<string, MCPServerInstance>;
+    let latestEntry: WorkspaceServers;
     for (;;) {
       const optionsMutationsBefore = this.workspaceOptionsMutationCounts.get(workspaceId) ?? 0;
       const generationBefore = this.configService.configGeneration;
@@ -1778,17 +1975,8 @@ export class MCPServerManager {
       const entry = this.workspaceServers.get(workspaceId);
       if (!entry) return [];
 
-      // Disabled clients may remain cached during leased restarts. Skip disabled and
-      // reconfigured instances so discovery neither queries stale endpoints nor
-      // returns outdated catalogs.
-      enabledInstances = new Map(
-        [...entry.instances].filter(
-          ([serverName]) =>
-            entry.enabledServerNames.has(serverName) &&
-            !entry.stalePromptServerNames?.has(serverName)
-        )
-      );
-      await this.refreshInstancePrompts(enabledInstances, callOptions?.signal);
+      latestEntry = entry;
+      await this.refreshInstancePrompts(this.promptEligibleInstances(entry), callOptions?.signal);
       const secretsNow = await this.resolveSecretsForRefresh(
         workspaceId,
         currentOptions.projectPath
@@ -1801,6 +1989,57 @@ export class MCPServerManager {
         break;
       }
     }
+    return this.promptDescriptorsFor(latestEntry);
+  }
+
+  /**
+   * Disabled clients may remain cached during leased restarts. Skip disabled and
+   * reconfigured instances so prompt discovery neither queries stale endpoints
+   * nor returns outdated catalogs.
+   */
+  private promptEligibleInstances(entry: WorkspaceServers): Map<string, MCPServerInstance> {
+    return new Map(
+      [...entry.instances].filter(
+        ([serverName]) =>
+          entry.enabledServerNames.has(serverName) && !entry.stalePromptServerNames?.has(serverName)
+      )
+    );
+  }
+
+  /**
+   * Memoize descriptors by exact instance and prompt-array references, since
+   * rebuilding sorts and re-keys the whole catalog on the send path. Refresh
+   * replaces prompt arrays wholesale and eligibility changes alter the
+   * instance list, so reference checks are sound.
+   */
+  private promptDescriptorsFor(entry: WorkspaceServers): MCPPromptDescriptor[] {
+    const eligible = this.promptEligibleInstances(entry);
+    const cached = entry.promptDescriptorCache;
+    if (cached && cached.sources.length === eligible.size) {
+      let index = 0;
+      let valid = true;
+      for (const instance of eligible.values()) {
+        const source = cached.sources[index++];
+        if (source?.instance !== instance || source.prompts !== instance.prompts) {
+          valid = false;
+          break;
+        }
+      }
+      if (valid) {
+        return cached.descriptors;
+      }
+    }
+    const descriptors = this.buildPromptDescriptors(eligible);
+    entry.promptDescriptorCache = {
+      sources: [...eligible.values()].map((instance) => ({ instance, prompts: instance.prompts })),
+      descriptors,
+    };
+    return descriptors;
+  }
+
+  private buildPromptDescriptors(
+    enabledInstances: Map<string, MCPServerInstance>
+  ): MCPPromptDescriptor[] {
     const descriptors: MCPPromptDescriptor[] = [];
     const usedNames = new Set<string>();
     const instances = [...enabledInstances.values()].sort((a, b) => a.name.localeCompare(b.name));
@@ -1827,6 +2066,8 @@ export class MCPServerManager {
         });
         const stableKey = buildMcpPromptStableKey(instance.name, prompt.name);
         if (!command || stableKey === null) continue;
+        // Catalogs are normalized at refresh, so this per-send path sees only
+        // bounded argument arrays.
         descriptors.push({
           commandKey: command.toolName,
           stableKey,
@@ -2100,7 +2341,8 @@ export class MCPServerManager {
       throw new Error(`MCP prompt '${serverName}/${promptName}' returned no text content`);
     }
     return {
-      text,
+      // Cap here because both composer expansion and mcp_prompt_get use this path.
+      text: truncateUtf8Bytes(text, MCP_PROMPT_MAX_TEXT_BYTES, MCP_PROMPT_TRUNCATION_MARKER),
       ...(result.description !== undefined ? { description: result.description } : {}),
     };
   }
@@ -2275,7 +2517,9 @@ export class MCPServerManager {
     workspaceOverrides?: WorkspaceMCPOverrides
   ): Record<string, Tool> {
     const aggregated: Record<string, Tool> = {};
-    const usedNames = new Set<string>();
+    // Reserve built-in names because MCP tools merge over base tools
+    // downstream and a normalized collision would otherwise shadow them.
+    const usedNames = new Set<string>(Object.keys(TOOL_DEFINITIONS));
 
     // Sort for determinism so collision handling yields stable tool keys.
     const sortedInstances = [...instances.values()].sort((a, b) => a.name.localeCompare(b.name));
@@ -2789,9 +3033,7 @@ export class MCPServerManager {
           prompts: [],
           getPrompt: (promptName, args, options) =>
             readyClient.getPrompt(promptName, args, options),
-          refreshPrompts: async (options) => {
-            instance.prompts = await readyClient.prompts(options);
-          },
+          refreshPrompts: (options) => readyClient.prompts(options),
           isClosed: transportClosed,
           ...(isModernEra(negotiatedPrior)
             ? {
@@ -3041,9 +3283,7 @@ export class MCPServerManager {
         tools,
         prompts: [],
         getPrompt: (promptName, args, options) => activeClient.getPrompt(promptName, args, options),
-        refreshPrompts: async (options) => {
-          instance.prompts = await activeClient.prompts(options);
-        },
+        refreshPrompts: (options) => activeClient.prompts(options),
         isClosed: transportErrored || clientClosed,
         ...(isModernEra(negotiatedPrior)
           ? {
