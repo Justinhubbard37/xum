@@ -13438,6 +13438,73 @@ describe("TaskService", () => {
     expect(findWorkspaceInConfig(config, parentTaskId)).toBeUndefined();
   });
 
+  test("rejected parent removals preserve archived workflow-owned descendants", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const ownerWorkspaceId = "owner-preserve-archived-workflow";
+    const activeParentId = "active-parent-preserve-workflow";
+    const activeWorkflowChildId = "active-parent-workflow-child";
+    const blockedParentId = "blocked-parent-preserve-workflow";
+    const userChildId = "blocked-parent-user-child";
+    const blockedWorkflowChildId = "blocked-parent-workflow-child";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "owner", ownerWorkspaceId),
+        projectWorkspace(projectPath, "active-parent", activeParentId, {
+          parentWorkspaceId: ownerWorkspaceId,
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "active-workflow-child", activeWorkflowChildId, {
+          parentWorkspaceId: activeParentId,
+          taskStatus: "interrupted",
+          workflowTask: { runId: "wfr_active_parent", stepId: "worker" },
+          archivedAt: "2026-08-16T00:00:00.000Z",
+        }),
+        projectWorkspace(projectPath, "blocked-parent", blockedParentId, {
+          parentWorkspaceId: ownerWorkspaceId,
+          taskStatus: "reported",
+        }),
+        projectWorkspace(projectPath, "user-child", userChildId, {
+          parentWorkspaceId: blockedParentId,
+          taskStatus: "reported",
+        }),
+        projectWorkspace(projectPath, "blocked-workflow-child", blockedWorkflowChildId, {
+          parentWorkspaceId: blockedParentId,
+          taskStatus: "interrupted",
+          workflowTask: { runId: "wfr_blocked_parent", stepId: "worker" },
+          archivedAt: "2026-08-16T00:00:00.000Z",
+        }),
+      ],
+      testTaskSettings()
+    );
+    const remove = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const { workspaceService } = createWorkspaceServiceMocks({ remove });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    expect(
+      await taskService.removeInactiveDescendantAgentTask(ownerWorkspaceId, activeParentId)
+    ).toMatchObject({ success: true, data: { status: "active", taskId: activeParentId } });
+    const blockedRemoval = await taskService.removeInactiveDescendantAgentTask(
+      ownerWorkspaceId,
+      blockedParentId
+    );
+    expect(blockedRemoval).toMatchObject({
+      success: true,
+      data: { status: "error", taskId: blockedParentId },
+    });
+    if (!blockedRemoval.success || blockedRemoval.data.status !== "error") {
+      throw new Error("Expected blocked parent removal to return an error lifecycle result");
+    }
+    expect(new Set(blockedRemoval.data.descendantTaskIds ?? [])).toEqual(
+      new Set([userChildId, blockedWorkflowChildId])
+    );
+    expect(remove).not.toHaveBeenCalled();
+    expect(findWorkspaceInConfig(config, activeWorkflowChildId)).toBeTruthy();
+    expect(findWorkspaceInConfig(config, blockedWorkflowChildId)).toBeTruthy();
+  });
+
   test("requestAgentFinalReportForTimeout records finalization token only after prompt send succeeds", async () => {
     const config = await createTestConfig(rootDir);
 

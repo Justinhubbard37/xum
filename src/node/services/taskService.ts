@@ -8619,30 +8619,6 @@ export class TaskService {
         workspaceId: taskId,
         ...(displayName != null ? { displayName } : {}),
       };
-      // Workflow-owned workers are hidden from public lifecycle tools, but their archived
-      // workspaces must not permanently block removal of the user-owned parent subtree.
-      const workflowCleanupResult =
-        await this.removeArchivedWorkflowOwnedDescendantsUnderLifecycleLock(taskId);
-      if (!workflowCleanupResult.success) {
-        return Ok({
-          status: "error",
-          action: "remove",
-          ...target,
-          error: workflowCleanupResult.error,
-        });
-      }
-
-      const descendantTaskIds = this.listDescendantAgentTasks(taskId).map((task) => task.taskId);
-      if (descendantTaskIds.length > 0) {
-        return Ok({
-          status: "error",
-          action: "remove",
-          ...target,
-          descendantTaskIds,
-          error: "Cannot remove a sub-agent while descendant sub-agents remain.",
-        });
-      }
-
       if (
         this.isActiveAgentTaskEntry({ ...entry.workspace, projectPath: entry.projectPath }) ||
         this.aiService.isStreaming(taskId)
@@ -8653,6 +8629,52 @@ export class TaskService {
           ...target,
           activeTaskIds: [taskId],
           note: "Stop the sub-agent before removing it.",
+        });
+      }
+
+      const descendantTaskIds = this.listDescendantAgentTasks(taskId).map((task) => task.taskId);
+      const blockingDescendantTaskIds = descendantTaskIds.filter((descendantTaskId) => {
+        const descendant = index.byId.get(descendantTaskId);
+        return (
+          descendant == null ||
+          !this.isWorkflowOwnedTaskUsingIndex(index, descendantTaskId) ||
+          !isWorkspaceArchived(descendant.archivedAt, descendant.unarchivedAt) ||
+          this.isActiveAgentTaskEntry(descendant) ||
+          this.aiService.isStreaming(descendantTaskId)
+        );
+      });
+      if (blockingDescendantTaskIds.length > 0) {
+        return Ok({
+          status: "error",
+          action: "remove",
+          ...target,
+          descendantTaskIds,
+          error: "Cannot remove a sub-agent while descendant sub-agents remain.",
+        });
+      }
+
+      // Workflow-owned workers are hidden from public lifecycle tools, but their archived
+      // workspaces must not permanently block an otherwise-eligible parent removal.
+      const workflowCleanupResult =
+        await this.removeArchivedWorkflowOwnedDescendantsUnderLifecycleLock(taskId);
+      if (!workflowCleanupResult.success) {
+        return Ok({
+          status: "error",
+          action: "remove",
+          ...target,
+          error: workflowCleanupResult.error,
+        });
+      }
+      const remainingDescendantTaskIds = this.listDescendantAgentTasks(taskId).map(
+        (task) => task.taskId
+      );
+      if (remainingDescendantTaskIds.length > 0) {
+        return Ok({
+          status: "error",
+          action: "remove",
+          ...target,
+          descendantTaskIds: remainingDescendantTaskIds,
+          error: "Cannot remove a sub-agent while descendant sub-agents remain.",
         });
       }
 
