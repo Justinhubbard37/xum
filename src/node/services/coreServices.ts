@@ -22,6 +22,9 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { createAgentPluginsMcpProvider } from "@/node/services/agentPlugins/mcpConfig";
 import { MCPConfigService } from "@/node/services/mcpConfigService";
 import { MCPServerManager, type MCPServerManagerOptions } from "@/node/services/mcpServerManager";
+import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
+import { isMultiProject } from "@/common/utils/multiProject";
+import { secretsToRecord } from "@/common/types/secrets";
 import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
 import { WorkspaceService } from "@/node/services/workspaceService";
 import { TaskService } from "@/node/services/taskService";
@@ -149,6 +152,17 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     opts.policyService
   );
   aiService.setMCPServerManager(mcpServerManager);
+  // Recorded prompt options can hold stale secret snapshots, so prompt refreshes
+  // resolve credentials from current configuration.
+  mcpServerManager.setSecretsResolver(async (workspaceId, projectPath) => {
+    const metadataResult = await aiService.getWorkspaceMetadata(workspaceId);
+    const metadata = metadataResult.success ? metadataResult.data : null;
+    const secrets =
+      metadata && isMultiProject(metadata)
+        ? mergeMultiProjectSecrets(metadata, config)
+        : config.getEffectiveSecrets(projectPath);
+    return secretsToRecord(secrets);
+  });
 
   const workspaceService = new WorkspaceService(
     config,

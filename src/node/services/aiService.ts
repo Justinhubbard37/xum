@@ -41,6 +41,7 @@ import {
   createRuntimeForWorkspace,
   resolveWorkspaceExecutionPath,
   resolveWorkspaceRootPath,
+  type WorkspaceRuntimeContext,
 } from "@/node/runtime/runtimeHelpers";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { getWorkspacePathHintForProject } from "@/node/services/workspaceProjectRepos";
@@ -1123,6 +1124,81 @@ export class AIService extends EventEmitter {
     return `Workspace ${workspaceId} reached multi-project AI runtime execution while ${EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES} is disabled`;
   }
 
+  /** Builds the runtime context shared by stream startup and MCP prompt discovery. */
+  createWorkspaceRuntimeContext(
+    workspaceId: string,
+    metadata: WorkspaceMetadata
+  ): Result<WorkspaceRuntimeContext & { hostCheckoutRoot: string | null }, SendMessageError> {
+    const workspace = this.config.findWorkspace(workspaceId);
+    if (!workspace) {
+      return Err({ type: "unknown", raw: `Workspace ${workspaceId} not found in config` });
+    }
+
+    const metadataWithPath = {
+      ...metadata,
+      // Existing SSH workspaces may use a persisted root that differs from the
+      // canonical hashed layout.
+      namedWorkspacePath: workspace.workspacePath,
+    };
+
+    const multiProjectExecutionGate = this.ensureMultiProjectRuntimeExecutionEnabled(
+      workspaceId,
+      metadata
+    );
+    if (!multiProjectExecutionGate.success) {
+      return multiProjectExecutionGate;
+    }
+
+    const singleProjectContext = isMultiProject(metadata)
+      ? undefined
+      : createRuntimeContextForWorkspace(metadataWithPath);
+    const runtime = singleProjectContext
+      ? singleProjectContext.runtime
+      : new MultiProjectRuntime(
+          new ContainerManager(getSrcBaseDir(metadata.runtimeConfig) ?? this.config.srcDir),
+          getProjects(metadata).map((project) => ({
+            projectPath: project.projectPath,
+            projectName: project.projectName,
+            runtime: createRuntime(metadata.runtimeConfig, {
+              projectPath: project.projectPath,
+              workspaceName: metadata.name,
+              workspacePath: isSSHRuntime(metadata.runtimeConfig)
+                ? getWorkspacePathHintForProject(
+                    {
+                      workspaceId,
+                      workspaceName: metadata.name,
+                      workspacePath: workspace.workspacePath,
+                      runtimeConfig: metadata.runtimeConfig,
+                      projectPath: metadata.projectPath,
+                      projectName: metadata.projectName,
+                      projects: metadata.projects,
+                    },
+                    project.projectPath
+                  )
+                : undefined,
+            }),
+          })),
+          metadata.name
+        );
+
+    const workspacePath =
+      singleProjectContext?.workspacePath ??
+      (isSSHRuntime(metadata.runtimeConfig)
+        ? resolveWorkspaceExecutionPath(metadataWithPath, runtime)
+        : // Multi-project containers start at their shared root so sibling repos remain addressable.
+          runtime.getWorkspacePath(metadata.projectPath, metadata.name));
+
+    // Agent Plugin containers use the host checkout root, not a subproject directory.
+    const hostCheckoutRoot =
+      singleProjectContext &&
+      metadata.runtimeConfig.type !== "ssh" &&
+      metadata.runtimeConfig.type !== "docker"
+        ? resolveWorkspaceRootPath(metadataWithPath, runtime)
+        : null;
+
+    return Ok({ runtime, workspacePath, hostCheckoutRoot });
+  }
+
   private ensureMultiProjectRuntimeExecutionEnabled(
     workspaceId: string,
     metadata: WorkspaceMetadata
@@ -1588,68 +1664,11 @@ export class AIService extends EventEmitter {
         });
       };
 
-      const workspace = this.config.findWorkspace(workspaceId);
-      if (!workspace) {
-        return Err({ type: "unknown", raw: `Workspace ${workspaceId} not found in config` });
+      const runtimeContextResult = this.createWorkspaceRuntimeContext(workspaceId, metadata);
+      if (!runtimeContextResult.success) {
+        return runtimeContextResult;
       }
-
-      const metadataWithPath = {
-        ...metadata,
-        // Existing SSH workspaces may still live at a persisted root that differs from the canonical
-        // hashed project layout, so stream startup seeds the runtime from config for the current
-        // workspace instead of always reconstructing the path from project metadata.
-        namedWorkspacePath: workspace.workspacePath,
-      };
-
-      const multiProjectExecutionGate = this.ensureMultiProjectRuntimeExecutionEnabled(
-        workspaceId,
-        metadata
-      );
-      if (!multiProjectExecutionGate.success) {
-        return multiProjectExecutionGate;
-      }
-
-      const singleProjectContext = isMultiProject(metadata)
-        ? undefined
-        : createRuntimeContextForWorkspace(metadataWithPath);
-      const runtime = singleProjectContext
-        ? singleProjectContext.runtime
-        : new MultiProjectRuntime(
-            new ContainerManager(getSrcBaseDir(metadata.runtimeConfig) ?? this.config.srcDir),
-            getProjects(metadata).map((project) => ({
-              projectPath: project.projectPath,
-              projectName: project.projectName,
-              runtime: createRuntime(metadata.runtimeConfig, {
-                projectPath: project.projectPath,
-                workspaceName: metadata.name,
-                workspacePath: isSSHRuntime(metadata.runtimeConfig)
-                  ? getWorkspacePathHintForProject(
-                      {
-                        workspaceId,
-                        workspaceName: metadata.name,
-                        workspacePath: workspace.workspacePath,
-                        runtimeConfig: metadata.runtimeConfig,
-                        projectPath: metadata.projectPath,
-                        projectName: metadata.projectName,
-                        projects: metadata.projects,
-                      },
-                      project.projectPath
-                    )
-                  : undefined,
-              }),
-            })),
-            metadata.name
-          );
-
-      const workspacePath =
-        singleProjectContext?.workspacePath ??
-        (isSSHRuntime(metadata.runtimeConfig)
-          ? resolveWorkspaceExecutionPath(metadataWithPath, runtime)
-          : // Non-SSH multi-project runtimes intentionally start from their shared container root so
-            // sibling repos stay addressable during agent/tool setup. SSH workspaces are the exception:
-            // upgraded legacy layouts must reuse the persisted root from config until remote layout
-            // detection seeds the new hashed paths.
-            runtime.getWorkspacePath(metadata.projectPath, metadata.name));
+      const { runtime, workspacePath, hostCheckoutRoot } = runtimeContextResult.data;
 
       // Wait for init to complete before any runtime I/O operations
       // (SSH/devcontainer may not be ready until init finishes pulling the container)
@@ -1842,18 +1861,6 @@ export class AIService extends EventEmitter {
         mcpOverrides = undefined;
       }
       recordStartupPhaseTiming("loadWorkspaceMcpOverridesMs", loadWorkspaceMcpOverridesStartedAt);
-
-      // Host checkout root for single-project host workspaces. This differs
-      // from `workspacePath` for subProjectPath workspaces, whose execution
-      // path is a subdirectory of the checkout; Agent Plugins containers (MCP
-      // and skills) anchor at the checkout root, matching the oRPC listing
-      // paths (resolveWorkspaceRootPath).
-      const hostCheckoutRoot =
-        singleProjectContext &&
-        metadata.runtimeConfig.type !== "ssh" &&
-        metadata.runtimeConfig.type !== "docker"
-          ? resolveWorkspaceRootPath(metadataWithPath, runtime)
-          : null;
 
       // Agent Plugins: discovery follows the active checkout and is disabled
       // for workspaces that exec off-host (SSH/Docker/devcontainer).

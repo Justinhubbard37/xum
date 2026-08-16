@@ -20,9 +20,8 @@ import assert from "@/common/utils/assert";
  * plain legacy `initialize` handshake, byte-identical to the previous wire
  * behavior, so existing user-configured servers see no change.
  *
- * This module intentionally mirrors the small surface mcpServerManager
- * consumed from @ai-sdk/mcp (createMCPClient -> { tools(), close() }) so the
- * manager's instance-cache/lease/recycle machinery stays unchanged.
+ * This module keeps transport and request details behind the small handle consumed by
+ * mcpServerManager, preserving its instance-cache, lease, and recycle machinery.
  */
 
 /** Client identity sent to servers (initialize request / clientInfo _meta). */
@@ -46,6 +45,9 @@ export const MCP_TOOL_CALL_TIMEOUT_MS = 300_000;
  * always wins the race, while the SDK still cleans up abandoned requests.
  */
 const SDK_TOOL_CALL_TIMEOUT_MS = MCP_TOOL_CALL_TIMEOUT_MS + 5_000;
+const PROMPT_GET_TIMEOUT_MS = 30_000;
+// One hung server must not stall the whole slash/inline prompt catalog.
+const PROMPT_LIST_TIMEOUT_MS = 10_000;
 
 export interface MCPHttpTransportConfig {
   type: "http" | "sse";
@@ -82,9 +84,18 @@ export interface MCPClientConfig {
   prior?: PriorDiscovery;
 }
 
+export type MCPPrompt = Awaited<ReturnType<Client["listPrompts"]>>["prompts"][number];
+export type MCPGetPromptResult = Awaited<ReturnType<Client["getPrompt"]>>;
+
 export interface MCPClientHandle {
   /** Fetch tools/list and build AI SDK tools whose execute calls tools/call. */
   tools(): Promise<Record<string, Tool>>;
+  prompts(options?: { signal?: AbortSignal }): Promise<MCPPrompt[]>;
+  getPrompt(
+    name: string,
+    args: Record<string, string>,
+    options?: { signal?: AbortSignal }
+  ): Promise<MCPGetPromptResult>;
   /**
    * The MCP protocol revision negotiated at connect ("2026-07-28" once the
    * server/discover probe finds a modern server; "2025-11-25" or earlier on
@@ -204,7 +215,7 @@ function mcpToModelOutput({
 }
 
 /**
- * Connect to an MCP server and return a handle exposing AI SDK tools.
+ * Connect to an MCP server and return a handle for tools and prompts.
  *
  * Version negotiation is per connection (and therefore per configured
  * server): connect() probes with `server/discover` and conservatively falls
@@ -271,6 +282,27 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
       }
       return tools;
     },
+    prompts: async (options) => {
+      // Cursorless listPrompts() aggregates pages up to ClientOptions.listMaxPages
+      // and forwards these options to each request; the integration test covers
+      // page two.
+      const result = await client.listPrompts(undefined, {
+        timeout: PROMPT_LIST_TIMEOUT_MS,
+        ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+      });
+      assert(Array.isArray(result.prompts), "MCP prompts/list result must carry a prompts array");
+      return result.prompts;
+    },
+    getPrompt: (name, args, options) =>
+      client.getPrompt(
+        { name, arguments: args },
+        {
+          // Prompt expansion blocks send preparation, so use a shorter timeout than
+          // tool calls and honor send cancellation.
+          timeout: PROMPT_GET_TIMEOUT_MS,
+          ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+        }
+      ),
     negotiatedProtocolVersion: () => client.getNegotiatedProtocolVersion(),
     priorDiscovery: (): PriorDiscovery => {
       const discover = client.getDiscoverResult();

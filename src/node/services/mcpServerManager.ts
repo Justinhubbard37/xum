@@ -7,6 +7,8 @@ import {
   isModernEra,
   MCP_TOOL_CALL_TIMEOUT_MS,
   type MCPClientHandle,
+  type MCPGetPromptResult,
+  type MCPPrompt,
 } from "@/node/services/mcpClient";
 import { log } from "@/node/services/log";
 import { MCPStdioTransport } from "@/node/services/mcpStdioTransport";
@@ -35,8 +37,18 @@ import {
 } from "@/node/services/mcpOauthService";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { transformMCPResult, type MCPCallToolResult } from "@/node/services/mcpResultTransform";
-import { buildMcpToolName } from "@/common/utils/tools/mcpToolName";
+import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
+import {
+  buildMcpPromptBaseKey,
+  buildMcpPromptCommandKey,
+  buildMcpPromptStableKey,
+  buildMcpToolName,
+} from "@/common/utils/tools/mcpToolName";
 import { getErrorMessage } from "@/common/utils/errors";
+import { AsyncSemaphore } from "@/node/utils/concurrency/asyncSemaphore";
+import { MutexMap } from "@/node/utils/concurrency/mutexMap";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
+import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 
 const TEST_TIMEOUT_MS = 10_000;
 const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
@@ -52,6 +64,9 @@ const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 const LEGACY_ERA_VERDICT_TTL_MS = 24 * 60 * 60 * 1000;
 const IDLE_CHECK_INTERVAL_MS = 60 * 1000; // Check every minute
 const MCP_STARTUP_TIMEOUT_MS = 60_000; // 60s — generous for npx package downloads
+// Bounded so a burst of stdio spawns (npx downloads) cannot thrash the host,
+// while several unhealthy servers' startup deadlines overlap instead of stacking.
+const MCP_STARTUP_CONCURRENCY = 4;
 const MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS = 5_000; // fail-safe so timeout error cannot hang forever
 
 /** Detect errors from the MCP SDK indicating the client/transport is closed.
@@ -221,6 +236,16 @@ export function wrapMCPTools(
 type ResolvedHeaders = Record<string, string> | undefined;
 
 type ResolvedTransport = "stdio" | "http" | "sse";
+
+function secretRecordsEqual(
+  a: Record<string, string> | undefined,
+  b: Record<string, string> | undefined
+): boolean {
+  if (a === b) return true;
+  if (a === undefined || b === undefined) return false;
+  const aKeys = Object.keys(a);
+  return aKeys.length === Object.keys(b).length && aKeys.every((key) => b[key] === a[key]);
+}
 
 function resolveHeaders(
   headers: Record<string, MCPHeaderValue> | undefined,
@@ -746,12 +771,41 @@ async function runServerTest(
   return Promise.race([testPromise, timeoutPromise]);
 }
 
+type MCPPromptContent = MCPGetPromptResult["messages"][number]["content"];
+
+function flattenPromptContent(content: MCPPromptContent): string {
+  switch (content.type) {
+    case "text":
+      return content.text;
+    case "resource":
+      return "text" in content.resource ? content.resource.text : "[Resource content omitted]";
+    case "image":
+      return "[Image content omitted]";
+    case "audio":
+      return "[Audio content omitted]";
+    default:
+      return "[Unsupported content omitted]";
+  }
+}
+
+export function flattenMcpPrompt(result: MCPGetPromptResult): string {
+  return result.messages
+    .map((message) => {
+      const text = flattenPromptContent(message.content);
+      return message.role === "user" ? text : `[${message.role}]\n${text}`;
+    })
+    .filter((message) => message.length > 0)
+    .join("\n\n");
+}
+
 interface MCPServerInstance {
   name: string;
   /** Resolved transport actually used (auto may fall back to sse). */
   resolvedTransport: ResolvedTransport;
   autoFallbackUsed: boolean;
   tools: Record<string, Tool>;
+  prompts: MCPPrompt[];
+  getPrompt: MCPClientHandle["getPrompt"];
   /** True once the underlying MCP client/transport has been closed. */
   isClosed: boolean;
   /**
@@ -763,6 +817,7 @@ interface MCPServerInstance {
    * results carry no freshness hints).
    */
   refreshTools?: () => Promise<void>;
+  refreshPrompts?: (options?: { signal?: AbortSignal }) => Promise<void>;
   close: () => Promise<void>;
 }
 
@@ -781,6 +836,22 @@ export interface MCPWorkspaceStats {
   transportMode: MCPTransportMode;
 }
 
+export interface MCPWorkspaceRequestOptions {
+  workspaceId: string;
+  projectPath: string;
+  runtime: Runtime;
+  workspacePath: string;
+  trusted?: boolean;
+  overrides?: WorkspaceMCPOverrides;
+  projectSecrets?: Record<string, string>;
+  agentPlugins?: AgentPluginsMcpContext | null;
+}
+
+export type MCPWorkspaceSecretsResolver = (
+  workspaceId: string,
+  projectPath: string
+) => Promise<Record<string, string>>;
+
 interface MCPToolsForWorkspaceResult {
   tools: Record<string, Tool>;
   stats: MCPWorkspaceStats;
@@ -788,10 +859,14 @@ interface MCPToolsForWorkspaceResult {
 interface WorkspaceServers {
   configSignature: string;
   instances: Map<string, MCPServerInstance>;
+  /** Filters prompts while leased restarts can leave disabled clients cached. */
+  enabledServerNames: Set<string>;
   stats: MCPWorkspaceStats;
   timedOutServerNames: string[];
   /** Prevent concurrent cached retries from stacking startup attempts for the same server. */
   retryingTimedOutServerNames: Set<string>;
+  /** Blocks prompt invocation on stale clients while an active lease defers restart. */
+  stalePromptServerNames?: Set<string>;
   lastActivity: number;
 }
 
@@ -804,6 +879,27 @@ export interface MCPServerManagerOptions {
 
 export class MCPServerManager {
   private readonly workspaceServers = new Map<string, WorkspaceServers>();
+  // Survives idle cleanup so an explicit prompt invocation can revive reaped
+  // servers at send time; forgotten only on workspace removal.
+  private readonly lastWorkspaceRequestOptions = new Map<string, MCPWorkspaceRequestOptions>();
+  /**
+   * Prompt paths compare this counter with global config generation across
+   * refreshes so workspace mutations cannot pass stale dispatch checks.
+   */
+  private readonly workspaceOptionsMutationCounts = new Map<string, number>();
+  /**
+   * Retains overrides for cold workspaces, where applyWorkspaceOverrides has no
+   * cached or recorded state to repair, so stale caller snapshots can be overlaid.
+   */
+  private readonly latestWorkspaceOverrides = new Map<string, WorkspaceMCPOverrides | undefined>();
+  private readonly latestProjectTrust = new Map<string, boolean>();
+  private readonly workspaceRestartLocks = new MutexMap<string>();
+  // Bumped by removal-style stops (stopServers without retainRestartOptions).
+  // Startups run outside any lock shared with removal, so an abort-abandoned
+  // startup can finish after the workspace is gone; the epoch check makes it
+  // close its clients instead of caching them. Never pruned: a stale capture
+  // reading a reset baseline would close legitimately started servers.
+  private readonly workspaceStopEpochs = new Map<string, number>();
   private readonly workspaceLeases = new Map<string, number>();
   /**
    * Cached per-server protocol era verdicts, keyed by server config
@@ -817,10 +913,15 @@ export class MCPServerManager {
   private inlineServers: Record<string, string> = {};
   private readonly policyService: PolicyService | null;
   private mcpOauthService: McpOauthService | null = null;
+  private secretsResolver: MCPWorkspaceSecretsResolver | null = null;
   private ignoreConfigFile = false;
 
   setMcpOauthService(service: McpOauthService): void {
     this.mcpOauthService = service;
+  }
+
+  setSecretsResolver(resolver: MCPWorkspaceSecretsResolver): void {
+    this.secretsResolver = resolver;
   }
   constructor(
     private readonly configService: MCPConfigService,
@@ -866,28 +967,40 @@ export class MCPServerManager {
     this.eraVerdicts.set(key, { prior, cachedAtMs: Date.now() });
   }
 
-  /**
-   * Best-effort tools/list refresh for cached modern-era instances
-   * (SEP-2549): a still-fresh cached list is served by the SDK with zero
-   * round trips; a stale one refetches. Failures keep the existing tool set —
-   * tool availability must never regress because a refresh failed.
-   */
   private async refreshModernInstanceTools(
     instances: Map<string, MCPServerInstance>
   ): Promise<void> {
     await Promise.all(
-      [...instances.values()]
-        .filter((instance) => instance.refreshTools !== undefined && !instance.isClosed)
-        .map(async (instance) => {
-          try {
-            await instance.refreshTools!();
-          } catch (error) {
-            log.debug("[MCP] Tool list refresh failed; keeping cached tools", {
-              name: instance.name,
-              error: getErrorMessage(error),
-            });
-          }
-        })
+      [...instances.values()].map(async (instance) => {
+        if (instance.isClosed || !instance.refreshTools) return;
+        try {
+          await instance.refreshTools();
+        } catch (error) {
+          log.debug("[MCP] Tool list refresh failed; keeping cached tools", {
+            name: instance.name,
+            error: getErrorMessage(error),
+          });
+        }
+      })
+    );
+  }
+
+  private async refreshInstancePrompts(
+    instances: Map<string, MCPServerInstance>,
+    signal?: AbortSignal
+  ): Promise<void> {
+    await Promise.all(
+      [...instances.values()].map(async (instance) => {
+        if (instance.isClosed || !instance.refreshPrompts) return;
+        try {
+          await instance.refreshPrompts(signal !== undefined ? { signal } : undefined);
+        } catch (error) {
+          log.debug("[MCP] Prompt list refresh failed; keeping cached prompts", {
+            name: instance.name,
+            error: getErrorMessage(error),
+          });
+        }
+      })
     );
   }
 
@@ -946,7 +1059,7 @@ export class MCPServerManager {
           workspaceId,
           idleMinutes: Math.round(idleMs / 60_000),
         });
-        void this.stopServers(workspaceId);
+        void this.stopServers(workspaceId, { retainRestartOptions: true });
       }
     }
   }
@@ -1164,20 +1277,37 @@ export class MCPServerManager {
     return filtered;
   }
 
-  async getToolsForWorkspace(options: {
-    workspaceId: string;
-    projectPath: string;
-    runtime: Runtime;
-    workspacePath: string;
-    /** Whether repo-local MCP config is allowed for this project. */
-    trusted?: boolean;
-    /** Per-workspace MCP overrides (disabled servers, tool allowlists) */
-    overrides?: WorkspaceMCPOverrides;
-    /** Project secrets, used for resolving {secret: "KEY"} header references. */
-    projectSecrets?: Record<string, string>;
-    /** Agent Plugins discovery context (null = off-host workspace, no plugin servers). */
-    agentPlugins?: AgentPluginsMcpContext | null;
-  }): Promise<MCPToolsForWorkspaceResult> {
+  async getToolsForWorkspace(
+    options: MCPWorkspaceRequestOptions
+  ): Promise<MCPToolsForWorkspaceResult> {
+    return this.ensureWorkspaceServers(options, true);
+  }
+
+  /**
+   * Skips tools/list refreshes on cached instances so an unrelated server's
+   * 60-second SDK timeout cannot block prompt paths.
+   */
+  private async ensureWorkspaceServers(
+    requestOptions: MCPWorkspaceRequestOptions,
+    refreshToolCatalogs: boolean
+  ): Promise<MCPToolsForWorkspaceResult> {
+    // Cold workspaces have no recorded state for applyWorkspaceOverrides to repair.
+    // Overlay the newest overrides over a caller snapshot that may predate the mutation.
+    let options = this.latestWorkspaceOverrides.has(requestOptions.workspaceId)
+      ? {
+          ...requestOptions,
+          overrides: this.latestWorkspaceOverrides.get(requestOptions.workspaceId),
+        }
+      : requestOptions;
+    // Same cold-workspace gap for project trust: a revocation landing while a
+    // stream's pre-await trusted snapshot is still in flight has no recorded
+    // options to repair, so overlay the newest trust the manager has seen.
+    const latestTrust = this.latestProjectTrust.get(
+      stripTrailingSlashes(requestOptions.projectPath)
+    );
+    if (latestTrust !== undefined && (options.trusted ?? false) !== latestTrust) {
+      options = { ...options, trusted: latestTrust };
+    }
     const {
       workspaceId,
       projectPath,
@@ -1188,6 +1318,13 @@ export class MCPServerManager {
       projectSecrets,
       agentPlugins,
     } = options;
+
+    this.lastWorkspaceRequestOptions.set(workspaceId, options);
+
+    // Global mutations (mcp.setEnabled / mcp.remove) bump the config
+    // generation without replacing recorded options; capture it before config
+    // reads so enablement repair can detect them.
+    const configGenerationUsed = this.configService.configGeneration;
 
     // Fetch full server info for project-level allowlists and server filtering
     const allServers = await this.getAllServers(projectPath, trusted, agentPlugins);
@@ -1217,53 +1354,7 @@ export class MCPServerManager {
 
     // Signature is based on *start config* only (not tool allowlists), so changing allowlists
     // does not force a server restart.
-    const signatureEntries: Record<string, unknown> = {};
-    for (const [name, info] of enabledEntries) {
-      if (info.transport === "stdio") {
-        // args/env/cwd participate so plugin mcp.json edits recycle servers.
-        signatureEntries[name] = {
-          transport: "stdio",
-          command: info.command,
-          args: info.args ?? null,
-          env: info.env ?? null,
-          cwd: info.cwd ?? null,
-        };
-        continue;
-      }
-
-      // OAuth status affects whether we can attach authProvider during server start.
-      // Include this (redacted) information in the signature so we retry starting
-      // remote servers after a user logs in/out.
-      let hasOauthTokens = false;
-      if (this.mcpOauthService) {
-        try {
-          hasOauthTokens = await this.mcpOauthService.hasAuthTokens({
-            serverUrl: info.url,
-          });
-        } catch (error) {
-          log.debug("[MCP] Failed to resolve MCP OAuth status", { name, error });
-        }
-      }
-
-      try {
-        const { headers } = resolveHeaders(info.headers, projectSecrets);
-        signatureEntries[name] = {
-          transport: info.transport,
-          url: info.url,
-          headers,
-          hasOauthTokens,
-        };
-      } catch {
-        // Missing secrets or invalid header config. Keep signature stable but avoid leaking details.
-        signatureEntries[name] = {
-          transport: info.transport,
-          url: info.url,
-          headers: null,
-          hasOauthTokens,
-        };
-      }
-    }
-
+    const signatureEntries = await this.computeSignatureEntries(enabledEntries, projectSecrets);
     const signature = JSON.stringify(signatureEntries);
 
     const existing = this.workspaceServers.get(workspaceId);
@@ -1280,6 +1371,7 @@ export class MCPServerManager {
 
     if (existing?.configSignature === signature && !hasClosedInstance) {
       existing.lastActivity = Date.now();
+      delete existing.stalePromptServerNames;
 
       const timedOutServerNamesToRetry = this.getTimedOutServerNamesToRetry(
         existing,
@@ -1386,9 +1478,20 @@ export class MCPServerManager {
         serverCount: enabledEntries.length,
       });
 
-      // Honor SEP-2549 freshness hints on modern-era connections instead of
-      // caching tool lists for the instance lifetime.
-      await this.refreshModernInstanceTools(existing.instances);
+      if (refreshToolCatalogs) {
+        // Honor SEP-2549 freshness hints instead of caching tool lists for the instance lifetime.
+        await this.refreshModernInstanceTools(existing.instances);
+      }
+
+      // A trust or settings mutation can land while getAllServers() runs above;
+      // re-derive enablement so this cached return cannot leave a revoked
+      // repo-local server invocable.
+      await this.repairEnablementAfterConcurrentMutation(
+        workspaceId,
+        options,
+        existing,
+        configGenerationUsed
+      );
 
       return {
         tools: this.collectTools(existing.instances, fullServerInfo, overrides),
@@ -1499,10 +1602,36 @@ export class MCPServerManager {
         failedServerNames
       );
       existing.stats = leasedStats;
+      existing.enabledServerNames = enabledServerNames;
 
-      // Honor SEP-2549 freshness hints on modern-era connections instead of
-      // caching tool lists for the instance lifetime.
-      await this.refreshModernInstanceTools(instancesForTools);
+      // The deferred restart retains same-named instances with the old config,
+      // so record which servers changed to block prompt invocation on them.
+      if (signature === existing.configSignature) {
+        delete existing.stalePromptServerNames;
+      } else {
+        // configSignature is always in-process JSON.stringify output, so parsing cannot fail.
+        const previousEntries = JSON.parse(existing.configSignature) as Record<string, unknown>;
+        existing.stalePromptServerNames = new Set(
+          Object.keys(signatureEntries).filter(
+            (name) =>
+              JSON.stringify(signatureEntries[name]) !== JSON.stringify(previousEntries[name])
+          )
+        );
+      }
+
+      // Runs after the staleness recompute so the delete above cannot clobber
+      // staleness detected from a mutation newer than this call's config read.
+      await this.repairEnablementAfterConcurrentMutation(
+        workspaceId,
+        options,
+        existing,
+        configGenerationUsed
+      );
+
+      if (refreshToolCatalogs) {
+        // Honor SEP-2549 freshness hints instead of caching tool lists for the instance lifetime.
+        await this.refreshModernInstanceTools(instancesForTools);
+      }
 
       return {
         tools: this.collectTools(instancesForTools, fullServerInfo, overrides),
@@ -1510,53 +1639,485 @@ export class MCPServerManager {
       };
     }
 
-    // Config changed, instance closed, or not started yet -> restart
-    if (enabledEntries.length > 0) {
-      log.info("[MCP] Starting servers", {
+    // Serialize restarts so concurrent callers cannot overwrite cached servers
+    // without closing discarded instances. Same-signature retries remain outside
+    // this lock because their replacement path reconciles concurrent changes.
+    return this.workspaceRestartLocks.withLock(workspaceId, async () => {
+      const stopEpochBefore = this.workspaceStopEpochs.get(workspaceId) ?? 0;
+      const current = this.workspaceServers.get(workspaceId);
+      if (current !== undefined) {
+        const currentHasClosedInstance = [...current.instances.values()].some(
+          (instance) => instance.isClosed
+        );
+        if (current.configSignature === signature && !currentHasClosedInstance) {
+          current.lastActivity = Date.now();
+          if (refreshToolCatalogs) {
+            await this.refreshModernInstanceTools(current.instances);
+          }
+          // Repair again in case a mutation landed after the concurrent starter's check.
+          await this.repairEnablementAfterConcurrentMutation(
+            workspaceId,
+            options,
+            current,
+            configGenerationUsed
+          );
+          return {
+            tools: this.collectTools(current.instances, fullServerInfo, overrides),
+            stats: current.stats,
+          };
+        }
+      }
+
+      if (enabledEntries.length > 0) {
+        log.info("[MCP] Starting servers", {
+          workspaceId,
+          servers: enabledEntries.map(([name]) => name),
+        });
+      }
+
+      if (existing && hasClosedInstance) {
+        log.info("[MCP] Restarting servers due to closed client", { workspaceId });
+      }
+
+      // Internal restart: retain the recorded request options so getPrompt can
+      // still revive servers reaped later; only workspace removal forgets them.
+      await this.stopServers(workspaceId, { retainRestartOptions: true });
+
+      const {
+        instances,
+        failedServerNames: startFailedNames,
+        timedOutServerNames: startTimedOutNames = [],
+      } = await this.startServers(
+        enabledServers,
+        runtime,
+        projectPath,
+        workspacePath,
+        projectSecrets,
+        () => this.markActivity(workspaceId),
+        workspaceId
+      );
+
+      const allFailedNames = [...restartFailedNames, ...startFailedNames];
+      const stats = this.createWorkspaceStats(enabledEntries.length, instances, allFailedNames);
+
+      // A removal-style stop landing mid-startup found no cache entry to
+      // close, so caching now would leave the removed workspace's processes
+      // alive until idle cleanup. Close the late clients instead.
+      if ((this.workspaceStopEpochs.get(workspaceId) ?? 0) !== stopEpochBefore) {
+        for (const instance of instances.values()) {
+          try {
+            await instance.close();
+          } catch (error) {
+            log.warn("Failed to stop late MCP server for removed workspace", {
+              error,
+              name: instance.name,
+            });
+          }
+        }
+        return { tools: {}, stats };
+      }
+
+      const entry: WorkspaceServers = {
+        configSignature: signature,
+        instances,
+        enabledServerNames,
+        stats,
+        timedOutServerNames: startTimedOutNames,
+        retryingTimedOutServerNames: new Set(),
+        lastActivity: Date.now(),
+      };
+      this.workspaceServers.set(workspaceId, entry);
+      await this.repairEnablementAfterConcurrentMutation(
         workspaceId,
-        servers: enabledEntries.map(([name]) => name),
+        options,
+        entry,
+        configGenerationUsed
+      );
+
+      return {
+        tools: this.collectTools(instances, fullServerInfo, overrides),
+        stats,
+      };
+    });
+  }
+
+  async getPromptsForWorkspace(
+    options: MCPWorkspaceRequestOptions,
+    callOptions?: { signal?: AbortSignal }
+  ): Promise<MCPPromptDescriptor[]> {
+    const workspaceId = options.workspaceId;
+    // Keep refreshing until both mutation counters and resolved secrets remain
+    // stable across the catalog fetch, preventing a pre-mutation instance copy
+    // from leaking descriptors. Secrets are resolved fresh each attempt and
+    // participate in the check because rotation bumps neither counter. Abort
+    // returns promptly while a losing startup may finish into the cache for
+    // idle cleanup.
+    let enabledInstances: Map<string, MCPServerInstance>;
+    for (;;) {
+      const optionsMutationsBefore = this.workspaceOptionsMutationCounts.get(workspaceId) ?? 0;
+      const generationBefore = this.configService.configGeneration;
+      const currentOptions = this.lastWorkspaceRequestOptions.get(workspaceId) ?? options;
+      const secretsUsed = await this.resolveSecretsForRefresh(
+        workspaceId,
+        currentOptions.projectPath
+      );
+      const refreshed = await raceWithAbortAndTimeout(
+        this.ensureWorkspaceServers(
+          secretsUsed !== undefined
+            ? { ...currentOptions, projectSecrets: secretsUsed }
+            : currentOptions,
+          false
+        ),
+        {
+          ...(callOptions?.signal !== undefined ? { signal: callOptions.signal } : {}),
+        }
+      );
+      if (refreshed.kind === "aborted") {
+        throw new Error("MCP prompt discovery was aborted");
+      }
+      const entry = this.workspaceServers.get(workspaceId);
+      if (!entry) return [];
+
+      // Disabled clients may remain cached during leased restarts. Skip disabled and
+      // reconfigured instances so discovery neither queries stale endpoints nor
+      // returns outdated catalogs.
+      enabledInstances = new Map(
+        [...entry.instances].filter(
+          ([serverName]) =>
+            entry.enabledServerNames.has(serverName) &&
+            !entry.stalePromptServerNames?.has(serverName)
+        )
+      );
+      await this.refreshInstancePrompts(enabledInstances, callOptions?.signal);
+      const secretsNow = await this.resolveSecretsForRefresh(
+        workspaceId,
+        currentOptions.projectPath
+      );
+      if (
+        (this.workspaceOptionsMutationCounts.get(workspaceId) ?? 0) === optionsMutationsBefore &&
+        this.configService.configGeneration === generationBefore &&
+        secretRecordsEqual(secretsUsed, secretsNow)
+      ) {
+        break;
+      }
+    }
+    const descriptors: MCPPromptDescriptor[] = [];
+    const usedNames = new Set<string>();
+    const instances = [...enabledInstances.values()].sort((a, b) => a.name.localeCompare(b.name));
+
+    // Suffix every member of a normalized collision group so a prompt's key
+    // never depends on catalog order or which colliding sibling is enabled.
+    const baseKeyCounts = new Map<string, number>();
+    for (const instance of instances) {
+      for (const prompt of instance.prompts) {
+        const baseKey = buildMcpPromptBaseKey(instance.name, prompt.name);
+        baseKeyCounts.set(baseKey, (baseKeyCounts.get(baseKey) ?? 0) + 1);
+      }
+    }
+
+    for (const instance of instances) {
+      const prompts = [...instance.prompts].sort((a, b) => a.name.localeCompare(b.name));
+      for (const prompt of prompts) {
+        const command = buildMcpPromptCommandKey({
+          serverName: instance.name,
+          promptName: prompt.name,
+          usedNames,
+          forceSuffix:
+            (baseKeyCounts.get(buildMcpPromptBaseKey(instance.name, prompt.name)) ?? 0) > 1,
+        });
+        const stableKey = buildMcpPromptStableKey(instance.name, prompt.name);
+        if (!command || stableKey === null) continue;
+        descriptors.push({
+          commandKey: command.toolName,
+          stableKey,
+          serverName: instance.name,
+          promptName: prompt.name,
+          ...(prompt.description !== undefined ? { description: prompt.description } : {}),
+          ...(prompt.arguments !== undefined ? { arguments: prompt.arguments } : {}),
+        });
+      }
+    }
+    return descriptors;
+  }
+
+  private async computeSignatureEntries(
+    enabledEntries: Array<[string, MCPServerInfo]>,
+    projectSecrets: Record<string, string> | undefined
+  ): Promise<Record<string, unknown>> {
+    const signatureEntries: Record<string, unknown> = {};
+    for (const [name, info] of enabledEntries) {
+      if (info.transport === "stdio") {
+        // args/env/cwd participate so plugin mcp.json edits recycle servers.
+        signatureEntries[name] = {
+          transport: "stdio",
+          command: info.command,
+          args: info.args ?? null,
+          env: info.env ?? null,
+          cwd: info.cwd ?? null,
+        };
+        continue;
+      }
+
+      // OAuth status affects whether we can attach authProvider during server start.
+      // Include this (redacted) information in the signature so we retry starting
+      // remote servers after a user logs in/out.
+      let hasOauthTokens = false;
+      if (this.mcpOauthService) {
+        try {
+          hasOauthTokens = await this.mcpOauthService.hasAuthTokens({
+            serverUrl: info.url,
+          });
+        } catch (error) {
+          log.debug("[MCP] Failed to resolve MCP OAuth status", { name, error });
+        }
+      }
+
+      try {
+        const { headers } = resolveHeaders(info.headers, projectSecrets);
+        signatureEntries[name] = {
+          transport: info.transport,
+          url: info.url,
+          headers,
+          hasOauthTokens,
+        };
+      } catch {
+        // Missing secrets or invalid header config. Keep signature stable but avoid leaking details.
+        signatureEntries[name] = {
+          transport: info.transport,
+          url: info.url,
+          headers: null,
+          hasOauthTokens,
+        };
+      }
+    }
+    return signatureEntries;
+  }
+
+  /**
+   * Settings changes during startup can miss cache synchronization. Re-derive
+   * enablement and mark reconfigured clients stale before prompt dispatch.
+   */
+  private async repairEnablementAfterConcurrentMutation(
+    workspaceId: string,
+    optionsUsed: MCPWorkspaceRequestOptions,
+    entry: WorkspaceServers,
+    configGenerationUsed: number
+  ): Promise<void> {
+    try {
+      let recorded = this.lastWorkspaceRequestOptions.get(workspaceId);
+      // Workspace mutations replace recorded options; global mutations only bump a
+      // generation. Either can invalidate derived enablement.
+      let needsRepair =
+        recorded !== optionsUsed || this.configService.configGeneration !== configGenerationUsed;
+      while (recorded !== undefined && needsRepair) {
+        const generationRead = this.configService.configGeneration;
+        const enabled = await this.listServers(
+          recorded.projectPath,
+          recorded.overrides,
+          recorded.trusted ?? false,
+          recorded.agentPlugins
+        );
+        const signatureEntries = await this.computeSignatureEntries(
+          Object.entries(enabled).sort(([a], [b]) => a.localeCompare(b)),
+          recorded.projectSecrets
+        );
+        const latest = this.lastWorkspaceRequestOptions.get(workspaceId);
+        if (latest === recorded && this.configService.configGeneration === generationRead) {
+          entry.enabledServerNames = new Set(Object.keys(enabled));
+          // configSignature is always in-process JSON.stringify output, so parsing cannot fail.
+          const previousEntries = JSON.parse(entry.configSignature) as Record<string, unknown>;
+          const reconfigured = Object.keys(signatureEntries).filter(
+            (name) =>
+              JSON.stringify(signatureEntries[name]) !== JSON.stringify(previousEntries[name])
+          );
+          if (reconfigured.length > 0) {
+            const stale = entry.stalePromptServerNames ?? new Set<string>();
+            for (const name of reconfigured) stale.add(name);
+            entry.stalePromptServerNames = stale;
+          }
+          return;
+        }
+        recorded = latest;
+        needsRepair = true;
+      }
+    } catch (error) {
+      log.debug("[MCP] Failed to repair enablement after concurrent settings change", {
+        workspaceId,
+        error: getErrorMessage(error),
       });
     }
+  }
 
-    if (existing && hasClosedInstance) {
-      log.info("[MCP] Restarting servers due to closed client", { workspaceId });
+  /** Keeps prompt invocation from using stale enablement before the next stream refresh. */
+  async applyWorkspaceOverrides(
+    workspaceId: string,
+    overrides: WorkspaceMCPOverrides | undefined
+  ): Promise<void> {
+    this.latestWorkspaceOverrides.set(workspaceId, overrides);
+    this.bumpWorkspaceOptionsMutationCount(workspaceId);
+    const recorded = this.lastWorkspaceRequestOptions.get(workspaceId);
+    if (recorded) {
+      this.lastWorkspaceRequestOptions.set(workspaceId, { ...recorded, overrides });
     }
+    const entry = this.workspaceServers.get(workspaceId);
+    if (!entry || !recorded) return;
+    try {
+      const enabled = await this.listServers(
+        recorded.projectPath,
+        overrides,
+        recorded.trusted ?? false,
+        recorded.agentPlugins
+      );
+      entry.enabledServerNames = new Set(Object.keys(enabled));
+    } catch (error) {
+      log.debug("[MCP] Failed to sync workspace overrides into cached state", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
 
-    await this.stopServers(workspaceId);
+  /**
+   * Trust is retained by path, so removing a project must forget its entry or
+   * a later re-registration of the same path would inherit the old decision.
+   */
+  forgetProjectTrust(projectPath: string): void {
+    this.latestProjectTrust.delete(stripTrailingSlashes(projectPath));
+  }
 
-    const {
-      instances,
-      failedServerNames: startFailedNames,
-      timedOutServerNames: startTimedOutNames = [],
-    } = await this.startServers(
-      enabledServers,
-      runtime,
-      projectPath,
-      workspacePath,
-      projectSecrets,
-      () => this.markActivity(workspaceId),
-      workspaceId
+  /** Updates recorded options so prompt refreshes cannot reuse stale project trust. */
+  applyProjectTrust(updates: Array<{ projectPath: string; trusted: boolean }>): void {
+    const trustByPath = new Map(
+      updates.map((update) => [stripTrailingSlashes(update.projectPath), update.trusted])
     );
+    // Retained by project path so cold workspaces (no recorded options yet)
+    // pick up the mutation when their first request reaches the manager.
+    for (const [path, trusted] of trustByPath) {
+      this.latestProjectTrust.set(path, trusted);
+    }
+    for (const [workspaceId, options] of this.lastWorkspaceRequestOptions) {
+      const trusted = trustByPath.get(stripTrailingSlashes(options.projectPath));
+      if (trusted === undefined || (options.trusted ?? false) === trusted) continue;
+      this.lastWorkspaceRequestOptions.set(workspaceId, { ...options, trusted });
+      this.bumpWorkspaceOptionsMutationCount(workspaceId);
+    }
+  }
 
-    const allFailedNames = [...restartFailedNames, ...startFailedNames];
-    const stats = this.createWorkspaceStats(enabledEntries.length, instances, allFailedNames);
+  private bumpWorkspaceOptionsMutationCount(workspaceId: string): void {
+    this.workspaceOptionsMutationCounts.set(
+      workspaceId,
+      (this.workspaceOptionsMutationCounts.get(workspaceId) ?? 0) + 1
+    );
+  }
 
-    this.workspaceServers.set(workspaceId, {
-      configSignature: signature,
-      instances,
-      stats,
-      timedOutServerNames: startTimedOutNames,
-      retryingTimedOutServerNames: new Set(),
-      lastActivity: Date.now(),
-    });
+  /** Rotated header credentials must change the signature so stale clients are replaced. */
+  private async resolveSecretsForRefresh(
+    workspaceId: string,
+    projectPath: string
+  ): Promise<Record<string, string> | undefined> {
+    if (!this.secretsResolver) return undefined;
+    try {
+      return await this.secretsResolver(workspaceId, projectPath);
+    } catch (error) {
+      log.debug("[MCP] Failed to re-resolve secrets for prompt refresh", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+      return undefined;
+    }
+  }
 
+  async getPrompt(
+    workspaceId: string,
+    serverName: string,
+    promptName: string,
+    args: Record<string, string>,
+    options?: { signal?: AbortSignal }
+  ): Promise<{ text: string; description?: string }> {
+    // Refresh cached state because it can outlive configuration changes. Race
+    // startup with cancellation, but let a losing startup finish into the cache
+    // so idle cleanup can close it.
+    const lastOptions = this.lastWorkspaceRequestOptions.get(workspaceId);
+    if (lastOptions) {
+      const refresh = async (projectSecrets: Record<string, string> | undefined): Promise<void> => {
+        // Re-read after the resolver await: a settings mutation recorded while
+        // secrets resolved must not be clobbered by a pre-await options snapshot.
+        const currentOptions = this.lastWorkspaceRequestOptions.get(workspaceId) ?? lastOptions;
+        await this.ensureWorkspaceServers(
+          projectSecrets !== undefined ? { ...currentOptions, projectSecrets } : currentOptions,
+          false
+        );
+      };
+      // Refresh until both mutation counters and resolved secrets remain stable
+      // so neither a settings mutation nor a secret rotation completing during
+      // the refresh leaves this dispatch on pre-mutation state. Later mutations
+      // race with the in-flight request and cannot be prevented here.
+      for (;;) {
+        const optionsMutationsBefore = this.workspaceOptionsMutationCounts.get(workspaceId) ?? 0;
+        const generationBefore = this.configService.configGeneration;
+        const secretsUsed = await this.resolveSecretsForRefresh(
+          workspaceId,
+          lastOptions.projectPath
+        );
+        const refreshed = await raceWithAbortAndTimeout(refresh(secretsUsed), {
+          ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+        });
+        if (refreshed.kind === "aborted") {
+          throw new Error(`MCP prompt request for '${serverName}/${promptName}' was aborted`);
+        }
+        const secretsNow = await this.resolveSecretsForRefresh(
+          workspaceId,
+          lastOptions.projectPath
+        );
+        if (
+          (this.workspaceOptionsMutationCounts.get(workspaceId) ?? 0) === optionsMutationsBefore &&
+          this.configService.configGeneration === generationBefore &&
+          secretRecordsEqual(secretsUsed, secretsNow)
+        ) {
+          break;
+        }
+      }
+    }
+    const entry = this.workspaceServers.get(workspaceId);
+    if (entry && !entry.enabledServerNames.has(serverName)) {
+      throw new Error(`MCP server '${serverName}' is disabled`);
+    }
+    if (entry?.stalePromptServerNames?.has(serverName)) {
+      throw new Error(
+        `MCP server '${serverName}' was reconfigured while this request was being prepared; retry`
+      );
+    }
+    const instance = entry?.instances.get(serverName);
+    if (!instance || instance.isClosed) {
+      throw new Error(`MCP server '${serverName}' is not connected`);
+    }
+    this.markActivity(workspaceId);
+    const result = await instance.getPrompt(promptName, args, options);
+    const text = flattenMcpPrompt(result);
+    if (text.trim().length === 0) {
+      // Providers can reject empty user content, so fail expansion up front
+      // rather than persisting an empty synthetic user message.
+      throw new Error(`MCP prompt '${serverName}/${promptName}' returned no text content`);
+    }
     return {
-      tools: this.collectTools(instances, fullServerInfo, overrides),
-      stats,
+      text,
+      ...(result.description !== undefined ? { description: result.description } : {}),
     };
   }
 
-  async stopServers(workspaceId: string): Promise<void> {
+  async stopServers(
+    workspaceId: string,
+    options?: { retainRestartOptions?: boolean }
+  ): Promise<void> {
+    if (options?.retainRestartOptions !== true) {
+      this.workspaceStopEpochs.set(
+        workspaceId,
+        (this.workspaceStopEpochs.get(workspaceId) ?? 0) + 1
+      );
+      this.lastWorkspaceRequestOptions.delete(workspaceId);
+      this.workspaceOptionsMutationCounts.delete(workspaceId);
+      this.latestWorkspaceOverrides.delete(workspaceId);
+    }
     const entry = this.workspaceServers.get(workspaceId);
     if (!entry) return;
 
@@ -1796,28 +2357,42 @@ export class MCPServerManager {
     const timedOutServerNames: string[] = [];
     const entries = Object.entries(servers);
 
-    for (const [name, info] of entries) {
-      try {
-        const instance = await this.startSingleServer(
-          name,
-          info,
-          runtime,
-          projectPath,
-          workspacePath,
-          projectSecrets,
-          onActivity,
-          workspaceId
-        );
-        if (instance) {
-          instances.set(name, instance);
+    // Bounded concurrency so one unresponsive server's 60s startup deadline
+    // cannot stack serially and stall tool/prompt availability for minutes.
+    const semaphore = new AsyncSemaphore(MCP_STARTUP_CONCURRENCY);
+    const results = await Promise.all(
+      entries.map(async ([name, info]): Promise<MCPServerInstance | null> => {
+        const slot = await semaphore.acquire();
+        try {
+          return await this.startSingleServer(
+            name,
+            info,
+            runtime,
+            projectPath,
+            workspacePath,
+            projectSecrets,
+            onActivity,
+            workspaceId
+          );
+        } catch (error) {
+          const message = getErrorMessage(error);
+          log.error("Failed to start MCP server", { name, error: message });
+          failedServerNames.push(name);
+          if (isMCPStartupTimeoutError(error)) {
+            timedOutServerNames.push(name);
+          }
+          return null;
+        } finally {
+          slot.release();
         }
-      } catch (error) {
-        const message = getErrorMessage(error);
-        log.error("Failed to start MCP server", { name, error: message });
-        failedServerNames.push(name);
-        if (isMCPStartupTimeoutError(error)) {
-          timedOutServerNames.push(name);
-        }
+      })
+    );
+    // Insert in the caller's (sorted) entry order so Map iteration stays
+    // deterministic regardless of which startups finish first.
+    for (const [index, [name]] of entries.entries()) {
+      const instance = results[index];
+      if (instance) {
+        instances.set(name, instance);
       }
     }
 
@@ -2211,6 +2786,12 @@ export class MCPServerManager {
           resolvedTransport: "stdio",
           autoFallbackUsed: false,
           tools,
+          prompts: [],
+          getPrompt: (promptName, args, options) =>
+            readyClient.getPrompt(promptName, args, options),
+          refreshPrompts: async (options) => {
+            instance.prompts = await readyClient.prompts(options);
+          },
           isClosed: transportClosed,
           ...(isModernEra(negotiatedPrior)
             ? {
@@ -2458,6 +3039,11 @@ export class MCPServerManager {
         resolvedTransport,
         autoFallbackUsed,
         tools,
+        prompts: [],
+        getPrompt: (promptName, args, options) => activeClient.getPrompt(promptName, args, options),
+        refreshPrompts: async (options) => {
+          instance.prompts = await activeClient.prompts(options);
+        },
         isClosed: transportErrored || clientClosed,
         ...(isModernEra(negotiatedPrior)
           ? {

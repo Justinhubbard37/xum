@@ -14,6 +14,7 @@ import type { AgentMode } from "./mode";
 import type { AgentSkillScope } from "./agentSkill";
 import type { ThinkingLevel } from "./thinking";
 import { type ReviewNoteData, formatReviewForModel } from "./review";
+import { isMcpPromptCommandKey } from "@/common/utils/tools/mcpPromptCommandKey";
 
 export type { ModelMessage };
 
@@ -294,6 +295,156 @@ export function withAgentSkillRefs(
   };
 }
 
+export interface MCPPromptReference {
+  serverName: string;
+  promptName: string;
+  commandKey: string;
+  source: "slash" | "inline";
+  arguments?: Record<string, string>;
+}
+
+export function getMcpPromptReferenceKey(serverName: string, promptName: string): string {
+  return `${serverName}\u0000${promptName}`;
+}
+
+export function buildMcpPromptUserText(
+  serverName: string,
+  promptName: string,
+  argumentText: string
+): string {
+  const base = `Using MCP prompt ${serverName}/${promptName}`;
+  return argumentText ? `${base}: ${argumentText}` : base;
+}
+
+export function isMcpPromptReference(value: unknown): value is MCPPromptReference {
+  if (value === null || typeof value !== "object") return false;
+  const ref = value as Partial<MCPPromptReference>;
+  // Empty identities would make snapshot materialization fail on every
+  // compact-and-retry instead of self-healing, so reject them here.
+  return (
+    typeof ref.serverName === "string" &&
+    ref.serverName.length > 0 &&
+    typeof ref.promptName === "string" &&
+    ref.promptName.length > 0 &&
+    typeof ref.commandKey === "string" &&
+    isMcpPromptCommandKey(ref.commandKey) &&
+    (ref.source === "slash" || ref.source === "inline")
+  );
+}
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  return Object.values(value).every((entry) => typeof entry === "string");
+}
+
+/** muxMetadata persists as z.any(), so corrupted references require read-time filtering. */
+export function sanitizeMcpPromptRefs(value: unknown): MCPPromptReference[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter(isMcpPromptReference).map((ref) => {
+    if (ref.arguments === undefined || isStringRecord(ref.arguments)) return ref;
+    // Drop malformed persisted arguments so prompt expansion can retry without them.
+    const { arguments: _malformed, ...rest } = ref;
+    return rest;
+  });
+}
+
+export function isAgentSkillReference(value: unknown): value is AgentSkillReference {
+  if (value === null || typeof value !== "object") return false;
+  const ref = value as Partial<AgentSkillReference>;
+  return (
+    typeof ref.skillName === "string" &&
+    typeof ref.scope === "string" &&
+    (ref.source === "slash" || ref.source === "inline")
+  );
+}
+
+export function sanitizeAgentSkillRefs(value: unknown): AgentSkillReference[] {
+  return Array.isArray(value) ? value.filter(isAgentSkillReference) : [];
+}
+
+/** Shared with the node-side ID factory so snapshot rows stay identifiable. */
+export const MCP_PROMPT_SNAPSHOT_MESSAGE_ID_PREFIX = "mcp-prompt-snapshot-";
+
+function isMcpPromptSnapshotBaseShape(
+  value: unknown
+): value is { serverName: string; promptName: string; invokingMessageId?: string } {
+  if (value === null || typeof value !== "object") return false;
+  const snapshot = value as Partial<NonNullable<MuxMetadata["mcpPromptSnapshot"]>>;
+  return typeof snapshot.serverName === "string" && typeof snapshot.promptName === "string";
+}
+
+/**
+ * Drops MCP prompt snapshots orphaned by a crash between snapshot persistence
+ * and the user-row append: a snapshot survives only when its invoking user row
+ * exists and still references the same prompt.
+ */
+export function filterOrphanedMcpPromptSnapshots(messages: MuxMessage[]): MuxMessage[] {
+  // Drop only genuine expansion rows: the reserved ID prefix marks one even
+  // when corruption removed its metadata, and synthetic rows with a valid
+  // snapshot shape cover legacy IDs. Other rows may be corrupted with this
+  // field and must survive after it is stripped.
+  const isMcpSnapshotRow = (message: MuxMessage): boolean =>
+    message.role === "user" &&
+    (message.id.startsWith(MCP_PROMPT_SNAPSHOT_MESSAGE_ID_PREFIX) ||
+      (message.metadata?.synthetic === true &&
+        isMcpPromptSnapshotBaseShape(message.metadata.mcpPromptSnapshot)));
+
+  const promptRefKeysByMessageId = new Map<string, Set<string>>();
+  for (const message of messages) {
+    if (message.role !== "user" || isMcpSnapshotRow(message)) continue;
+    const refs = sanitizeMcpPromptRefs(message.metadata?.muxMetadata?.mcpPromptRefs);
+    if (refs.length === 0) continue;
+    promptRefKeysByMessageId.set(
+      message.id,
+      new Set(refs.map((ref) => getMcpPromptReferenceKey(ref.serverName, ref.promptName)))
+    );
+  }
+  return messages.flatMap((message): MuxMessage[] => {
+    const snapshot: unknown = message.metadata?.mcpPromptSnapshot;
+    if (!isMcpSnapshotRow(message)) {
+      if (snapshot === undefined || message.metadata === undefined) return [message];
+      const { mcpPromptSnapshot: _stripped, ...metadata } = message.metadata;
+      return [{ ...message, metadata }];
+    }
+    // Raw chat.jsonl bypasses oRPC sanitization. Absent or malformed expansion
+    // snapshots and legacy snapshots without an invoking ID are crash orphans.
+    if (!isMcpPromptSnapshotBaseShape(snapshot) || snapshot.invokingMessageId === undefined) {
+      return [];
+    }
+    const invokingRefKeys = promptRefKeysByMessageId.get(snapshot.invokingMessageId);
+    return invokingRefKeys?.has(
+      getMcpPromptReferenceKey(snapshot.serverName, snapshot.promptName)
+    ) === true
+      ? [message]
+      : [];
+  });
+}
+
+export function dedupeMcpPromptRefs(refs: MCPPromptReference[]): MCPPromptReference[] {
+  const deduped = new Map<string, MCPPromptReference>();
+  for (const ref of refs) {
+    const key = getMcpPromptReferenceKey(ref.serverName, ref.promptName);
+    const existing = deduped.get(key);
+    if (!existing || (existing.source === "inline" && ref.source === "slash")) {
+      deduped.set(key, ref);
+    }
+  }
+  return [...deduped.values()];
+}
+
+export function withMcpPromptRefs(
+  metadata: MuxMessageMetadata | undefined,
+  refs: MCPPromptReference[]
+): MuxMessageMetadata | undefined {
+  const existingRefs = sanitizeMcpPromptRefs(metadata?.mcpPromptRefs);
+  if (existingRefs.length === 0 && refs.length === 0) {
+    return metadata;
+  }
+
+  const mcpPromptRefs = dedupeMcpPromptRefs([...existingRefs, ...refs]);
+  return metadata ? { ...metadata, mcpPromptRefs } : { type: "normal", mcpPromptRefs };
+}
+
 export interface BuildAgentSkillMetadataOptions {
   rawCommand: string;
   skillName: string;
@@ -351,6 +502,7 @@ interface MuxMessageMetadataBase {
    * muxMetadata loose by design, so this orthogonal field needs no schema change.
    */
   agentSkillRefs?: AgentSkillReference[];
+  mcpPromptRefs?: MCPPromptReference[];
   /** Display-only insertion point within an assistant message that was streaming. */
   transcriptAnchor?: TranscriptAnchor;
 }
@@ -647,6 +799,14 @@ export interface MuxMetadata {
      */
     frontmatterYaml?: string;
   };
+  mcpPromptSnapshot?: {
+    serverName: string;
+    promptName: string;
+    commandKey: string;
+    /** Missing legacy values are treated as crash orphans. */
+    invokingMessageId?: string;
+    description?: string;
+  };
 }
 
 // Extended tool part type that supports interrupted tool calls (input-available state)
@@ -735,7 +895,7 @@ export type DisplayedMessage =
       isBudgetLimitWrapup?: boolean;
       /** True when this row is loaded above the latest Context Boundary and must not mutate active context. */
       isBeforeLatestContextBoundary?: boolean;
-      /** Present when this message invoked an agent skill via /{skill-name} */
+      /** Present when this message invoked an agent skill or MCP prompt via slash command. */
       agentSkill?: {
         skillName: string;
         scope: AgentSkillScope;
@@ -750,8 +910,12 @@ export type DisplayedMessage =
           body?: string;
         };
       };
+      /** Preserved so compaction retry can rematerialize MCP prompt invocations. */
+      mcpPromptRefs?: MCPPromptReference[];
+      /** Preserved so compaction retry can rematerialize inline skill references. */
+      agentSkillRefs?: AgentSkillReference[];
       /**
-       * Inline skill snapshots are derived display state from prior synthetic snapshot messages.
+       * Inline skill and MCP prompt snapshots are derived from prior synthetic messages.
        * They are not persisted on the user message itself.
        */
       inlineSkillSnapshots?: InlineSkillSnapshotMap;
@@ -914,6 +1078,17 @@ export interface QueuedMessage {
   queueDispatchMode?: QueueDispatchMode;
   /** True when the queued message is a compaction request (/compact) */
   hasCompactionRequest?: boolean;
+}
+
+/** Keep every snapshot kind here so history scans and edits retain it with its user message. */
+export function isSyntheticSnapshotUserMessage(message: MuxMessage): boolean {
+  return (
+    message.role === "user" &&
+    message.metadata?.synthetic === true &&
+    (message.metadata.fileAtMentionSnapshot !== undefined ||
+      message.metadata.agentSkillSnapshot !== undefined ||
+      message.metadata.mcpPromptSnapshot !== undefined)
+  );
 }
 
 // Helper to create a simple text message

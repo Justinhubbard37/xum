@@ -223,6 +223,17 @@ export class MCPConfigService {
       encoding: "utf-8",
       mode: 0o600,
     });
+    this.globalConfigGeneration += 1;
+  }
+
+  /**
+   * Incremented after successful global config writes. Prompt paths compare it
+   * across refreshes because global mutations do not replace workspace options.
+   */
+  private globalConfigGeneration = 0;
+
+  get configGeneration(): number {
+    return this.globalConfigGeneration;
   }
 
   /**

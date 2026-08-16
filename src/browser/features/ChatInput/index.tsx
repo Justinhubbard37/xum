@@ -85,7 +85,10 @@ import { Button } from "@/browser/components/Button/Button";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { findAtMentionAtCursor } from "@/common/utils/atMentions";
-import { findInlineSkillReferenceAtCursor } from "@/browser/utils/agentSkills/inlineSkillReferences";
+import {
+  extractInlineSkillReferenceCandidates,
+  findInlineSkillReferenceAtCursor,
+} from "@/browser/utils/agentSkills/inlineSkillReferences";
 import {
   convertSymbolCommandAtCursor,
   convertTerminatedSymbolCommand,
@@ -156,6 +159,7 @@ import {
 } from "@/browser/utils/chatEditing";
 
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
+import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import {
   coerceThinkingLevel,
@@ -169,10 +173,12 @@ import {
 } from "@/common/types/runtime";
 import { resolveThinkingInput } from "@/common/utils/thinking/policy";
 import {
+  type AgentSkillReference,
   type MuxMessageMetadata,
   type ReviewNoteDataForDisplay,
   prepareUserMessageForSend,
   withAgentSkillRefs,
+  withMcpPromptRefs,
 } from "@/common/types/message";
 import type { Review } from "@/common/types/review";
 import {
@@ -220,8 +226,11 @@ import {
   hasProjectScopedSkillRef,
   parseCommandWithSkillInvocation,
   resolveInlineSkillRefsForSend,
+  resolveMcpPromptRefsForSend,
   validateCreationRuntime,
   filePartsToChatAttachments,
+  type MCPPromptInvocation,
+  type SkillInvocation,
   type SkillResolutionTarget,
 } from "./utils";
 import { normalizeAgentId } from "@/common/utils/agentIds";
@@ -322,9 +331,15 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   });
   const asyncCommandTokenRef = useRef(0);
   const workspaceId = variant === "workspace" ? props.workspaceId : null;
+  // One controller covers all sends in a composer scope. Scope changes abort
+  // stale continuations; unmount does not, so submitted sends can still reach
+  // their captured workspace after navigation.
+  const sendResolutionAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     asyncCommandScopeRef.current = { variant, workspaceId };
+    sendResolutionAbortRef.current?.abort();
+    sendResolutionAbortRef.current = null;
   }, [variant, workspaceId]);
 
   const store = useWorkspaceStoreRaw();
@@ -436,6 +451,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const projectedWorkflowRunCardKeysRef = useRef(new Set<string>());
   const workflowsRequestIdRef = useRef(0);
   const agentSkillsRequestIdRef = useRef(0);
+  const mcpPromptsRequestIdRef = useRef(0);
+  const mcpPromptsRequestRef = useRef<Promise<void> | null>(null);
+  const mcpPromptsLoadedAtRef = useRef(0);
+  const mcpPromptsWorkspaceRef = useRef<string | null>(null);
+  // Abandoned cold discovery would otherwise keep starting servers and
+  // waiting out prompts/list deadlines for a workspace we already left.
+  const mcpPromptsAbortRef = useRef<AbortController | null>(null);
   const atMentionDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const atMentionRequestIdRef = useRef(0);
   const lastAtMentionScopeIdRef = useRef<string | null>(null);
@@ -444,6 +466,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const lastSkillInputRef = useRef<string | null>(null);
   const lastSkillQueryRef = useRef<string | null>(null);
   const lastSkillDescriptorsRef = useRef<AgentSkillDescriptor[] | null>(null);
+  const lastMcpPromptDescriptorsRef = useRef<MCPPromptDescriptor[] | null>(null);
   const [showCommandSuggestions, setShowCommandSuggestions] = useState(false);
 
   const [commandSuggestions, setCommandSuggestions] = useState<SlashSuggestion[]>([]);
@@ -452,6 +475,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const [symbolSuggestions, setSymbolSuggestions] = useState<SlashSuggestion[]>([]);
   const lastSymbolQueryRef = useRef<string>("");
   const [agentSkillDescriptors, setAgentSkillDescriptors] = useState<AgentSkillDescriptor[]>([]);
+  const [mcpPromptDescriptors, setMcpPromptDescriptors] = useState<MCPPromptDescriptor[]>([]);
   const [toast, setToast] = useState<Toast | null>(null);
   // State for destructive command confirmation modal (currently only /clear).
   const [pendingDestructiveCommand, setPendingDestructiveCommand] = useState(false);
@@ -626,6 +650,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   useEffect(() => {
     return () => {
       isMountedRef.current = false;
+      mcpPromptsAbortRef.current?.abort();
+      mcpPromptsAbortRef.current = null;
     };
   }, []);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -1026,7 +1052,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         }
   );
 
-  const isSendInFlight = variant === "creation" ? creationState.isSending : isSending;
+  // Creation sends also pass through the async resolution phase guarded by
+  // sendingCount, so include it alongside the creation-specific flag.
+  const isSendInFlight = variant === "creation" ? creationState.isSending || isSending : isSending;
   const sendInFlightBlocksInput =
     variant === "workspace" ? isSendInFlight && !isStreamStarting : isSendInFlight;
 
@@ -1564,7 +1592,71 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     atMentionCursorNonce,
   ]);
 
-  // Watch input/cursor for inline $skill references
+  useEffect(() => {
+    if (!api || variant !== "workspace" || !workspaceId) {
+      if (mcpPromptsWorkspaceRef.current !== null) {
+        mcpPromptsWorkspaceRef.current = null;
+        mcpPromptsLoadedAtRef.current = 0;
+        mcpPromptsRequestIdRef.current++;
+        mcpPromptsRequestRef.current = null;
+        mcpPromptsAbortRef.current?.abort();
+        mcpPromptsAbortRef.current = null;
+        setMcpPromptDescriptors([]);
+      }
+      return;
+    }
+
+    if (mcpPromptsWorkspaceRef.current !== workspaceId) {
+      mcpPromptsWorkspaceRef.current = workspaceId;
+      mcpPromptsLoadedAtRef.current = 0;
+      mcpPromptsRequestIdRef.current++;
+      mcpPromptsRequestRef.current = null;
+      mcpPromptsAbortRef.current?.abort();
+      mcpPromptsAbortRef.current = null;
+      setMcpPromptDescriptors([]);
+    }
+
+    const cursor = Math.min(inputRef.current?.selectionStart ?? input.length, input.length);
+    const opensPromptSurface =
+      input.trimStart().startsWith("/") || findInlineSkillReferenceAtCursor(input, cursor) !== null;
+    if (!opensPromptSurface || Date.now() - mcpPromptsLoadedAtRef.current < 30_000) return;
+    if (mcpPromptsRequestRef.current) return;
+
+    const requestId = ++mcpPromptsRequestIdRef.current;
+    const abortController = new AbortController();
+    mcpPromptsAbortRef.current = abortController;
+    const request = api.workspace.mcp.prompts
+      .list({ workspaceId }, { signal: abortController.signal })
+      .then((prompts) => {
+        if (
+          mcpPromptsWorkspaceRef.current !== workspaceId ||
+          mcpPromptsRequestIdRef.current !== requestId
+        ) {
+          return;
+        }
+        setMcpPromptDescriptors(prompts);
+        mcpPromptsLoadedAtRef.current = Date.now();
+      })
+      .catch(() => {
+        if (
+          mcpPromptsWorkspaceRef.current === workspaceId &&
+          mcpPromptsRequestIdRef.current === requestId
+        ) {
+          mcpPromptsLoadedAtRef.current = Date.now();
+        }
+      })
+      .finally(() => {
+        if (mcpPromptsRequestRef.current === request) {
+          mcpPromptsRequestRef.current = null;
+        }
+        if (mcpPromptsAbortRef.current === abortController) {
+          mcpPromptsAbortRef.current = null;
+        }
+      });
+    mcpPromptsRequestRef.current = request;
+    // Caret movement must retrigger discovery when the input text is unchanged.
+  }, [api, input, variant, workspaceId, atMentionCursorNonce]);
+
   useEffect(() => {
     if (showAtMentionSuggestions) {
       // File mentions win precedence if an edge-case token could match both menus.
@@ -1587,8 +1679,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       return;
     }
 
-    // Avoid recomputing on caret movement within the same partial, but still refresh when
-    // skill discovery finishes asynchronously for already-typed `$partial` input.
     if (
       !shouldRefreshInlineSkillSuggestions({
         inputChanged,
@@ -1596,6 +1686,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         partial: match.partial,
         previousDescriptors: lastSkillDescriptorsRef.current,
         descriptors: agentSkillDescriptors,
+        previousMcpPrompts: lastMcpPromptDescriptorsRef.current,
+        mcpPrompts: mcpPromptDescriptors,
       })
     ) {
       return;
@@ -1606,16 +1698,25 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     const nextSuggestions = getInlineSkillSuggestions({
       partial: match.partial,
       descriptors: agentSkillDescriptors,
+      mcpPrompts: mcpPromptDescriptors,
     });
     lastSkillDescriptorsRef.current = agentSkillDescriptors;
+    lastMcpPromptDescriptorsRef.current = mcpPromptDescriptors;
     setSkillSuggestions(nextSuggestions);
     setShowSkillSuggestions(nextSuggestions.length > 0);
-  }, [input, showAtMentionSuggestions, agentSkillDescriptors, atMentionCursorNonce]);
+  }, [
+    input,
+    showAtMentionSuggestions,
+    agentSkillDescriptors,
+    mcpPromptDescriptors,
+    atMentionCursorNonce,
+  ]);
 
   // Keep slash suggestions current before Enter can accept a stale item.
   useLayoutEffect(() => {
     const suggestions = getSlashCommandSuggestions(input, {
       agentSkills: agentSkillDescriptors,
+      mcpPrompts: mcpPromptDescriptors,
       variant,
       isExperimentEnabled: (experimentId) =>
         resolveSlashCommandExperimentValue(experimentId, {
@@ -1630,6 +1731,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   }, [
     input,
     agentSkillDescriptors,
+    mcpPromptDescriptors,
     variant,
     workspaceHeartbeatsExperimentEnabled,
     dynamicWorkflowsExperimentEnabled,
@@ -2537,19 +2639,67 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                 transferredDraftProjectDiscovery,
             }
           : null;
-    const { parsed, skillInvocation } = await parseCommandWithSkillInvocation({
-      messageText,
-      agentSkillDescriptors,
-      api,
-      discovery: skillDiscovery,
-    });
-    const combinedSkillRefs = await resolveInlineSkillRefsForSend({
-      messageText,
-      slashInvocation: skillInvocation,
-      agentSkillDescriptors,
-      api,
-      discovery: skillDiscovery,
-    });
+    // Resolving commands/references can include cold MCP server startup and
+    // prompt discovery; mark the send in flight so a second Enter cannot start
+    // a duplicate send against the same captured draft.
+    setSendingCount((c) => c + 1);
+    sendResolutionAbortRef.current ??= new AbortController();
+    const resolutionSignal = sendResolutionAbortRef.current.signal;
+    const isSendScopeCurrent = () =>
+      !resolutionSignal.aborted &&
+      asyncCommandScopeRef.current.variant === variant &&
+      asyncCommandScopeRef.current.workspaceId === workspaceId;
+    let parsed: ParsedCommand;
+    let skillInvocation: SkillInvocation | null;
+    let mcpPromptInvocation: MCPPromptInvocation | null;
+    let combinedSkillRefs: AgentSkillReference[];
+    let mcpPromptRefsResult: Awaited<ReturnType<typeof resolveMcpPromptRefsForSend>>;
+    try {
+      const resolution = await parseCommandWithSkillInvocation({
+        messageText,
+        agentSkillDescriptors,
+        mcpPromptDescriptors,
+        api,
+        discovery: skillDiscovery,
+        signal: resolutionSignal,
+      });
+      if (!isSendScopeCurrent()) return;
+      parsed = resolution.parsed;
+      skillInvocation = resolution.skillInvocation;
+      mcpPromptInvocation = resolution.mcpPromptInvocation;
+      if (resolution.error) {
+        pushToast({ type: "error", message: resolution.error });
+        return;
+      }
+      const inlineReferenceCandidates = extractInlineSkillReferenceCandidates(messageText);
+      [combinedSkillRefs, mcpPromptRefsResult] = await Promise.all([
+        resolveInlineSkillRefsForSend({
+          messageText,
+          slashInvocation: skillInvocation,
+          agentSkillDescriptors,
+          api,
+          discovery: skillDiscovery,
+          candidates: inlineReferenceCandidates,
+        }),
+        resolveMcpPromptRefsForSend({
+          messageText,
+          slashInvocation: mcpPromptInvocation,
+          descriptors: mcpPromptDescriptors,
+          api,
+          discovery: skillDiscovery,
+          candidates: inlineReferenceCandidates,
+          signal: resolutionSignal,
+        }),
+      ]);
+      if (!isSendScopeCurrent()) return;
+      if (mcpPromptRefsResult.error) {
+        pushToast({ type: "error", message: mcpPromptRefsResult.error });
+        return;
+      }
+    } finally {
+      setSendingCount((c) => c - 1);
+    }
+    const combinedMcpPromptRefs = mcpPromptRefsResult.refs;
 
     // Route to creation handler for creation variant
     if (variant === "creation") {
@@ -2687,7 +2837,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       const modelOverride = modelOneShot?.modelString;
 
       // Regular message (or /<model-alias> one-shot override) - send directly via API
-      const messageTextForSend = modelOneShot?.message ?? skillInvocation?.userText ?? messageText;
+      const messageTextForSend =
+        modelOneShot?.message ??
+        skillInvocation?.userText ??
+        mcpPromptInvocation?.userText ??
+        messageText;
 
       if (!api) {
         pushToast({ type: "error", message: "Not connected to server" });
@@ -2725,6 +2879,15 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             skillInvocation.descriptor,
             skillInvocation.argumentText
           )
+        : undefined;
+      const promptMuxMetadata: MuxMessageMetadata | undefined = mcpPromptInvocation
+        ? {
+            type: "normal",
+            // Include the staged-attachment notice so edit restoration and
+            // compact-and-retry (which prefer rawCommand) keep the attached files.
+            rawCommand: appendStagedAttachmentNotice(messageText, sendAttachments),
+            commandPrefix: `/${mcpPromptInvocation.descriptor.commandKey}`,
+          }
         : undefined;
 
       const policyModel = modelOverride ?? baseModel;
@@ -2794,9 +2957,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
         // When editing a /compact command, regenerate the actual summarization request
         let actualMessageText = messageTextForSend;
-        let muxMetadata: MuxMessageMetadata | undefined = skillMuxMetadata;
+        let muxMetadata: MuxMessageMetadata | undefined = skillMuxMetadata ?? promptMuxMetadata;
         if (combinedSkillRefs.length > 0) {
           muxMetadata = withAgentSkillRefs(muxMetadata, combinedSkillRefs);
+        }
+        if (combinedMcpPromptRefs.length > 0) {
+          muxMetadata = withMcpPromptRefs(muxMetadata, combinedMcpPromptRefs);
         }
         let compactionOptions: Partial<SendMessageOptions> = {};
 

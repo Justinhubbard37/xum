@@ -64,6 +64,8 @@ import type {
 } from "@/common/orpc/schemas/memory";
 import { memoryLogicalKey } from "@/node/services/memoryMeta";
 import { secretsToRecord } from "@/common/types/secrets";
+import { isMultiProject } from "@/common/utils/multiProject";
+import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
 import { roundToBase2 } from "@/common/telemetry/utils";
 import { createAsyncEventQueue } from "@/common/utils/asyncEventIterator";
 import { withQueueHeartbeat } from "@/common/utils/withQueueHeartbeat";
@@ -119,6 +121,7 @@ import {
   type SubagentTranscriptArtifactIndexEntry,
 } from "@/node/services/subagentTranscriptArtifacts";
 import { getErrorMessage } from "@/common/utils/errors";
+import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 import { CHAT_FILE_NAME, CHAT_ARCHIVE_FILE_NAME } from "@/common/constants/paths";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { workflowRunStreamHub } from "@/node/services/workflows/workflowRunStreamHub";
@@ -3315,8 +3318,8 @@ export const router = (authToken?: string) => {
         .input(schemas.projects.setTrust.input)
         .output(schemas.projects.setTrust.output)
         .handler(async ({ context, input }) => {
+          const normalizedPath = stripTrailingSlashes(input.projectPath);
           await context.config.editConfig((config) => {
-            const normalizedPath = stripTrailingSlashes(input.projectPath);
             let project = config.projects.get(normalizedPath);
             if (!project) {
               // Create a minimal project entry so trust can be set before
@@ -3327,6 +3330,24 @@ export const router = (authToken?: string) => {
             project.trusted = input.trusted;
             return config;
           });
+          // Prompt invocation revives servers from recorded request options, so
+          // sync the trust change (owner plus inheriting children) immediately.
+          // Child trust is inherited from parentProjectPath, not the child's stored flag.
+          const affectedPaths = [normalizedPath];
+          for (const [projectPath, project] of context.config.loadConfigOrDefault().projects) {
+            if (
+              project.parentProjectPath !== undefined &&
+              stripTrailingSlashes(project.parentProjectPath) === normalizedPath
+            ) {
+              affectedPaths.push(projectPath);
+            }
+          }
+          context.mcpServerManager.applyProjectTrust(
+            affectedPaths.map((projectPath) => ({
+              projectPath,
+              trusted: isProjectTrusted(context.config, projectPath),
+            }))
+          );
         }),
       setDisplayName: t
         .input(schemas.projects.setDisplayName.input)
@@ -3360,7 +3381,17 @@ export const router = (authToken?: string) => {
         .input(schemas.projects.remove.input)
         .output(schemas.projects.remove.output)
         .handler(async ({ context, input }) => {
-          return context.projectService.remove(input.projectPath, input.force ?? false);
+          const result = await context.projectService.remove(
+            input.projectPath,
+            input.force ?? false
+          );
+          if (!result.success) return result;
+          // Removal cascades to child projects, whose retained trust must also
+          // be forgotten or a re-registered path would inherit the old grant.
+          for (const removedPath of result.data.removedProjectPaths) {
+            context.mcpServerManager.forgetProjectTrust(removedPath);
+          }
+          return Ok(undefined);
         }),
       secrets: {
         get: t
@@ -5559,12 +5590,80 @@ export const router = (authToken?: string) => {
               return {};
             }
           }),
+        prompts: {
+          list: t
+            .input(schemas.workspace.mcp.prompts.list.input)
+            .output(schemas.workspace.mcp.prompts.list.output)
+            .handler(async ({ context, input, signal }) => {
+              // Preflight waits (init, Coder/SSH/devcontainer startup) can take
+              // minutes; forward the handler signal so navigating away cancels
+              // the whole request, not just the MCP manager phase.
+              await context.aiService.waitForInit(input.workspaceId, signal);
+              const metadataResult = await context.aiService.getWorkspaceMetadata(
+                input.workspaceId
+              );
+              if (!metadataResult.success) throw new Error(metadataResult.error);
+              const metadata = metadataResult.data;
+              // Build the exact runtime context stream startup uses (including the
+              // multi-project shared root) so servers started here match the start
+              // signature streams later reuse.
+              const runtimeContextResult = context.aiService.createWorkspaceRuntimeContext(
+                input.workspaceId,
+                metadata
+              );
+              if (!runtimeContextResult.success) {
+                throw new Error(formatSendMessageError(runtimeContextResult.error).message);
+              }
+              const { runtime, workspacePath, hostCheckoutRoot } = runtimeContextResult.data;
+              // Cold prompt discovery can start stdio servers through runtime.exec,
+              // so wait until the runtime is ready.
+              const readyResult = await runtime.ensureReady(
+                signal !== undefined ? { signal } : undefined
+              );
+              if (!readyResult.ready) {
+                throw new Error(readyResult.error);
+              }
+              const overrides = await context.workspaceMcpOverridesService.getOverridesForWorkspace(
+                input.workspaceId
+              );
+              // Match streamMessage and the prompt-invocation resolver: multi-project
+              // workspaces need every project's secrets, not just the primary's.
+              const projectSecrets = await secretsToRecord(
+                isMultiProject(metadata)
+                  ? mergeMultiProjectSecrets(metadata, context.config)
+                  : context.config.getEffectiveSecrets(metadata.projectPath)
+              );
+              // Agent Plugin containers anchor at the checkout root, not a subproject directory.
+              const agentPlugins = hostCheckoutRoot
+                ? resolveAgentPluginsMcpContext(metadata, hostCheckoutRoot)
+                : null;
+              return context.mcpServerManager.getPromptsForWorkspace(
+                {
+                  workspaceId: input.workspaceId,
+                  projectPath: metadata.projectPath,
+                  runtime,
+                  workspacePath,
+                  trusted: isWorkspaceProjectTrusted(context.config, metadata),
+                  overrides,
+                  projectSecrets,
+                  agentPlugins,
+                },
+                signal !== undefined ? { signal } : undefined
+              );
+            }),
+        },
         set: t
           .input(schemas.workspace.mcp.set.input)
           .output(schemas.workspace.mcp.set.output)
           .handler(async ({ context, input }) => {
             try {
               await context.workspaceMcpOverridesService.setOverridesForWorkspace(
+                input.workspaceId,
+                input.overrides
+              );
+              // Prompt invocation can hit cached servers before the next stream
+              // recomputes enablement, so sync the manager's view immediately.
+              await context.mcpServerManager.applyWorkspaceOverrides(
                 input.workspaceId,
                 input.overrides
               );

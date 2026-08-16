@@ -75,6 +75,26 @@ export const MCPServerInfoSchema = z.discriminatedUnion("transport", [
   }),
 ]);
 
+export const MCPPromptDescriptorSchema = z.object({
+  commandKey: z.string(),
+  /** Identity-derived alias (always hash-suffixed); stable across catalog changes. */
+  stableKey: z.string(),
+  serverName: z.string(),
+  promptName: z.string(),
+  description: z.string().optional(),
+  arguments: z
+    .array(
+      z.object({
+        name: z.string(),
+        description: z.string().optional(),
+        required: z.boolean().optional(),
+      })
+    )
+    .optional(),
+});
+
+export type MCPPromptDescriptor = z.infer<typeof MCPPromptDescriptorSchema>;
+
 export const MCPServerMapSchema = z.record(z.string(), MCPServerInfoSchema);
 
 export const MCPListParamsSchema = z.object({

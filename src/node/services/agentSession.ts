@@ -9,6 +9,7 @@ import type { Config } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
 import type { HistoryService } from "@/node/services/historyService";
 import type { InitStateManager } from "@/node/services/initStateManager";
+import type { MCPServerManager } from "@/node/services/mcpServerManager";
 
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
 import type { RuntimeConfig } from "@/common/types/runtime";
@@ -45,6 +46,7 @@ import {
   createUserMessageId,
   createFileSnapshotMessageId,
   createAgentSkillSnapshotMessageId,
+  createMcpPromptSnapshotMessageId,
 } from "@/node/services/utils/messageIds";
 import {
   FileChangeTracker,
@@ -67,11 +69,16 @@ import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverrid
 import {
   createMuxMessage,
   dedupeAgentSkillRefs,
+  dedupeMcpPromptRefs,
+  filterOrphanedMcpPromptSnapshots,
+  sanitizeAgentSkillRefs,
+  sanitizeMcpPromptRefs,
   isCompactionSummaryMetadata,
   pickPreservedSendOptions,
   pickStartupRetrySendOptions,
   prepareUserMessageForSend,
   type AgentSkillReference,
+  isSyntheticSnapshotUserMessage,
   type CompactionFollowUpRequest,
   type MuxMessageMetadata,
   type MuxFilePart,
@@ -223,7 +230,7 @@ const ACP_DELEGATED_TOOLS_METADATA_KEY = "acpDelegatedTools";
 function extractAgentSkillRefs(metadata: MuxMessageMetadata | undefined): AgentSkillReference[] {
   if (!metadata) return [];
 
-  const refs = Array.isArray(metadata.agentSkillRefs) ? [...metadata.agentSkillRefs] : [];
+  const refs = sanitizeAgentSkillRefs(metadata.agentSkillRefs);
   if (metadata.type === "agent-skill") {
     const hasLegacySlashRef = refs.some(
       (ref) => ref.skillName === metadata.skillName && ref.source === "slash"
@@ -401,6 +408,7 @@ interface AgentSessionOptions {
   config: Config;
   historyService: HistoryService;
   aiService: AIService;
+  mcpServerManager?: MCPServerManager;
   initStateManager: InitStateManager;
   telemetryService?: TelemetryService;
   backgroundProcessManager: BackgroundProcessManager;
@@ -444,6 +452,7 @@ export class AgentSession {
   private readonly config: Config;
   private readonly historyService: HistoryService;
   private readonly aiService: AIService;
+  private readonly mcpServerManager?: MCPServerManager;
   private readonly initStateManager: InitStateManager;
   private readonly backgroundProcessManager: BackgroundProcessManager;
   private readonly workspaceGoalService?: WorkspaceGoalService;
@@ -661,6 +670,7 @@ export class AgentSession {
       config,
       historyService,
       aiService,
+      mcpServerManager,
       initStateManager,
       telemetryService,
       backgroundProcessManager,
@@ -679,6 +689,7 @@ export class AgentSession {
     this.config = config;
     this.historyService = historyService;
     this.aiService = aiService;
+    this.mcpServerManager = mcpServerManager;
     this.initStateManager = initStateManager;
     this.backgroundProcessManager = backgroundProcessManager;
     this.workspaceGoalService = workspaceGoalService;
@@ -1336,15 +1347,6 @@ export class AgentSession {
     );
   }
 
-  private isSyntheticSnapshotUserMessage(message: MuxMessage): boolean {
-    return (
-      message.role === "user" &&
-      message.metadata?.synthetic === true &&
-      (message.metadata.fileAtMentionSnapshot !== undefined ||
-        message.metadata.agentSkillSnapshot !== undefined)
-    );
-  }
-
   private isSyntheticGoalPauseBoundaryMessage(message: MuxMessage): boolean {
     return (
       message.role === "user" &&
@@ -1365,7 +1367,7 @@ export class AgentSession {
     let truncateTargetId = editMessageId;
     for (let i = editIndex - 1; i >= 0; i -= 1) {
       const message = messages[i];
-      if (!this.isSyntheticSnapshotUserMessage(message)) {
+      if (!isSyntheticSnapshotUserMessage(message)) {
         break;
       }
       truncateTargetId = message.id;
@@ -1410,7 +1412,7 @@ export class AgentSession {
       if (this.isSyntheticGoalPauseBoundaryMessage(candidate)) {
         continue;
       }
-      if (this.isSyntheticSnapshotUserMessage(candidate)) {
+      if (isSyntheticSnapshotUserMessage(candidate)) {
         continue;
       }
       return candidate;
@@ -1535,7 +1537,7 @@ export class AgentSession {
     if (this.isSyntheticGoalPauseBoundaryMessage(message)) {
       return false;
     }
-    if (this.isSyntheticSnapshotUserMessage(message)) {
+    if (isSyntheticSnapshotUserMessage(message)) {
       return false;
     }
 
@@ -2549,6 +2551,21 @@ export class AgentSession {
 
     const cancelSignal = internal?.cancelSignal;
     const persistedCancelableMessageIds: string[] = [];
+    // Roll back synthetic snapshots if the invoking user row fails to persist, or
+    // later provider requests could consume orphaned context.
+    const rollbackPersistedTurnRows = async (): Promise<void> => {
+      if (persistedCancelableMessageIds.length === 0) return;
+      const rollbackResult = await this.historyService.deleteMessages(
+        this.workspaceId,
+        persistedCancelableMessageIds
+      );
+      if (!rollbackResult.success) {
+        log.error("Failed to roll back partially persisted turn rows", {
+          workspaceId: this.workspaceId,
+          error: rollbackResult.error,
+        });
+      }
+    };
     let cancellationHandled = false;
     let cancellationDisabled = false;
     const cancelBeforeAcceptance = async (): Promise<boolean> => {
@@ -3066,15 +3083,18 @@ export class AgentSession {
     // On on-send compaction paths, snapshots are deferred with the follow-up turn.
     const shouldPersistTurnSnapshots = autoCompactionMessage === null;
 
-    // Materialize skill snapshots only for turns that send immediately (see the
-    // compaction-decision comment above: deferred turns re-materialize on follow-up,
-    // and materialization may execute dynamic context directives).
     let skillSnapshotMessages: MuxMessage[] = [];
+    let mcpPromptSnapshotMessages: MuxMessage[] = [];
     if (shouldPersistTurnSnapshots) {
       try {
         skillSnapshotMessages = await this.materializeAgentSkillSnapshots(
           typedMuxMetadata,
           options?.disableWorkspaceAgents
+        );
+        mcpPromptSnapshotMessages = await this.materializeMcpPromptSnapshots(
+          typedMuxMetadata,
+          userMessage.id,
+          cancelSignal
         );
       } catch (error) {
         return Err(createUnknownSendMessageError(getErrorMessage(error)));
@@ -3105,7 +3125,25 @@ export class AgentSession {
           snapshotMessage
         );
         if (!skillSnapshotAppendResult.success) {
+          await rollbackPersistedTurnRows();
           return Err(createUnknownSendMessageError(skillSnapshotAppendResult.error));
+        }
+        persistedCancelableMessageIds.push(snapshotMessage.id);
+        if (await cancelBeforeAcceptance()) {
+          return Ok(undefined);
+        }
+      }
+    }
+
+    if (shouldPersistTurnSnapshots && mcpPromptSnapshotMessages.length > 0) {
+      for (const snapshotMessage of mcpPromptSnapshotMessages) {
+        const appendResult = await this.historyService.appendToHistory(
+          this.workspaceId,
+          snapshotMessage
+        );
+        if (!appendResult.success) {
+          await rollbackPersistedTurnRows();
+          return Err(createUnknownSendMessageError(appendResult.error));
         }
         persistedCancelableMessageIds.push(snapshotMessage.id);
         if (await cancelBeforeAcceptance()) {
@@ -3119,9 +3157,7 @@ export class AgentSession {
     if (!autoCompactionMessage) {
       const appendResult = await this.historyService.appendToHistory(this.workspaceId, userMessage);
       if (!appendResult.success) {
-        // Note: If we get here with snapshots, one or more snapshots may already be persisted but user message
-        // failed. This is a rare edge case (disk full mid-operation). The next edit will clean up
-        // the orphan via the truncation logic that removes preceding snapshots.
+        await rollbackPersistedTurnRows();
         return Err(createUnknownSendMessageError(appendResult.error));
       }
       persistedCancelableMessageIds.push(userMessage.id);
@@ -3177,6 +3213,12 @@ export class AgentSession {
 
     if (shouldPersistTurnSnapshots && skillSnapshotMessages.length > 0) {
       for (const snapshotMessage of skillSnapshotMessages) {
+        this.emitChatEvent({ ...snapshotMessage, type: "message" });
+      }
+    }
+
+    if (shouldPersistTurnSnapshots && mcpPromptSnapshotMessages.length > 0) {
+      for (const snapshotMessage of mcpPromptSnapshotMessages) {
         this.emitChatEvent({ ...snapshotMessage, type: "message" });
       }
     }
@@ -3984,7 +4026,7 @@ export class AgentSession {
       return Ok(undefined);
     }
 
-    let historyResult = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
+    const historyResult = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
     if (isStartupAbortRequested()) {
       return Ok(undefined);
     }
@@ -3993,7 +4035,11 @@ export class AgentSession {
       return Err(createUnknownSendMessageError(historyResult.error));
     }
 
-    if (historyResult.data.length === 0) {
+    // A crash between snapshot and user-row appends can leave orphaned prompt
+    // expansions on disk; exclude them from every provider request.
+    let requestMessages = filterOrphanedMcpPromptSnapshots(historyResult.data);
+
+    if (requestMessages.length === 0) {
       return Err(
         createUnknownSendMessageError(
           "Cannot resume stream: workspace history is empty. Send a new message instead."
@@ -4006,7 +4052,7 @@ export class AgentSession {
     // Non-partial trailing assistants indicate a missing user message upstream — inject a
     // [CONTINUE] sentinel so the model has a valid conversation to respond to. This is
     // defense-in-depth; callers should prefer sendMessage() which persists a real user message.
-    const lastMsg = historyResult.data[historyResult.data.length - 1];
+    const lastMsg = requestMessages[requestMessages.length - 1];
     if (lastMsg?.role === "assistant" && !lastMsg.metadata?.partial) {
       log.warn("streamWithHistory: trailing non-partial assistant detected, injecting [CONTINUE]", {
         workspaceId: this.workspaceId,
@@ -4019,16 +4065,16 @@ export class AgentSession {
       await this.historyService.appendToHistory(this.workspaceId, sentinelMessage);
       const refreshed = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
       if (refreshed.success) {
-        historyResult = refreshed;
+        requestMessages = filterOrphanedMcpPromptSnapshots(refreshed.data);
       }
     }
 
     // Capture the current user message id so retries are stable across assistant message ids.
-    const lastUserMessage = [...historyResult.data].reverse().find((m) => m.role === "user");
+    const lastUserMessage = [...requestMessages].reverse().find((m) => m.role === "user");
     this.activeStreamUserMessageId = lastUserMessage?.id;
 
     this.activeCompactionRequest = this.resolveCompactionRequest(
-      historyResult.data,
+      requestMessages,
       modelString,
       options
     );
@@ -4100,7 +4146,7 @@ export class AgentSession {
         : retryMuxMetadata?.type === "workspace-turn-task"
           ? retryMuxMetadata
           : retryMuxMetadata?.type === "bash-monitor-wake"
-            ? inheritOpenWorkspaceTurnMetadata(historyResult.data)
+            ? inheritOpenWorkspaceTurnMetadata(requestMessages)
             : undefined;
     // Mid-stream compaction runs after the original send options have already been resolved against
     // history (notably bash-monitor wakes). Persist the actual correlation used by this stream so the
@@ -4115,7 +4161,7 @@ export class AgentSession {
       extractAcpDelegatedTools(optionsMuxMetadata);
 
     const streamResult = await this.aiService.streamMessage({
-      messages: historyResult.data,
+      messages: requestMessages,
       workspaceId: this.workspaceId,
       modelString,
       abortSignal,
@@ -6306,6 +6352,60 @@ export class AgentSession {
     });
 
     return { snapshotMessage, materializedTokens: tokens };
+  }
+
+  private async materializeMcpPromptSnapshots(
+    muxMetadata: MuxMessageMetadata | undefined,
+    invokingMessageId: string,
+    cancelSignal: AbortSignal | undefined
+  ): Promise<MuxMessage[]> {
+    const mcpServerManager = this.mcpServerManager;
+    if (!mcpServerManager) return [];
+
+    const refs = dedupeMcpPromptRefs(sanitizeMcpPromptRefs(muxMetadata?.mcpPromptRefs));
+    const snapshots = await Promise.all(
+      refs.map(async (ref): Promise<MuxMessage | null> => {
+        try {
+          const prompt = await mcpServerManager.getPrompt(
+            this.workspaceId,
+            ref.serverName,
+            ref.promptName,
+            ref.arguments ?? {},
+            cancelSignal !== undefined ? { signal: cancelSignal } : undefined
+          );
+          return createMuxMessage(createMcpPromptSnapshotMessageId(), "user", prompt.text, {
+            timestamp: Date.now(),
+            synthetic: true,
+            mcpPromptSnapshot: {
+              serverName: ref.serverName,
+              promptName: ref.promptName,
+              commandKey: ref.commandKey,
+              invokingMessageId,
+              ...(prompt.description !== undefined ? { description: prompt.description } : {}),
+            },
+          });
+        } catch (error) {
+          // Cancellation is handled by cancelBeforeAcceptance after this returns.
+          if (cancelSignal?.aborted) return null;
+          // A slash-invoked prompt was explicitly selected; sending the turn
+          // without its expansion would silently change what the user asked
+          // for. Inline references degrade to the authored text instead.
+          if (ref.source === "slash") {
+            throw new Error(
+              `Cannot expand MCP prompt '${ref.serverName}/${ref.promptName}': ${getErrorMessage(error)}`
+            );
+          }
+          log.debug("Failed to materialize MCP prompt reference", {
+            workspaceId: this.workspaceId,
+            serverName: ref.serverName,
+            promptName: ref.promptName,
+            error: getErrorMessage(error),
+          });
+          return null;
+        }
+      })
+    );
+    return snapshots.filter((snapshot): snapshot is MuxMessage => snapshot !== null);
   }
 
   private async materializeAgentSkillSnapshots(

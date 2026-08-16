@@ -105,6 +105,7 @@ import {
   MCPAddGlobalParamsSchema,
   MCPAddParamsSchema,
   MCPListParamsSchema,
+  MCPPromptDescriptorSchema,
   MCPRemoveGlobalParamsSchema,
   MCPRemoveParamsSchema,
   MCPServerMapSchema,
@@ -1843,6 +1844,12 @@ export const workspace = {
     get: {
       input: z.object({ workspaceId: z.string() }),
       output: WorkspaceMCPOverridesSchema,
+    },
+    prompts: {
+      list: {
+        input: z.object({ workspaceId: z.string() }),
+        output: z.array(MCPPromptDescriptorSchema),
+      },
     },
     set: {
       input: z.object({

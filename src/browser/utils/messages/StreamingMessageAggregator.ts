@@ -4,9 +4,14 @@ import type {
   DisplayedMessage,
   CompactionRequestData,
   InlineSkillSnapshotMap,
-  AgentSkillReference,
 } from "@/common/types/message";
-import { createMuxMessage, isCompactionSummaryMetadata } from "@/common/types/message";
+import {
+  createMuxMessage,
+  getMcpPromptReferenceKey,
+  isCompactionSummaryMetadata,
+  sanitizeAgentSkillRefs,
+  sanitizeMcpPromptRefs,
+} from "@/common/types/message";
 
 import {
   copyStreamLifecycleSnapshot,
@@ -346,6 +351,27 @@ interface AgentSkillSnapshotContent {
   body?: string;
 }
 
+interface MCPPromptSnapshotContent {
+  serverName: string;
+  promptName: string;
+  commandKey: string;
+  invokingMessageId?: string;
+  description?: string;
+  body: string;
+}
+
+function maybeCollectMcpPromptSnapshot(
+  message: MuxMessage,
+  snapshots: Map<string, MCPPromptSnapshotContent>
+): void {
+  const metadata = message.metadata?.mcpPromptSnapshot;
+  if (!metadata) return;
+  snapshots.set(getMcpPromptReferenceKey(metadata.serverName, metadata.promptName), {
+    ...metadata,
+    body: getTextPartContent(message.parts),
+  });
+}
+
 interface InlineSkillSnapshotDisplayState {
   snapshots?: InlineSkillSnapshotMap;
   cacheKey?: string;
@@ -392,61 +418,52 @@ function maybeCollectAgentSkillSnapshot(
   });
 }
 
-function isAgentSkillReferenceArray(
-  refs: readonly AgentSkillReference[] | undefined
-): refs is readonly AgentSkillReference[] {
-  return Array.isArray(refs);
-}
-
 function deriveInlineSkillSnapshotDisplayState(
-  refs: readonly AgentSkillReference[] | undefined,
-  latestAgentSkillSnapshotByKey: ReadonlyMap<string, AgentSkillSnapshotContent>
+  messageId: string,
+  rawRefs: unknown,
+  latestAgentSkillSnapshotByKey: ReadonlyMap<string, AgentSkillSnapshotContent>,
+  rawMcpRefs: unknown,
+  latestMcpPromptSnapshotByKey: ReadonlyMap<string, MCPPromptSnapshotContent>
 ): InlineSkillSnapshotDisplayState {
-  if (!isAgentSkillReferenceArray(refs) || refs.length === 0) {
-    return {};
-  }
-
   const snapshotsBySkillName: InlineSkillSnapshotMap = {};
   const cacheEntryBySkillName = new Map<string, string>();
 
-  for (const ref of refs) {
-    if (ref.source !== "inline") {
-      continue;
-    }
-
+  for (const ref of sanitizeAgentSkillRefs(rawRefs)) {
+    if (ref.source !== "inline") continue;
     const snapshot = latestAgentSkillSnapshotByKey.get(
       getAgentSkillSnapshotKey(ref.scope, ref.skillName)
     );
     if (!snapshot || (snapshot.frontmatterYaml === undefined && snapshot.body === undefined)) {
       continue;
     }
-
     snapshotsBySkillName[ref.skillName] = {
       skillName: ref.skillName,
       scope: ref.scope,
-      snapshot: {
-        frontmatterYaml: snapshot.frontmatterYaml,
-        body: snapshot.body,
-      },
+      snapshot: { frontmatterYaml: snapshot.frontmatterYaml, body: snapshot.body },
     };
-    cacheEntryBySkillName.set(
-      ref.skillName,
-      JSON.stringify({
-        scope: ref.scope,
-        skillName: ref.skillName,
-        snapshot: getAgentSkillSnapshotDisplayCacheKey(snapshot),
-      })
+    cacheEntryBySkillName.set(ref.skillName, getAgentSkillSnapshotDisplayCacheKey(snapshot));
+  }
+
+  for (const ref of sanitizeMcpPromptRefs(rawMcpRefs)) {
+    if (ref.source !== "inline") continue;
+    const snapshot = latestMcpPromptSnapshotByKey.get(
+      getMcpPromptReferenceKey(ref.serverName, ref.promptName)
     );
+    // Same exact-correlation rule as the slash surface (crash orphans).
+    if (snapshot?.invokingMessageId !== messageId) continue;
+    snapshotsBySkillName[ref.commandKey] = {
+      skillName: ref.commandKey,
+      scope: "built-in",
+      snapshot: { body: snapshot.body },
+    };
+    cacheEntryBySkillName.set(ref.commandKey, snapshot.body);
   }
 
-  if (cacheEntryBySkillName.size === 0) {
-    return {};
-  }
-
+  if (cacheEntryBySkillName.size === 0) return {};
   return {
     snapshots: snapshotsBySkillName,
     cacheKey: Array.from(cacheEntryBySkillName.entries())
-      .sort(([leftSkillName], [rightSkillName]) => leftSkillName.localeCompare(rightSkillName))
+      .sort(([leftName], [rightName]) => leftName.localeCompare(rightName))
       .map(([, cacheEntry]) => cacheEntry)
       .join("\n"),
   };
@@ -3531,11 +3548,18 @@ export class StreamingMessageAggregator {
         ((message.metadata?.synthetic === true && message.metadata?.uiVisible !== true) ||
           isWorkflowResultMessage(message));
 
-      // Synthetic agent-skill snapshot messages are hidden from the transcript unless
-      // debugLlmRequest is enabled. We still want to surface their content in the UI by
-      // attaching the resolved snapshot (frontmatterYaml + body) to subsequent user
-      // messages that reference skills via /{skillName} or inline $skillName tokens.
+      // Retain hidden snapshots so referenced user messages can display their resolved content.
       const latestAgentSkillSnapshotByKey = new Map<string, AgentSkillSnapshotContent>();
+      // MCP prompt snapshots are re-materialized per turn and may fail, so a user
+      // row only sees the contiguous snapshot block directly before it; a
+      // history-wide map would falsely attach an older turn's expansion.
+      const blockMcpPromptSnapshotByKey = new Map<string, MCPPromptSnapshotContent>();
+      const isSyntheticSnapshotRow = (message: MuxMessage): boolean =>
+        message.metadata?.synthetic === true &&
+        (message.metadata.mcpPromptSnapshot !== undefined ||
+          message.metadata.agentSkillSnapshot !== undefined ||
+          message.metadata.fileAtMentionSnapshot !== undefined);
+      let previousWasSnapshotRow = true;
 
       // Pair completed subagent cards with the assistant response to their prior progress turn.
       // Persisted anchors improve within-response precision, but historical correctness must not
@@ -3546,7 +3570,10 @@ export class StreamingMessageAggregator {
       );
 
       for (const message of allMessages) {
+        if (!previousWasSnapshotRow) blockMcpPromptSnapshotByKey.clear();
+        previousWasSnapshotRow = isSyntheticSnapshotRow(message);
         maybeCollectAgentSkillSnapshot(message, latestAgentSkillSnapshotByKey);
+        maybeCollectMcpPromptSnapshot(message, blockMcpPromptSnapshotByKey);
         // Synthetic messages are typically for model context only.
         // Show them only in debug mode, or when explicitly marked as UI-visible.
         if (shouldHideMessageFromTranscript(message)) {
@@ -3562,20 +3589,40 @@ export class StreamingMessageAggregator {
         const agentSkillSnapshot = agentSkillSnapshotKey
           ? latestAgentSkillSnapshotByKey.get(agentSkillSnapshotKey)
           : undefined;
+        const slashMcpPromptRef =
+          message.role === "user"
+            ? sanitizeMcpPromptRefs(muxMeta?.mcpPromptRefs).find((ref) => ref.source === "slash")
+            : undefined;
+        const mcpPromptSnapshotCandidate = slashMcpPromptRef
+          ? blockMcpPromptSnapshotByKey.get(
+              getMcpPromptReferenceKey(slashMcpPromptRef.serverName, slashMcpPromptRef.promptName)
+            )
+          : undefined;
+        // Prompt identity alone can attach a crash-orphaned expansion to a
+        // later same-prompt turn; require the exact invoking row.
+        const mcpPromptSnapshot =
+          mcpPromptSnapshotCandidate?.invokingMessageId === message.id
+            ? mcpPromptSnapshotCandidate
+            : undefined;
 
         const agentSkillSnapshotForDisplay = agentSkillSnapshot
           ? { frontmatterYaml: agentSkillSnapshot.frontmatterYaml, body: agentSkillSnapshot.body }
-          : undefined;
+          : mcpPromptSnapshot
+            ? { body: mcpPromptSnapshot.body }
+            : undefined;
 
         const agentSkillSnapshotCacheKey = agentSkillSnapshot
           ? getAgentSkillSnapshotDisplayCacheKey(agentSkillSnapshot)
-          : undefined;
+          : mcpPromptSnapshot?.body;
 
         const inlineSkillSnapshotState =
           message.role === "user"
             ? deriveInlineSkillSnapshotDisplayState(
+                message.id,
                 muxMeta?.agentSkillRefs,
-                latestAgentSkillSnapshotByKey
+                latestAgentSkillSnapshotByKey,
+                muxMeta?.mcpPromptRefs,
+                blockMcpPromptSnapshotByKey
               )
             : undefined;
         const inlineSkillSnapshotsCacheKey = inlineSkillSnapshotState?.cacheKey;
