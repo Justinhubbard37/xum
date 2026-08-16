@@ -1,6 +1,11 @@
 import type React from "react";
 import { normalizeAttachmentMediaType } from "@/common/utils/attachments/supportedAttachmentMediaTypes";
 import { KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
+import {
+  downloadBlob,
+  downloadViaAnchor,
+  isIosStandaloneWebApp,
+} from "@/browser/utils/downloadFile";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 
 /**
@@ -128,12 +133,22 @@ export function handleImageActionKeyDown(
   return false;
 }
 
-/** Trigger a browser download of a data URL via a temporary anchor element. */
+/**
+ * Trigger a download of a data URL. iOS home-screen web apps drop anchor
+ * downloads, so only there the payload is decoded into a Blob for the share
+ * sheet; everywhere else the anchor uses the data URL directly, avoiding a
+ * synchronous base64 decode of potentially multi-MB attachments.
+ */
 export function downloadDataUrl(dataUrl: string, filename: string): void {
-  const anchor = document.createElement("a");
-  anchor.href = dataUrl;
-  anchor.download = filename;
-  document.body.appendChild(anchor);
-  anchor.click();
-  document.body.removeChild(anchor);
+  if (isIosStandaloneWebApp()) {
+    const blob = dataUrlToBlob(dataUrl);
+    if (blob) {
+      // downloadBlob alerts the user on failure itself, so fire-and-forget
+      // cannot silently drop the download.
+      void downloadBlob(blob, filename);
+      return;
+    }
+  }
+
+  downloadViaAnchor(dataUrl, filename);
 }
