@@ -1,7 +1,11 @@
 import { tool } from "ai";
 
 import { getErrorMessage } from "@/common/utils/errors";
-import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
+import type {
+  ToolConfiguration,
+  ToolFactory,
+  ToolWorkflowService,
+} from "@/common/utils/tools/tools";
 import { WorkflowRunRecordSchema } from "@/common/orpc/schemas";
 import {
   isActiveWorkflowRunStatus,
@@ -32,7 +36,7 @@ const WORKFLOW_STOPPED_NOTE =
  * (whose contract says in-progress work is discarded).
  */
 async function interruptWorkflowRun(
-  config: ToolConfiguration,
+  workflowService: ToolWorkflowService | null | undefined,
   workspaceId: string,
   taskId: string,
   options?: {
@@ -41,7 +45,6 @@ async function interruptWorkflowRun(
     onRunInterrupted?: (runId: string) => void;
   }
 ) {
-  const workflowService = config.workflowService;
   if (workflowService?.getRun == null || workflowService.interruptRun == null) {
     return {
       status: "error" as const,
@@ -140,15 +143,14 @@ async function interruptWorkflowRunsOwnedByAgentTaskTree(
         task.status === "awaiting_report")
   );
 
-  const workflowService = config.workflowService;
-  if (workflowService?.listRuns == null || workflowService.interruptRun == null) {
-    return activeWorkflowOwnedDescendants.length > 0
-      ? "Workflow service not available to stop workflow-owned descendants"
-      : null;
-  }
-
   let activeRunCount = 0;
   for (const ownerWorkspaceId of [taskId, ...userOwnedTaskIds]) {
+    const workflowService =
+      config.workflowServiceForWorkspace?.(ownerWorkspaceId) ??
+      (ownerWorkspaceId === config.workspaceId ? config.workflowService : null);
+    if (workflowService?.listRuns == null || workflowService.interruptRun == null) {
+      return `Workflow service not available for descendant workspace ${ownerWorkspaceId}`;
+    }
     const rawRuns = await workflowService.listRuns({ workspaceId: ownerWorkspaceId });
     for (const rawRun of rawRuns) {
       const parsedRun = WorkflowRunRecordSchema.safeParse(rawRun);
@@ -162,11 +164,16 @@ async function interruptWorkflowRunsOwnedByAgentTaskTree(
       }
 
       activeRunCount += 1;
-      const outcome = await interruptWorkflowRun(config, ownerWorkspaceId, parsedRun.data.id, {
-        deferTaskSweep: true,
-        lockAlreadyHeld: true,
-        onRunInterrupted: (runId) => deferredWorkflowRunIds.push(runId),
-      });
+      const outcome = await interruptWorkflowRun(
+        workflowService,
+        ownerWorkspaceId,
+        parsedRun.data.id,
+        {
+          deferTaskSweep: true,
+          lockAlreadyHeld: true,
+          onRunInterrupted: (runId) => deferredWorkflowRunIds.push(runId),
+        }
+      );
       if (outcome.status === "stopped") {
         deferredWorkflowRunIds.push(parsedRun.data.id);
       }
@@ -226,7 +233,7 @@ export const createTaskStopTool: ToolFactory = (config: ToolConfiguration) => {
           const terminationPromise = (async () => {
             try {
               if (isWorkflowRunTaskId(taskId)) {
-                return await interruptWorkflowRun(config, workspaceId, taskId);
+                return await interruptWorkflowRun(config.workflowService, workspaceId, taskId);
               }
 
               if (isWorkspaceTurnTaskId(taskId)) {

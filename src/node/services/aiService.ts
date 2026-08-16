@@ -2190,6 +2190,41 @@ export class AIService extends EventEmitter {
       });
       const getWorkflowProjectTrusted = () => isWorkspaceProjectTrusted(this.config, metadata);
 
+      const createWorkflowLifecycleService = (ownerWorkspaceId: string) =>
+        new WorkflowService({
+          runStore: new WorkflowRunStore({
+            sessionDir: this.config.getSessionDir(ownerWorkspaceId),
+          }),
+          onRunStatusChanged: async (event) => {
+            if (!isTerminalWorkflowRunStatus(event.status)) {
+              await this.taskService?.resetWorkflowRunTerminalAttention({
+                ownerWorkspaceId: event.workspaceId,
+                runId: event.runId,
+              });
+            }
+            await this.onWorkflowRunStatusChanged?.(event);
+          },
+          runtimeFactory: new QuickJSRuntimeFactory(),
+          withRunStartLock: (lockedWorkspaceId, operation) =>
+            this.taskService!.withWorkspaceOwnedWorkStartLock(lockedWorkspaceId, operation),
+          taskAdapterFactory: (runId, workflowName) =>
+            new WorkflowTaskServiceAdapter({
+              taskService: this.taskService!,
+              parentWorkspaceId: ownerWorkspaceId,
+              workflowRunId: runId,
+              workflowName,
+              defaultAgentId: DEFAULT_WORKFLOW_AGENT_ID,
+              cleanupWorkspaceBackgroundProcesses: (taskWorkspaceId) =>
+                this.cleanupWorkspaceBackgroundProcesses(taskWorkspaceId),
+              experiments: {
+                ...experiments,
+                dynamicWorkflows: dynamicWorkflowsExperimentEnabled,
+                workspaceHeartbeats: workspaceHeartbeatsExperimentEnabled,
+              },
+            }),
+          runnerId: `workflow-runner:${ownerWorkspaceId}`,
+        });
+
       const workflowService =
         dynamicWorkflowsExperimentEnabled && this.taskService != null
           ? new WorkflowService({
@@ -2503,6 +2538,13 @@ export class AIService extends EventEmitter {
         muxScope,
         timelineService: timelineExperimentEnabled ? this.timelineService : undefined,
         workspaceHeartbeatService: this.workspaceHeartbeatService,
+        workflowServiceForWorkspace:
+          workflowService != null
+            ? (ownerWorkspaceId) =>
+                ownerWorkspaceId === workspaceId
+                  ? workflowService
+                  : createWorkflowLifecycleService(ownerWorkspaceId)
+            : undefined,
         workflowService,
         goalService: workspaceGoalService,
         goalDefaults: effectiveGoalDefaults,

@@ -324,27 +324,37 @@ describe("task_stop tool", () => {
         return Promise.resolve();
       }),
     } as unknown as TaskService;
+    const childWorkflowService = {
+      listRuns: mock(() => Promise.resolve([workflowRun])),
+      getRun: mock(() => Promise.resolve(workflowRun)),
+      interruptRun: mock(
+        (input: {
+          deferTaskSweep?: boolean;
+          lockAlreadyHeld?: boolean;
+          onRunInterrupted?: (runId: string) => void;
+        }) => {
+          expect(input.deferTaskSweep).toBe(true);
+          expect(input.lockAlreadyHeld).toBe(true);
+          input.onRunInterrupted?.("wfr_run_1");
+          input.onRunInterrupted?.("wfr_nested");
+          events.push("workflow");
+          return Promise.resolve({ ...workflowRun, status: "interrupted" });
+        }
+      ),
+    };
+    const workflowServiceForWorkspace = mock((ownerWorkspaceId: string) => {
+      expect(ownerWorkspaceId).toBe("child-task");
+      return childWorkflowService;
+    });
     const tool = createTaskStopTool({
       ...baseConfig,
       taskService,
       workflowService: {
-        listRuns: mock(() => Promise.resolve([workflowRun])),
-        getRun: mock(() => Promise.resolve(workflowRun)),
-        interruptRun: mock(
-          (input: {
-            deferTaskSweep?: boolean;
-            lockAlreadyHeld?: boolean;
-            onRunInterrupted?: (runId: string) => void;
-          }) => {
-            expect(input.deferTaskSweep).toBe(true);
-            expect(input.lockAlreadyHeld).toBe(true);
-            input.onRunInterrupted?.("wfr_run_1");
-            input.onRunInterrupted?.("wfr_nested");
-            events.push("workflow");
-            return Promise.resolve({ ...workflowRun, status: "interrupted" });
-          }
-        ),
+        listRuns: mock(() => {
+          throw new Error("Parent workflow store must not be used for child-owned runs");
+        }),
       },
+      workflowServiceForWorkspace,
     });
 
     expect(
@@ -352,6 +362,7 @@ describe("task_stop tool", () => {
     ).toEqual({
       results: [{ status: "stopped", taskId: "child-task", stoppedTaskIds: ["child-task"] }],
     });
+    expect(workflowServiceForWorkspace).toHaveBeenCalledWith("child-task");
     expect(events).toEqual(["workflow", "task", "sweep:wfr_run_1", "sweep:wfr_nested"]);
   });
 
