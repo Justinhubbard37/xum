@@ -124,6 +124,33 @@ describe("task_stop tool", () => {
     });
   });
 
+  it("stops ordinary task trees when dynamic workflow services are unavailable", async () => {
+    using tempDir = new TestTempDir("test-task-stop-without-workflow-service");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });
+    const taskService = {
+      listDescendantAgentTasks: mock(() => [
+        { taskId: "ordinary-grandchild", status: "running" as const },
+      ]),
+      stopDescendantAgentTask: mock(
+        (): Promise<Result<{ stoppedTaskIds: string[] }, string>> =>
+          Promise.resolve(Ok({ stoppedTaskIds: ["ordinary-grandchild", "ordinary-child"] }))
+      ),
+    } as unknown as TaskService;
+    const tool = createTaskStopTool({ ...baseConfig, taskService });
+
+    expect(
+      await Promise.resolve(tool.execute!({ task_ids: ["ordinary-child"] }, mockToolCallOptions))
+    ).toEqual({
+      results: [
+        {
+          status: "stopped",
+          taskId: "ordinary-child",
+          stoppedTaskIds: ["ordinary-grandchild", "ordinary-child"],
+        },
+      ],
+    });
+  });
+
   it("returns an interrupted error promptly while completed task IDs still resolve", async () => {
     using tempDir = new TestTempDir("test-task-terminate-abort");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });
@@ -306,7 +333,14 @@ describe("task_stop tool", () => {
         (_taskId: string, options?: { excludeWorkflowTasks?: boolean }) =>
           options?.excludeWorkflowTasks === true
             ? []
-            : [{ taskId: "workflow-worker", status: "running" as const }]
+            : [
+                {
+                  taskId: "workflow-worker",
+                  status: "running" as const,
+                  workflowRunId: "wfr_run_1",
+                  workflowOwnerWorkspaceId: "child-task",
+                },
+              ]
       ),
       isDescendantAgentTask: mock(() => Promise.resolve(true)),
       isWorkflowOwnedDescendantAgentTask: mock(() => Promise.resolve(false)),
@@ -384,6 +418,80 @@ describe("task_stop tool", () => {
       "sweep:wfr_run_1",
       "sweep:wfr_worker",
     ]);
+  });
+
+  it("does not let a healthy workflow run mask an orphaned active workflow worker", async () => {
+    using tempDir = new TestTempDir("test-task-stop-orphaned-workflow-worker");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });
+    const healthyRun = { ...buildWorkflowRun("running"), id: "wfr_healthy", workspaceId: "child" };
+    const stopDescendantAgentTask = mock(
+      async (
+        _workspaceId: string,
+        _taskId: string,
+        options?: { beforeStop?: () => Promise<string | null> }
+      ): Promise<Result<{ stoppedTaskIds: string[] }, string>> => {
+        const error = await options?.beforeStop?.();
+        return error == null ? Ok({ stoppedTaskIds: ["child"] }) : Err(error);
+      }
+    );
+    const taskService = {
+      listDescendantAgentTasks: mock(
+        (_taskId: string, options?: { excludeWorkflowTasks?: boolean }) =>
+          options?.excludeWorkflowTasks === true
+            ? []
+            : [
+                {
+                  taskId: "healthy-worker",
+                  status: "running" as const,
+                  workflowRunId: "wfr_healthy",
+                  workflowOwnerWorkspaceId: "child",
+                },
+                {
+                  taskId: "orphan-worker",
+                  status: "running" as const,
+                  workflowRunId: "wfr_missing",
+                  workflowOwnerWorkspaceId: "child",
+                },
+              ]
+      ),
+      stopDescendantAgentTask,
+    } as unknown as TaskService;
+    const ownerWorkflowService = {
+      listRuns: mock(() => Promise.resolve([healthyRun])),
+      getRun: mock((input: { runId: string }) =>
+        Promise.resolve(input.runId === "wfr_healthy" ? healthyRun : null)
+      ),
+      interruptRun: mock((input: { onRunInterrupted?: (runId: string) => void }) => {
+        input.onRunInterrupted?.("wfr_healthy");
+        return Promise.resolve({ ...healthyRun, status: "interrupted" });
+      }),
+    };
+    const emptyWorkflowService = {
+      listRuns: mock(() => Promise.resolve([])),
+      getRun: mock(() => Promise.resolve(null)),
+      interruptRun: mock(() => Promise.resolve(null)),
+    };
+    const tool = createTaskStopTool({
+      ...baseConfig,
+      taskService,
+      workflowServiceForWorkspace: (ownerWorkspaceId) =>
+        ownerWorkspaceId === "child" ? ownerWorkflowService : emptyWorkflowService,
+    });
+
+    expect(
+      await Promise.resolve(tool.execute!({ task_ids: ["child"] }, mockToolCallOptions))
+    ).toEqual({
+      results: [
+        {
+          status: "error",
+          taskId: "child",
+          error:
+            "Owning workflow run wfr_missing for active descendant orphan-worker is missing or unreadable",
+        },
+      ],
+    });
+    expect(ownerWorkflowService.interruptRun).toHaveBeenCalledTimes(1);
+    expect(stopDescendantAgentTask).toHaveBeenCalledTimes(1);
   });
 
   it("does not start termination when the signal is already aborted", async () => {

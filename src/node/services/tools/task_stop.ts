@@ -132,8 +132,9 @@ async function interruptWorkflowRunsOwnedByAgentTaskTree(
   }
 
   const descendants = listDescendants(taskId);
-  const userOwnedDescendants = listDescendants(taskId, { excludeWorkflowTasks: true });
-  const userOwnedTaskIds = new Set(userOwnedDescendants.map((task) => task.taskId));
+  const userOwnedTaskIds = new Set(
+    listDescendants(taskId, { excludeWorkflowTasks: true }).map((task) => task.taskId)
+  );
   const activeWorkflowOwnedDescendants = descendants.filter(
     (task) =>
       !userOwnedTaskIds.has(task.taskId) &&
@@ -142,14 +143,53 @@ async function interruptWorkflowRunsOwnedByAgentTaskTree(
         task.status === "running" ||
         task.status === "awaiting_report")
   );
-
-  let activeRunCount = 0;
-  for (const ownerWorkspaceId of [taskId, ...descendants.map((task) => task.taskId)]) {
-    const workflowService =
+  const workflowServices = new Map<string, ToolWorkflowService | null>();
+  const resolveWorkflowService = (ownerWorkspaceId: string): ToolWorkflowService | null => {
+    if (workflowServices.has(ownerWorkspaceId)) {
+      return workflowServices.get(ownerWorkspaceId) ?? null;
+    }
+    const service =
       config.workflowServiceForWorkspace?.(ownerWorkspaceId) ??
-      (ownerWorkspaceId === config.workspaceId ? config.workflowService : null);
+      (ownerWorkspaceId === config.workspaceId ? config.workflowService : null) ??
+      null;
+    workflowServices.set(ownerWorkspaceId, service);
+    return service;
+  };
+  const interruptedRunKeys = new Set<string>();
+  const interruptOwnedRun = async (
+    ownerWorkspaceId: string,
+    runId: string,
+    workflowService: ToolWorkflowService
+  ): Promise<string | null> => {
+    const runKey = `${ownerWorkspaceId}\u0000${runId}`;
+    if (interruptedRunKeys.has(runKey)) {
+      return null;
+    }
+    const outcome = await interruptWorkflowRun(workflowService, ownerWorkspaceId, runId, {
+      deferTaskSweep: true,
+      lockAlreadyHeld: true,
+      onRunInterrupted: (interruptedRunId) => deferredWorkflowRunIds.push(interruptedRunId),
+    });
+    if (outcome.status === "error") {
+      return outcome.error;
+    }
+    if (outcome.status === "not_found") {
+      return `Workflow run ${runId} disappeared before it could be stopped`;
+    }
+    interruptedRunKeys.add(runKey);
+    if (outcome.status === "stopped") {
+      deferredWorkflowRunIds.push(runId);
+    }
+    return null;
+  };
+
+  // A descendant workspace may own an independent background workflow even when that workspace is
+  // itself workflow-owned. Scan every resolvable descendant session, but do not require workflow
+  // services for ordinary task trees when dynamic workflows are unavailable.
+  for (const ownerWorkspaceId of [taskId, ...descendants.map((task) => task.taskId)]) {
+    const workflowService = resolveWorkflowService(ownerWorkspaceId);
     if (workflowService?.listRuns == null || workflowService.interruptRun == null) {
-      return `Workflow service not available for descendant workspace ${ownerWorkspaceId}`;
+      continue;
     }
     const rawRuns = await workflowService.listRuns({ workspaceId: ownerWorkspaceId });
     for (const rawRun of rawRuns) {
@@ -162,33 +202,42 @@ async function interruptWorkflowRunsOwnedByAgentTaskTree(
       ) {
         continue;
       }
-
-      activeRunCount += 1;
-      const outcome = await interruptWorkflowRun(
-        workflowService,
-        ownerWorkspaceId,
-        parsedRun.data.id,
-        {
-          deferTaskSweep: true,
-          lockAlreadyHeld: true,
-          onRunInterrupted: (runId) => deferredWorkflowRunIds.push(runId),
-        }
-      );
-      if (outcome.status === "stopped") {
-        deferredWorkflowRunIds.push(parsedRun.data.id);
-      }
-      if (outcome.status === "error") {
-        return outcome.error;
-      }
-      if (outcome.status === "not_found") {
-        return `Workflow run ${parsedRun.data.id} disappeared before it could be stopped`;
-      }
+      const error = await interruptOwnedRun(ownerWorkspaceId, parsedRun.data.id, workflowService);
+      if (error != null) return error;
     }
   }
 
-  if (activeWorkflowOwnedDescendants.length > 0 && activeRunCount === 0) {
-    return "Active workflow-owned descendants have no active owning workflow run";
+  // Correlate each still-active workflow worker to its exact owning run. A healthy run elsewhere in
+  // the tree must not mask a missing, unreadable, or already-terminal owner for this worker.
+  for (const worker of activeWorkflowOwnedDescendants) {
+    const ownerWorkspaceId = worker.workflowOwnerWorkspaceId;
+    const runId = worker.workflowRunId;
+    if (ownerWorkspaceId == null || runId == null) {
+      return `Active workflow-owned descendant ${worker.taskId} is missing workflow ownership metadata`;
+    }
+    const runKey = `${ownerWorkspaceId}\u0000${runId}`;
+    if (interruptedRunKeys.has(runKey)) {
+      continue;
+    }
+    const workflowService = resolveWorkflowService(ownerWorkspaceId);
+    if (workflowService?.getRun == null || workflowService.interruptRun == null) {
+      return `Workflow service not available for active workflow-owned descendant ${worker.taskId}`;
+    }
+    const rawRun = await workflowService.getRun({ workspaceId: ownerWorkspaceId, runId });
+    const parsedRun = WorkflowRunRecordSchema.safeParse(rawRun);
+    if (!parsedRun.success) {
+      return `Owning workflow run ${runId} for active descendant ${worker.taskId} is missing or unreadable`;
+    }
+    if (
+      !isActiveWorkflowRunStatus(parsedRun.data.status) &&
+      parsedRun.data.status !== "interrupted"
+    ) {
+      return `Owning workflow run ${runId} for active descendant ${worker.taskId} is already ${parsedRun.data.status}`;
+    }
+    const error = await interruptOwnedRun(ownerWorkspaceId, runId, workflowService);
+    if (error != null) return error;
   }
+
   return null;
 }
 

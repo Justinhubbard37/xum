@@ -14098,9 +14098,18 @@ describe("TaskService", () => {
     const { workspaceService } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
 
-    expect(
-      new Set(taskService.listDescendantAgentTasks(rootWorkspaceId).map((task) => task.taskId))
-    ).toEqual(new Set([regularTaskId, workflowChildTaskId, workflowTaskId]));
+    const descendants = taskService.listDescendantAgentTasks(rootWorkspaceId);
+    expect(new Set(descendants.map((task) => task.taskId))).toEqual(
+      new Set([regularTaskId, workflowChildTaskId, workflowTaskId])
+    );
+    expect(descendants.find((task) => task.taskId === workflowTaskId)).toMatchObject({
+      workflowRunId: "wfr_target",
+      workflowOwnerWorkspaceId: rootWorkspaceId,
+    });
+    expect(descendants.find((task) => task.taskId === workflowChildTaskId)).toMatchObject({
+      workflowRunId: "wfr_target",
+      workflowOwnerWorkspaceId: rootWorkspaceId,
+    });
     expect(
       taskService
         .listDescendantAgentTasks(rootWorkspaceId, {

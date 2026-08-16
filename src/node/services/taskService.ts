@@ -614,6 +614,10 @@ export interface DescendantAgentTaskInfo {
   executionStatus?: WorkspaceTurnTaskStatus;
   modelString?: string;
   thinkingLevel?: ThinkingLevel;
+  /** Effective owning workflow run for this task branch, inherited through workflow ancestry. */
+  workflowRunId?: string;
+  /** Workspace session that persists the effective owning workflow run. */
+  workflowOwnerWorkspaceId?: string;
   depth: number;
 }
 
@@ -8768,6 +8772,9 @@ export class TaskService {
       );
 
       const workflowOwned = next.workflowOwned || entry.workflowTask != null;
+      const workflowOwner = workflowOwned
+        ? this.findWorkflowTaskOwnerInAncestry(index, next.taskId)
+        : null;
       const status: AgentTaskStatus = entry.taskStatus ?? "running";
       if (
         (!statusFilter || statusFilter.has(status)) &&
@@ -8783,6 +8790,14 @@ export class TaskService {
           createdAt: entry.createdAt,
           executionTaskId: entry.taskExecutionId,
           executionStatus: entry.taskExecutionStatus,
+          ...(workflowOwner != null
+            ? {
+                workflowRunId: workflowOwner.workflowTask.runId,
+                ...(workflowOwner.workspace.parentWorkspaceId != null
+                  ? { workflowOwnerWorkspaceId: workflowOwner.workspace.parentWorkspaceId }
+                  : {}),
+              }
+            : {}),
           modelString: entry.aiSettings?.model,
           thinkingLevel: entry.aiSettings?.thinkingLevel,
           depth: next.depth,

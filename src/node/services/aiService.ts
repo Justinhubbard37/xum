@@ -2539,9 +2539,9 @@ export class AIService extends EventEmitter {
         timelineService: timelineExperimentEnabled ? this.timelineService : undefined,
         workspaceHeartbeatService: this.workspaceHeartbeatService,
         workflowServiceForWorkspace:
-          workflowService != null
+          this.taskService != null
             ? (ownerWorkspaceId) =>
-                ownerWorkspaceId === workspaceId
+                ownerWorkspaceId === workspaceId && workflowService != null
                   ? workflowService
                   : createWorkflowLifecycleService(ownerWorkspaceId)
             : undefined,
