@@ -13380,6 +13380,45 @@ describe("TaskService", () => {
     ).toEqual(Err({ code: "not_found" }));
   });
 
+  test("removeInactiveDescendantAgentTask removes archived workflow-owned descendants with their user-owned parent", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const ownerWorkspaceId = "owner-remove-archived-workflow";
+    const parentTaskId = "parent-remove-archived-workflow";
+    const workflowTaskId = "workflow-remove-archived-child";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "owner", ownerWorkspaceId),
+        projectWorkspace(projectPath, "parent", parentTaskId, {
+          parentWorkspaceId: ownerWorkspaceId,
+          taskStatus: "reported",
+        }),
+        projectWorkspace(projectPath, "workflow-child", workflowTaskId, {
+          parentWorkspaceId: parentTaskId,
+          taskStatus: "interrupted",
+          workflowTask: { runId: "wfr_remove_archived", stepId: "worker" },
+          archivedAt: "2026-08-16T00:00:00.000Z",
+        }),
+      ],
+      testTaskSettings()
+    );
+    const remove = mock(async (workspaceId: string): Promise<Result<void>> => {
+      await removeWorkspaceFromTestConfig(config, workspaceId);
+      return Ok(undefined);
+    });
+    const { workspaceService } = createWorkspaceServiceMocks({ remove });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    expect(
+      await taskService.removeInactiveDescendantAgentTask(ownerWorkspaceId, parentTaskId)
+    ).toMatchObject({ success: true, data: { status: "removed", taskId: parentTaskId } });
+    expect(remove.mock.calls.map((call) => call[0])).toEqual([workflowTaskId, parentTaskId]);
+    expect(findWorkspaceInConfig(config, workflowTaskId)).toBeUndefined();
+    expect(findWorkspaceInConfig(config, parentTaskId)).toBeUndefined();
+  });
+
   test("requestAgentFinalReportForTimeout records finalization token only after prompt send succeeds", async () => {
     const config = await createTestConfig(rootDir);
 

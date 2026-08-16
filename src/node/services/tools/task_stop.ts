@@ -144,7 +144,7 @@ async function interruptWorkflowRunsOwnedByAgentTaskTree(
   );
 
   let activeRunCount = 0;
-  for (const ownerWorkspaceId of [taskId, ...userOwnedTaskIds]) {
+  for (const ownerWorkspaceId of [taskId, ...descendants.map((task) => task.taskId)]) {
     const workflowService =
       config.workflowServiceForWorkspace?.(ownerWorkspaceId) ??
       (ownerWorkspaceId === config.workspaceId ? config.workflowService : null);

@@ -8526,6 +8526,60 @@ export class TaskService {
     return Ok(didUnarchive);
   }
 
+  private async removeArchivedWorkflowOwnedDescendantsUnderLifecycleLock(
+    taskId: string
+  ): Promise<Result<void, string>> {
+    const config = this.config.loadConfigOrDefault();
+    const index = this.buildAgentTaskIndex(config);
+    const candidateTaskIds = this.listDescendantAgentTaskIdsFromIndex(index, taskId).filter(
+      (descendantTaskId) => {
+        const descendant = index.byId.get(descendantTaskId);
+        return (
+          descendant != null &&
+          this.isWorkflowOwnedTaskUsingIndex(index, descendantTaskId) &&
+          isWorkspaceArchived(descendant.archivedAt, descendant.unarchivedAt)
+        );
+      }
+    );
+    candidateTaskIds.sort(
+      (left, right) =>
+        this.getTaskDepthFromParentById(index.parentById, right) -
+        this.getTaskDepthFromParentById(index.parentById, left)
+    );
+
+    for (const descendantTaskId of candidateTaskIds) {
+      const freshConfig = this.config.loadConfigOrDefault();
+      const freshIndex = this.buildAgentTaskIndex(freshConfig);
+      const descendant = freshIndex.byId.get(descendantTaskId);
+      if (
+        descendant == null ||
+        !this.isWorkflowOwnedTaskUsingIndex(freshIndex, descendantTaskId) ||
+        !isWorkspaceArchived(descendant.archivedAt, descendant.unarchivedAt)
+      ) {
+        continue;
+      }
+      if (this.isActiveAgentTaskEntry(descendant) || this.aiService.isStreaming(descendantTaskId)) {
+        return Err(`Archived workflow-owned descendant ${descendantTaskId} is still active.`);
+      }
+      if ((freshIndex.childrenByParent.get(descendantTaskId) ?? []).length > 0) {
+        continue;
+      }
+
+      const tombstoneResult = await this.persistRemovedAgentTaskTombstones(descendantTaskId);
+      if (!tombstoneResult.success) {
+        return tombstoneResult;
+      }
+      const removeResult = await this.workspaceService.removeWhileTaskTreeLocked(
+        descendantTaskId,
+        true
+      );
+      if (!removeResult.success) {
+        return Err(removeResult.error);
+      }
+    }
+    return Ok(undefined);
+  }
+
   async removeInactiveDescendantAgentTask(
     ownerWorkspaceId: string,
     taskId: string
@@ -8561,6 +8615,19 @@ export class TaskService {
         workspaceId: taskId,
         ...(displayName != null ? { displayName } : {}),
       };
+      // Workflow-owned workers are hidden from public lifecycle tools, but their archived
+      // workspaces must not permanently block removal of the user-owned parent subtree.
+      const workflowCleanupResult =
+        await this.removeArchivedWorkflowOwnedDescendantsUnderLifecycleLock(taskId);
+      if (!workflowCleanupResult.success) {
+        return Ok({
+          status: "error",
+          action: "remove",
+          ...target,
+          error: workflowCleanupResult.error,
+        });
+      }
+
       const descendantTaskIds = this.listDescendantAgentTasks(taskId).map((task) => task.taskId);
       if (descendantTaskIds.length > 0) {
         return Ok({

@@ -296,6 +296,11 @@ describe("task_stop tool", () => {
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });
     const events: string[] = [];
     const workflowRun = { ...buildWorkflowRun("running"), workspaceId: "child-task" };
+    const workerWorkflowRun = {
+      ...buildWorkflowRun("running"),
+      id: "wfr_worker",
+      workspaceId: "workflow-worker",
+    };
     const taskService = {
       listDescendantAgentTasks: mock(
         (_taskId: string, options?: { excludeWorkflowTasks?: boolean }) =>
@@ -324,27 +329,33 @@ describe("task_stop tool", () => {
         return Promise.resolve();
       }),
     } as unknown as TaskService;
+    const interruptRun =
+      (runId: string, run: ReturnType<typeof buildWorkflowRun>, event: string) =>
+      (input: {
+        deferTaskSweep?: boolean;
+        lockAlreadyHeld?: boolean;
+        onRunInterrupted?: (interruptedRunId: string) => void;
+      }) => {
+        expect(input.deferTaskSweep).toBe(true);
+        expect(input.lockAlreadyHeld).toBe(true);
+        input.onRunInterrupted?.(runId);
+        events.push(event);
+        return Promise.resolve({ ...run, status: "interrupted" });
+      };
     const childWorkflowService = {
       listRuns: mock(() => Promise.resolve([workflowRun])),
       getRun: mock(() => Promise.resolve(workflowRun)),
-      interruptRun: mock(
-        (input: {
-          deferTaskSweep?: boolean;
-          lockAlreadyHeld?: boolean;
-          onRunInterrupted?: (runId: string) => void;
-        }) => {
-          expect(input.deferTaskSweep).toBe(true);
-          expect(input.lockAlreadyHeld).toBe(true);
-          input.onRunInterrupted?.("wfr_run_1");
-          input.onRunInterrupted?.("wfr_nested");
-          events.push("workflow");
-          return Promise.resolve({ ...workflowRun, status: "interrupted" });
-        }
-      ),
+      interruptRun: mock(interruptRun("wfr_run_1", workflowRun, "workflow:child")),
+    };
+    const workerWorkflowService = {
+      listRuns: mock(() => Promise.resolve([workerWorkflowRun])),
+      getRun: mock(() => Promise.resolve(workerWorkflowRun)),
+      interruptRun: mock(interruptRun("wfr_worker", workerWorkflowRun, "workflow:workflow-worker")),
     };
     const workflowServiceForWorkspace = mock((ownerWorkspaceId: string) => {
-      expect(ownerWorkspaceId).toBe("child-task");
-      return childWorkflowService;
+      if (ownerWorkspaceId === "child-task") return childWorkflowService;
+      if (ownerWorkspaceId === "workflow-worker") return workerWorkflowService;
+      throw new Error(`Unexpected workflow owner ${ownerWorkspaceId}`);
     });
     const tool = createTaskStopTool({
       ...baseConfig,
@@ -362,8 +373,17 @@ describe("task_stop tool", () => {
     ).toEqual({
       results: [{ status: "stopped", taskId: "child-task", stoppedTaskIds: ["child-task"] }],
     });
-    expect(workflowServiceForWorkspace).toHaveBeenCalledWith("child-task");
-    expect(events).toEqual(["workflow", "task", "sweep:wfr_run_1", "sweep:wfr_nested"]);
+    expect(workflowServiceForWorkspace.mock.calls.map((call) => call[0])).toEqual([
+      "child-task",
+      "workflow-worker",
+    ]);
+    expect(events).toEqual([
+      "workflow:child",
+      "workflow:workflow-worker",
+      "task",
+      "sweep:wfr_run_1",
+      "sweep:wfr_worker",
+    ]);
   });
 
   it("does not start termination when the signal is already aborted", async () => {
