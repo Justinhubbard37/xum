@@ -636,24 +636,26 @@ export class WorkflowService {
   }
 
   async startWorkflowInBackground(input: StartWorkflowInput): Promise<StartNamedWorkflowResult> {
-    const createdRun = await this.createWorkflowRun({
-      ...input,
-      attentionPolicy: "notify_on_terminal",
+    return await this.withWorkflowRunStartLock(input.workspaceId, async () => {
+      const createdRun = await this.createWorkflowRunUnlocked({
+        ...input,
+        attentionPolicy: "notify_on_terminal",
+      });
+      const runId = createdRun.id;
+      await this.notifyRunStatusChanged(createdRun);
+      await input.onRunCreated?.({ runId, status: "pending", result: null, run: createdRun });
+      const run = await this.runStore.appendStatus(
+        runId,
+        "running",
+        this.clock?.nowIso() ?? new Date().toISOString()
+      );
+      await this.notifyRunStatusChanged(run);
+      await input.onBackgroundRunCreated?.({ runId, status: "running", result: null, run });
+      void this.runInBackground(runId, "Background workflow run failed:", {
+        projectTrusted: input.projectTrusted,
+      }).catch(() => undefined);
+      return { runId, status: "running", result: null };
     });
-    const runId = createdRun.id;
-    await this.notifyRunStatusChanged(createdRun);
-    await input.onRunCreated?.({ runId, status: "pending", result: null, run: createdRun });
-    const run = await this.runStore.appendStatus(
-      runId,
-      "running",
-      this.clock?.nowIso() ?? new Date().toISOString()
-    );
-    await this.notifyRunStatusChanged(run);
-    await input.onBackgroundRunCreated?.({ runId, status: "running", result: null, run });
-    void this.runInBackground(runId, "Background workflow run failed:", {
-      projectTrusted: input.projectTrusted,
-    }).catch(() => undefined);
-    return { runId, status: "running", result: null };
   }
 
   async startWorkflow(input: StartWorkflowInput): Promise<StartNamedWorkflowResult> {
@@ -893,6 +895,12 @@ export class WorkflowService {
   }
 
   private async createWorkflowRun(input: StartWorkflowInput): Promise<WorkflowRunRecord> {
+    return await this.withWorkflowRunStartLock(input.workspaceId, async () =>
+      this.createWorkflowRunUnlocked(input)
+    );
+  }
+
+  private async createWorkflowRunUnlocked(input: StartWorkflowInput): Promise<WorkflowRunRecord> {
     assert(
       input.workspaceId.length > 0,
       "WorkflowService.createWorkflowRun: workspaceId is required"
@@ -903,19 +911,15 @@ export class WorkflowService {
     const normalized = normalizeWorkflowArgsForSource(input.script.source, input.args, {
       defaultArgs: input.defaultArgs,
     });
-    const createRun = async () =>
-      await this.runStore.createRun({
-        id: runId,
-        workspaceId: input.workspaceId,
-        workflow: buildWorkflowScriptDescriptor(input.script),
-        source: input.script.source,
-        args: normalized.args,
-        ...(input.attentionPolicy != null ? { attentionPolicy: input.attentionPolicy } : {}),
-        now: this.clock?.nowIso() ?? new Date().toISOString(),
-      });
-    return this.withRunStartLock != null
-      ? await this.withRunStartLock(input.workspaceId, createRun)
-      : await createRun();
+    return await this.runStore.createRun({
+      id: runId,
+      workspaceId: input.workspaceId,
+      workflow: buildWorkflowScriptDescriptor(input.script),
+      source: input.script.source,
+      args: normalized.args,
+      ...(input.attentionPolicy != null ? { attentionPolicy: input.attentionPolicy } : {}),
+      now: this.clock?.nowIso() ?? new Date().toISOString(),
+    });
   }
 
   private async runInBackground(

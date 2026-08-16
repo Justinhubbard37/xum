@@ -363,6 +363,57 @@ export default function workflow() { return { reportMarkdown: "done" }; }
     });
   });
 
+  test("holds the lifecycle lock until a background start is durably running", async () => {
+    using tmp = new DisposableTempDir("workflow-service-background-start-lock");
+    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+    let lockHeld = false;
+    const events: string[] = [];
+    const service = new WorkflowService({
+      runStore,
+      runtimeFactory: new QuickJSRuntimeFactory(),
+      taskAdapter: {
+        async runAgent() {
+          throw new Error("No agent steps expected");
+        },
+      },
+      withRunStartLock: async (_workspaceId, operation) => {
+        lockHeld = true;
+        events.push("lock:start");
+        try {
+          return await operation();
+        } finally {
+          events.push("lock:end");
+          lockHeld = false;
+        }
+      },
+      generateRunId: () => "wfr_background_lock",
+      runnerId: "runner-a",
+    });
+
+    await service.startWorkflowInBackground({
+      script: createScript(
+        `export default function workflow() { return { reportMarkdown: "done" }; }\n`
+      ),
+      workspaceId: "workspace-1",
+      projectTrusted: true,
+      args: {},
+      onRunCreated: ({ status }) => {
+        expect(lockHeld).toBe(true);
+        expect(status).toBe("pending");
+        events.push("created:pending");
+      },
+      onBackgroundRunCreated: ({ status, run }) => {
+        expect(lockHeld).toBe(true);
+        expect(status).toBe("running");
+        expect(run.status).toBe("running");
+        events.push("created:running");
+      },
+    });
+
+    expect(lockHeld).toBe(false);
+    expect(events).toEqual(["lock:start", "created:pending", "created:running", "lock:end"]);
+  });
+
   test("foreground workflows that self-background persist notify_on_terminal policy", async () => {
     using tmp = new DisposableTempDir("workflow-service-self-background-notify");
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
