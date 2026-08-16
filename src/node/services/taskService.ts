@@ -192,6 +192,7 @@ export interface AgentTaskTimestamps {
 }
 
 type WorkspaceLifecycleResult = z.infer<typeof TaskWorkspaceLifecycleToolTargetResultSchema>;
+type RemoveInactiveAgentTaskResult = Exclude<WorkspaceLifecycleResult, { status: "not_found" }>;
 
 export interface TaskCreateArgs {
   parentWorkspaceId: string;
@@ -687,7 +688,7 @@ const WORKSPACE_TURN_STALE_RESTART_ERROR = "Workspace turn interrupted after res
  * Settled workspace-turn records eligible for self-heal correction (resettle from a
  * correlated stream-end, or read-time repair/revive): transient stream-error settlements
  * (status "error") and stale restart-recovery interrupts. Explicit interrupts — user Esc,
- * task_terminate, cancel reasons — must stay terminal even if a late correlated stream-end
+ * task_stop, cancel reasons — must stay terminal even if a late correlated stream-end
  * or same-turn retry evidence arrives, so canceled work never resurfaces as completed.
  */
 function isSelfHealEligibleSettledWorkspaceTurn(
@@ -2093,6 +2094,38 @@ export class TaskService {
       return await this.workspaceTreeLifecycleLocks.withLock(rootId, () => acquire(index + 1));
     };
     return await acquire(0);
+  }
+
+  async withWorkspaceOwnedWorkStartLock<T>(
+    workspaceId: string,
+    operation: () => Promise<T>
+  ): Promise<T> {
+    assert(workspaceId.length > 0, "withWorkspaceOwnedWorkStartLock requires workspaceId");
+    return await this.withTaskTreeLifecycleLock(workspaceId, async () => {
+      {
+        await using _lock = await this.mutex.acquire();
+        const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+        if (
+          entry != null &&
+          isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)
+        ) {
+          throw new Error("Cannot start workflow work from an archived workspace");
+        }
+        if (
+          entry?.workspace.taskStatus === "interrupted" &&
+          !isActiveWorkspaceTurnTaskStatus(entry.workspace.taskExecutionStatus)
+        ) {
+          throw new Error("Cannot start workflow work after task_stop");
+        }
+        if (
+          entry?.workspace.taskStatus === "reported" &&
+          !isActiveWorkspaceTurnTaskStatus(entry.workspace.taskExecutionStatus)
+        ) {
+          throw new Error("Cannot start workflow work after agent_report");
+        }
+      }
+      return await operation();
+    });
   }
 
   private async editWorkspaceEntry(
@@ -4444,7 +4477,10 @@ export class TaskService {
           taskIndex.parentById,
           ancestorWorkspaceId,
           taskId
-        )
+        ) ||
+        // Workflow-owned workers are private implementation details; their lifecycle is consumed
+        // through the owning workflow run rather than direct parent task tools.
+        this.isWorkflowOwnedTaskUsingIndex(taskIndex, taskId)
       ) {
         return Err({ code: "invalid_scope" as const });
       }
@@ -4487,7 +4523,8 @@ export class TaskService {
             taskIndex.parentById,
             ancestorWorkspaceId,
             taskId
-          )
+          ) ||
+          this.isWorkflowOwnedTaskUsingIndex(taskIndex, taskId)
         ) {
           return Err({ code: "invalid_scope" as const });
         }
@@ -4656,14 +4693,46 @@ export class TaskService {
 
   async stopDescendantAgentTask(
     ancestorWorkspaceId: string,
-    taskId: string
+    taskId: string,
+    options?: { beforeStop?: () => Promise<string | null> }
   ): Promise<Result<{ stoppedTaskIds: string[] }, string>> {
     assert(ancestorWorkspaceId.length > 0, "stopDescendantAgentTask: ancestorWorkspaceId required");
     assert(taskId.length > 0, "stopDescendantAgentTask: taskId required");
 
-    return await this.withTaskTreeLifecycleLock(taskId, () =>
-      this.stopDescendantAgentTaskUnderLifecycleLock(ancestorWorkspaceId, taskId)
-    );
+    return await this.withTaskTreeLifecycleLock(taskId, async () => {
+      const scopeResult = await this.validateDirectDescendantAgentTaskScope(
+        ancestorWorkspaceId,
+        taskId
+      );
+      if (!scopeResult.success) {
+        return scopeResult;
+      }
+      const beforeStopError = await options?.beforeStop?.();
+      if (beforeStopError != null) {
+        return Err(beforeStopError);
+      }
+      return await this.stopDescendantAgentTaskUnderLifecycleLock(ancestorWorkspaceId, taskId);
+    });
+  }
+
+  private async validateDirectDescendantAgentTaskScope(
+    ancestorWorkspaceId: string,
+    taskId: string
+  ): Promise<Result<void, string>> {
+    await using _lock = await this.mutex.acquire();
+    const cfg = this.config.loadConfigOrDefault();
+    const entry = findWorkspaceEntry(cfg, taskId);
+    if (!entry?.workspace.parentWorkspaceId) {
+      return Err("Task not found");
+    }
+    const index = this.buildAgentTaskIndex(cfg);
+    if (
+      !this.isDescendantAgentTaskUsingParentById(index.parentById, ancestorWorkspaceId, taskId) ||
+      this.isWorkflowOwnedTaskUsingIndex(index, taskId)
+    ) {
+      return Err("Task is not a descendant of this workspace");
+    }
+    return Ok(undefined);
   }
 
   private async stopDescendantAgentTaskUnderLifecycleLock(
@@ -4682,12 +4751,20 @@ export class TaskService {
       }
       const index = this.buildAgentTaskIndex(cfg);
       if (
-        !this.isDescendantAgentTaskUsingParentById(index.parentById, ancestorWorkspaceId, taskId)
+        !this.isDescendantAgentTaskUsingParentById(index.parentById, ancestorWorkspaceId, taskId) ||
+        this.isWorkflowOwnedTaskUsingIndex(index, taskId)
       ) {
         return Err("Task is not a descendant of this workspace");
       }
 
-      const taskIds = [taskId, ...this.listDescendantAgentTaskIdsFromIndex(index, taskId)];
+      const taskIds = [
+        taskId,
+        ...this.listDescendantAgentTaskIdsFromIndex(index, taskId).filter(
+          // Workflow-owned branches are stopped through WorkflowService so the durable run and
+          // its workers transition together; direct tree stopping must not mutate them behind it.
+          (descendantTaskId) => !this.isWorkflowOwnedTaskUsingIndex(index, descendantTaskId)
+        ),
+      ];
       taskIds.sort(
         (left, right) =>
           this.getTaskDepthFromParentById(index.parentById, right) -
@@ -5139,7 +5216,11 @@ export class TaskService {
    */
   async terminateAllDescendantAgentTasks(
     workspaceId: string,
-    options?: { workflowRunId?: string }
+    options?: {
+      workflowRunId?: string;
+      cleanupWorkspaceBackgroundProcesses?: (workspaceId: string) => Promise<void>;
+      deferWorkflowSweep?: boolean;
+    }
   ): Promise<string[]> {
     assert(
       workspaceId.length > 0,
@@ -5173,6 +5254,18 @@ export class TaskService {
       const interruptionError = new Error("Parent workspace interrupted");
 
       for (const id of descendants) {
+        // Workflow workers can leave long-running bash processes behind even after their AI stream
+        // stops. Cleanup is best-effort: a disposal failure must not leave an interrupted workflow
+        // with agent streams and task statuses still active.
+        try {
+          await options?.cleanupWorkspaceBackgroundProcesses?.(id);
+        } catch (error: unknown) {
+          log.warn("terminateAllDescendantAgentTasks: background cleanup failed", {
+            taskId: id,
+            error: getErrorMessage(error),
+          });
+        }
+
         // Best-effort: clear queue first. AgentSession stream-end cleanup auto-flushes
         // queued messages, so descendants must not keep pending input after a hard interrupt.
         try {
@@ -5245,7 +5338,7 @@ export class TaskService {
       await this.emitWorkspaceMetadata(taskId);
     }
 
-    if (options?.workflowRunId != null) {
+    if (options?.workflowRunId != null && options.deferWorkflowSweep !== true) {
       // Run-scoped interrupts arrive after the owning run's terminal status write
       // (WorkflowService.interruptRun aborts the runner, persists "interrupted", THEN
       // terminates descendants), so the children just interrupted above can be archived
@@ -8313,7 +8406,7 @@ export class TaskService {
   async interruptWorkspaceTurn(
     ownerWorkspaceId: string,
     handleId: string
-  ): Promise<Result<{ workspaceId: string }, string>> {
+  ): Promise<Result<{ workspaceId: string; alreadyInactive?: boolean }, string>> {
     let workspaceId: string | undefined;
     let shouldClearQueuedPrompt = false;
     let shouldStopStream = false;
@@ -8324,8 +8417,12 @@ export class TaskService {
       if (record == null) {
         return Err("Workspace turn not found or out of scope");
       }
-      if (record.status === "completed" || record.status === "error") {
-        return Err(`Workspace turn is already ${record.status} and cannot be interrupted.`);
+      if (
+        record.status === "completed" ||
+        record.status === "error" ||
+        record.status === "interrupted"
+      ) {
+        return Ok({ workspaceId: record.workspaceId, alreadyInactive: true });
       }
 
       workspaceId = record.workspaceId;
@@ -8357,7 +8454,10 @@ export class TaskService {
       return Ok({ workspaceId: record.workspaceId });
     });
 
-    if (!result.success) {
+    if (
+      !result.success ||
+      ("alreadyInactive" in result.data && result.data.alreadyInactive === true)
+    ) {
       return result;
     }
 
@@ -8429,7 +8529,7 @@ export class TaskService {
   async removeInactiveDescendantAgentTask(
     ownerWorkspaceId: string,
     taskId: string
-  ): Promise<Result<WorkspaceLifecycleResult, string>> {
+  ): Promise<Result<RemoveInactiveAgentTaskResult, string>> {
     assert(ownerWorkspaceId.length > 0, "removeInactiveDescendantAgentTask requires owner");
     assert(taskId.length > 0, "removeInactiveDescendantAgentTask requires taskId");
 
@@ -8448,7 +8548,10 @@ export class TaskService {
       }
 
       const index = this.buildAgentTaskIndex(config);
-      if (!this.isDescendantAgentTaskUsingParentById(index.parentById, ownerWorkspaceId, taskId)) {
+      if (
+        !this.isDescendantAgentTaskUsingParentById(index.parentById, ownerWorkspaceId, taskId) ||
+        this.isWorkflowOwnedTaskUsingIndex(index, taskId)
+      ) {
         return Ok({ status: "invalid_scope", action: "remove", taskId });
       }
 

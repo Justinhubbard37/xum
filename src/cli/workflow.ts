@@ -436,6 +436,8 @@ function createWorkflowService(input: {
   return new WorkflowService({
     runStore: new WorkflowRunStore({ sessionDir: workspaceSessionDir }),
     runtimeFactory: new QuickJSRuntimeFactory(),
+    withRunStartLock: (ownerWorkspaceId, operation) =>
+      input.ctx.services.taskService.withWorkspaceOwnedWorkStartLock(ownerWorkspaceId, operation),
     taskAdapterFactory: (runId) =>
       new WorkflowTaskServiceAdapter({
         taskService: input.ctx.services.taskService,
@@ -445,6 +447,8 @@ function createWorkflowService(input: {
         experiments,
         modelString: input.model,
         thinkingLevel: input.thinkingLevel,
+        cleanupWorkspaceBackgroundProcesses: (taskWorkspaceId) =>
+          input.ctx.services.backgroundProcessManager.cleanup(taskWorkspaceId),
         getProjectTrusted: () => input.ctx.projectTrusted,
         patchToolConfig: {
           workspaceId: input.ctx.workspaceId,

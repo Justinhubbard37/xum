@@ -3,10 +3,16 @@ import { tool } from "ai";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { WorkflowRunRecordSchema } from "@/common/orpc/schemas";
+import {
+  isActiveWorkflowRunStatus,
+  isNestedWorkflowRun,
+  isTerminalWorkflowRunStatus,
+} from "@/common/types/workflow";
 import { TaskStopToolResultSchema, TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 
 import { TASK_TERMINATION_TOOL_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import { log } from "@/node/services/log";
+import type { TaskService } from "@/node/services/taskService";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { isWorkspaceTurnTaskId } from "@/node/services/taskHandleStore";
 import { fromBashTaskId, isWorkflowRunTaskId } from "./taskId";
@@ -28,7 +34,12 @@ const WORKFLOW_STOPPED_NOTE =
 async function interruptWorkflowRun(
   config: ToolConfiguration,
   workspaceId: string,
-  taskId: string
+  taskId: string,
+  options?: {
+    deferTaskSweep?: boolean;
+    lockAlreadyHeld?: boolean;
+    onRunInterrupted?: (runId: string) => void;
+  }
 ) {
   const workflowService = config.workflowService;
   if (workflowService?.getRun == null || workflowService.interruptRun == null) {
@@ -56,24 +67,140 @@ async function interruptWorkflowRun(
   }
   const run = parsedRun.data;
 
-  if (run.status === "interrupted") {
-    // Idempotent: re-interrupting an interrupted run is a no-op success.
+  if (run.status === "completed" || run.status === "failed") {
     return { status: "already_inactive" as const, taskId };
   }
-  if (run.status === "completed" || run.status === "failed") {
-    return {
-      status: "error" as const,
-      taskId,
-      error: `Workflow run is already ${run.status} and cannot be interrupted.`,
-    };
+
+  if (run.status === "interrupted") {
+    try {
+      await workflowService.interruptRun({
+        workspaceId,
+        runId: taskId,
+        retryTaskCleanup: true,
+        ...(options?.deferTaskSweep === true ? { deferTaskSweep: true } : {}),
+        ...(options?.lockAlreadyHeld === true ? { lockAlreadyHeld: true } : {}),
+        onRunInterrupted: options?.onRunInterrupted,
+      });
+      return { status: "already_inactive" as const, taskId };
+    } catch (error: unknown) {
+      return { status: "error" as const, taskId, error: getErrorMessage(error) };
+    }
   }
 
+  let persistedByThisCall = false;
   try {
-    await workflowService.interruptRun({ workspaceId, runId: taskId });
+    await workflowService.interruptRun({
+      workspaceId,
+      runId: taskId,
+      ...(options?.deferTaskSweep === true ? { deferTaskSweep: true } : {}),
+      ...(options?.lockAlreadyHeld === true ? { lockAlreadyHeld: true } : {}),
+      onRunInterrupted: (runId) => {
+        persistedByThisCall ||= runId === taskId;
+        options?.onRunInterrupted?.(runId);
+      },
+    });
   } catch (error: unknown) {
+    // A terminal re-read means idempotent success only when another actor won the transition race.
+    // If this invocation persisted interrupted and cleanup then failed, surface that failure so the
+    // caller does not report success while workflow-owned workers may still be active.
+    if (!persistedByThisCall) {
+      const latestRawRun = await workflowService
+        .getRun({ workspaceId, runId: taskId })
+        .catch(() => null);
+      const latestRun = WorkflowRunRecordSchema.safeParse(latestRawRun);
+      if (latestRun.success && isTerminalWorkflowRunStatus(latestRun.data.status)) {
+        return { status: "already_inactive" as const, taskId };
+      }
+    }
     return { status: "error" as const, taskId, error: getErrorMessage(error) };
   }
   return { status: "stopped" as const, taskId, note: WORKFLOW_STOPPED_NOTE };
+}
+
+async function interruptWorkflowRunsOwnedByAgentTaskTree(
+  config: ToolConfiguration,
+  taskService: TaskService,
+  taskId: string,
+  deferredWorkflowRunIds: string[]
+): Promise<string | null> {
+  const listDescendants = taskService.listDescendantAgentTasks?.bind(taskService);
+  if (listDescendants == null) {
+    return null;
+  }
+
+  const descendants = listDescendants(taskId);
+  const userOwnedDescendants = listDescendants(taskId, { excludeWorkflowTasks: true });
+  const userOwnedTaskIds = new Set(userOwnedDescendants.map((task) => task.taskId));
+  const activeWorkflowOwnedDescendants = descendants.filter(
+    (task) =>
+      !userOwnedTaskIds.has(task.taskId) &&
+      (task.status === "queued" ||
+        task.status === "starting" ||
+        task.status === "running" ||
+        task.status === "awaiting_report")
+  );
+
+  const workflowService = config.workflowService;
+  if (workflowService?.listRuns == null || workflowService.interruptRun == null) {
+    return activeWorkflowOwnedDescendants.length > 0
+      ? "Workflow service not available to stop workflow-owned descendants"
+      : null;
+  }
+
+  let activeRunCount = 0;
+  for (const ownerWorkspaceId of [taskId, ...userOwnedTaskIds]) {
+    const rawRuns = await workflowService.listRuns({ workspaceId: ownerWorkspaceId });
+    for (const rawRun of rawRuns) {
+      const parsedRun = WorkflowRunRecordSchema.safeParse(rawRun);
+      if (
+        !parsedRun.success ||
+        (!isActiveWorkflowRunStatus(parsedRun.data.status) &&
+          parsedRun.data.status !== "interrupted") ||
+        isNestedWorkflowRun(parsedRun.data)
+      ) {
+        continue;
+      }
+
+      activeRunCount += 1;
+      const outcome = await interruptWorkflowRun(config, ownerWorkspaceId, parsedRun.data.id, {
+        deferTaskSweep: true,
+        lockAlreadyHeld: true,
+        onRunInterrupted: (runId) => deferredWorkflowRunIds.push(runId),
+      });
+      if (outcome.status === "stopped") {
+        deferredWorkflowRunIds.push(parsedRun.data.id);
+      }
+      if (outcome.status === "error") {
+        return outcome.error;
+      }
+      if (outcome.status === "not_found") {
+        return `Workflow run ${parsedRun.data.id} disappeared before it could be stopped`;
+      }
+    }
+  }
+
+  if (activeWorkflowOwnedDescendants.length > 0 && activeRunCount === 0) {
+    return "Active workflow-owned descendants have no active owning workflow run";
+  }
+  return null;
+}
+
+async function sweepDeferredWorkflowRuns(
+  taskService: TaskService,
+  taskId: string,
+  workflowRunIds: string[]
+): Promise<void> {
+  for (const workflowRunId of dedupeStrings(workflowRunIds)) {
+    try {
+      await taskService.markWorkflowRunEnded(workflowRunId);
+    } catch (error: unknown) {
+      log.warn("task_stop deferred workflow sweep failed", {
+        taskId,
+        workflowRunId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
 }
 
 export const createTaskStopTool: ToolFactory = (config: ToolConfiguration) => {
@@ -114,6 +241,9 @@ export const createTaskStopTool: ToolFactory = (config: ToolConfiguration) => {
                   }
                   return { status: "error" as const, taskId, error: msg };
                 }
+                if (interruptResult.data.alreadyInactive === true) {
+                  return { status: "already_inactive" as const, taskId };
+                }
                 return {
                   status: "stopped" as const,
                   taskId,
@@ -143,7 +273,14 @@ export const createTaskStopTool: ToolFactory = (config: ToolConfiguration) => {
                 const inScope =
                   proc.workspaceId === workspaceId ||
                   (await taskService.isDescendantAgentTask(workspaceId, proc.workspaceId));
-                if (!inScope) {
+                const workflowOwned =
+                  proc.workspaceId !== workspaceId &&
+                  ((await taskService.isWorkflowOwnedDescendantAgentTask?.(
+                    workspaceId,
+                    proc.workspaceId
+                  )) ??
+                    false);
+                if (!inScope || workflowOwned) {
                   return { status: "invalid_scope" as const, taskId };
                 }
 
@@ -160,7 +297,24 @@ export const createTaskStopTool: ToolFactory = (config: ToolConfiguration) => {
                 };
               }
 
-              const stopResult = await taskService.stopDescendantAgentTask(workspaceId, taskId);
+              const deferredWorkflowRunIds: string[] = [];
+              const stopResult = await taskService.stopDescendantAgentTask(workspaceId, taskId, {
+                // Run workflow interruption while TaskService holds the task-tree lifecycle lock.
+                // Workflow worker creation uses the same lock, so no new workflow-owned branch can
+                // appear between discovery and the direct user-owned subtree stop. Archive sweeps
+                // are deferred because WorkspaceService.archive reacquires this non-reentrant lock.
+                beforeStop:
+                  taskService.listDescendantAgentTasks != null
+                    ? async () =>
+                        await interruptWorkflowRunsOwnedByAgentTaskTree(
+                          config,
+                          taskService,
+                          taskId,
+                          deferredWorkflowRunIds
+                        )
+                    : undefined,
+              });
+              await sweepDeferredWorkflowRuns(taskService, taskId, deferredWorkflowRunIds);
               if (!stopResult.success) {
                 const msg = stopResult.error;
                 // Exact-match the canonical scope errors: aggregated cleanup failures
@@ -195,7 +349,7 @@ export const createTaskStopTool: ToolFactory = (config: ToolConfiguration) => {
           }
 
           void terminationPromise.catch((error: unknown) => {
-            log.debug("task_terminate cleanup failed after tool returned", { taskId, error });
+            log.debug("task_stop cleanup failed after tool returned", { taskId, error });
           });
           return {
             status: "error" as const,

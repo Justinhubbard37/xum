@@ -557,6 +557,10 @@ export class AIService extends EventEmitter {
   private analyticsService?: { executeRawQuery(sql: string): Promise<unknown> };
   private desktopSessionManager?: DesktopSessionManager;
 
+  async cleanupWorkspaceBackgroundProcesses(workspaceId: string): Promise<void> {
+    await this.backgroundProcessManager?.cleanup(workspaceId);
+  }
+
   constructor(
     config: Config,
     historyService: HistoryService,
@@ -2202,6 +2206,8 @@ export class AIService extends EventEmitter {
                 await this.onWorkflowRunStatusChanged?.(event);
               },
               runtimeFactory: new QuickJSRuntimeFactory(),
+              withRunStartLock: (ownerWorkspaceId, operation) =>
+                this.taskService!.withWorkspaceOwnedWorkStartLock(ownerWorkspaceId, operation),
               taskAdapterFactory: (runId, workflowName) =>
                 new WorkflowTaskServiceAdapter({
                   taskService: this.taskService!,
@@ -2217,6 +2223,8 @@ export class AIService extends EventEmitter {
                     workspaceSessionDir: this.config.getSessionDir(workspaceId),
                     trusted: getWorkflowProjectTrusted(),
                   },
+                  cleanupWorkspaceBackgroundProcesses: (taskWorkspaceId) =>
+                    this.cleanupWorkspaceBackgroundProcesses(taskWorkspaceId),
                   getProjectTrusted: getWorkflowProjectTrusted,
                   experiments: {
                     ...experiments,

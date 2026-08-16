@@ -231,7 +231,14 @@ export interface ToolConfiguration {
         run: unknown;
       }) => Promise<void> | void;
     }): Promise<{ runId: string; status: string; result: unknown }>;
-    interruptRun?(input: { workspaceId: string; runId: string }): Promise<unknown>;
+    interruptRun?(input: {
+      workspaceId: string;
+      runId: string;
+      deferTaskSweep?: boolean;
+      lockAlreadyHeld?: boolean;
+      retryTaskCleanup?: boolean;
+      onRunInterrupted?: (runId: string) => void;
+    }): Promise<unknown>;
     resumeRun?(input: {
       workspaceId: string;
       runId: string;
@@ -765,7 +772,7 @@ export async function getToolsForModel(
     task_remove: wrap(createTaskRemoveTool(config)),
     task_list: wrap(createTaskListTool(config)),
 
-    // Bash execution (foreground/background). Manage background output via task_await/task_list/task_terminate.
+    // Bash execution (foreground/background). Manage background output via task_await/task_list/task_stop.
     bash: wrap(createBashTool(config)),
 
     // Legacy bash process tools (deprecated)
