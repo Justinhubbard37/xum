@@ -3,12 +3,19 @@
  */
 
 import { describe, it, expect, mock } from "bun:test";
-import { createCodeExecutionTool, clearTypeCaches } from "./code_execution";
+import {
+  createCodeExecutionTool,
+  retargetCodeExecutionTool,
+  clearTypeCaches,
+  type MountRunner,
+} from "./code_execution";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { ToolBridge } from "@/node/services/ptc/toolBridge";
 import type { Tool, ToolExecutionOptions } from "ai";
 import type { PTCEvent, PTCExecutionResult } from "@/node/services/ptc/types";
 import { z } from "zod";
+import { DisposableTempDir } from "@/node/services/tempDir";
+import { SandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 
 const mockToolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
@@ -419,6 +426,65 @@ describe("createCodeExecutionTool", () => {
     });
   });
 
+  describe("retargetCodeExecutionTool", () => {
+    it("retargets a captured execute reference onto the donor's bridge", async () => {
+      // The request.assemble wrapper scenario: middleware captured the
+      // pre-hook instance's execute, while a later rebuild removed `bash`
+      // from the bridgeable set. After retargeting, the captured reference
+      // must dispatch through the donor's bridge — bash is gone, file_read
+      // still works.
+      const bashExecute = mock(() => mockResults.bash);
+      const preHookTool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge({
+          bash: createMockTool("bash", z.object({ script: z.string() }), bashExecute),
+          file_read: createMockTool("file_read", z.object({ filePath: z.string() })),
+        })
+      );
+      const donorTool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge({
+          file_read: createMockTool("file_read", z.object({ filePath: z.string() })),
+        })
+      );
+
+      // Wrapper-style capture BEFORE the retarget.
+      const capturedExecute = preHookTool.execute!.bind(preHookTool);
+
+      expect(retargetCodeExecutionTool(preHookTool, donorTool)).toBe(true);
+
+      const bashResult = (await capturedExecute(
+        { code: 'return mux.bash({ script: "echo hi" })' },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(bashResult.success).toBe(false);
+      expect(bashExecute).not.toHaveBeenCalled();
+
+      const readResult = (await capturedExecute(
+        { code: 'return mux.file_read({ filePath: "a.txt" })' },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(readResult.success).toBe(true);
+      expect(readResult.result).toMatchObject({ content: "mock file content" });
+    });
+
+    it("returns false when either tool was not created by the factory", async () => {
+      const realTool = await createCodeExecutionTool(runtimeFactory, new ToolBridge({}));
+      const foreignTool = createMockTool("bash", z.object({ script: z.string() }));
+
+      expect(retargetCodeExecutionTool(foreignTool, realTool)).toBe(false);
+      expect(retargetCodeExecutionTool(realTool, foreignTool)).toBe(false);
+
+      // The real tool stays functional after rejected retargets.
+      const result = (await realTool.execute!(
+        { code: "return 7" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      expect(result.result).toBe(7);
+    });
+  });
+
   describe("event streaming", () => {
     it("emits events for tool calls", async () => {
       const events: PTCEvent[] = [];
@@ -544,6 +610,175 @@ describe("createCodeExecutionTool", () => {
       expect(desc1).not.toBe(desc2);
       expect(desc1).not.toContain("function bash");
       expect(desc2).toContain("function bash");
+    });
+
+    it("persistent mount shares vars across two separate code_execution calls and a simulated restart", async () => {
+      using tmp = new DisposableTempDir("code-exec-persistent");
+      const host = new SandboxHostService();
+      const mountProvider: MountRunner = (fn) =>
+        host.withPersistentMount(
+          {
+            lifetime: "persistent",
+            runtimeFactory,
+            scopeKey: "ws-code-exec",
+            sessionDir: tmp.path,
+          },
+          fn
+        );
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge({}),
+        undefined,
+        mountProvider
+      );
+
+      // Call 1 writes vars; call 2 (a separate tool call) reads them.
+      const first = (await tool.execute!(
+        { code: "vars.total = 40; return vars.total;" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(first.success).toBe(true);
+      expect(first.result).toBe(40);
+
+      const second = (await tool.execute!(
+        { code: "vars.total += 2; return vars.total;" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(second.success).toBe(true);
+      expect(second.result).toBe(42);
+
+      // Simulated restart: fresh host restores the per-call snapshot.
+      await host.disposeScope("ws-code-exec");
+      const host2 = new SandboxHostService();
+      const tool2 = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge({}),
+        undefined,
+        (fn) =>
+          host2.withPersistentMount(
+            {
+              lifetime: "persistent",
+              runtimeFactory,
+              scopeKey: "ws-code-exec",
+              sessionDir: tmp.path,
+            },
+            fn
+          )
+      );
+      const third = (await tool2.execute!(
+        { code: "return vars.total;" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(third.success).toBe(true);
+      expect(third.result).toBe(42);
+      await host2.disposeScope("ws-code-exec");
+    });
+
+    it("persists vars mutated before a failed eval so memory and disk agree", async () => {
+      using tmp = new DisposableTempDir("code-exec-persistent");
+      const host = new SandboxHostService();
+      const mountProvider: MountRunner = (fn) =>
+        host.withPersistentMount(
+          {
+            lifetime: "persistent",
+            runtimeFactory,
+            scopeKey: "ws-failed-eval",
+            sessionDir: tmp.path,
+          },
+          fn
+        );
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge({}),
+        undefined,
+        mountProvider
+      );
+
+      const seed = (await tool.execute!(
+        { code: "vars.state = 'initial'; return vars.state;" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(seed.success).toBe(true);
+
+      // Guest mutates vars, THEN throws: the live guest keeps the mutation,
+      // so the snapshot must too — a restart must not resurrect 'initial'.
+      const failed = (await tool.execute!(
+        { code: "vars.state = 'mutated-before-throw'; throw new Error('boom');" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(failed.success).toBe(false);
+
+      // Simulated restart: fresh host restores the latest snapshot.
+      await host.disposeScope("ws-failed-eval");
+      const host2 = new SandboxHostService();
+      const tool2 = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge({}),
+        undefined,
+        (fn) =>
+          host2.withPersistentMount(
+            {
+              lifetime: "persistent",
+              runtimeFactory,
+              scopeKey: "ws-failed-eval",
+              sessionDir: tmp.path,
+            },
+            fn
+          )
+      );
+      const after = (await tool2.execute!(
+        { code: "return vars.state;" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(after.success).toBe(true);
+      expect(after.result).toBe("mutated-before-throw");
+      await host2.disposeScope("ws-failed-eval");
+    });
+
+    it("recovers from unsnapshottable vars by rebuilding the mount from the last durable snapshot", async () => {
+      using tmp = new DisposableTempDir("code-exec-persistent");
+      const host = new SandboxHostService();
+      const mountProvider: MountRunner = (fn) =>
+        host.withPersistentMount(
+          {
+            lifetime: "persistent",
+            runtimeFactory,
+            scopeKey: "ws-cyclic-vars",
+            sessionDir: tmp.path,
+          },
+          fn
+        );
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge({}),
+        undefined,
+        mountProvider
+      );
+
+      const seed = (await tool.execute!(
+        { code: "vars.state = 'durable'; return vars.state;" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(seed.success).toBe(true);
+
+      // Guest makes vars cyclic (unsnapshottable) and throws: the snapshot
+      // fails, so the live mount must be disposed rather than kept with state
+      // that disk can never reflect.
+      const poisoned = (await tool.execute!(
+        { code: "vars.self = vars; throw new Error('boom');" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(poisoned.success).toBe(false);
+
+      // Next call rebuilds the mount from the last durable snapshot: the
+      // cyclic mutation is gone, the seeded value is restored.
+      const recovered = (await tool.execute!(
+        { code: "return { state: vars.state, self: typeof vars.self };" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(recovered.success).toBe(true);
+      expect(recovered.result).toEqual({ state: "durable", self: "undefined" });
+      await host.disposeScope("ws-cyclic-vars");
     });
 
     it("clearTypeCaches forces regeneration", async () => {

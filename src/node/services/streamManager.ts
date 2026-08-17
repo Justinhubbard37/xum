@@ -1,6 +1,7 @@
 import { EventEmitter } from "events";
 import * as path from "path";
 import { PlatformPaths } from "@/common/utils/paths";
+import { eventSpine } from "@/node/services/events/eventSpine";
 import {
   streamText,
   stepCountIs,
@@ -2345,6 +2346,16 @@ export class StreamManager extends EventEmitter {
         ? { acpPromptId: streamInfo.initialMetadata.acpPromptId }
         : {}),
     } as StreamStartEvent);
+    // Lifecycle spine event: skipped on replay — a reconnecting subscriber
+    // re-observes an already-running stream, and observers must see exactly
+    // one start per stream (paired with the guaranteed end in
+    // processStreamWithCleanup's finally).
+    if (!options?.replay) {
+      eventSpine.emit("stream.start", {
+        workspaceId: workspaceId as string,
+        messageId: streamInfo.messageId,
+      });
+    }
   }
 
   private emitStreamAbort(
@@ -3604,6 +3615,15 @@ export class StreamManager extends EventEmitter {
       }
 
       this.workspaceStreams.delete(workspaceId);
+
+      // Lifecycle spine event: emitted from the guaranteed-cleanup path so
+      // EVERY terminal outcome (completion, abort/Escape, provider failure)
+      // closes the stream.start emitted at the top of this method — observers
+      // tracking active streams must never retain stale entries.
+      eventSpine.emit("stream.end", {
+        workspaceId: workspaceId as string,
+        messageId: streamInfo.messageId,
+      });
     }
   }
 

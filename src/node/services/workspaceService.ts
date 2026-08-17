@@ -22,6 +22,8 @@ import { Ok, Err } from "@/common/types/result";
 import { askUserQuestionManager } from "@/node/services/askUserQuestionManager";
 import { delegatedToolCallManager } from "@/node/services/delegatedToolCallManager";
 import { log } from "@/node/services/log";
+import { eventSpine } from "@/node/services/events/eventSpine";
+import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import { isPathInsideDir } from "@/node/utils/pathUtils";
 import { AgentSession, type StreamErrorRecoveryOutcome } from "@/node/services/agentSession";
 import type { HistoryService } from "@/node/services/historyService";
@@ -4038,6 +4040,7 @@ export class WorkspaceService extends EventEmitter {
 
       const enrichedMetadata = this.enrichFrontendMetadata(completeMetadata);
       this.getOrCreateSession(workspaceId).emitMetadata(enrichedMetadata);
+      eventSpine.emit("workspace.created", { workspaceId });
       return Ok({ metadata: enrichedMetadata });
     } catch (error) {
       await this.config.removeWorkspace(workspaceId).catch(() => undefined);
@@ -4337,6 +4340,7 @@ export class WorkspaceService extends EventEmitter {
         session.emitMetadata(this.enrichFrontendMetadata(completeMetadata));
       }
 
+      eventSpine.emit("workspace.created", { workspaceId });
       return Ok({ metadata: this.enrichFrontendMetadata(completeMetadata) });
     } catch (error) {
       initLogger.logComplete(-1);
@@ -4728,6 +4732,7 @@ export class WorkspaceService extends EventEmitter {
         session.emitMetadata(this.enrichFrontendMetadata(completeMetadata));
       }
 
+      eventSpine.emit("workspace.created", { workspaceId });
       return Ok(enrichedMetadata);
     } catch (error) {
       initLogger?.logComplete(-1);
@@ -5204,6 +5209,13 @@ export class WorkspaceService extends EventEmitter {
       // the resulting stream-abort event would otherwise be recorded on the timeline after the
       // delete, recreating the session directory for a workspace the user removed.
       this.disposeSession(workspaceId);
+
+      // Drop any persistent sandbox mount BEFORE deleting the session
+      // directory: dropScope disposes the runtime without disk writes and
+      // waits for in-flight evaluation, so a late vars snapshot cannot
+      // recreate the directory (and the QuickJS runtime is not leaked in the
+      // process-wide singleton).
+      await sandboxHostService.dropScope(workspaceId);
       try {
         await this.timelineRecorder.closeWorkspace(workspaceId);
         timelineClosed = true;
@@ -6986,6 +6998,11 @@ export class WorkspaceService extends EventEmitter {
       // before the workspace's memory dies with it. Fire-and-forget; never blocks archive.
       this.memoryConsolidationService?.triggerInBackground(workspaceId, "archive");
 
+      // Dispose the workspace's persistent sandbox mount (snapshot-then-dispose
+      // inside disposeScope keeps vars recoverable on un-archive).
+      await sandboxHostService.disposeScope(workspaceId);
+
+      eventSpine.emit("workspace.archived", { workspaceId });
       return Ok({ kind: "archived" as const });
     } catch (error) {
       const message = getErrorMessage(error);
@@ -8244,6 +8261,7 @@ export class WorkspaceService extends EventEmitter {
       const enrichedMetadata = this.enrichFrontendMetadata(metadata);
       session.emitMetadata(enrichedMetadata);
 
+      eventSpine.emit("workspace.created", { workspaceId: newWorkspaceId });
       return Ok({ metadata: enrichedMetadata, projectPath: foundProjectPath });
     } catch (error) {
       const message = getErrorMessage(error);
@@ -9823,6 +9841,12 @@ export class WorkspaceService extends EventEmitter {
         log.error("Failed to require goal acknowledgment after context reset:", error);
       }
       this.sessions.get(workspaceId)?.clearFileState();
+
+      // Persistent sandbox mounts are scoped to the workspace session; a
+      // context reset ends that session, so sandbox state is DISCARDED (not
+      // snapshotted) — vars must not survive a reset the way they survive
+      // archive/un-archive.
+      await sandboxHostService.discardScope(workspaceId, this.config.getSessionDir(workspaceId));
 
       return Ok("reset");
     } finally {

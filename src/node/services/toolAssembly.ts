@@ -12,13 +12,18 @@
 import type { Tool } from "ai";
 
 import { applyToolPolicy, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import { applyCapabilityGrants } from "@/common/utils/tools/capabilityGrants";
+import type { CapabilityGrants } from "@/common/types/capabilityGrants";
 // PTC types only — modules lazy-loaded to avoid loading typescript/prettier at startup
 import type {
   PTCEventWithParent,
   createCodeExecutionTool as CreateCodeExecutionToolFn,
+  retargetCodeExecutionTool as RetargetCodeExecutionToolFn,
 } from "@/node/services/tools/code_execution";
 import type { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import type { ToolBridge } from "@/node/services/ptc/toolBridge";
+import type { PTCExecutionResult } from "@/node/services/ptc/types";
+import { sandboxHostService, type SandboxMount } from "@/node/services/sandbox/sandboxHostService";
 import { log } from "./log";
 import type { MCPWorkspaceStats } from "@/node/services/mcpServerManager";
 import type { TelemetryService } from "@/node/services/telemetryService";
@@ -36,6 +41,7 @@ import { getRuntimeTypeForTelemetry, roundToBase2 } from "@/common/telemetry/uti
 // Dynamic imports are justified: PTC pulls in ~10MB of dependencies that would slow startup.
 interface PTCModules {
   createCodeExecutionTool: typeof CreateCodeExecutionToolFn;
+  retargetCodeExecutionTool: typeof RetargetCodeExecutionToolFn;
   QuickJSRuntimeFactory: typeof QuickJSRuntimeFactory;
   ToolBridge: typeof ToolBridge;
   runtimeFactory: QuickJSRuntimeFactory | null;
@@ -56,11 +62,49 @@ async function getPTCModules(): Promise<PTCModules> {
 
   ptcModules = {
     createCodeExecutionTool: codeExecution.createCodeExecutionTool,
+    retargetCodeExecutionTool: codeExecution.retargetCodeExecutionTool,
     QuickJSRuntimeFactory: quickjs.QuickJSRuntimeFactory,
     ToolBridge: toolBridge.ToolBridge,
     runtimeFactory: null,
   };
   return ptcModules;
+}
+
+/**
+ * Lazy-loading wrapper around code_execution's retargetCodeExecutionTool for
+ * callers (aiService) that must not statically import the PTC modules.
+ * Returns false when either tool was not created by createCodeExecutionTool.
+ */
+export async function retargetCodeExecution(target: Tool, donor: Tool): Promise<boolean> {
+  const ptc = await getPTCModules();
+  return ptc.retargetCodeExecutionTool(target, donor);
+}
+
+/**
+ * Reinstate a request.assemble middleware's code_execution replacement over a
+ * rebuilt instance while reconciling stale model-facing metadata. A wrapper
+ * built by spreading the pre-hook tool (`{ ...tool, execute: wrapped }`)
+ * inherits its description, whose embedded TypeScript definitions still
+ * advertise tools the rebuild removed/replaced — execution fails closed, but
+ * the model keeps being instructed those tools exist. When the wrapper
+ * inherited the pre-hook description verbatim, swap in the rebuilt
+ * description; middleware that authored its own description keeps it (it took
+ * ownership of the model-facing contract).
+ */
+export function reconcileHookReplacedCodeExecution(
+  preHook: Tool,
+  hookReplacement: Tool,
+  rebuilt: Tool
+): Tool {
+  if (
+    hookReplacement.description !== undefined &&
+    hookReplacement.description === preHook.description &&
+    rebuilt.description !== undefined &&
+    rebuilt.description !== hookReplacement.description
+  ) {
+    return { ...hookReplacement, description: rebuilt.description };
+  }
+  return hookReplacement;
 }
 
 // ---------------------------------------------------------------------------
@@ -82,6 +126,26 @@ export interface ApplyToolPolicyAndExperimentsOptions {
   };
   /** Callback to forward nested PTC tool events to the stream. */
   emitNestedToolEvent: (event: PTCEventWithParent) => void;
+  /**
+   * Sandbox host context for code_execution. When set AND persistent mounts
+   * are enabled (MUX_SANDBOX_PERSISTENT_MOUNTS=1), code_execution reuses a
+   * per-workspace persistent mount (shared `vars`, snapshot/restore) instead
+   * of an ephemeral per-call runtime. Foundation-level opt-in only; the
+   * persistent-kernel UX belongs to the RLM track.
+   */
+  sandbox?: { workspaceId: string; sessionDir: string };
+  /**
+   * Capability grants for this assembly (registry-with-filters posture).
+   * Omitted = session-scope full grants (identical to pre-grants behavior).
+   * Enforced here (tool visibility) and at the sandbox bridge boundary
+   * (ToolBridge stubs/denies non-granted mux.* calls).
+   */
+  capabilityGrants?: CapabilityGrants;
+}
+
+/** Env opt-in for persistent code_execution mounts (dogfooding/Track 2). */
+export function persistentSandboxMountsEnabled(): boolean {
+  return process.env.MUX_SANDBOX_PERSISTENT_MOUNTS === "1";
 }
 
 /**
@@ -99,16 +163,31 @@ export interface ApplyToolPolicyAndExperimentsOptions {
 export async function applyToolPolicyAndExperiments(
   opts: ApplyToolPolicyAndExperimentsOptions
 ): Promise<Record<string, Tool>> {
-  const { allTools, extraTools, effectiveToolPolicy, experiments, emitNestedToolEvent } = opts;
+  const { allTools, extraTools, effectiveToolPolicy, experiments, emitNestedToolEvent, sandbox } =
+    opts;
 
   // Merge in extra tools (e.g., CLI-specific tools like set_exit_code).
   // These bypass policy filtering since they're injected by the runtime, not user config.
   const allToolsWithExtra = extraTools ? { ...allTools, ...extraTools } : allTools;
 
+  // Capability grants are a ceiling applied before policy: policy can narrow
+  // further but can never re-add a non-granted tool.
+  const grantFilteredTools = opts.capabilityGrants
+    ? applyCapabilityGrants(allToolsWithExtra, opts.capabilityGrants)
+    : allToolsWithExtra;
+
   // Apply tool policy FIRST — this must happen before PTC to ensure the sandbox
   // respects allow/deny filters. The policy-filtered tools are passed to
   // ToolBridge so the mux.* API only exposes policy-allowed tools.
-  const policyFilteredTools = applyToolPolicy(allToolsWithExtra, effectiveToolPolicy);
+  const policyFilteredTools = applyToolPolicy(grantFilteredTools, effectiveToolPolicy);
+
+  // The bridge is built from the PRE-grant policy-filtered set: ToolBridge
+  // must see grant-denied tools so it can stub them with a catchable
+  // "Capability denied" guest error (not a confusing "mux.x is not a
+  // function"). Model-visible sets below still use the grant-filtered tools.
+  const policyFilteredPreGrant = opts.capabilityGrants
+    ? applyToolPolicy(allToolsWithExtra, effectiveToolPolicy)
+    : policyFilteredTools;
 
   // Handle PTC experiments — add or replace tools with code_execution
   let toolsForModel = policyFilteredTools;
@@ -117,23 +196,58 @@ export async function applyToolPolicyAndExperiments(
       // Lazy-load PTC modules only when experiments are enabled
       const ptc = await getPTCModules();
 
-      // ToolBridge uses policy-filtered tools — sandbox only exposes allowed tools
-      const toolBridge = new ptc.ToolBridge(policyFilteredTools);
+      // ToolBridge uses the pre-grant policy-filtered tools — the bridge
+      // enforces grants itself (denied tools become explicit error stubs).
+      const toolBridge = new ptc.ToolBridge(policyFilteredPreGrant, opts.capabilityGrants);
 
       // Singleton runtime factory (WASM module is expensive to load)
       ptc.runtimeFactory ??= new ptc.QuickJSRuntimeFactory();
+      const runtimeFactory = ptc.runtimeFactory;
+
+      // Persistent mount opt-in: reuse one per-workspace guest across calls.
+      // Grants must flow through: the mount enforces vars/hostEvents exposure,
+      // so omitting them here would silently widen to full session grants.
+      // bridgeKey identifies the effective bridgeable tool NAMES so the mount
+      // is rebuilt when policy changes what the sandbox may reach. Names-only
+      // is sufficient for same-name replacements: guest method references
+      // dispatch through the runtime's current registration (see
+      // QuickJSRuntime.registerObject), so re-registering the fresh bridge
+      // retargets even guest-saved references to the newest implementation.
+      // The lease runner (withPersistentMount) holds the scope lock from
+      // acquisition through execution.
+      const bridgeKey = toolBridge.getBridgeableToolNames().sort().join(",");
+      const withMount =
+        sandbox && persistentSandboxMountsEnabled()
+          ? (fn: (mount: SandboxMount) => Promise<PTCExecutionResult>) =>
+              sandboxHostService.withPersistentMount(
+                {
+                  lifetime: "persistent",
+                  runtimeFactory,
+                  scopeKey: sandbox.workspaceId,
+                  sessionDir: sandbox.sessionDir,
+                  grants: opts.capabilityGrants,
+                  bridgeKey,
+                },
+                fn
+              )
+          : undefined;
 
       const codeExecutionTool = await ptc.createCodeExecutionTool(
-        ptc.runtimeFactory,
+        runtimeFactory,
         toolBridge,
-        emitNestedToolEvent
+        emitNestedToolEvent,
+        withMount
       );
 
       if (experiments?.programmaticToolCallingExclusive) {
         // Exclusive mode: code_execution is mandatory — it's the only way to use bridged
         // tools. The experiment flag is the opt-in; policy cannot disable it here since
-        // that would leave no way to access tools. nonBridgeable is already policy-filtered.
-        const nonBridgeable = toolBridge.getNonBridgeableTools();
+        // that would leave no way to access tools. nonBridgeable is policy-filtered but
+        // comes from the PRE-grant bridge input, so re-apply the grants ceiling here to
+        // keep grant-denied non-bridgeable tools out of the model-visible set.
+        const nonBridgeable = opts.capabilityGrants
+          ? applyCapabilityGrants(toolBridge.getNonBridgeableTools(), opts.capabilityGrants)
+          : toolBridge.getNonBridgeableTools();
         // Keep mcp_prompt_get direct because sandbox declarations omit its
         // multiline prompt catalog.
         const promptGet = policyFilteredTools.mcp_prompt_get;
