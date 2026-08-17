@@ -400,6 +400,154 @@ describe("TimelinePanel", () => {
     ).not.toBeNull();
   });
 
+  test("drops the sub-agent update row once the same task's report lands", () => {
+    const events = [
+      makeEvent("report", "task.reported", 2, {
+        source: { system: "task", key: "task-report:task-a" },
+        status: "completed",
+        data: { title: "Comment audit finding", digest: "No must-fix issues" },
+        anchor: { taskId: "task-a", childWorkspaceId: "task-a" },
+      }),
+      makeEvent("update", "task.progress", 1, {
+        source: { system: "task" },
+        status: "started",
+        data: { title: "Comment audit finding", digest: "No must-fix issues" },
+        anchor: { taskId: "task-a", messageId: "msg-1", childWorkspaceId: "task-a" },
+      }),
+    ];
+
+    const view = renderTimeline({ events });
+
+    expect(view.container.querySelector('[data-timeline-event-id="update"]')).toBeNull();
+    expect(view.container.querySelector('[data-timeline-event-id="report"]')).not.toBeNull();
+  });
+
+  test("keeps earlier updates with distinct findings after the report lands", () => {
+    const events = [
+      makeEvent("report", "task.reported", 2, {
+        source: { system: "task", key: "task-report:task-a" },
+        status: "completed",
+        data: { title: "Final summary", digest: "All checks pass" },
+        anchor: { taskId: "task-a", childWorkspaceId: "task-a" },
+      }),
+      makeEvent("finding", "task.progress", 1, {
+        source: { system: "task" },
+        status: "started",
+        data: { title: "Important finding", digest: "Found a race in the loader" },
+        anchor: { taskId: "task-a", messageId: "msg-1", childWorkspaceId: "task-a" },
+      }),
+    ];
+
+    const view = renderTimeline({ events });
+
+    expect(view.container.querySelector('[data-timeline-event-id="finding"]')).not.toBeNull();
+    expect(view.container.querySelector('[data-timeline-event-id="report"]')).not.toBeNull();
+  });
+
+  test("keeps default-titled updates whose digests differ", () => {
+    const events = [
+      makeEvent("update-late", "task.progress", 2, {
+        source: { system: "task" },
+        status: "started",
+        data: { title: "Subagent (explore) update", digest: "Cache poisoning suspected" },
+        anchor: { taskId: "task-a", messageId: "msg-2", childWorkspaceId: "task-a" },
+      }),
+      makeEvent("update-early", "task.progress", 1, {
+        source: { system: "task" },
+        status: "started",
+        data: { title: "Subagent (explore) update", digest: "Found a race in the loader" },
+        anchor: { taskId: "task-a", messageId: "msg-1", childWorkspaceId: "task-a" },
+      }),
+    ];
+
+    const view = renderTimeline({ events });
+
+    expect(view.container.querySelector('[data-timeline-event-id="update-late"]')).not.toBeNull();
+    expect(view.container.querySelector('[data-timeline-event-id="update-early"]')).not.toBeNull();
+  });
+
+  test("drops an untitled update when the terminal report repeats its content", () => {
+    // Mapper update rows carry the producer fallback title; TaskService terminal rows omit it.
+    const events = [
+      makeEvent("report", "task.reported", 2, {
+        source: { system: "task", key: "task-report:task-a" },
+        status: "completed",
+        data: { digest: "All timeline suites pass" },
+        anchor: { taskId: "task-a", childWorkspaceId: "task-a" },
+      }),
+      makeEvent("update", "task.progress", 1, {
+        source: { system: "task" },
+        status: "started",
+        data: { title: "Subagent (explore) update", digest: "All timeline suites pass" },
+        anchor: { taskId: "task-a", messageId: "msg-1", childWorkspaceId: "task-a" },
+      }),
+    ];
+
+    const view = renderTimeline({ events });
+
+    expect(view.container.querySelector('[data-timeline-event-id="update"]')).toBeNull();
+    expect(view.container.querySelector('[data-timeline-event-id="report"]')).not.toBeNull();
+  });
+
+  test("drops an update whose report repeats it beyond the row digest cap", () => {
+    const reportMarkdown = "finding detail ".repeat(20).trim();
+    const rowCapped = `${reportMarkdown.slice(0, 117)}...`;
+    const events = [
+      makeEvent("report", "task.reported", 2, {
+        source: { system: "task", key: "task-report:task-a" },
+        status: "completed",
+        data: { title: "Audit result", digest: reportMarkdown },
+        anchor: { taskId: "task-a", childWorkspaceId: "task-a" },
+      }),
+      makeEvent("update", "task.progress", 1, {
+        source: { system: "task" },
+        status: "started",
+        data: { title: "Audit result", digest: rowCapped },
+        anchor: { taskId: "task-a", messageId: "msg-1", childWorkspaceId: "task-a" },
+      }),
+    ];
+
+    const view = renderTimeline({ events });
+
+    expect(view.container.querySelector('[data-timeline-event-id="update"]')).toBeNull();
+    expect(view.container.querySelector('[data-timeline-event-id="report"]')).not.toBeNull();
+  });
+
+  test("collapses duplicate update rows while keeping distinct checkpoints", () => {
+    const events = [
+      makeEvent("update-late", "task.progress", 4, {
+        source: { system: "task" },
+        status: "started",
+        data: { title: "Second checkpoint" },
+        anchor: { taskId: "task-a", messageId: "msg-3", childWorkspaceId: "task-a" },
+      }),
+      makeEvent("update-dupe", "task.progress", 3, {
+        source: { system: "task" },
+        status: "started",
+        data: { title: "Second checkpoint" },
+        anchor: { taskId: "task-a", messageId: "msg-2", childWorkspaceId: "task-a" },
+      }),
+      makeEvent("update-early", "task.progress", 2, {
+        source: { system: "task" },
+        status: "started",
+        data: { title: "First checkpoint" },
+        anchor: { taskId: "task-a", messageId: "msg-1", childWorkspaceId: "task-a" },
+      }),
+      makeEvent("start", "task.created", 1, {
+        source: { system: "task", key: "task-created:task-a" },
+        status: "started",
+        anchor: { taskId: "task-a", toolCallId: "call-a", childWorkspaceId: "task-a" },
+      }),
+    ];
+
+    const view = renderTimeline({ events });
+
+    expect(view.container.querySelector('[data-timeline-event-id="update-late"]')).not.toBeNull();
+    expect(view.container.querySelector('[data-timeline-event-id="update-dupe"]')).toBeNull();
+    expect(view.container.querySelector('[data-timeline-event-id="update-early"]')).not.toBeNull();
+    expect(view.container.querySelector('[data-timeline-event-id="start"]')).toBeNull();
+  });
+
   test("shows a single representation when the preview excerpt duplicates the digest", async () => {
     // Mirror the producer: a >120-char prompt is digested to a 117-char cut plus "...".
     const longPrompt = "alpha beta gamma delta epsilon ".repeat(8).trim();

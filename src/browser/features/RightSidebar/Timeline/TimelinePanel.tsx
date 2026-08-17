@@ -24,10 +24,12 @@ import { formatDuration } from "@/common/utils/formatDuration";
 import {
   TIMELINE_ROW_DIGEST_MAX_LENGTH,
   TIMELINE_TEXT_MAX_LENGTH,
+  truncateTimelineRowDigest,
   type TimelineAnchor,
   type TimelineEvent,
   type TimelinePreview,
 } from "@/common/orpc/schemas/timeline";
+import { isSubagentFallbackTitle } from "@/common/utils/subagentReportEnvelope";
 
 import {
   TIMELINE_CATEGORIES,
@@ -230,11 +232,23 @@ const TASK_LIFECYCLE_KINDS = new Set([
   "task.interrupted",
 ]);
 
-// An older task.created row adds no unique information once the same task has a newer lifecycle
-// row on the feed; an in-flight task with no other rows still shows that it started. The started
-// row is the only one anchored to the spawning tool call, so rows that cannot reveal a transcript
-// target themselves inherit that anchor before the started row is dropped.
-function dropSupersededTaskStarts(newestFirst: TimelineEvent[]): TimelineEvent[] {
+// Mapper and TaskService rows encode untitled reports and digest lengths differently, so
+// canonicalize both fields before cross-producer dedupe; the digest distinguishes untitled
+// updates because they share a fallback title. Comparing capped previews is a deliberate
+// tradeoff: rows store only the capped digest, so reports that diverge past the cap collapse
+// into one row while their full text stays in the transcript.
+function taskRowContentKey(event: TimelineEvent): string {
+  const title = event.data?.title;
+  const canonicalTitle = title == null || isSubagentFallbackTitle(title) ? "" : title;
+  const digest = event.data?.digest;
+  const canonicalDigest = digest == null ? "" : truncateTimelineRowDigest(digest);
+  return `${canonicalTitle}\u0000${canonicalDigest}`;
+}
+
+// A newer lifecycle row makes task.created redundant, but its transcript anchor may still be the
+// task's only reveal target. Deduplicate only task.progress rows whose title and digest match a
+// newer row for that task; terminal rows remain because a reawakened task can report again.
+function dropSupersededTaskRows(newestFirst: TimelineEvent[]): TimelineEvent[] {
   const startAnchors = new Map<string, TimelineAnchor>();
   for (const event of newestFirst) {
     const anchor = event.anchor;
@@ -248,6 +262,7 @@ function dropSupersededTaskStarts(newestFirst: TimelineEvent[]): TimelineEvent[]
   }
 
   const supersededTaskIds = new Set<string>();
+  const newerRowKeys = new Set<string>();
   const events: TimelineEvent[] = [];
   for (const event of newestFirst) {
     const taskId = event.anchor?.taskId;
@@ -259,8 +274,13 @@ function dropSupersededTaskStarts(newestFirst: TimelineEvent[]): TimelineEvent[]
     if (kind === "task.created" && supersededTaskIds.has(taskId)) {
       continue;
     }
+    const contentKey = `${taskId}:${taskRowContentKey(event)}`;
+    if (kind === "task.progress" && newerRowKeys.has(contentKey)) {
+      continue;
+    }
     if (TASK_LIFECYCLE_KINDS.has(kind)) {
       supersededTaskIds.add(taskId);
+      newerRowKeys.add(contentKey);
       const start = startAnchors.get(taskId);
       if (kind !== "task.created" && start != null && !hasTranscriptAnchor(event.anchor)) {
         events.push({
@@ -754,7 +774,7 @@ export function TimelinePanelView(props: TimelinePanelViewProps) {
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
   const [expandedRuns, setExpandedRuns] = useState<Record<string, boolean>>({});
   const filter = isTimelineFilter(storedFilter) ? storedFilter : "all";
-  const filteredEvents = dropSupersededTaskStarts(
+  const filteredEvents = dropSupersededTaskRows(
     timeline.events.filter(
       (event) => filter === "all" || getTimelineEventCategories(event).includes(filter)
     )
