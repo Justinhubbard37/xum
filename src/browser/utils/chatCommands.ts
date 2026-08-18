@@ -54,6 +54,7 @@ import { HEARTBEAT_DEFAULT_INTERVAL_MS } from "@/constants/heartbeat";
 import {
   WORKSPACE_ONLY_COMMAND_KEYS,
   WORKSPACE_ONLY_COMMAND_TYPES,
+  type WorkspaceOnlyCommandType,
 } from "@/constants/slashCommands";
 import { applyCompactionOverrides } from "@/browser/utils/messages/compactionOptions";
 import { resolveCompactionModel } from "@/browser/utils/messages/compactionModelPreference";
@@ -257,6 +258,35 @@ function parseWorkflowSlashArgs(argsText: string | undefined): unknown {
 // ============================================================================
 // Command Dispatcher
 // ============================================================================
+
+/** Compiles only when T is a subset of U; used to pin constants to the parser's union. */
+type SubsetOf<T extends U, U> = T;
+
+// A typo or stale entry in WORKSPACE_ONLY_COMMAND_TYPE_LIST fails this subset
+// constraint at compile time instead of being silently dropped by Extract
+// (which would leave the dispatch switch exhaustive while the real command
+// falls through unhandled).
+type CheckedWorkspaceOnlyCommandType = SubsetOf<
+  WorkspaceOnlyCommandType,
+  NonNullable<ParsedCommand>["type"]
+>;
+
+type WorkspaceOnlyParsedCommand = Extract<
+  NonNullable<ParsedCommand>,
+  { type: CheckedWorkspaceOnlyCommandType }
+>;
+
+/**
+ * Narrow a parsed command to the workspace-only subset so the dispatch switch
+ * below stays compiler-checked exhaustive: adding a type to
+ * WORKSPACE_ONLY_COMMAND_TYPE_LIST without a handler fails lint instead of
+ * silently falling through to the generic toast path.
+ */
+function isWorkspaceOnlyParsedCommand(
+  parsed: NonNullable<ParsedCommand>
+): parsed is WorkspaceOnlyParsedCommand {
+  return WORKSPACE_ONLY_COMMAND_TYPES.has(parsed.type);
+}
 
 /**
  * Process any slash command
@@ -711,7 +741,7 @@ export async function processSlashCommand(
     }
   })();
 
-  const isWorkspaceCommandType = WORKSPACE_ONLY_COMMAND_TYPES.has(parsed.type);
+  const isWorkspaceCommandType = isWorkspaceOnlyParsedCommand(parsed);
   const isWorkspaceOnlyCommand =
     isWorkspaceCommandType ||
     (workspaceOnlyKey ? WORKSPACE_ONLY_COMMAND_KEYS.has(workspaceOnlyKey) : false);
@@ -839,6 +869,10 @@ export async function processSlashCommand(
           api: client,
           workspaceId: context.workspaceId,
         } as CommandHandlerContext);
+      // No default: parsed is narrowed to workspace-only commands (minus
+      // workflow-run/heartbeat-set, which returned above), so adding a type
+      // to WORKSPACE_ONLY_COMMAND_TYPE_LIST without a case fails the
+      // switch-exhaustiveness lint here.
     }
   }
 
