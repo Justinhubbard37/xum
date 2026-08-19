@@ -5,6 +5,15 @@ import { describe, it, expect } from "bun:test";
 import type { MuxToolScope } from "@/common/types/toolScope";
 import { FILE_EDIT_DIFF_OMITTED_MESSAGE } from "@/common/types/tools";
 import type { AgentSkillReadToolResult, AgentSkillWriteToolResult } from "@/common/types/tools";
+import {
+  RefinementEvidenceSchema,
+  RefinementInverseSchema,
+  SkillRefinementActionSchema,
+} from "@/common/types/refinement";
+import {
+  applyRefinementInverse,
+  readRefinementEvents,
+} from "@/node/services/refinement/refinementTestHelpers";
 import { createAgentSkillReadTool } from "./agent_skill_read";
 import { createAgentSkillWriteTool } from "./agent_skill_write";
 import { SKILL_FILENAME } from "./skillFileUtils";
@@ -779,5 +788,99 @@ describe("agent_skill_write", () => {
     // Verify no directories were created in external target
     const externalEntries = await fs.readdir(externalDir);
     expect(externalEntries).toEqual([]);
+  });
+});
+
+describe("refinement journal", () => {
+  function sessionDirOf(muxHome: string): string {
+    return path.join(muxHome, "sessions", GLOBAL_WORKSPACE_ID);
+  }
+
+  it("journals a new-file write with a delete inverse that round-trips", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-write-refinement-create");
+
+    const tool = await createWriteTool(tempDir.path);
+    const content = skillMarkdown("demo-skill");
+    const result = (await tool.execute!(
+      { name: "demo-skill", content },
+      mockToolCallOptions
+    )) as AgentSkillWriteToolResult;
+    expect(result.success).toBe(true);
+
+    const events = await readRefinementEvents(sessionDirOf(tempDir.path));
+    expect(events).toHaveLength(1);
+    expect(events[0].data.kind).toBe("skill");
+    expect(SkillRefinementActionSchema.parse(events[0].data.action)).toEqual({
+      op: "write",
+      skillName: "demo-skill",
+      filePath: SKILL_FILENAME,
+    });
+    const evidence = RefinementEvidenceSchema.parse(events[0].data.evidence);
+    expect(evidence.toolName).toBe("agent_skill_write");
+    expect(evidence.toolCallId).toBe("test-call-id");
+
+    const skillPath = path.join(tempDir.path, "skills", "demo-skill", SKILL_FILENAME);
+    expect(await fs.readFile(skillPath, "utf-8")).toBe(content);
+    await applyRefinementInverse(sessionDirOf(tempDir.path), events[0].data.inverse);
+    const statErr = await fs.stat(skillPath).catch((error: NodeJS.ErrnoException) => error);
+    expect(statErr).toMatchObject({ code: "ENOENT" });
+  });
+
+  it("journals an overwrite with a blob-backed restore inverse that round-trips", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-write-refinement-overwrite");
+
+    const tool = await createWriteTool(tempDir.path);
+    // Over the inline cap so the inverse must round-trip through the blob store.
+    const original = skillMarkdown("demo-skill", { body: "x".repeat(5000) });
+    const updated = skillMarkdown("demo-skill", { body: "Updated body" });
+
+    const first = (await tool.execute!(
+      { name: "demo-skill", content: original },
+      mockToolCallOptions
+    )) as AgentSkillWriteToolResult;
+    expect(first.success).toBe(true);
+    const second = (await tool.execute!(
+      { name: "demo-skill", content: updated },
+      mockToolCallOptions
+    )) as AgentSkillWriteToolResult;
+    expect(second.success).toBe(true);
+
+    const events = await readRefinementEvents(sessionDirOf(tempDir.path));
+    expect(events).toHaveLength(2);
+    const inverse = RefinementInverseSchema.parse(events[1].data.inverse);
+    expect(inverse.op).toBe("restore-files");
+    if (inverse.op === "restore-files") {
+      expect(inverse.files).toHaveLength(1);
+      expect(inverse.files[0].text).toBeUndefined();
+      expect(inverse.files[0].blobRef).toBeDefined();
+    }
+
+    const skillPath = path.join(tempDir.path, "skills", "demo-skill", SKILL_FILENAME);
+    expect(await fs.readFile(skillPath, "utf-8")).toBe(updated);
+    await applyRefinementInverse(sessionDirOf(tempDir.path), events[1].data.inverse);
+    expect(await fs.readFile(skillPath, "utf-8")).toBe(original);
+  });
+
+  it("does not fail the write when the journal is unavailable", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-write-refinement-broken-journal");
+
+    // Occupy the session dir path with a FILE so journal appends cannot mkdir.
+    const brokenSessionDir = path.join(tempDir.path, "broken-session");
+    await fs.writeFile(brokenSessionDir, "not a directory", "utf-8");
+    const config = createTestToolConfig(tempDir.path, {
+      workspaceId: "ws-broken",
+      sessionsDir: brokenSessionDir,
+    });
+    const tool = createAgentSkillWriteTool(config);
+
+    const content = skillMarkdown("demo-skill");
+    const result = (await tool.execute!(
+      { name: "demo-skill", content },
+      mockToolCallOptions
+    )) as AgentSkillWriteToolResult;
+    expect(result.success).toBe(true);
+    expect(
+      await fs.readFile(path.join(tempDir.path, "skills", "demo-skill", SKILL_FILENAME), "utf-8")
+    ).toBe(content);
   });
 });

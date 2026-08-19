@@ -7,9 +7,14 @@ import type { AgentSkillDeleteToolResult } from "@/common/types/tools";
 import { getErrorMessage } from "@/common/utils/errors";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
-import type { FileStat } from "@/node/runtime/Runtime";
+import type { FileStat, Runtime } from "@/node/runtime/Runtime";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
-import { execBuffered } from "@/node/utils/runtime/helpers";
+import {
+  appendRefinementEventFromTool,
+  type RefinementFileCapture,
+} from "@/node/services/refinement/refinementJournal";
+import { log } from "@/node/services/log";
+import { execBuffered, readFileString } from "@/node/utils/runtime/helpers";
 import { quoteRuntimeProbePath } from "./runtimePathShellQuote";
 import {
   ensureRuntimePathWithinWorkspace,
@@ -30,18 +35,93 @@ interface AgentSkillDeleteToolArgs {
 }
 
 /**
+ * Capture every regular file under a local skill dir (refinement inverse for a
+ * whole-skill delete). Contents are captured as UTF-8 text; symlinks are
+ * skipped (the tool refuses symlink targets anyway). Returns null when capture
+ * fails: the delete then proceeds unjournaled (log-only) rather than failing.
+ */
+async function captureLocalSkillFiles(skillDir: string): Promise<RefinementFileCapture[] | null> {
+  try {
+    const captures: RefinementFileCapture[] = [];
+    const walk = async (dir: string): Promise<void> => {
+      const entries = await fsPromises.readdir(dir, { withFileTypes: true });
+      entries.sort((a, b) => (a.name < b.name ? -1 : 1));
+      for (const entry of entries) {
+        const entryPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          await walk(entryPath);
+        } else if (entry.isFile()) {
+          captures.push({
+            path: entryPath,
+            content: await fsPromises.readFile(entryPath, "utf-8"),
+          });
+        }
+      }
+    };
+    await walk(skillDir);
+    return captures;
+  } catch (error) {
+    log.debug("[agent_skill_delete] failed to capture skill files for refinement inverse", {
+      skillDir,
+      error,
+    });
+    return null;
+  }
+}
+
+/**
+ * Runtime-path variant of captureLocalSkillFiles. `find` runs relative to the
+ * skill dir so its output stays namespace-agnostic (remote runtimes translate
+ * paths embedded in commands); results are resolved back to runtime paths.
+ */
+async function captureRuntimeSkillFiles(
+  runtime: Runtime,
+  skillDir: string
+): Promise<RefinementFileCapture[] | null> {
+  try {
+    const findResult = await execBuffered(runtime, "find . -type f", {
+      cwd: skillDir,
+      timeout: 10,
+    });
+    if (findResult.exitCode !== 0) {
+      log.debug("[agent_skill_delete] find failed while capturing refinement inverse", {
+        skillDir,
+        stderr: findResult.stderr,
+      });
+      return null;
+    }
+    const relPaths = findResult.stdout
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+      .map((line) => line.replace(/^\.\//, ""))
+      .sort();
+    const captures: RefinementFileCapture[] = [];
+    for (const relPath of relPaths) {
+      const runtimePath = runtime.normalizePath(relPath, skillDir);
+      captures.push({ path: runtimePath, content: await readFileString(runtime, runtimePath) });
+    }
+    return captures;
+  } catch (error) {
+    log.debug("[agent_skill_delete] failed to capture skill files for refinement inverse", {
+      skillDir,
+      error,
+    });
+    return null;
+  }
+}
+
+/**
  * Tool that deletes skills/files under the contextual skills directory.
  */
 export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguration) => {
   return tool({
     description: TOOL_DEFINITIONS.agent_skill_delete.description,
     inputSchema: TOOL_DEFINITIONS.agent_skill_delete.schema,
-    execute: async ({
-      name,
-      target,
-      filePath,
-      confirm,
-    }: AgentSkillDeleteToolArgs): Promise<AgentSkillDeleteToolResult> => {
+    execute: async (
+      { name, target, filePath, confirm }: AgentSkillDeleteToolArgs,
+      { toolCallId }
+    ): Promise<AgentSkillDeleteToolResult> => {
       if (!confirm) {
         return {
           success: false,
@@ -101,6 +181,9 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
               };
             }
 
+            // Prior contents must be captured before removal (refinement inverse).
+            const skillCaptures = await captureRuntimeSkillFiles(config.runtime, skillDir);
+
             const rmSkillResult = await execBuffered(
               config.runtime,
               `rm -rf ${quoteRuntimeProbePath(skillDir)}`,
@@ -116,6 +199,15 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
                 success: false,
                 error: details || `Failed to delete skill directory '${parsedName.data}'`,
               };
+            }
+
+            if (skillCaptures !== null) {
+              await appendRefinementEventFromTool(config, {
+                kind: "skill",
+                action: { op: "delete-skill", skillName: parsedName.data },
+                inverse: { op: "restore-files", files: skillCaptures },
+                evidence: { toolName: "agent_skill_delete", toolCallId },
+              });
             }
 
             return {
@@ -162,6 +254,21 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
             };
           }
 
+          // Prior content must be captured before removal (refinement inverse).
+          // Null capture (e.g. unreadable file) skips journaling, never the delete.
+          let fileCapture: RefinementFileCapture | null = null;
+          try {
+            fileCapture = {
+              path: resolvedPath,
+              content: await readFileString(config.runtime, resolvedPath),
+            };
+          } catch (error) {
+            log.debug("[agent_skill_delete] failed to capture file for refinement inverse", {
+              resolvedPath,
+              error,
+            });
+          }
+
           const rmFileResult = await execBuffered(
             config.runtime,
             `rm ${quoteRuntimeProbePath(resolvedPath)}`,
@@ -184,6 +291,15 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
               success: false,
               error: details || `Failed to delete file in skill '${parsedName.data}'`,
             };
+          }
+
+          if (fileCapture !== null) {
+            await appendRefinementEventFromTool(config, {
+              kind: "skill",
+              action: { op: "delete-file", skillName: parsedName.data, filePath },
+              inverse: { op: "restore-files", files: [fileCapture] },
+              evidence: { toolName: "agent_skill_delete", toolCallId },
+            });
           }
 
           return {
@@ -241,7 +357,17 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
 
         const targetMode = target ?? "file";
         if (targetMode === "skill") {
+          // Prior contents must be captured before removal (refinement inverse).
+          const skillCaptures = await captureLocalSkillFiles(skillDir);
           await fsPromises.rm(skillDir, { recursive: true });
+          if (skillCaptures !== null) {
+            await appendRefinementEventFromTool(config, {
+              kind: "skill",
+              action: { op: "delete-skill", skillName: parsedName.data },
+              inverse: { op: "restore-files", files: skillCaptures },
+              evidence: { toolName: "agent_skill_delete", toolCallId },
+            });
+          }
           return {
             success: true,
             deleted: "skill",
@@ -294,7 +420,32 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
           };
         }
 
+        // Prior content must be captured before removal (refinement inverse).
+        // Null capture (e.g. unreadable file) skips journaling, never the delete.
+        let localFileCapture: RefinementFileCapture | null = null;
+        try {
+          localFileCapture = {
+            path: targetPath,
+            content: await fsPromises.readFile(targetPath, "utf-8"),
+          };
+        } catch (error) {
+          log.debug("[agent_skill_delete] failed to capture file for refinement inverse", {
+            targetPath,
+            error,
+          });
+        }
+
         await fsPromises.unlink(targetPath);
+
+        if (localFileCapture !== null) {
+          await appendRefinementEventFromTool(config, {
+            kind: "skill",
+            action: { op: "delete-file", skillName: parsedName.data, filePath },
+            inverse: { op: "restore-files", files: [localFileCapture] },
+            evidence: { toolName: "agent_skill_delete", toolCallId },
+          });
+        }
+
         return {
           success: true,
           deleted: "file",

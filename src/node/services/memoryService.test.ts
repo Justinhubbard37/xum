@@ -16,6 +16,13 @@ import {
   type MemoryScopeContext,
 } from "./memoryService";
 import { MemoryMetaService } from "./memoryMeta";
+import {
+  MemoryRefinementActionSchema,
+  REFINEMENT_INLINE_MAX_CHARS,
+  RefinementEvidenceSchema,
+  RefinementInverseSchema,
+} from "@/common/types/refinement";
+import { applyRefinementInverse, readRefinementEvents } from "./refinement/refinementTestHelpers";
 import { TestTempDir } from "./tools/testHelpers";
 
 function pathExists(target: string): Promise<boolean> {
@@ -1136,5 +1143,199 @@ describe("MemoryService", () => {
       await fixture.service.listHotMemories(fixture.ctx, { countTokens: () => Promise.resolve(1) });
       expect((await fixture.metaService.getEntries()).get("global:a.md")?.accessCount).toBe(1);
     });
+  });
+});
+
+describe("MemoryService refinement journal", () => {
+  const WORKSPACE_ID = "ws-1";
+
+  function sessionDirOf(fixture: MemoryFixture): string {
+    return fixture.config.getSessionDir(WORKSPACE_ID);
+  }
+
+  it("journals create with a delete inverse that round-trips", async () => {
+    using fixture = await createFixture();
+    const result = await fixture.service.create(
+      fixture.ctx,
+      "/memories/global/notes.md",
+      "hello",
+      "agent"
+    );
+    expect(result.success).toBe(true);
+
+    const events = await readRefinementEvents(sessionDirOf(fixture));
+    expect(events).toHaveLength(1);
+    expect(events[0].data.kind).toBe("memory");
+    const action = MemoryRefinementActionSchema.parse(events[0].data.action);
+    expect(action).toEqual({ op: "create", path: "/memories/global/notes.md" });
+    const evidence = RefinementEvidenceSchema.parse(events[0].data.evidence);
+    expect(evidence.workspaceId).toBe(WORKSPACE_ID);
+    expect(evidence.toolName).toBe("memory");
+    expect(evidence.actor).toBe("agent");
+
+    const physical = path.join(fixture.muxHome, "memory", "global", "notes.md");
+    expect(await pathExists(physical)).toBe(true);
+    await applyRefinementInverse(sessionDirOf(fixture), events[0].data.inverse);
+    expect(await pathExists(physical)).toBe(false);
+  });
+
+  it("journals str_replace with a restore inverse that round-trips byte-identically", async () => {
+    using fixture = await createFixture();
+    await fixture.service.create(fixture.ctx, "/memories/global/notes.md", "alpha beta", "agent");
+    const result = await fixture.service.strReplace(
+      fixture.ctx,
+      "/memories/global/notes.md",
+      "beta",
+      "gamma",
+      "agent"
+    );
+    expect(result.success).toBe(true);
+
+    const events = await readRefinementEvents(sessionDirOf(fixture));
+    expect(events).toHaveLength(2);
+    expect(MemoryRefinementActionSchema.parse(events[1].data.action).op).toBe("str_replace");
+
+    const physical = path.join(fixture.muxHome, "memory", "global", "notes.md");
+    expect(await fsPromises.readFile(physical, "utf-8")).toBe("alpha gamma");
+    await applyRefinementInverse(sessionDirOf(fixture), events[1].data.inverse);
+    expect(await fsPromises.readFile(physical, "utf-8")).toBe("alpha beta");
+  });
+
+  it("journals insert with a restore inverse that round-trips byte-identically", async () => {
+    using fixture = await createFixture();
+    await fixture.service.create(fixture.ctx, "/memories/global/notes.md", "one\ntwo", "agent");
+    const result = await fixture.service.insert(
+      fixture.ctx,
+      "/memories/global/notes.md",
+      1,
+      "between",
+      "agent"
+    );
+    expect(result.success).toBe(true);
+
+    const events = await readRefinementEvents(sessionDirOf(fixture));
+    expect(events).toHaveLength(2);
+    expect(MemoryRefinementActionSchema.parse(events[1].data.action).op).toBe("insert");
+
+    const physical = path.join(fixture.muxHome, "memory", "global", "notes.md");
+    expect(await fsPromises.readFile(physical, "utf-8")).toBe("one\nbetween\ntwo");
+    await applyRefinementInverse(sessionDirOf(fixture), events[1].data.inverse);
+    expect(await fsPromises.readFile(physical, "utf-8")).toBe("one\ntwo");
+  });
+
+  it("journals file delete with a blob-backed restore inverse for large contents", async () => {
+    using fixture = await createFixture();
+    // Over the inline cap so the inverse must round-trip through the blob store.
+    const content = "x".repeat(REFINEMENT_INLINE_MAX_CHARS + 1000);
+    await fixture.service.create(fixture.ctx, "/memories/global/big.md", content, "agent");
+    const result = await fixture.service.deletePath(
+      fixture.ctx,
+      "/memories/global/big.md",
+      "agent"
+    );
+    expect(result.success).toBe(true);
+
+    const events = await readRefinementEvents(sessionDirOf(fixture));
+    expect(events).toHaveLength(2);
+    const inverse = RefinementInverseSchema.parse(events[1].data.inverse);
+    expect(inverse.op).toBe("restore-files");
+    if (inverse.op === "restore-files") {
+      expect(inverse.files).toHaveLength(1);
+      expect(inverse.files[0].text).toBeUndefined();
+      expect(inverse.files[0].blobRef).toBeDefined();
+    }
+
+    const physical = path.join(fixture.muxHome, "memory", "global", "big.md");
+    expect(await pathExists(physical)).toBe(false);
+    await applyRefinementInverse(sessionDirOf(fixture), events[1].data.inverse);
+    expect(await fsPromises.readFile(physical, "utf-8")).toBe(content);
+  });
+
+  it("journals directory delete with an inverse restoring every contained file", async () => {
+    using fixture = await createFixture();
+    await fixture.service.create(fixture.ctx, "/memories/global/dir/a.md", "aaa", "agent");
+    await fixture.service.create(fixture.ctx, "/memories/global/dir/sub/b.md", "bbb", "agent");
+    const result = await fixture.service.deletePath(fixture.ctx, "/memories/global/dir", "agent");
+    expect(result.success).toBe(true);
+
+    const events = await readRefinementEvents(sessionDirOf(fixture));
+    expect(events).toHaveLength(3);
+    expect(MemoryRefinementActionSchema.parse(events[2].data.action)).toEqual({
+      op: "delete",
+      path: "/memories/global/dir",
+    });
+
+    const dir = path.join(fixture.muxHome, "memory", "global", "dir");
+    expect(await pathExists(dir)).toBe(false);
+    await applyRefinementInverse(sessionDirOf(fixture), events[2].data.inverse);
+    expect(await fsPromises.readFile(path.join(dir, "a.md"), "utf-8")).toBe("aaa");
+    expect(await fsPromises.readFile(path.join(dir, "sub", "b.md"), "utf-8")).toBe("bbb");
+  });
+
+  it("journals rename with an inverse that renames back", async () => {
+    using fixture = await createFixture();
+    await fixture.service.create(fixture.ctx, "/memories/global/old.md", "content", "agent");
+    const result = await fixture.service.rename(
+      fixture.ctx,
+      "/memories/global/old.md",
+      "/memories/global/sub/new.md",
+      "agent"
+    );
+    expect(result.success).toBe(true);
+
+    const events = await readRefinementEvents(sessionDirOf(fixture));
+    expect(events).toHaveLength(2);
+    expect(MemoryRefinementActionSchema.parse(events[1].data.action)).toEqual({
+      op: "rename",
+      path: "/memories/global/old.md",
+      newPath: "/memories/global/sub/new.md",
+    });
+
+    await applyRefinementInverse(sessionDirOf(fixture), events[1].data.inverse);
+    expect(
+      await fsPromises.readFile(path.join(fixture.muxHome, "memory", "global", "old.md"), "utf-8")
+    ).toBe("content");
+    expect(await pathExists(path.join(fixture.muxHome, "memory", "global", "sub", "new.md"))).toBe(
+      false
+    );
+  });
+
+  it("writes no rows for read-only ops or failed mutations", async () => {
+    using fixture = await createFixture();
+    await fixture.service.create(fixture.ctx, "/memories/global/notes.md", "hello", "agent");
+
+    await fixture.service.view(fixture.ctx, "/memories/global/notes.md");
+    await fixture.service.view(fixture.ctx, "/memories/global");
+    // Failed mutation: create over an existing file is rejected.
+    const failed = await fixture.service.create(
+      fixture.ctx,
+      "/memories/global/notes.md",
+      "other",
+      "agent"
+    );
+    expect(failed.success).toBe(false);
+
+    const events = await readRefinementEvents(sessionDirOf(fixture));
+    expect(events).toHaveLength(1);
+  });
+
+  it("does not fail the mutation when the journal is unavailable", async () => {
+    using fixture = await createFixture();
+    // Occupy the session dir path with a FILE so journal appends cannot mkdir.
+    const brokenSessionDir = fixture.config.getSessionDir("ws-broken");
+    await fsPromises.mkdir(path.dirname(brokenSessionDir), { recursive: true });
+    await fsPromises.writeFile(brokenSessionDir, "not a directory", "utf-8");
+
+    const brokenCtx = { ...fixture.ctx, workspaceId: "ws-broken" };
+    const result = await fixture.service.create(
+      brokenCtx,
+      "/memories/global/notes.md",
+      "hello",
+      "agent"
+    );
+    expect(result.success).toBe(true);
+    expect(
+      await fsPromises.readFile(path.join(fixture.muxHome, "memory", "global", "notes.md"), "utf-8")
+    ).toBe("hello");
   });
 });

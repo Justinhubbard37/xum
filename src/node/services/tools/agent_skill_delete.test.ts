@@ -4,6 +4,15 @@ import * as path from "node:path";
 import { describe, it, expect } from "bun:test";
 import type { MuxToolScope } from "@/common/types/toolScope";
 import type { AgentSkillDeleteToolResult } from "@/common/types/tools";
+import {
+  RefinementEvidenceSchema,
+  RefinementInverseSchema,
+  SkillRefinementActionSchema,
+} from "@/common/types/refinement";
+import {
+  applyRefinementInverse,
+  readRefinementEvents,
+} from "@/node/services/refinement/refinementTestHelpers";
 import { createAgentSkillDeleteTool } from "./agent_skill_delete";
 import {
   createTestToolConfig,
@@ -13,6 +22,7 @@ import {
   restoreMuxRoot,
   TEST_GLOBAL_WORKSPACE_ID as GLOBAL_WORKSPACE_ID,
   TestTempDir,
+  writeGlobalSkill,
   writeSkillWithReference,
 } from "./testHelpers";
 
@@ -729,5 +739,147 @@ describe("agent_skill_delete", () => {
     // Verify external content is still intact
     const stat = await fs.stat(path.join(externalDir, "skills", "demo-skill", "SKILL.md"));
     expect(stat.isFile()).toBe(true);
+  });
+});
+
+describe("refinement journal", () => {
+  function sessionDirOf(muxHome: string): string {
+    return path.join(muxHome, "sessions", GLOBAL_WORKSPACE_ID);
+  }
+
+  it("journals a file delete with a restore inverse that round-trips", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-delete-refinement-file");
+
+    await writeSkillWithReference(tempDir.path, "demo-skill");
+    const referencePath = path.join(tempDir.path, "skills", "demo-skill", "references", "foo.txt");
+    const original = await fs.readFile(referencePath, "utf-8");
+
+    const tool = await createDeleteTool(tempDir.path);
+    const result = (await tool.execute!(
+      { name: "demo-skill", filePath: "references/foo.txt", confirm: true },
+      mockToolCallOptions
+    )) as AgentSkillDeleteToolResult;
+    expect(result).toMatchObject({ success: true, deleted: "file" });
+
+    const events = await readRefinementEvents(sessionDirOf(tempDir.path));
+    expect(events).toHaveLength(1);
+    expect(events[0].data.kind).toBe("skill");
+    expect(SkillRefinementActionSchema.parse(events[0].data.action)).toEqual({
+      op: "delete-file",
+      skillName: "demo-skill",
+      filePath: "references/foo.txt",
+    });
+    const evidence = RefinementEvidenceSchema.parse(events[0].data.evidence);
+    expect(evidence.toolName).toBe("agent_skill_delete");
+    expect(evidence.toolCallId).toBe("test-call-id");
+
+    await applyRefinementInverse(sessionDirOf(tempDir.path), events[0].data.inverse);
+    expect(await fs.readFile(referencePath, "utf-8")).toBe(original);
+  });
+
+  it("journals a whole-skill delete with an inverse restoring every file", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-delete-refinement-skill");
+
+    // Include a nested file and an over-inline-cap file (blob-backed inverse).
+    const bigContent = "x".repeat(5000);
+    await writeGlobalSkill(tempDir.path, "demo-skill", {
+      description: "fixture",
+      files: { "references/foo.txt": "fixture", "references/big.txt": bigContent },
+    });
+    const skillDir = path.join(tempDir.path, "skills", "demo-skill");
+    const originalSkillMd = await fs.readFile(path.join(skillDir, "SKILL.md"), "utf-8");
+
+    const tool = await createDeleteTool(tempDir.path);
+    const result = (await tool.execute!(
+      { name: "demo-skill", target: "skill", confirm: true },
+      mockToolCallOptions
+    )) as AgentSkillDeleteToolResult;
+    expect(result).toMatchObject({ success: true, deleted: "skill" });
+
+    const events = await readRefinementEvents(sessionDirOf(tempDir.path));
+    expect(events).toHaveLength(1);
+    expect(SkillRefinementActionSchema.parse(events[0].data.action)).toEqual({
+      op: "delete-skill",
+      skillName: "demo-skill",
+    });
+    const inverse = RefinementInverseSchema.parse(events[0].data.inverse);
+    expect(inverse.op).toBe("restore-files");
+    if (inverse.op === "restore-files") {
+      expect(inverse.files).toHaveLength(3);
+    }
+
+    const statErr = await fs.stat(skillDir).catch((error: NodeJS.ErrnoException) => error);
+    expect(statErr).toMatchObject({ code: "ENOENT" });
+
+    await applyRefinementInverse(sessionDirOf(tempDir.path), events[0].data.inverse);
+    expect(await fs.readFile(path.join(skillDir, "SKILL.md"), "utf-8")).toBe(originalSkillMd);
+    expect(await fs.readFile(path.join(skillDir, "references", "foo.txt"), "utf-8")).toBe(
+      "fixture"
+    );
+    expect(await fs.readFile(path.join(skillDir, "references", "big.txt"), "utf-8")).toBe(
+      bigContent
+    );
+  });
+
+  it("writes no row when the delete fails", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-delete-refinement-missing");
+
+    const tool = await createDeleteTool(tempDir.path);
+    const result = (await tool.execute!(
+      { name: "missing-skill", target: "skill", confirm: true },
+      mockToolCallOptions
+    )) as AgentSkillDeleteToolResult;
+    expect(result.success).toBe(false);
+
+    const events = await readRefinementEvents(sessionDirOf(tempDir.path));
+    expect(events).toHaveLength(0);
+  });
+
+  it("captures runtime-path skill deletes in the journal", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-delete-refinement-runtime");
+    const skillName = "my-skill";
+    const remoteWorkspaceRoot = "/remote/workspace";
+
+    await writeSkillWithReference(path.join(tempDir.path, ".mux"), skillName);
+    const originalSkillMd = await fs.readFile(
+      path.join(tempDir.path, ".mux", "skills", skillName, "SKILL.md"),
+      "utf-8"
+    );
+
+    const remoteRuntime = new RemotePathMappedRuntime(tempDir.path, remoteWorkspaceRoot);
+    const sessionsDir = path.join(tempDir.path, "session-dir");
+    await fs.mkdir(sessionsDir, { recursive: true });
+    const baseConfig = createTestToolConfig(tempDir.path, {
+      workspaceId: "regular-workspace",
+      sessionsDir,
+      runtime: remoteRuntime,
+      muxScope: {
+        type: "project",
+        muxHome: tempDir.path,
+        projectRoot: "/host/project",
+        projectStorageAuthority: "runtime",
+      },
+    });
+    const config = { ...baseConfig, cwd: remoteWorkspaceRoot };
+
+    const tool = createAgentSkillDeleteTool(config);
+    const result = (await tool.execute!(
+      { name: skillName, target: "skill", confirm: true },
+      mockToolCallOptions
+    )) as AgentSkillDeleteToolResult;
+    expect(result).toMatchObject({ success: true, deleted: "skill" });
+
+    const events = await readRefinementEvents(sessionsDir);
+    expect(events).toHaveLength(1);
+    const inverse = RefinementInverseSchema.parse(events[0].data.inverse);
+    expect(inverse.op).toBe("restore-files");
+    if (inverse.op === "restore-files") {
+      // Paths are runtime-namespace; contents were captured through the runtime.
+      const skillMd = inverse.files.find((file) => file.path.endsWith("SKILL.md"));
+      expect(skillMd?.path).toBe(`${remoteWorkspaceRoot}/.mux/skills/${skillName}/SKILL.md`);
+      expect(skillMd?.text).toBe(originalSkillMd);
+      const reference = inverse.files.find((file) => file.path.endsWith("foo.txt"));
+      expect(reference?.text).toBe("fixture");
+    }
   });
 });

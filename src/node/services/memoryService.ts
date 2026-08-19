@@ -43,6 +43,12 @@ import type { Config } from "@/node/config";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
+import type { MemoryRefinementAction } from "@/common/types/refinement";
+import {
+  appendRefinementEvent,
+  type RefinementFileCapture,
+  type RefinementInverseDraft,
+} from "@/node/services/refinement/refinementJournal";
 import {
   escapeXmlAttribute,
   selectHotMemories,
@@ -242,6 +248,8 @@ type MemoryEntryKind = "file" | "dir" | null;
 interface MemoryStore {
   /** Physical root; used as the mutex key. */
   readonly physicalRoot: string;
+  /** Absolute physical path of an entry (refinement inverses restore by exact path). */
+  physicalPath(relPath: string): string;
   /**
    * Validate the root before use without creating it. Host-local roots currently
    * need no root-level checks; path containment is enforced per target.
@@ -298,6 +306,10 @@ class LocalMemoryStore implements MemoryStore {
 
   private abs(relPath: string): string {
     return relPath === "" ? this.physicalRoot : path.join(this.physicalRoot, ...relPath.split("/"));
+  }
+
+  physicalPath(relPath: string): string {
+    return this.abs(relPath);
   }
 
   assertRootSafe(): Promise<void> {
@@ -623,6 +635,80 @@ export class MemoryService extends EventEmitter {
     return parsed.scope;
   }
 
+  /**
+   * Append the invertible `refinement` row for one memory mutation (RLM r2).
+   *
+   * Rows land in the ACTING workspace's session journal even though memory
+   * files can be global/project-scoped: the journal is per-session, so
+   * cross-workspace edits to a shared file are attributed to (and invertible
+   * from) whichever workspace made them — the intended v1 scope. When the
+   * context has no workspace, there is no session journal; skip (log-only).
+   * Never throws: journaling failures must not fail the memory command.
+   */
+  private async journalRefinement(
+    ctx: MemoryScopeContext,
+    action: MemoryRefinementAction,
+    inverse: RefinementInverseDraft,
+    actor: MemoryActor,
+    toolCallId?: string
+  ): Promise<void> {
+    if (!ctx.workspaceId) {
+      log.debug("[MemoryService] skipping refinement journal: no workspace session", {
+        op: action.op,
+      });
+      return;
+    }
+    await appendRefinementEvent({
+      sessionDir: this.config.getSessionDir(ctx.workspaceId),
+      workspaceId: ctx.workspaceId,
+      kind: "memory",
+      action,
+      inverse,
+      evidence: {
+        toolName: "memory",
+        actor,
+        ...(toolCallId !== undefined ? { toolCallId } : {}),
+      },
+    });
+  }
+
+  /**
+   * Capture the restore payload for a delete (file or recursive directory)
+   * BEFORE it is removed. Returns null when capture fails (e.g. an over-cap or
+   * binary file edited outside Mux): the delete then proceeds unjournaled
+   * (log-only) rather than failing the user-facing command.
+   */
+  private async captureDeleteInverse(
+    store: MemoryStore,
+    relPath: string,
+    kind: MemoryEntryKind
+  ): Promise<RefinementInverseDraft | null> {
+    try {
+      const capture = async (fileRelPath: string): Promise<RefinementFileCapture> => ({
+        path: store.physicalPath(fileRelPath),
+        content: await this.readBoundedTextFile(store, fileRelPath, fileRelPath),
+      });
+      if (kind === "file") {
+        return { op: "restore-files", files: [await capture(relPath)] };
+      }
+      // Directory: every file under the prefix (dotfiles excluded, matching
+      // listFiles — the memory path grammar never addresses dotfiles anyway).
+      const prefix = `${relPath}/`;
+      const files = (await store.listFiles()).filter((file) => file.startsWith(prefix));
+      const captures: RefinementFileCapture[] = [];
+      for (const file of files) {
+        captures.push(await capture(file));
+      }
+      return { op: "restore-files", files: captures };
+    } catch (error) {
+      log.debug("[MemoryService] failed to capture delete inverse; delete proceeds unjournaled", {
+        relPath,
+        error,
+      });
+      return null;
+    }
+  }
+
   private emitChange(
     ctx: MemoryScopeContext,
     scope: MemoryScope,
@@ -701,7 +787,8 @@ export class MemoryService extends EventEmitter {
     ctx: MemoryScopeContext,
     virtualPath: string,
     fileText: string,
-    actor: MemoryActor
+    actor: MemoryActor,
+    toolCallId?: string
   ): Promise<MemoryCommandResult> {
     return this.runCommand(async () => {
       const parsed = parseMemoryPath(virtualPath);
@@ -723,6 +810,14 @@ export class MemoryService extends EventEmitter {
           );
         }
         await store.writeFile(parsed.relPath, fileText);
+        // Row is written before the create is acknowledged (mutation → row → ack).
+        await this.journalRefinement(
+          ctx,
+          { op: "create", path: toVirtualPath(scope, parsed.relPath) },
+          { op: "delete-files", paths: [store.physicalPath(parsed.relPath)] },
+          actor,
+          toolCallId
+        );
         await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
         this.emitChange(ctx, scope, parsed.relPath, actor);
         return {
@@ -738,7 +833,8 @@ export class MemoryService extends EventEmitter {
     virtualPath: string,
     oldStr: string,
     newStr: string,
-    actor: MemoryActor
+    actor: MemoryActor,
+    toolCallId?: string
   ): Promise<MemoryCommandResult> {
     return this.runCommand(async () => {
       const parsed = parseMemoryPath(virtualPath);
@@ -764,6 +860,17 @@ export class MemoryService extends EventEmitter {
         const updated = content.replace(oldStr, newStr);
         assertWithinFileSizeCap(updated);
         await store.writeFile(parsed.relPath, updated);
+        // Row is written before the edit is acknowledged (mutation → row → ack).
+        await this.journalRefinement(
+          ctx,
+          { op: "str_replace", path: toVirtualPath(scope, parsed.relPath) },
+          {
+            op: "restore-files",
+            files: [{ path: store.physicalPath(parsed.relPath), content }],
+          },
+          actor,
+          toolCallId
+        );
         await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
         this.emitChange(ctx, scope, parsed.relPath, actor);
         return { success: true as const, output: `Edited ${toVirtualPath(scope, parsed.relPath)}` };
@@ -776,7 +883,8 @@ export class MemoryService extends EventEmitter {
     virtualPath: string,
     insertLine: number,
     insertText: string,
-    actor: MemoryActor
+    actor: MemoryActor,
+    toolCallId?: string
   ): Promise<MemoryCommandResult> {
     return this.runCommand(async () => {
       const parsed = parseMemoryPath(virtualPath);
@@ -797,6 +905,17 @@ export class MemoryService extends EventEmitter {
         const updated = lines.join("\n");
         assertWithinFileSizeCap(updated);
         await store.writeFile(parsed.relPath, updated);
+        // Row is written before the edit is acknowledged (mutation → row → ack).
+        await this.journalRefinement(
+          ctx,
+          { op: "insert", path: toVirtualPath(scope, parsed.relPath) },
+          {
+            op: "restore-files",
+            files: [{ path: store.physicalPath(parsed.relPath), content }],
+          },
+          actor,
+          toolCallId
+        );
         await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
         this.emitChange(ctx, scope, parsed.relPath, actor);
         return {
@@ -810,7 +929,8 @@ export class MemoryService extends EventEmitter {
   async deletePath(
     ctx: MemoryScopeContext,
     virtualPath: string,
-    actor: MemoryActor
+    actor: MemoryActor,
+    toolCallId?: string
   ): Promise<MemoryCommandResult> {
     return this.runCommand(async () => {
       const parsed = parseMemoryPath(virtualPath);
@@ -821,7 +941,19 @@ export class MemoryService extends EventEmitter {
         if (kind === null) {
           throw new MemoryCommandError(`No memory file or directory at ${virtualPath}`);
         }
+        // Prior contents must be captured before removal; the row itself is
+        // written after the mutation succeeds and before it is acknowledged.
+        const inverse = await this.captureDeleteInverse(store, parsed.relPath, kind);
         await store.remove(parsed.relPath);
+        if (inverse !== null) {
+          await this.journalRefinement(
+            ctx,
+            { op: "delete", path: toVirtualPath(scope, parsed.relPath) },
+            inverse,
+            actor,
+            toolCallId
+          );
+        }
         await this.recordDelete(ctx, scope, parsed.relPath);
         this.emitChange(ctx, scope, parsed.relPath, actor);
         return {
@@ -836,7 +968,8 @@ export class MemoryService extends EventEmitter {
     ctx: MemoryScopeContext,
     oldVirtualPath: string,
     newVirtualPath: string,
-    actor: MemoryActor
+    actor: MemoryActor,
+    toolCallId?: string
   ): Promise<MemoryCommandResult> {
     return this.runCommand(async () => {
       const oldParsed = parseMemoryPath(oldVirtualPath);
@@ -861,6 +994,22 @@ export class MemoryService extends EventEmitter {
           throw new MemoryCommandError(`Destination ${newVirtualPath} already exists`);
         }
         await store.rename(oldParsed.relPath, newParsed.relPath);
+        // Row is written before the rename is acknowledged (mutation → row → ack).
+        await this.journalRefinement(
+          ctx,
+          {
+            op: "rename",
+            path: toVirtualPath(scope, oldParsed.relPath),
+            newPath: toVirtualPath(scope, newParsed.relPath),
+          },
+          {
+            op: "rename",
+            from: store.physicalPath(newParsed.relPath),
+            to: store.physicalPath(oldParsed.relPath),
+          },
+          actor,
+          toolCallId
+        );
         await this.recordRename(ctx, scope, oldParsed.relPath, newParsed.relPath);
         this.emitChange(ctx, scope, oldParsed.relPath, actor);
         this.emitChange(ctx, scope, newParsed.relPath, actor);

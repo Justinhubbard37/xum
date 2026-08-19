@@ -10,6 +10,7 @@ import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
+import { appendRefinementEventFromTool } from "@/node/services/refinement/refinementJournal";
 import { readFileString, writeFileString } from "@/node/utils/runtime/helpers";
 import { generateDiff } from "@/node/services/tools/fileCommon";
 import {
@@ -83,11 +84,10 @@ export const createAgentSkillWriteTool: ToolFactory = (config: ToolConfiguration
   return tool({
     description: TOOL_DEFINITIONS.agent_skill_write.description,
     inputSchema: TOOL_DEFINITIONS.agent_skill_write.schema,
-    execute: async ({
-      name,
-      filePath,
-      content,
-    }: AgentSkillWriteToolArgs): Promise<AgentSkillWriteToolResult> => {
+    execute: async (
+      { name, filePath, content }: AgentSkillWriteToolArgs,
+      { toolCallId }
+    ): Promise<AgentSkillWriteToolResult> => {
       const parsedName = SkillNameSchema.safeParse(name);
       if (!parsedName.success) {
         return {
@@ -180,14 +180,35 @@ export const createAgentSkillWriteTool: ToolFactory = (config: ToolConfiguration
           }
 
           let originalContent = "";
+          let fileExisted = false;
           try {
             originalContent = await readFileString(config.runtime, resolvedTarget.resolvedPath);
+            fileExisted = true;
           } catch {
-            // Best-effort read for diff generation.
+            // Best-effort read for diff generation + refinement inverse
+            // (unreadable is treated as "did not exist").
           }
 
           await config.runtime.ensureDir(path.dirname(resolvedTarget.resolvedPath));
           await writeFileString(config.runtime, resolvedTarget.resolvedPath, contentToWrite);
+
+          // Refinement journal (RLM r2): row is appended before the write is
+          // acknowledged; failures never fail the tool (self-healing).
+          await appendRefinementEventFromTool(config, {
+            kind: "skill",
+            action: {
+              op: "write",
+              skillName: parsedName.data,
+              filePath: resolvedTarget.normalizedRelativePath,
+            },
+            inverse: fileExisted
+              ? {
+                  op: "restore-files",
+                  files: [{ path: resolvedTarget.resolvedPath, content: originalContent }],
+                }
+              : { op: "delete-files", paths: [resolvedTarget.resolvedPath] },
+            evidence: { toolName: "agent_skill_write", toolCallId },
+          });
 
           const diff = generateDiff(resolvedTarget.resolvedPath, originalContent, contentToWrite);
 
@@ -275,6 +296,7 @@ export const createAgentSkillWriteTool: ToolFactory = (config: ToolConfiguration
         }
 
         let originalContent = "";
+        let fileExisted = false;
         try {
           const existingStat = await fsPromises.lstat(resolvedTarget.resolvedPath);
           if (existingStat.isSymbolicLink()) {
@@ -292,6 +314,7 @@ export const createAgentSkillWriteTool: ToolFactory = (config: ToolConfiguration
           }
 
           originalContent = await fsPromises.readFile(resolvedTarget.resolvedPath, "utf-8");
+          fileExisted = true;
         } catch (error) {
           if (!hasErrorCode(error, "ENOENT")) {
             throw error;
@@ -300,6 +323,24 @@ export const createAgentSkillWriteTool: ToolFactory = (config: ToolConfiguration
 
         await fsPromises.mkdir(path.dirname(resolvedTarget.resolvedPath), { recursive: true });
         await fsPromises.writeFile(resolvedTarget.resolvedPath, contentToWrite, "utf-8");
+
+        // Refinement journal (RLM r2): row is appended before the write is
+        // acknowledged; failures never fail the tool (self-healing).
+        await appendRefinementEventFromTool(config, {
+          kind: "skill",
+          action: {
+            op: "write",
+            skillName: parsedName.data,
+            filePath: resolvedTarget.normalizedRelativePath,
+          },
+          inverse: fileExisted
+            ? {
+                op: "restore-files",
+                files: [{ path: resolvedTarget.resolvedPath, content: originalContent }],
+              }
+            : { op: "delete-files", paths: [resolvedTarget.resolvedPath] },
+          evidence: { toolName: "agent_skill_write", toolCallId },
+        });
 
         const diff = generateDiff(resolvedTarget.resolvedPath, originalContent, contentToWrite);
 
