@@ -29,6 +29,7 @@ import {
   readSubagentFailureArtifact,
   upsertSubagentFailureArtifact,
 } from "@/node/services/subagentFailureArtifacts";
+import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import { resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
 import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
 import { SessionUsageService } from "@/node/services/sessionUsageService";
@@ -12195,6 +12196,143 @@ describe("TaskService", () => {
     expect(serializedParentHistory).toContain("structuredOutput");
     expect(serializedParentHistory).toContain("claims");
     expect(serializedParentHistory).not.toContain("Background sub-agent task(s) have completed");
+  });
+
+  // Track 2 r5: mux.events() in the parent's persistent sandbox mount depends on
+  // finalizeAgentTaskReport invoking the sandbox host hook — without it, spawned-task
+  // completions never reach the guest queue in production.
+  test("terminal report posts a task-terminal event to the parent's sandbox mount", async () => {
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-sandbox-evt";
+    const childTaskId = "task-sandbox-evt";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId, {
+          aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
+        }),
+        projectWorkspace(projectPath, "child-task", childTaskId, {
+          name: "agent_explore_child",
+          parentWorkspaceId,
+          agentType: "explore",
+          taskStatus: "running",
+          taskModelString: "openai:gpt-5.2",
+          taskThinkingLevel: "medium",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { aiService } = createAIServiceMocks(config);
+    const { workspaceService } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+
+    // Real impl runs (no live mount for this scope => harmless no-op); calls are recorded.
+    const postSpy = spyOn(sandboxHostService, "postTaskTerminalEvent");
+    try {
+      await handleTaskServiceStreamEndForTest(taskService, {
+        type: "stream-end",
+        workspaceId: childTaskId,
+        messageId: "assistant-child-output",
+        metadata: { model: "openai:gpt-5.2", finishReason: "stop" },
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "agent-report-call-1",
+            toolName: "agent_report",
+            input: { reportMarkdown: "Spawned child done", title: "Result" },
+            state: "output-available",
+            output: {
+              success: true,
+              report: { reportMarkdown: "Spawned child done", title: "Result" },
+            },
+          },
+          // The terminal report requires a final assistant text response
+          // (resolveFinalAgentReportArgs derives reportMarkdown from it).
+          { type: "text", text: "Spawned child done" },
+        ],
+      });
+
+      expect(postSpy).toHaveBeenCalledTimes(1);
+      expect(postSpy).toHaveBeenCalledWith(parentWorkspaceId, {
+        taskId: childTaskId,
+        status: "completed",
+        reportMarkdown: "Spawned child done",
+      });
+    } finally {
+      postSpy.mockRestore();
+    }
+  });
+
+  test("foreground waiter suppresses the sandbox task-terminal event", async () => {
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-sandbox-fg";
+    const childTaskId = "task-sandbox-fg";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId, {
+          aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
+        }),
+        projectWorkspace(projectPath, "child-task", childTaskId, {
+          name: "agent_explore_child",
+          parentWorkspaceId,
+          agentType: "explore",
+          taskStatus: "running",
+          taskModelString: "openai:gpt-5.2",
+          taskThinkingLevel: "medium",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { aiService } = createAIServiceMocks(config);
+    const { workspaceService } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+
+    const postSpy = spyOn(sandboxHostService, "postTaskTerminalEvent");
+    try {
+      // Blocking consumption (mux.task / task_await) already delivers the report
+      // directly; the guest queue must not double-deliver it.
+      const waitPromise = taskService.waitForAgentReport(childTaskId, {
+        requestingWorkspaceId: parentWorkspaceId,
+      });
+
+      await handleTaskServiceStreamEndForTest(taskService, {
+        type: "stream-end",
+        workspaceId: childTaskId,
+        messageId: "assistant-child-output",
+        metadata: { model: "openai:gpt-5.2", finishReason: "stop" },
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "agent-report-call-1",
+            toolName: "agent_report",
+            input: { reportMarkdown: "Awaited child done", title: "Result" },
+            state: "output-available",
+            output: {
+              success: true,
+              report: { reportMarkdown: "Awaited child done", title: "Result" },
+            },
+          },
+          { type: "text", text: "Awaited child done" },
+        ],
+      });
+
+      const report = await waitPromise;
+      expect(report.reportMarkdown).toBe("Awaited child done");
+      expect(postSpy).not.toHaveBeenCalled();
+    } finally {
+      postSpy.mockRestore();
+    }
   });
 
   test("waitForAgentReport surfaces the child's report-time AI settings", async () => {

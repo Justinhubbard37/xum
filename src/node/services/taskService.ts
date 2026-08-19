@@ -29,6 +29,7 @@ import { BACKGROUND_WORK_WAKE_OPENINGS } from "@/common/utils/machineTurnPrompts
 import { WORKSPACE_TURN_TASK_TAGS } from "@/constants/workspaceTags";
 import { log } from "@/node/services/log";
 import { eventSpine } from "@/node/services/events/eventSpine";
+import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import {
   discoverAgentDefinitions,
   getSkipScopesAboveForKnownScope,
@@ -12505,6 +12506,30 @@ export class TaskService {
       model: latestChildEntry?.workspace.taskModelString,
       thinkingLevel: latestChildEntry?.workspace.taskThinkingLevel,
     });
+
+    // Track 2 r5: surface the terminal report into the parent's persistent
+    // sandbox mount so a later code_execution eval can drain it via
+    // mux.events(). Foreground waiters (blocking mux.task / task_await)
+    // already consume the report directly, so skip the queue to avoid
+    // double-delivery. Fire-and-forget by contract: the oversized-report path
+    // acquires the scope lock (a long-running eval may hold it), and the
+    // queue is best-effort acceleration — the durable terminal wake below
+    // remains the source of truth, so failures only log.
+    if (!hadForegroundWaiters) {
+      void sandboxHostService
+        .postTaskTerminalEvent(parentWorkspaceId, {
+          taskId: childWorkspaceId,
+          status: "completed",
+          reportMarkdown: reportArgs.reportMarkdown,
+        })
+        .catch((error: unknown) => {
+          log.warn("Failed to post task terminal event to sandbox mount", {
+            parentWorkspaceId,
+            childWorkspaceId,
+            error,
+          });
+        });
+    }
 
     // Free slot and start queued tasks.
     await this.maybeStartQueuedTasks();
