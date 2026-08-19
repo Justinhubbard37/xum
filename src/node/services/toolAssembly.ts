@@ -245,7 +245,16 @@ export async function applyToolPolicyAndExperiments(
         runtimeFactory,
         toolBridge,
         emitNestedToolEvent,
-        withMount
+        withMount,
+        // Kernel-first description preamble is the RLM + exclusive posture
+        // only: RLM alone keeps supplement-mode descriptions, exclusive alone
+        // (or with the env-var mount override) keeps today's exclusive
+        // descriptions byte-identical. createCodeExecutionTool additionally
+        // requires a live persistent mount before honoring the flag.
+        {
+          kernelFirst:
+            experiments?.rlm === true && experiments?.programmaticToolCallingExclusive === true,
+        }
       );
 
       if (experiments?.programmaticToolCallingExclusive) {
@@ -281,9 +290,15 @@ export async function applyToolPolicyAndExperiments(
       // byte-identical. The env-var mount override deliberately does NOT
       // expose it: persistent mounts are a dev override, RLM is the opt-in.
       if (experiments?.rlm === true && sandbox) {
+        // Grants are a ceiling over the whole model-visible set; this tool is
+        // synthesized after the ceiling above, so re-apply it here — a
+        // least-privilege assembly must not gain a harness-rollback surface.
+        const rollback = { refinement_rollback: createRefinementRollbackTool(sandbox) };
         toolsForModel = {
           ...toolsForModel,
-          refinement_rollback: createRefinementRollbackTool(sandbox),
+          ...(opts.capabilityGrants
+            ? applyCapabilityGrants(rollback, opts.capabilityGrants)
+            : rollback),
         };
       }
     } catch (error) {

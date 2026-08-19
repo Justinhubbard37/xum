@@ -176,11 +176,24 @@ async function offloadOversizedResults(
   }
 }
 
+/** Model-facing description options for createCodeExecutionTool. */
+export interface CodeExecutionToolOptions {
+  /**
+   * RLM + PTC-exclusive posture: code_execution is the single kernel tool, so
+   * its description leads with a short preamble tying the kernel features
+   * (persistent vars, result handles + slicing, task_spawn/events) together.
+   * Only honored when a persistent mount exists — advertising kernel features
+   * without a kernel would instruct the model to use APIs that don't exist.
+   */
+  kernelFirst?: boolean;
+}
+
 export async function createCodeExecutionTool(
   runtimeFactory: IJSRuntimeFactory,
   toolBridge: ToolBridge,
   emitNestedEvent?: (event: PTCEventWithParent) => void,
-  withMount?: MountRunner
+  withMount?: MountRunner,
+  options?: CodeExecutionToolOptions
 ): Promise<Tool> {
   const bridgeableTools = toolBridge.getBridgeableTools();
   const state: RetargetableState = { toolBridge, withMount };
@@ -209,8 +222,22 @@ export async function createCodeExecutionTool(
           : ""
       }`;
 
+  // Kernel-first preamble: only for the RLM + exclusive posture (see
+  // CodeExecutionToolOptions). Exclusive mode without RLM and the env-var
+  // mount override keep their current descriptions byte-identical.
+  const kernelFirstPreamble =
+    kernel && options?.kernelFirst === true
+      ? `**Kernel-first workflow:** this is your primary tool — other tools are \`mux.*\` calls inside it. Persist state in \`vars\` across calls and turns; oversized results come back as {handle, preview, size} — read or slice the full value at its handle in a follow-up call${
+          "task" in bridgeableTools
+            ? "; spawn sub-agents with `mux.task_spawn(...)` and collect their reports with `mux.events()`"
+            : ""
+        }.
+
+`
+      : "";
+
   const codeExecutionTool = tool({
-    description: `Execute sandboxed JavaScript to batch tools and transform outputs.
+    description: `${kernelFirstPreamble}Execute sandboxed JavaScript to batch tools and transform outputs.
 
 **When to use:** Prefer this tool when making 2+ tool calls, especially when later calls depend on earlier results. Reduces round-trip latency.
 

@@ -5,6 +5,7 @@ import { z } from "zod";
 import type { Tool } from "ai";
 
 import { applyToolPolicyAndExperiments, reconcileHookReplacedCodeExecution } from "./toolAssembly";
+import { buildToolsetManifest } from "./turnEnvelope";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { appendRefinementEvent } from "@/node/services/refinement/refinementJournal";
@@ -236,6 +237,175 @@ describe("persistent kernel graduation (RLM mode)", () => {
       expect(second.result).toBe(2);
     } finally {
       await sandboxHostService.disposeScope(scopeKey);
+    }
+  });
+});
+
+describe("toolset composition (PTC × RLM × exclusive)", () => {
+  const originalEnv = process.env.MUX_SANDBOX_PERSISTENT_MOUNTS;
+
+  beforeEach(() => {
+    // Pin the env override off so RLM gating is exercised via the flag alone.
+    delete process.env.MUX_SANDBOX_PERSISTENT_MOUNTS;
+  });
+
+  afterEach(() => {
+    if (originalEnv === undefined) {
+      delete process.env.MUX_SANDBOX_PERSISTENT_MOUNTS;
+    } else {
+      process.env.MUX_SANDBOX_PERSISTENT_MOUNTS = originalEnv;
+    }
+  });
+
+  // Bridgeable (bash/file_read/mcp_prompt_get) + non-bridgeable interaction
+  // tools (excluded from the sandbox by ToolBridge, must stay top-level).
+  const compositionTools = (): Record<string, Tool> => ({
+    bash: executableTool("Run a command"),
+    file_read: executableTool("Read a file"),
+    ask_user_question: executableTool("Ask the user"),
+    todo_write: executableTool("Write todos"),
+    agent_report: executableTool("Report to parent — taskService reads args from history"),
+    mcp_prompt_get: executableTool("Fetch a prompt"),
+  });
+
+  const assemble = (
+    scopeKey: string,
+    sessionDir: string,
+    experiments: {
+      programmaticToolCalling?: boolean;
+      programmaticToolCallingExclusive?: boolean;
+      rlm?: boolean;
+    },
+    capabilityGrants?: Parameters<typeof applyToolPolicyAndExperiments>[0]["capabilityGrants"]
+  ): Promise<Record<string, Tool>> =>
+    applyToolPolicyAndExperiments({
+      allTools: compositionTools(),
+      effectiveToolPolicy: undefined,
+      experiments,
+      emitNestedToolEvent: () => undefined,
+      sandbox: { workspaceId: scopeKey, sessionDir },
+      capabilityGrants,
+    });
+
+  const SUPPLEMENT_NAMES = [
+    "agent_report",
+    "ask_user_question",
+    "bash",
+    "code_execution",
+    "file_read",
+    "mcp_prompt_get",
+    "todo_write",
+  ];
+  // Exclusive: bridgeable tools reachable only via code_execution; the
+  // interaction tools and mcp_prompt_get stay model-visible.
+  const EXCLUSIVE_NAMES = [
+    "agent_report",
+    "ask_user_question",
+    "code_execution",
+    "mcp_prompt_get",
+    "todo_write",
+  ];
+
+  test("PTC only: supplement set, no kernel surfaces", async () => {
+    using tmp = new DisposableTempDir("compose-ptc");
+    const tools = await assemble("ws-compose-ptc", tmp.path, { programmaticToolCalling: true });
+    expect(Object.keys(tools).sort()).toEqual(SUPPLEMENT_NAMES);
+    expect(tools.code_execution.description).not.toContain("Persistent kernel");
+    expect(tools.code_execution.description).not.toContain("Kernel-first");
+  });
+
+  test("PTC + RLM: supplement set + rollback, kernel notes but no kernel-first preamble", async () => {
+    using tmp = new DisposableTempDir("compose-ptc-rlm");
+    try {
+      const tools = await assemble("ws-compose-ptc-rlm", tmp.path, {
+        programmaticToolCalling: true,
+        rlm: true,
+      });
+      expect(Object.keys(tools).sort()).toEqual(
+        [...SUPPLEMENT_NAMES, "refinement_rollback"].sort()
+      );
+      expect(tools.code_execution.description).toContain("Persistent kernel");
+      expect(tools.code_execution.description).not.toContain("Kernel-first");
+    } finally {
+      await sandboxHostService.disposeScope("ws-compose-ptc-rlm");
+    }
+  });
+
+  test("exclusive only: narrowed set, descriptions unchanged (no kernel surfaces)", async () => {
+    using tmp = new DisposableTempDir("compose-excl");
+    const tools = await assemble("ws-compose-excl", tmp.path, {
+      programmaticToolCallingExclusive: true,
+    });
+    expect(Object.keys(tools).sort()).toEqual(EXCLUSIVE_NAMES);
+    expect(tools.code_execution.description).not.toContain("Persistent kernel");
+    expect(tools.code_execution.description).not.toContain("Kernel-first");
+  });
+
+  test("exclusive + RLM: single-kernel posture — narrowed set + rollback + kernel-first preamble", async () => {
+    using tmp = new DisposableTempDir("compose-excl-rlm");
+    try {
+      const tools = await assemble("ws-compose-excl-rlm", tmp.path, {
+        programmaticToolCallingExclusive: true,
+        rlm: true,
+      });
+      expect(Object.keys(tools).sort()).toEqual([...EXCLUSIVE_NAMES, "refinement_rollback"].sort());
+      // agent_report must stay top-level: taskService reads its args from history.
+      expect(tools.agent_report).toBeDefined();
+      const desc = tools.code_execution.description ?? "";
+      expect(desc.startsWith("**Kernel-first workflow:**")).toBe(true);
+      expect(desc).toContain("Persistent kernel");
+    } finally {
+      await sandboxHostService.disposeScope("ws-compose-excl-rlm");
+    }
+  });
+
+  test("exclusive + RLM re-applies the grants ceiling to non-bridgeable tools and refinement_rollback", async () => {
+    using tmp = new DisposableTempDir("compose-excl-rlm-grants");
+    try {
+      const tools = await assemble(
+        "ws-compose-excl-rlm-grants",
+        tmp.path,
+        { programmaticToolCallingExclusive: true, rlm: true },
+        {
+          version: 1,
+          bridgeTools: { allow: ["file_read"] },
+          vars: false,
+          hostEvents: false,
+        }
+      );
+      // Grants are a ceiling over the WHOLE model-visible set: non-granted
+      // interaction tools, mcp_prompt_get, and the synthesized
+      // refinement_rollback are all hidden; code_execution stays (exclusive
+      // mode's mandatory entry point — the bridge enforces grants inside).
+      expect(Object.keys(tools).sort()).toEqual(["code_execution"]);
+    } finally {
+      await sandboxHostService.disposeScope("ws-compose-excl-rlm-grants");
+    }
+  });
+
+  test("turn-envelope manifest fingerprints the narrowed exclusive + RLM toolset", async () => {
+    using tmp = new DisposableTempDir("compose-envelope");
+    try {
+      const tools = await assemble("ws-compose-envelope", tmp.path, {
+        programmaticToolCallingExclusive: true,
+        rlm: true,
+      });
+      const manifest = buildToolsetManifest(tools);
+      // The manifest must describe the actually-narrowed set: bridged-away
+      // tools (bash/file_read) never appear, and entries come back sorted.
+      expect(manifest.map((entry) => entry.name)).toEqual(
+        [...EXCLUSIVE_NAMES, "refinement_rollback"].sort()
+      );
+      for (const entry of manifest) {
+        expect(entry.schemaHash).toMatch(/^[0-9a-f]{64}$/);
+      }
+      // Hashes are schema-sensitive: identical empty-object fixture schemas
+      // collapse to one hash while code_execution's real schema differs.
+      const byName = new Map(manifest.map((entry) => [entry.name, entry.schemaHash]));
+      expect(byName.get("agent_report")).toBe(byName.get("todo_write")!);
+      expect(byName.get("code_execution")).not.toBe(byName.get("agent_report")!);
+    } finally {
+      await sandboxHostService.disposeScope("ws-compose-envelope");
     }
   });
 });

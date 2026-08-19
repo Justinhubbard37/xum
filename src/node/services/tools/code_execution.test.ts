@@ -125,6 +125,79 @@ describe("createCodeExecutionTool", () => {
     });
   });
 
+  describe("kernel-first description preamble (RLM + exclusive posture)", () => {
+    // Never invoked: these tests only inspect the model-facing description,
+    // which is settled at creation time.
+    const unusedMount: MountRunner = () => Promise.reject(new Error("not executed"));
+    const baseTools = (): Record<string, Tool> => ({
+      file_read: createMockTool("file_read", z.object({ filePath: z.string() })),
+    });
+
+    it("prepends the preamble only when kernelFirst is set on a persistent mount", async () => {
+      const withPreamble = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(baseTools()),
+        undefined,
+        unusedMount,
+        { kernelFirst: true }
+      );
+      const kernelOnly = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(baseTools()),
+        undefined,
+        unusedMount
+      );
+
+      const preambleDesc = withPreamble.description ?? "";
+      expect(preambleDesc.startsWith("**Kernel-first workflow:**")).toBe(true);
+      // The kernel addendum stays too — the preamble is additive.
+      expect(preambleDesc).toContain("Persistent kernel");
+
+      // RLM without exclusive (or the env-var mount override): kernel notes
+      // only, byte-identical to the pre-preamble kernel description.
+      const kernelDesc = kernelOnly.description ?? "";
+      expect(kernelDesc).not.toContain("Kernel-first");
+      expect(preambleDesc.endsWith(kernelDesc)).toBe(true);
+    });
+
+    it("ignores kernelFirst without a persistent mount (never advertise a missing kernel)", async () => {
+      const ephemeralWithFlag = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(baseTools()),
+        undefined,
+        undefined,
+        { kernelFirst: true }
+      );
+      const ephemeral = await createCodeExecutionTool(runtimeFactory, new ToolBridge(baseTools()));
+
+      expect(ephemeralWithFlag.description).toBe(ephemeral.description ?? "");
+      expect(ephemeralWithFlag.description).not.toContain("Kernel-first");
+    });
+
+    it("mentions task_spawn/events only when the task tool is bridgeable", async () => {
+      const withTask = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge({
+          ...baseTools(),
+          task: createMockTool("task", z.object({ prompt: z.string() })),
+        }),
+        undefined,
+        unusedMount,
+        { kernelFirst: true }
+      );
+      const withoutTask = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(baseTools()),
+        undefined,
+        unusedMount,
+        { kernelFirst: true }
+      );
+
+      expect(withTask.description).toContain("mux.task_spawn");
+      expect(withoutTask.description).not.toContain("task_spawn");
+    });
+  });
+
   describe("static analysis", () => {
     it("rejects code with syntax errors", async () => {
       const tool = await createCodeExecutionTool(runtimeFactory, new ToolBridge({}));
