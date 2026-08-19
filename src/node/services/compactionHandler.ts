@@ -1344,8 +1344,7 @@ export class CompactionHandler {
     // MCP prompt snapshots pair with their invoking user row by message ID;
     // rewrite to the invoking row's copy ID so the pairing survives copying.
     const mcpPromptSnapshot =
-      source?.mcpPromptSnapshot !== undefined &&
-      source.mcpPromptSnapshot.invokingMessageId !== undefined
+      source?.mcpPromptSnapshot?.invokingMessageId !== undefined
         ? {
             ...source.mcpPromptSnapshot,
             invokingMessageId:

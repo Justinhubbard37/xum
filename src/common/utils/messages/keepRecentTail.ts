@@ -46,7 +46,9 @@ export function estimateMuxMessageTokens(message: MuxMessage): number {
  * summarize; candidates that would leave an empty head are skipped.
  */
 export function selectKeepRecentTailStartIndex(
-  messages: readonly MuxMessage[],
+  // Mutable array type (repo convention for message helpers): Array.isArray on a
+  // readonly array parameter would narrow it to any[] and poison type safety.
+  messages: MuxMessage[],
   floorTokens: number
 ): number {
   assert(Array.isArray(messages), "selectKeepRecentTailStartIndex requires a message array");

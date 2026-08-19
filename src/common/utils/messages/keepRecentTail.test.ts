@@ -18,12 +18,13 @@ function assistantMessage(id: string, text: string, historySequence: number): Mu
 }
 
 function compactionRequestMetadata(startHistorySequence?: number): MuxMessageMetadata {
-  return {
+  const metadata: MuxMessageMetadata = {
     type: "compaction-request",
     rawCommand: "/compact",
     parsed: {},
     ...(startHistorySequence !== undefined ? { keepRecentTail: { startHistorySequence } } : {}),
-  } as MuxMessageMetadata;
+  };
+  return metadata;
 }
 
 describe("estimateMuxMessageTokens", () => {
