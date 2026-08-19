@@ -351,7 +351,7 @@ describe("toolset composition (PTC × RLM × exclusive)", () => {
       expect(Object.keys(tools).sort()).toEqual([...EXCLUSIVE_NAMES, "refinement_rollback"].sort());
       // agent_report must stay top-level: taskService reads its args from history.
       expect(tools.agent_report).toBeDefined();
-      const desc = tools.code_execution.description ?? "";
+      const desc = (tools.code_execution as { description?: string }).description ?? "";
       expect(desc.startsWith("**Kernel-first workflow:**")).toBe(true);
       expect(desc).toContain("Persistent kernel");
     } finally {
@@ -402,8 +402,8 @@ describe("toolset composition (PTC × RLM × exclusive)", () => {
       // Hashes are schema-sensitive: identical empty-object fixture schemas
       // collapse to one hash while code_execution's real schema differs.
       const byName = new Map(manifest.map((entry) => [entry.name, entry.schemaHash]));
-      expect(byName.get("agent_report")).toBe(byName.get("todo_write")!);
-      expect(byName.get("code_execution")).not.toBe(byName.get("agent_report")!);
+      expect(byName.get("agent_report")).toBe(byName.get("todo_write"));
+      expect(byName.get("code_execution")).not.toBe(byName.get("agent_report"));
     } finally {
       await sandboxHostService.disposeScope("ws-compose-envelope");
     }

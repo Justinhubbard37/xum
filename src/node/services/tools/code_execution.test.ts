@@ -148,14 +148,14 @@ describe("createCodeExecutionTool", () => {
         unusedMount
       );
 
-      const preambleDesc = withPreamble.description ?? "";
+      const preambleDesc = (withPreamble as { description?: string }).description ?? "";
       expect(preambleDesc.startsWith("**Kernel-first workflow:**")).toBe(true);
       // The kernel addendum stays too — the preamble is additive.
       expect(preambleDesc).toContain("Persistent kernel");
 
       // RLM without exclusive (or the env-var mount override): kernel notes
       // only, byte-identical to the pre-preamble kernel description.
-      const kernelDesc = kernelOnly.description ?? "";
+      const kernelDesc = (kernelOnly as { description?: string }).description ?? "";
       expect(kernelDesc).not.toContain("Kernel-first");
       expect(preambleDesc.endsWith(kernelDesc)).toBe(true);
     });
