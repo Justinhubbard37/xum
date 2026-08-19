@@ -309,4 +309,119 @@ describe("ToolBridge", () => {
       expect(mockExecute).not.toHaveBeenCalled();
     });
   });
+
+  describe("RLM kernel namespace (task_spawn + events)", () => {
+    const taskSchema = z.object({
+      prompt: z.string(),
+      title: z.string(),
+      run_in_background: z.boolean().nullish(),
+    });
+
+    interface Captured {
+      mux: Record<string, (...args: unknown[]) => Promise<unknown>>;
+      sync: Record<string, (...args: unknown[]) => unknown>;
+    }
+
+    function registerCapturing(bridge: ToolBridge, kernel?: { drainHostEvents: () => unknown[] }) {
+      const captured: Captured = { mux: {}, sync: {} };
+      const mockRuntime = createMockRuntime({
+        registerObject: (
+          name: string,
+          obj: Record<string, (...args: unknown[]) => Promise<unknown>>,
+          syncMethods?: Record<string, (...args: unknown[]) => unknown>
+        ) => {
+          if (name === "mux") {
+            captured.mux = obj;
+            captured.sync = syncMethods ?? {};
+          }
+        },
+      });
+      bridge.register(mockRuntime, kernel);
+      return captured;
+    }
+
+    it("without kernel options, task_spawn and events are absent from the namespace", () => {
+      const bridge = new ToolBridge({
+        task: createMockTool("task", taskSchema, () => ({ taskId: "t1", status: "queued" })),
+      });
+      const captured = registerCapturing(bridge);
+      expect(captured.mux.task_spawn).toBeUndefined();
+      expect(captured.sync.events).toBeUndefined();
+    });
+
+    it("task_spawn forces run_in_background and returns the admission handle without waiting", async () => {
+      let receivedArgs: unknown;
+      const taskTool = createMockTool("task", taskSchema, (args) => {
+        receivedArgs = args;
+        // Background admission result: returned immediately after create.
+        return { status: "queued", taskId: "child-1" };
+      });
+
+      const bridge = new ToolBridge({ task: taskTool });
+      const captured = registerCapturing(bridge, { drainHostEvents: () => [] });
+
+      const taskSpawn = captured.mux.task_spawn as (...args: unknown[]) => Promise<unknown>;
+      const handle = await taskSpawn({
+        prompt: "do it",
+        title: "Worker",
+        run_in_background: false, // guest cannot opt out of background admission
+      });
+      expect(handle).toEqual({ taskId: "child-1", status: "spawned" });
+      expect((receivedArgs as { run_in_background?: boolean }).run_in_background).toBe(true);
+    });
+
+    it("task_spawn maps grouped admissions to taskIds", async () => {
+      const taskTool = createMockTool("task", taskSchema, () => ({
+        status: "queued",
+        taskIds: ["c1", "c2"],
+      }));
+      const bridge = new ToolBridge({ task: taskTool });
+      const captured = registerCapturing(bridge, { drainHostEvents: () => [] });
+
+      const taskSpawn = captured.mux.task_spawn as (...args: unknown[]) => Promise<unknown>;
+      expect(await taskSpawn({ prompt: "p", title: "T" })).toEqual({
+        taskIds: ["c1", "c2"],
+        status: "spawned",
+      });
+    });
+
+    it("task_spawn is denied by the same grant as task", async () => {
+      const executed = mock(() => ({ status: "queued", taskId: "never" }));
+      const bridge = new ToolBridge(
+        { task: createMockTool("task", taskSchema, executed) },
+        { version: 1, bridgeTools: { allow: [] }, vars: true, hostEvents: true }
+      );
+      const captured = registerCapturing(bridge, { drainHostEvents: () => [] });
+
+      const taskSpawn = captured.mux.task_spawn as (...args: unknown[]) => Promise<unknown>;
+      try {
+        await taskSpawn({ prompt: "p", title: "T" });
+        expect.unreachable("Should have thrown");
+      } catch (e) {
+        expect(String(e)).toContain("Capability denied: mux.task_spawn is not granted");
+      }
+      expect(executed).not.toHaveBeenCalled();
+    });
+
+    it("events drains the kernel queue; denied without the hostEvents grant", () => {
+      const queue: unknown[] = [{ type: "task-terminal", taskId: "c1" }];
+      const bridge = new ToolBridge({
+        task: createMockTool("task", taskSchema, () => ({ taskId: "t", status: "queued" })),
+      });
+      const captured = registerCapturing(bridge, {
+        drainHostEvents: () => queue.splice(0, queue.length),
+      });
+      expect(captured.sync.events()).toEqual([{ type: "task-terminal", taskId: "c1" }]);
+      expect(captured.sync.events()).toEqual([]);
+
+      const denied = new ToolBridge(
+        { task: createMockTool("task", taskSchema, () => ({ taskId: "t", status: "queued" })) },
+        { version: 1, bridgeTools: { allow: "all" }, vars: true, hostEvents: false }
+      );
+      const deniedCaptured = registerCapturing(denied, { drainHostEvents: () => [] });
+      expect(() => deniedCaptured.sync.events()).toThrow(
+        /Capability denied: mux\.events is not granted/
+      );
+    });
+  });
 });

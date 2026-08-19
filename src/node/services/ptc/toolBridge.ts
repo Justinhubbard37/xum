@@ -15,6 +15,49 @@ import {
   type CapabilityGrants,
 } from "@/common/types/capabilityGrants";
 
+/**
+ * RLM kernel extras for register(): host bindings that only exist on
+ * persistent mounts. Presence of this options object is the availability
+ * gate — RLM off (no persistent mount) => mux.task_spawn / mux.events are
+ * absent from the namespace entirely.
+ */
+export interface KernelBridgeOptions {
+  /** Drains the mount's host→guest event queue (bound to SandboxMount). */
+  drainHostEvents: () => unknown[];
+}
+
+/** Admission handle returned by mux.task_spawn (single or grouped spawn). */
+export type TaskSpawnAdmissionHandle =
+  | { taskId: string; status: "spawned" }
+  | { taskIds: string[]; status: "spawned" };
+
+/**
+ * Map the task tool's non-blocking (run_in_background) result to the compact
+ * admission handle mux.task_spawn returns. The pending result proves the
+ * child was admitted by taskService; everything else (status, notes) is
+ * intentionally dropped — completion arrives via host events / the durable
+ * terminal wake, not by polling this handle.
+ */
+function extractAdmissionHandle(result: unknown): TaskSpawnAdmissionHandle {
+  if (typeof result === "object" && result !== null) {
+    const record = result as Record<string, unknown>;
+    if (typeof record.taskId === "string" && record.taskId.length > 0) {
+      return { taskId: record.taskId, status: "spawned" };
+    }
+    const taskIds: unknown = record.taskIds;
+    if (
+      Array.isArray(taskIds) &&
+      taskIds.length > 0 &&
+      taskIds.every((id): id is string => typeof id === "string")
+    ) {
+      return { taskIds, status: "spawned" };
+    }
+  }
+  // Impossible by construction: the task tool's background result always
+  // carries taskId(s). Crash-fast so a contract drift surfaces immediately.
+  throw new Error("task_spawn: task admission returned no taskId");
+}
+
 /** Tools excluded from sandbox - UI-specific or would cause recursion */
 const EXCLUDED_TOOLS = new Set([
   "code_execution", // Prevent recursive sandbox creation
@@ -90,7 +133,7 @@ export class ToolBridge {
    * This ensures nested tool calls are cancelled when the sandbox times out,
    * not just when the parent stream is cancelled.
    */
-  register(runtime: IJSRuntime): void {
+  register(runtime: IJSRuntime, kernel?: KernelBridgeOptions): void {
     const xumObj: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
 
     // Grant-denied tools get an explicit stub: the guest sees a clear
@@ -137,9 +180,13 @@ export class ToolBridge {
       };
     }
 
+    const syncMethods: Record<string, (...args: unknown[]) => unknown> = {};
+    if (kernel !== undefined) {
+      this.addKernelMethods(xumObj, syncMethods, kernel, runtime);
+    }
     // Same object under both names so saved `mux.*` snippets keep working.
-    runtime.registerObject("xum", xumObj);
-    runtime.registerObject("mux", xumObj);
+    runtime.registerObject("xum", xumObj, syncMethods);
+    runtime.registerObject("mux", xumObj, syncMethods);
   }
 
   private hasExecute(tool: Tool): tool is Tool & { execute: NonNullable<Tool["execute"]> } {
