@@ -604,6 +604,14 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
         type: "branch-summary";
       }
     | {
+        // Durable summary of a completed /refine pass (rlm-mode experiment):
+        // lists each applied self-modification with its refinement journal id
+        // so users can audit and roll edits back (r6). The labeled summary
+        // stays in the message text; this marker identifies the row for
+        // UI/tests.
+        type: "refine-summary";
+      }
+    | {
         type: "heartbeat-request";
         /** Synthetic heartbeat follow-ups use an explicit marker so future backend dispatch stays inspectable. */
         source?: "heartbeat";

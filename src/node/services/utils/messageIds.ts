@@ -45,6 +45,10 @@ export const createPreservedTailCopyMessageId = (): string =>
 export const createBranchSummaryMessageId = (): string =>
   `branch-summary-${Date.now()}-${randomSuffix(9)}`;
 
+/** Refine pass summary IDs (rlm-mode /refine): refine-summary-{timestamp}-{random} */
+export const createRefineSummaryMessageId = (): string =>
+  `refine-summary-${Date.now()}-${randomSuffix(9)}`;
+
 /** Context reset boundary IDs: context-reset-{timestamp}-{random} */
 export const createContextResetBoundaryMessageId = (): string =>
   `context-reset-${Date.now()}-${randomSuffix(9)}`;
