@@ -2675,6 +2675,23 @@ CREATE TABLE IF NOT EXISTS delegation_rollups (
       code: z.string().min(1).describe("JavaScript code to execute in the PTC sandbox"),
     }),
   },
+  refinement_rollback: {
+    description:
+      "Roll back a journaled harness self-modification (a memory or skill edit) by its refinement row id, " +
+      "restoring the exact prior file contents recorded in the session's refinement journal. " +
+      "The rollback is journaled as a refinement row of its own, so it can be rolled back again. " +
+      "Refuses rows that were already rolled back and rows whose files changed since (divergence). " +
+      "Available only in RLM mode.",
+    schema: z
+      .object({
+        id: z.string().min(1).describe("Refinement row id (envelope id) to roll back"),
+        reason: z
+          .string()
+          .min(1)
+          .describe("Why this refinement is being rolled back (recorded in the journal)"),
+      })
+      .strict(),
+  },
   // #region NOTIFY_DOCS
   notify: {
     description:

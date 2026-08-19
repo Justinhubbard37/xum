@@ -1,10 +1,14 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import * as fsPromises from "node:fs/promises";
+import * as path from "node:path";
 import { z } from "zod";
 import type { Tool } from "ai";
 
 import { applyToolPolicyAndExperiments, reconcileHookReplacedCodeExecution } from "./toolAssembly";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import { DisposableTempDir } from "@/node/services/tempDir";
+import { appendRefinementEvent } from "@/node/services/refinement/refinementJournal";
+import { listRefinements } from "@/node/services/refinement/refinementRollback";
 
 function executableTool(description: string): Tool {
   return {
@@ -152,6 +156,61 @@ describe("persistent kernel graduation (RLM mode)", () => {
     const third = await run(withSandbox, "return typeof globalThis.leak;");
     expect(third.success).toBe(true);
     expect(third.result).toBe("undefined");
+  });
+
+  test("refinement_rollback is exposed only with rlm on (and works end-to-end)", async () => {
+    using tmp = new DisposableTempDir("tool-assembly-rlm-rollback");
+    const scopeKey = "ws-tool-assembly-rlm-rollback";
+    const sessionDir = path.join(tmp.path, "sessions", scopeKey);
+    const assemble = (experiments: {
+      programmaticToolCalling?: boolean;
+      rlm?: boolean;
+    }): Promise<Record<string, Tool>> =>
+      applyToolPolicyAndExperiments({
+        allTools: { file_read: executableTool("Read a file") },
+        effectiveToolPolicy: undefined,
+        experiments,
+        emitNestedToolEvent: () => undefined,
+        sandbox: { workspaceId: scopeKey, sessionDir },
+      });
+    try {
+      // RLM off (PTC on): no rollback surface, byte-identical to today.
+      const rlmOff = await assemble({ programmaticToolCalling: true });
+      expect(rlmOff.refinement_rollback).toBeUndefined();
+
+      // rlm flag without the PTC parent: no PTC branch, so no surface either.
+      const ptcOff = await assemble({ rlm: true });
+      expect(ptcOff.refinement_rollback).toBeUndefined();
+      expect(ptcOff.code_execution).toBeUndefined();
+
+      const rlmOn = await assemble({ programmaticToolCalling: true, rlm: true });
+      expect(rlmOn.refinement_rollback).toBeDefined();
+
+      // The wired tool rolls back a seeded skill-write row in the sandbox's
+      // session dir and reports what changed.
+      const skillFile = path.join(tmp.path, "checkout", ".mux", "skills", "s", "SKILL.md");
+      await fsPromises.mkdir(path.dirname(skillFile), { recursive: true });
+      await fsPromises.writeFile(skillFile, "body", "utf-8");
+      await appendRefinementEvent({
+        sessionDir,
+        workspaceId: scopeKey,
+        kind: "skill",
+        action: { op: "write", skillName: "s", filePath: "SKILL.md" },
+        inverse: { op: "delete-files", paths: [skillFile] },
+        evidence: { toolName: "agent_skill_write" },
+      });
+      const rows = await listRefinements(sessionDir);
+      const result = (await rlmOn.refinement_rollback.execute!(
+        { id: rows[0].id, reason: "test rollback" },
+        { toolCallId: "test-call-id", messages: [], context: undefined }
+      )) as { success: boolean; rollbackOf?: string; deleted?: string[] };
+      expect(result.success).toBe(true);
+      expect(result.rollbackOf).toBe(rows[0].id);
+      expect(result.deleted).toEqual([skillFile]);
+      await expect(fsPromises.access(skillFile)).rejects.toThrow();
+    } finally {
+      await sandboxHostService.disposeScope(scopeKey);
+    }
   });
 
   test("MUX_SANDBOX_PERSISTENT_MOUNTS=1 still opts in without the rlm experiment", async () => {

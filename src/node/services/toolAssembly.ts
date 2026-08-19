@@ -25,6 +25,7 @@ import type { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import type { ToolBridge } from "@/node/services/ptc/toolBridge";
 import type { PTCExecutionResult } from "@/node/services/ptc/types";
 import { sandboxHostService, type SandboxMount } from "@/node/services/sandbox/sandboxHostService";
+import { createRefinementRollbackTool } from "@/node/services/tools/refinement_rollback";
 import { log } from "./log";
 import type { MCPWorkspaceStats } from "@/node/services/mcpServerManager";
 import type { TelemetryService } from "@/node/services/telemetryService";
@@ -271,6 +272,19 @@ export async function applyToolPolicyAndExperiments(
           { ...policyFilteredTools, code_execution: codeExecutionTool },
           effectiveToolPolicy
         );
+      }
+
+      // RLM-only model surface: ID-addressed rollback of journaled harness
+      // self-modifications (refinement rows). Read inside the PTC branch by
+      // construction (RLM is nested under the PTC parent) — with the
+      // experiment off the tool never exists and provider requests stay
+      // byte-identical. The env-var mount override deliberately does NOT
+      // expose it: persistent mounts are a dev override, RLM is the opt-in.
+      if (experiments?.rlm === true && sandbox) {
+        toolsForModel = {
+          ...toolsForModel,
+          refinement_rollback: createRefinementRollbackTool(sandbox),
+        };
       }
     } catch (error) {
       // Fall back to policy-filtered tools if PTC creation fails
