@@ -8,6 +8,7 @@
 export const EXPERIMENT_IDS = {
   PROGRAMMATIC_TOOL_CALLING: "programmatic-tool-calling",
   PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE: "programmatic-tool-calling-exclusive",
+  RLM: "rlm-mode",
   CONFIGURABLE_BIND_URL: "configurable-bind-url",
   MUX_GOVERNOR: "mux-governor",
   MULTI_PROJECT_WORKSPACES: "multi-project-workspaces",
@@ -62,6 +63,17 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     id: EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE,
     name: "PTC Exclusive Mode",
     description: "Replace all tools with code_execution (forces PTC usage)",
+    enabledByDefault: false,
+    showInSettings: true,
+  },
+  // Sub-experiment of Programmatic Tool Calling (flat flag, gated on the PTC
+  // parent at call sites; Settings nests it under the PTC toggle). Without a
+  // PTC flag the option is inert: code_execution is never assembled.
+  [EXPERIMENT_IDS.RLM]: {
+    id: EXPERIMENT_IDS.RLM,
+    name: "RLM Mode",
+    description:
+      "Persistent sandbox kernel for code_execution: vars survive across calls and turns (snapshot-backed). Later RLM features build on this kernel.",
     enabledByDefault: false,
     showInSettings: true,
   },

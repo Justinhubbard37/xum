@@ -1,8 +1,10 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { z } from "zod";
 import type { Tool } from "ai";
 
 import { applyToolPolicyAndExperiments, reconcileHookReplacedCodeExecution } from "./toolAssembly";
+import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
+import { DisposableTempDir } from "@/node/services/tempDir";
 
 function executableTool(description: string): Tool {
   return {
@@ -63,6 +65,115 @@ describe("applyToolPolicyAndExperiments", () => {
     )) as { success: boolean; result?: unknown };
     expect(evalResult.success).toBe(true);
     expect(evalResult.result).toBe("Capability denied: xum.bash is not granted for this sandbox");
+  });
+});
+
+describe("persistent kernel graduation (RLM mode)", () => {
+  const originalEnv = process.env.MUX_SANDBOX_PERSISTENT_MOUNTS;
+
+  beforeEach(() => {
+    // Pin the env override off so each test controls persistence explicitly.
+    delete process.env.MUX_SANDBOX_PERSISTENT_MOUNTS;
+  });
+
+  afterEach(() => {
+    if (originalEnv === undefined) {
+      delete process.env.MUX_SANDBOX_PERSISTENT_MOUNTS;
+    } else {
+      process.env.MUX_SANDBOX_PERSISTENT_MOUNTS = originalEnv;
+    }
+  });
+
+  async function assembleCodeExecution(opts: {
+    rlm?: boolean;
+    sandbox?: { workspaceId: string; sessionDir: string };
+  }): Promise<Tool> {
+    const tools = await applyToolPolicyAndExperiments({
+      allTools: { file_read: executableTool("Read a file") },
+      effectiveToolPolicy: undefined,
+      experiments: { programmaticToolCalling: true, rlm: opts.rlm },
+      emitNestedToolEvent: () => undefined,
+      sandbox: opts.sandbox,
+    });
+    expect(tools.code_execution).toBeDefined();
+    return tools.code_execution;
+  }
+
+  async function run(tool: Tool, code: string): Promise<{ success: boolean; result?: unknown }> {
+    return (await tool.execute!(
+      { code },
+      { toolCallId: "test-call-id", messages: [], context: undefined }
+    )) as { success: boolean; result?: unknown };
+  }
+
+  test("rlm on: persistent mount is used — vars survive across two invocations in one session", async () => {
+    using tmp = new DisposableTempDir("tool-assembly-rlm-on");
+    const scopeKey = "ws-tool-assembly-rlm-on";
+    try {
+      const codeExecution = await assembleCodeExecution({
+        rlm: true,
+        sandbox: { workspaceId: scopeKey, sessionDir: tmp.path },
+      });
+      expect(codeExecution.description).toContain("Persistent kernel");
+
+      const first = await run(codeExecution, "vars.total = 40; return vars.total;");
+      expect(first.success).toBe(true);
+      expect(first.result).toBe(40);
+
+      const second = await run(codeExecution, "vars.total += 2; return vars.total;");
+      expect(second.success).toBe(true);
+      expect(second.result).toBe(42);
+    } finally {
+      await sandboxHostService.disposeScope(scopeKey);
+    }
+  });
+
+  test("rlm off: ephemeral per-call runtime and unchanged description", async () => {
+    using tmp = new DisposableTempDir("tool-assembly-rlm-off");
+    const withSandbox = await assembleCodeExecution({
+      sandbox: { workspaceId: "ws-tool-assembly-rlm-off", sessionDir: tmp.path },
+    });
+    const withoutSandbox = await assembleCodeExecution({});
+
+    // With the experiment off, sandbox context alone must not change the
+    // model-visible description (byte-identical to today's ephemeral tool).
+    expect(withSandbox.description).toBe(withoutSandbox.description);
+    expect(withSandbox.description).not.toContain("Persistent kernel");
+
+    // Ephemeral runtimes have no kernel `vars` namespace...
+    const first = await run(withSandbox, "return typeof vars;");
+    expect(first.success).toBe(true);
+    expect(first.result).toBe("undefined");
+
+    // ...and state set in one call does not leak into the next (fresh runtime).
+    const second = await run(withSandbox, "globalThis.leak = 1; return globalThis.leak;");
+    expect(second.success).toBe(true);
+    expect(second.result).toBe(1);
+    const third = await run(withSandbox, "return typeof globalThis.leak;");
+    expect(third.success).toBe(true);
+    expect(third.result).toBe("undefined");
+  });
+
+  test("MUX_SANDBOX_PERSISTENT_MOUNTS=1 still opts in without the rlm experiment", async () => {
+    using tmp = new DisposableTempDir("tool-assembly-env-mounts");
+    const scopeKey = "ws-tool-assembly-env-mounts";
+    process.env.MUX_SANDBOX_PERSISTENT_MOUNTS = "1";
+    try {
+      const codeExecution = await assembleCodeExecution({
+        sandbox: { workspaceId: scopeKey, sessionDir: tmp.path },
+      });
+      expect(codeExecution.description).toContain("Persistent kernel");
+
+      const first = await run(codeExecution, "vars.count = 1; return vars.count;");
+      expect(first.success).toBe(true);
+      expect(first.result).toBe(1);
+
+      const second = await run(codeExecution, "vars.count += 1; return vars.count;");
+      expect(second.success).toBe(true);
+      expect(second.result).toBe(2);
+    } finally {
+      await sandboxHostService.disposeScope(scopeKey);
+    }
   });
 });
 

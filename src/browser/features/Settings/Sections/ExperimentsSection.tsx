@@ -36,6 +36,10 @@ const MEMORY_SUB_EXPERIMENT_IDS: readonly ExperimentId[] = [
   EXPERIMENT_IDS.MEMORY_CONSOLIDATION,
 ];
 
+// Sub-experiments of Programmatic Tool Calling: same nesting treatment — RLM
+// mode is a no-op while PTC is off (code_execution is never assembled).
+const PTC_SUB_EXPERIMENT_IDS: readonly ExperimentId[] = [EXPERIMENT_IDS.RLM];
+
 type SettingsConfig = Awaited<ReturnType<APIClient["config"]["getConfig"]>>;
 
 interface ExperimentRowProps {
@@ -662,13 +666,14 @@ function ExperimentSettingsPanel(props: ExperimentSettingsPanelProps) {
   return <div className="bg-background-secondary px-4 py-3">{props.children}</div>;
 }
 
-// Renders the Agent Memory sub-experiment toggles as a nested list. Extracted so
-// the nested-config call site mirrors its siblings (AdvisorToolExperimentConfig,
-// HeartbeatDefaultsControls) instead of inlining the map in the section render.
-function MemorySubExperimentRows() {
+// Renders a parent experiment's sub-experiment toggles as a nested list.
+// Extracted so the nested-config call sites mirror their siblings
+// (AdvisorToolExperimentConfig, HeartbeatDefaultsControls) instead of
+// inlining the map in the section render.
+function SubExperimentRows(props: { experimentIds: readonly ExperimentId[] }) {
   return (
     <div className="divide-border-light divide-y">
-      {MEMORY_SUB_EXPERIMENT_IDS.map((subId) => {
+      {props.experimentIds.map((subId) => {
         const subExp = EXPERIMENTS[subId];
         return (
           <ExperimentRow
@@ -689,6 +694,7 @@ export function ExperimentsSection() {
   const advisorToolEnabled = useExperimentValue(EXPERIMENT_IDS.ADVISOR_TOOL);
   const workspaceHeartbeatsEnabled = useExperimentValue(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS);
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
+  const ptcEnabled = useExperimentValue(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
   const settingsConfigRequestRef = useRef<{
     api: APIClient;
     request: Promise<SettingsConfig>;
@@ -726,11 +732,14 @@ export function ExperimentsSection() {
   }, [api]);
 
   // Only show user-overridable experiments (non-overridable ones are hidden since users can't
-  // change them). Memory sub-experiments render nested under the Agent Memory row instead.
+  // change them). Sub-experiments render nested under their parent row instead.
   const experiments = useMemo(
     () =>
       allExperiments.filter(
-        (exp) => exp.showInSettings !== false && !MEMORY_SUB_EXPERIMENT_IDS.includes(exp.id)
+        (exp) =>
+          exp.showInSettings !== false &&
+          !MEMORY_SUB_EXPERIMENT_IDS.includes(exp.id) &&
+          !PTC_SUB_EXPERIMENT_IDS.includes(exp.id)
       ),
     [allExperiments]
   );
@@ -788,7 +797,12 @@ export function ExperimentsSection() {
               )}
               {exp.id === EXPERIMENT_IDS.MEMORY && memoryEnabled && (
                 <ExperimentSettingsPanel>
-                  <MemorySubExperimentRows />
+                  <SubExperimentRows experimentIds={MEMORY_SUB_EXPERIMENT_IDS} />
+                </ExperimentSettingsPanel>
+              )}
+              {exp.id === EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING && ptcEnabled && (
+                <ExperimentSettingsPanel>
+                  <SubExperimentRows experimentIds={PTC_SUB_EXPERIMENT_IDS} />
                 </ExperimentSettingsPanel>
               )}
               {exp.id === EXPERIMENT_IDS.PORTABLE_DESKTOP && <PortableDesktopExperimentWarning />}

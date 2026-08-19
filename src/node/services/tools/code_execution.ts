@@ -99,6 +99,17 @@ export async function createCodeExecutionTool(
   // Generate xum types for type validation and documentation (cached by tool set hash)
   const xumTypes = await getCachedXumTypes(bridgeableTools);
 
+  // Persistent-kernel addendum: only advertised when this instance runs on a
+  // persistent mount (RLM mode or MUX_SANDBOX_PERSISTENT_MOUNTS). Ephemeral
+  // instances must keep today's description byte-identical so RLM-off
+  // provider requests are unchanged.
+  const persistentKernelNotes =
+    withMount === undefined
+      ? ""
+      : `
+
+**Persistent kernel:** the global \`vars\` object persists across code_execution calls and turns (JSON-serializable values only) and survives restarts via snapshots. Stash intermediate results in \`vars\` instead of re-fetching or re-computing them.`;
+
   const codeExecutionTool = tool({
     description: `Execute sandboxed JavaScript to batch tools and transform outputs.
 
@@ -114,7 +125,7 @@ ${xumTypes}
 - Use \`return\` to provide a final result to the model
 - Use \`console.log/warn/error\` for debugging - output is captured
 - Results are JSON-serialized; non-serializable values return \`{ error: "..." }\`
-- On failure, partial results (completed tool calls) are returned for debugging
+- On failure, partial results (completed tool calls) are returned for debugging${persistentKernelNotes}
 
 **Security:** The sandbox has no access to \`require\`, \`import\`, \`process\`, \`fetch\`, or filesystem outside of \`xum.*\` tools.`,
 

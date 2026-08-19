@@ -124,15 +124,20 @@ export interface ApplyToolPolicyAndExperimentsOptions {
   experiments?: {
     programmaticToolCalling?: boolean;
     programmaticToolCallingExclusive?: boolean;
+    /**
+     * RLM mode: graduate code_execution onto the persistent per-workspace
+     * kernel mount (shared `vars`, snapshot/restore). Gated on the PTC parent
+     * by construction — this flag is only read inside the PTC branch below.
+     */
+    rlm?: boolean;
   };
   /** Callback to forward nested PTC tool events to the stream. */
   emitNestedToolEvent: (event: PTCEventWithParent) => void;
   /**
    * Sandbox host context for code_execution. When set AND persistent mounts
-   * are enabled (MUX_SANDBOX_PERSISTENT_MOUNTS=1), code_execution reuses a
-   * per-workspace persistent mount (shared `vars`, snapshot/restore) instead
-   * of an ephemeral per-call runtime. Foundation-level opt-in only; the
-   * persistent-kernel UX belongs to the RLM track.
+   * are enabled (RLM mode experiment or MUX_SANDBOX_PERSISTENT_MOUNTS=1),
+   * code_execution reuses a per-workspace persistent mount (shared `vars`,
+   * snapshot/restore) instead of an ephemeral per-call runtime.
    */
   sandbox?: { workspaceId: string; sessionDir: string };
   /**
@@ -217,8 +222,10 @@ export async function applyToolPolicyAndExperiments(
       // The lease runner (withPersistentMount) holds the scope lock from
       // acquisition through execution.
       const bridgeKey = toolBridge.getBridgeableToolNames().sort().join(",");
+      // RLM mode is the user-facing opt-in; the env var stays as a dev/test
+      // override so persistent mounts can be dogfooded without the experiment.
       const withMount =
-        sandbox && persistentSandboxMountsEnabled()
+        sandbox && (experiments?.rlm === true || persistentSandboxMountsEnabled())
           ? (fn: (mount: SandboxMount) => Promise<PTCExecutionResult>) =>
               sandboxHostService.withPersistentMount(
                 {
