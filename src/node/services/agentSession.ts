@@ -157,7 +157,11 @@ import {
   SKILL_DYNAMIC_OUTPUT_CAP_BYTES,
 } from "@/node/services/agentSkills/skillDynamicContext";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
-import { isRlmModeEnabled, maybeAppendAbandonedBranchSummary } from "@/node/services/branchSummary";
+import {
+  awaitPendingBranchSummary,
+  isRlmModeEnabled,
+  maybeAppendAbandonedBranchSummary,
+} from "@/node/services/branchSummary";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { renderAgentSkillSnapshotText } from "@/common/utils/agentSkills/skillSnapshot";
@@ -2812,6 +2816,18 @@ export class AgentSession {
           }
         }
       }
+    }
+
+    // A fork starts its abandoned-branch summary in the background so the fork
+    // itself returns fast; the first send must then await that pending row so
+    // it keeps its position BEFORE this turn's user message and request build
+    // (the "summary lands before the next request" contract). Bounded by the
+    // generation deadline; resolves immediately when nothing is pending.
+    const pendingBranchSummary = await awaitPendingBranchSummary(this.workspaceId);
+    if (pendingBranchSummary) {
+      // The renderer loaded history before the background row landed; surface
+      // it without requiring a reload.
+      this.emitChatEvent({ ...pendingBranchSummary, type: "message" });
     }
 
     if (editMessageId) {

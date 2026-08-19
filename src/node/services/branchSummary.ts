@@ -19,7 +19,7 @@ import { streamText } from "ai";
 
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { NAME_GEN_PREFERRED_MODELS } from "@/common/constants/nameGeneration";
-import { WORDS_TO_TOKENS_RATIO, buildCompactionPrompt } from "@/common/constants/ui";
+import { buildCompactionPrompt } from "@/common/constants/ui";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -28,6 +28,7 @@ import {
   BRANCH_SUMMARY_MAX_OUTPUT_TOKENS,
   BRANCH_SUMMARY_MAX_TRANSCRIPT_CHARS,
   BRANCH_SUMMARY_MIN_SEGMENT_TOKENS,
+  BRANCH_SUMMARY_TARGET_WORDS,
   BRANCH_SUMMARY_TIMEOUT_MS,
 } from "@/constants/branchSummary";
 
@@ -154,9 +155,8 @@ export function buildAbandonedBranchTranscript(messages: MuxMessage[]): string {
  * instructions).
  */
 export function buildAbandonedBranchSummaryPrompt(transcript: string): string {
-  const targetWords = Math.round(BRANCH_SUMMARY_MAX_OUTPUT_TOKENS / WORDS_TO_TOKENS_RATIO);
   return [
-    buildCompactionPrompt(targetWords),
+    buildCompactionPrompt(BRANCH_SUMMARY_TARGET_WORDS),
     "",
     "Special case: the transcript below is an ABANDONED branch of the conversation — the user rewound to an earlier message, so these turns were removed from the active history. Summarize what was attempted, decided, and learned on that branch so the continuing assistant retains the context.",
     "",
@@ -193,18 +193,39 @@ async function getSideChannelModelCandidates(
   return candidates;
 }
 
+/**
+ * Trim generated text to its last complete line or sentence. Salvages
+ * deadline- or max_tokens-truncated output: a summary that ends mid-sentence
+ * ("…The assistant") reads as corrupt, while cutting back to the last
+ * sentence terminator (or newline, which protects list-style output) keeps
+ * only whole statements. Returns "" when no boundary exists.
+ */
+export function trimSummaryToBoundary(text: string): string {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return "";
+  // Sentence terminators optionally followed by closing quotes/brackets.
+  const sentenceEnd = /[.!?][)"'\]]*(?=\s|$)/g;
+  let lastBoundary = -1;
+  for (const match of trimmed.matchAll(sentenceEnd)) {
+    lastBoundary = Math.max(lastBoundary, match.index + match[0].length);
+  }
+  lastBoundary = Math.max(lastBoundary, trimmed.lastIndexOf("\n"));
+  if (lastBoundary <= 0) return "";
+  return trimmed.slice(0, lastBoundary).trim();
+}
+
 async function generateAbandonedBranchSummaryText(input: {
   aiService: BranchSummaryAiService;
   candidates: string[];
   prompt: string;
   timeoutMs: number;
 }): Promise<string | null> {
-  // One shared deadline across all candidates: the caller blocks on this, so
+  // One shared deadline across all candidates: callers may block on this, so
   // the total wait must stay bounded regardless of how many models fail over.
   const abortSignal = AbortSignal.timeout(input.timeoutMs);
   // Defensive double-bound: abortSignal cancels well-behaved providers, but a
   // provider that ignores abort must not hold the fork/edit operation hostage,
-  // so every await below also races against this deadline promise.
+  // so the consume loop below also races against this deadline promise.
   const deadline = new Promise<null>((resolve) => {
     if (abortSignal.aborted) {
       resolve(null);
@@ -238,20 +259,58 @@ async function generateAbandonedBranchSummaryText(input: {
         maxOutputTokens: BRANCH_SUMMARY_MAX_OUTPUT_TOKENS,
         abortSignal,
       });
-      // stream.text is a PromiseLike; wrap it so the race below can abandon it
-      // while keeping its eventual rejection handled.
-      const textPromise = Promise.resolve(stream.text);
-      textPromise.catch(() => undefined);
-      const racedText = await Promise.race([textPromise, deadline]);
-      if (racedText === null) {
-        log.debug("Branch summary: generation deadline reached", { modelString });
+      // Consume deltas incrementally (not stream.text) so a deadline that
+      // fires mid-stream can salvage the text streamed so far instead of
+      // turning the whole bounded wait into pure waste. The consumer never
+      // rejects: abort/stream errors set streamFailed and end the loop.
+      let accumulated = "";
+      let streamFailed = false;
+      const consume = (async () => {
+        try {
+          for await (const delta of stream.textStream) {
+            accumulated += delta;
+          }
+        } catch (error) {
+          streamFailed = true;
+          log.debug("Branch summary stream ended with error", {
+            modelString,
+            error: getErrorMessage(error),
+          });
+        }
+      })();
+      await Promise.race([consume, deadline]);
+
+      if (abortSignal.aborted) {
+        // Deadline hit. Salvage whole sentences already streamed — a missed
+        // deadline should still buy a (shorter) summary when tokens flowed.
+        const salvaged = trimSummaryToBoundary(accumulated);
+        if (salvaged.length > 0) {
+          log.debug("Branch summary: deadline reached, salvaging partial text", {
+            modelString,
+            chars: salvaged.length,
+          });
+          return salvaged;
+        }
+        log.debug("Branch summary: generation deadline reached with no text", { modelString });
         break;
       }
-      const text = racedText.trim();
-      if (text.length > 0) {
-        return text;
+      if (!streamFailed) {
+        // A "length" stop means max_tokens cut the model off mid-sentence, so
+        // trim back to a whole-statement boundary; a natural stop is complete
+        // by definition and kept verbatim. Raced against the deadline
+        // defensively (a stream that closes without a finish part must not
+        // hang us); an unknown reason is treated as truncated.
+        const finishReason = await Promise.race([stream.finishReason, deadline]);
+        const text =
+          finishReason === "length" || finishReason === null
+            ? trimSummaryToBoundary(accumulated)
+            : accumulated.trim();
+        if (text.length > 0) {
+          return text;
+        }
+        log.debug("Branch summary: model produced empty summary", { modelString });
       }
-      log.debug("Branch summary: model produced empty summary", { modelString });
+      // streamFailed without abort => try the next candidate.
     } catch (error) {
       log.debug("Branch summary generation failed", {
         modelString,
@@ -283,22 +342,9 @@ export function createBranchSummaryMessage(summaryText: string): MuxMessage {
   );
 }
 
-/**
- * Summarize an abandoned history segment and append the labeled row to the
- * new branch's chat.jsonl. Returns the appended row (so live sessions can
- * emit it to the renderer) or null when no summary was produced.
- *
- * Runs SYNCHRONOUSLY (bounded by timeoutMs) inside fork/edit rather than
- * appending asynchronously on completion: an async append cannot be proven
- * race-free against the first turn on the new branch — it could land after
- * that turn's request was built (row invisible to the model for a turn) or
- * interleave with stream placeholder appends mid-turn. The hard deadline
- * keeps the user-facing operation responsive instead.
- *
- * Never throws; every failure path degrades to "no summary row".
- */
-export async function maybeAppendAbandonedBranchSummary(input: {
-  historyService: Pick<HistoryService, "appendToHistory">;
+/** Everything maybeAppendAbandonedBranchSummary needs; shared by the background starter. */
+export interface AbandonedBranchSummaryInput {
+  historyService: Pick<HistoryService, "appendToHistory" | "appendToHistoryIfTailMatches">;
   aiService: BranchSummaryAiService;
   /** The NEW branch: fork target workspace, or the edited workspace post-truncation. */
   workspaceId: string;
@@ -308,8 +354,35 @@ export async function maybeAppendAbandonedBranchSummary(input: {
   experiments?: RlmExperimentFlags;
   /** Machine-override fallback (ExperimentsService/AIService.isExperimentEnabled). */
   isExperimentEnabled?: (experimentId: ExperimentId) => boolean;
+  /**
+   * When set, the summary row is appended only if this message is still the
+   * branch's tail at append time (compare-and-append under the history lock).
+   * Required for callers that do not block on generation (fork): the row must
+   * never land after unrelated rows, so losing the race drops it silently.
+   */
+  guardTailMessageId?: string;
   timeoutMs?: number;
-}): Promise<MuxMessage | null> {
+}
+
+/**
+ * Summarize an abandoned history segment and append the labeled row to the
+ * new branch's chat.jsonl. Returns the appended row (so live sessions can
+ * emit it to the renderer) or null when no summary was produced.
+ *
+ * The edit-resend path awaits this SYNCHRONOUSLY (bounded by timeoutMs):
+ * the acceptance contract requires the summary row to precede the re-sent
+ * user message, which is appended immediately after, so there is no later
+ * point where the row could still land in order. The fork path instead runs
+ * this in the background (startAbandonedBranchSummaryInBackground) because
+ * the fork's next request is not built until the user's first send, which
+ * awaits the pending summary; the tail guard makes the late append
+ * provably race-free.
+ *
+ * Never throws; every failure path degrades to "no summary row".
+ */
+export async function maybeAppendAbandonedBranchSummary(
+  input: AbandonedBranchSummaryInput
+): Promise<MuxMessage | null> {
   try {
     // RLM off => byte-identical behavior to today: no model call, no row.
     if (!isRlmModeEnabled(input.experiments, input.isExperimentEnabled)) {
@@ -349,6 +422,31 @@ export async function maybeAppendAbandonedBranchSummary(input: {
     }
 
     const summaryMessage = createBranchSummaryMessage(summaryText);
+    if (input.guardTailMessageId !== undefined) {
+      const guardedResult = await input.historyService.appendToHistoryIfTailMatches(
+        input.workspaceId,
+        summaryMessage,
+        input.guardTailMessageId
+      );
+      if (!guardedResult.success) {
+        log.debug("Branch summary: failed to append summary row", {
+          workspaceId: input.workspaceId,
+          error: guardedResult.error,
+        });
+        return null;
+      }
+      if (guardedResult.data === "tail-mismatch") {
+        // History moved past the branch point while we were generating (the
+        // user's first turn won the race, or the branch was rewritten).
+        // Appending now would put the row out of order — drop it instead.
+        log.debug("Branch summary: history advanced past branch point, dropping summary", {
+          workspaceId: input.workspaceId,
+          guardTailMessageId: input.guardTailMessageId,
+        });
+        return null;
+      }
+      return summaryMessage;
+    }
     const appendResult = await input.historyService.appendToHistory(
       input.workspaceId,
       summaryMessage
@@ -370,4 +468,51 @@ export async function maybeAppendAbandonedBranchSummary(input: {
     });
     return null;
   }
+}
+
+/**
+ * Pending background summaries by workspace id. Fork registers here so the
+ * new workspace's first send can await the row before building its request
+ * (keeping the "summary lands before the next request" contract) without the
+ * fork operation itself stalling on generation.
+ */
+const pendingBranchSummaries = new Map<string, Promise<MuxMessage | null>>();
+
+/**
+ * Start abandoned-branch summarization WITHOUT blocking the caller. Used by
+ * fork: awaiting generation synchronously stalls the user-facing fork for
+ * seconds even when it ultimately produces nothing. Instead the promise is
+ * registered so the fork's first send awaits it (see
+ * awaitPendingBranchSummary), and the tail guard guarantees a late append can
+ * never land after unrelated rows. maybeAppendAbandonedBranchSummary never
+ * rejects, so this deliberate not-awaited call cannot leave an unhandled
+ * rejection behind.
+ */
+export function startAbandonedBranchSummaryInBackground(
+  input: AbandonedBranchSummaryInput & { guardTailMessageId: string }
+): void {
+  const promise = maybeAppendAbandonedBranchSummary(input);
+  pendingBranchSummaries.set(input.workspaceId, promise);
+  void promise.finally(() => {
+    // Only clear our own registration (a re-fork of the same workspace id
+    // cannot happen, but stay defensive about overwrites).
+    if (pendingBranchSummaries.get(input.workspaceId) === promise) {
+      pendingBranchSummaries.delete(input.workspaceId);
+    }
+  });
+}
+
+/**
+ * Await a pending background branch summary for this workspace, if any.
+ * Bounded: the underlying generation enforces BRANCH_SUMMARY_TIMEOUT_MS.
+ * Returns the appended row (for renderer emission) or null. Callers that
+ * append user messages / build requests must call this first so the summary
+ * row keeps its before-the-next-request ordering.
+ */
+export async function awaitPendingBranchSummary(workspaceId: string): Promise<MuxMessage | null> {
+  const pending = pendingBranchSummaries.get(workspaceId);
+  if (!pending) {
+    return null;
+  }
+  return pending;
 }

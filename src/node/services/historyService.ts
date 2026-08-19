@@ -1875,6 +1875,43 @@ export class HistoryService {
   }
 
   /**
+   * Compare-and-append: append `message` only if the workspace's current tail
+   * message id still equals `expectedTailMessageId`, checked atomically under
+   * the same per-workspace lock every other history mutation takes. Used by
+   * background writers (abandoned-branch summaries) that must never land
+   * after unrelated rows: if anything else was appended (or history was
+   * rewritten) since the caller observed the tail, the append is skipped and
+   * `"tail-mismatch"` is returned instead of an error — losing the race is an
+   * expected outcome, not a failure.
+   */
+  async appendToHistoryIfTailMatches(
+    workspaceId: string,
+    message: MuxMessage,
+    expectedTailMessageId: string
+  ): Promise<Result<"appended" | "tail-mismatch">> {
+    assert(
+      expectedTailMessageId.length > 0,
+      "appendToHistoryIfTailMatches requires a non-empty expected tail id"
+    );
+    return this.withRecoveredHistoryResultLock<"appended" | "tail-mismatch">(
+      workspaceId,
+      "Failed to append history",
+      async () => {
+        const tail = await this.readLastMessagesFromFile(this.getChatHistoryPath(workspaceId), 1);
+        if (tail.length === 0 || tail[0].id !== expectedTailMessageId) {
+          return Ok("tail-mismatch");
+        }
+        const result = await this._appendToHistoryUnlocked(workspaceId, message);
+        if (!result.success) {
+          return Err(result.error);
+        }
+        await this.rotateAfterBoundaryWriteUnlocked(workspaceId, message);
+        return Ok("appended");
+      }
+    );
+  }
+
+  /**
    * Update an existing message in history by historySequence
    * Reads the active chat.jsonl, replaces the matching message, and rewrites the file.
    *
