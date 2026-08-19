@@ -25,6 +25,16 @@ import { TestTempDir } from "../tools/testHelpers";
  * first-class no-op. The model is a scripted mock.
  */
 
+// fsPromises.access rejects with a plain value in bun's typings, tripping
+// @typescript-eslint/await-thenable on `expect(...).rejects`; assert existence
+// via a boolean instead (same pattern as refinementRollback.test.ts).
+function pathExists(target: string): Promise<boolean> {
+  return fsPromises.access(target).then(
+    () => true,
+    () => false
+  );
+}
+
 const WORKSPACE_ID = "ws-refine";
 const LESSON_PATH = "/memories/workspace/refine-lessons.md";
 
@@ -167,8 +177,10 @@ async function createFixture(options?: {
           metadataModel: modelString,
         });
       },
-      getWorkspaceMetadata: async () =>
-        options?.withSkillTool === true ? Ok(metadata) : Err("no metadata in this fixture"),
+      getWorkspaceMetadata: () =>
+        Promise.resolve(
+          options?.withSkillTool === true ? Ok(metadata) : Err("no metadata in this fixture")
+        ),
     },
     { isExperimentEnabled: (id) => enabled.has(id) },
     {
@@ -178,19 +190,20 @@ async function createFixture(options?: {
       timelineService:
         options?.timelineEvents !== undefined
           ? {
-              list: async () => ({
-                events: options.timelineEvents!.map((event, index) => ({
-                  v: 1 as const,
-                  seq: index + 1,
-                  id: `tl-${index}`,
-                  ts: 1_700_000_000_000 + index,
-                  kind: event.kind,
-                  source: { system: "test" },
-                  data: { description: event.description },
-                })),
-                nextCursor: null,
-                hasOlder: false,
-              }),
+              list: () =>
+                Promise.resolve({
+                  events: options.timelineEvents!.map((event, index) => ({
+                    v: 1 as const,
+                    seq: index + 1,
+                    id: `tl-${index}`,
+                    ts: 1_700_000_000_000 + index,
+                    kind: event.kind,
+                    source: { system: "test" },
+                    data: { description: event.description },
+                  })),
+                  nextCursor: null,
+                  hasOlder: false,
+                }),
             }
           : undefined,
     }
@@ -365,7 +378,7 @@ describe("RefineService", () => {
       evidence: { toolName: "test" },
     });
     expect(rollback.success).toBe(true);
-    await expect(fsPromises.access(lessonFile)).rejects.toThrow();
+    expect(await pathExists(lessonFile)).toBe(false);
   });
 
   it("rejects guard-rail escapes: invalid memory paths apply nothing and journal nothing", async () => {
@@ -395,7 +408,7 @@ describe("RefineService", () => {
       expect(result.data.applied).toHaveLength(0);
     }
     expect(await listRefinements(fixture.sessionDir)).toHaveLength(0);
-    await expect(fsPromises.access(path.join(fixture.muxHome, "AGENTS.md"))).rejects.toThrow();
+    expect(await pathExists(path.join(fixture.muxHome, "AGENTS.md"))).toBe(false);
   });
 
   it("writes project skills through the standard tool (journaled) but refuses path escapes", async () => {
@@ -448,9 +461,7 @@ describe("RefineService", () => {
     );
     expect(await fsPromises.readFile(skillFile, "utf-8")).toContain("bun install");
     // The escape attempt landed nowhere (workspace AGENTS.md untouched).
-    await expect(
-      fsPromises.access(path.join(fixture.workspacePath, "AGENTS.md"))
-    ).rejects.toThrow();
+    expect(await pathExists(path.join(fixture.workspacePath, "AGENTS.md"))).toBe(false);
 
     // Journal row carries the delete inverse; rollback removes the skill file.
     const rows = await listRefinements(fixture.sessionDir);
@@ -461,7 +472,7 @@ describe("RefineService", () => {
       evidence: { toolName: "test" },
     });
     expect(rollback.success).toBe(true);
-    await expect(fsPromises.access(skillFile)).rejects.toThrow();
+    expect(await pathExists(skillFile)).toBe(false);
   });
 
   it("includes timeline events in the prompt only when the Timeline experiment is on", async () => {
