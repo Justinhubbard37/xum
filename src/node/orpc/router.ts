@@ -125,6 +125,9 @@ import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 import { CHAT_FILE_NAME, CHAT_ARCHIVE_FILE_NAME } from "@/common/constants/paths";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { workflowRunStreamHub } from "@/node/services/workflows/workflowRunStreamHub";
+import { buildWorkspaceComposition } from "@/node/services/agentPlugins/composition";
+import { discoverWorkspaceAgentPlugins } from "@/node/services/agentPlugins/discovery";
+import { collectPluginSlashCommands } from "@/node/services/agentPlugins/slashCommands";
 import { discoverWorkflowScripts } from "@/node/services/workflows/workflowScriptDiscovery";
 import {
   WorkflowService,
@@ -486,6 +489,9 @@ export async function resolveWorkflowContext(
           runtime,
           workspacePath,
           projectTrusted: resolveWorkflowProjectTrusted(),
+          includeAgentPlugins: context.experimentsService.isExperimentEnabled(
+            EXPERIMENT_IDS.AGENT_PLUGINS
+          ),
         }),
       onRunStatusChanged: (event) => context.workspaceService.emitWorkflowRunActivity(event),
       ...(options.onBackgroundRunTerminal != null
@@ -1796,7 +1802,12 @@ export const router = (authToken?: string) => {
 
           const { runtime, discoveryPath } = await resolveAgentDiscoveryContext(context, input);
 
-          const descriptors = await discoverAgentDefinitions(runtime, discoveryPath);
+          const includeAgentPlugins = context.experimentsService.isExperimentEnabled(
+            EXPERIMENT_IDS.AGENT_PLUGINS
+          );
+          const descriptors = await discoverAgentDefinitions(runtime, discoveryPath, {
+            includeAgentPlugins,
+          });
 
           const cfg = context.config.loadConfigOrDefault();
 
@@ -1808,6 +1819,7 @@ export const router = (authToken?: string) => {
                   discoveryPath,
                   descriptor.id,
                   {
+                    includeAgentPlugins,
                     skipScopesAbove: getSkipScopesAboveForKnownScope(descriptor.scope),
                   }
                 );
@@ -1874,7 +1886,11 @@ export const router = (authToken?: string) => {
             await context.aiService.waitForInit(input.workspaceId);
           }
           const { runtime, discoveryPath } = await resolveAgentDiscoveryContext(context, input);
-          return readAgentDefinition(runtime, discoveryPath, input.agentId);
+          return readAgentDefinition(runtime, discoveryPath, input.agentId, {
+            includeAgentPlugins: context.experimentsService.isExperimentEnabled(
+              EXPERIMENT_IDS.AGENT_PLUGINS
+            ),
+          });
         }),
     },
     agentSkills: {
@@ -2055,6 +2071,9 @@ export const router = (authToken?: string) => {
             runtime,
             workspacePath,
             projectTrusted,
+            includeAgentPlugins: context.experimentsService.isExperimentEnabled(
+              EXPERIMENT_IDS.AGENT_PLUGINS
+            ),
           });
           if (input.rawCommand != null) {
             await context.workspaceService.prepareManualWorkflowInvocation(input.workspaceId);
@@ -2224,7 +2243,14 @@ export const router = (authToken?: string) => {
             context,
             input.workspaceId
           );
-          return discoverWorkflowScripts({ runtime, workspacePath, projectTrusted });
+          return discoverWorkflowScripts({
+            runtime,
+            workspacePath,
+            projectTrusted,
+            includeAgentPlugins: context.experimentsService.isExperimentEnabled(
+              EXPERIMENT_IDS.AGENT_PLUGINS
+            ),
+          });
         }),
     },
     providers: {
@@ -5673,6 +5699,91 @@ export const router = (authToken?: string) => {
               return { success: false, error: message };
             }
           }),
+      },
+      // Agent Plugins: manifest-contributed slash commands (host-local discovery).
+      plugins: {
+        slashCommands: {
+          list: t
+            .input(schemas.workspace.plugins.slashCommands.list.input)
+            .output(schemas.workspace.plugins.slashCommands.list.output)
+            .handler(async ({ context, input, signal }) => {
+              // LOADING third-party plugin contributions stays experiment-gated.
+              if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS)) {
+                return [];
+              }
+              await context.aiService.waitForInit(input.workspaceId, signal);
+              const metadataResult = await context.aiService.getWorkspaceMetadata(
+                input.workspaceId
+              );
+              if (!metadataResult.success) throw new Error(metadataResult.error);
+              const metadata = metadataResult.data;
+              const runtimeContextResult = context.aiService.createWorkspaceRuntimeContext(
+                input.workspaceId,
+                metadata
+              );
+              if (!runtimeContextResult.success) {
+                throw new Error(formatSendMessageError(runtimeContextResult.error).message);
+              }
+              // Agent Plugin containers anchor at the host checkout root; plugin
+              // discovery is host-filesystem-only, so off-host workspaces have none.
+              const { hostCheckoutRoot } = runtimeContextResult.data;
+              if (!hostCheckoutRoot) {
+                return [];
+              }
+              const { plugins } = await discoverWorkspaceAgentPlugins({
+                workspacePath: hostCheckoutRoot,
+                muxHome: context.config.rootDir,
+                projectTrusted: isWorkspaceProjectTrusted(context.config, metadata),
+              });
+              return collectPluginSlashCommands(plugins);
+            }),
+        },
+        // Composition inspector: effective skills/agents/workflows/MCP servers/
+        // slash commands/hooks by layer, with shadowing. Works regardless of the
+        // agent-plugins experiment (the gate only controls plugin LOADING).
+        composition: {
+          get: t
+            .input(schemas.workspace.plugins.composition.get.input)
+            .output(schemas.workspace.plugins.composition.get.output)
+            .handler(async ({ context, input, signal }) => {
+              await context.aiService.waitForInit(input.workspaceId, signal);
+              const metadataResult = await context.aiService.getWorkspaceMetadata(
+                input.workspaceId
+              );
+              if (!metadataResult.success) throw new Error(metadataResult.error);
+              const metadata = metadataResult.data;
+              const runtimeContextResult = context.aiService.createWorkspaceRuntimeContext(
+                input.workspaceId,
+                metadata
+              );
+              if (!runtimeContextResult.success) {
+                throw new Error(formatSendMessageError(runtimeContextResult.error).message);
+              }
+              const { runtime, workspacePath, hostCheckoutRoot } = runtimeContextResult.data;
+              const projectTrusted = isWorkspaceProjectTrusted(context.config, metadata);
+              const agentPlugins = hostCheckoutRoot
+                ? resolveAgentPluginsMcpContext(metadata, hostCheckoutRoot)
+                : null;
+              return buildWorkspaceComposition({
+                runtime,
+                // Execution path: production skill/agent/workflow/hook loaders
+                // discover from here (subProjectPath workspaces run in the
+                // subdirectory). Plugin containers anchor separately at the
+                // nullable host checkout root.
+                workspacePath,
+                hostCheckoutRoot,
+                muxHome: context.config.rootDir,
+                projectTrusted,
+                agentPluginsEnabled: context.experimentsService.isExperimentEnabled(
+                  EXPERIMENT_IDS.AGENT_PLUGINS
+                ),
+                listMcpServerLayers: () =>
+                  context.mcpConfigService.listServerLayers(metadata.projectPath, projectTrusted, {
+                    agentPlugins,
+                  }),
+              });
+            }),
+        },
       },
     },
     tasks: {

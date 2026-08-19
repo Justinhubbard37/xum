@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { describe, expect, test } from "bun:test";
 
 import { DisposableTempDir } from "@/node/services/tempDir";
-import { discoverAgentPlugins } from "./discovery";
+import { computeAgentPluginContainers, discoverAgentPlugins } from "./discovery";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 
 async function writePlugin(
@@ -15,6 +15,8 @@ async function writePlugin(
     rawManifest?: string;
     skills?: string[];
     mcpJson?: string;
+    agents?: string[];
+    workflows?: string[];
   }
 ): Promise<string> {
   const pluginDir = path.join(containerPath, dirName);
@@ -44,6 +46,22 @@ async function writePlugin(
     await fs.writeFile(path.join(pluginDir, "mcp.json"), options.mcpJson, "utf8");
   }
 
+  for (const agentId of options?.agents ?? []) {
+    const agentsDir = path.join(pluginDir, "agents");
+    await fs.mkdir(agentsDir, { recursive: true });
+    await fs.writeFile(
+      path.join(agentsDir, `${agentId}.md`),
+      `---\nname: ${agentId}\ndescription: Test agent\n---\nBody\n`,
+      "utf8"
+    );
+  }
+
+  for (const workflowFile of options?.workflows ?? []) {
+    const workflowsDir = path.join(pluginDir, "workflows");
+    await fs.mkdir(workflowsDir, { recursive: true });
+    await fs.writeFile(path.join(workflowsDir, workflowFile), "export {};\n", "utf8");
+  }
+
   return pluginDir;
 }
 
@@ -63,6 +81,47 @@ describe("discoverAgentPlugins", () => {
     expect(plugin.skillsDir).toBe(path.join(plugin.rootPath, "skills"));
     expect(plugin.mcpConfigPath).toBe(path.join(plugin.rootPath, "mcp.json"));
     expect(result.diagnostics).toEqual([]);
+  });
+
+  test("discovers agents/ and workflows/ component directories", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    await writePlugin(container, "full-plugin", {
+      agents: ["reviewer"],
+      workflows: ["release.js"],
+    });
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins).toHaveLength(1);
+    const plugin = result.plugins[0];
+    expect(plugin.agentsDir).toBe(path.join(plugin.rootPath, "agents"));
+    expect(plugin.workflowsDir).toBe(path.join(plugin.rootPath, "workflows"));
+    expect(result.diagnostics).toEqual([]);
+  });
+
+  test("contributes path overrides relocate component resolution", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = await writePlugin(container, "custom-plugin", {
+      manifest: {
+        $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+        name: "custom-plugin",
+        contributes: { skills: "lib/skills", workflows: "scripts" },
+      },
+    });
+    await fs.mkdir(path.join(pluginDir, "lib", "skills"), { recursive: true });
+    await fs.mkdir(path.join(pluginDir, "scripts"), { recursive: true });
+    // The conventional locations exist too, but the override must win.
+    await fs.mkdir(path.join(pluginDir, "skills"), { recursive: true });
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins).toHaveLength(1);
+    const plugin = result.plugins[0];
+    expect(plugin.skillsDir).toBe(path.join(plugin.rootPath, "lib", "skills"));
+    expect(plugin.workflowsDir).toBe(path.join(plugin.rootPath, "scripts"));
+    expect(plugin.agentsDir).toBeUndefined();
   });
 
   test("discovers a manifest-only plugin without components", async () => {
@@ -211,6 +270,34 @@ describe("discoverAgentPlugins", () => {
     expect(result.plugins[0].mcpConfigPath).toBeDefined();
   });
 
+  test("resolves hooks.js as a component path when present", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = await writePlugin(container, "hooky");
+    await fs.writeFile(path.join(pluginDir, "hooks.js"), "({})", "utf8");
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins).toHaveLength(1);
+    expect(result.plugins[0].hooksPath).toBe(path.join(pluginDir, "hooks.js"));
+    expect(result.diagnostics).toEqual([]);
+  });
+
+  test("hooks.js of the wrong filesystem kind invalidates only the hooks component", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = await writePlugin(container, "dir-hooks", { mcpJson: "{}" });
+    await fs.mkdir(path.join(pluginDir, "hooks.js"));
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins).toHaveLength(1);
+    expect(result.plugins[0].hooksPath).toBeUndefined();
+    expect(result.plugins[0].mcpConfigPath).toBeDefined();
+    expect(result.diagnostics).toHaveLength(1);
+    expect(result.diagnostics[0].message).toContain("hooks.js");
+  });
+
   test("a symlinked plugin directory anchors containment at its realpath", async () => {
     using tmp = new DisposableTempDir("agent-plugins");
     const container = path.join(tmp.path, "plugins");
@@ -259,5 +346,41 @@ describe("discoverAgentPlugins", () => {
     ]);
 
     expect(result.plugins.map((p) => p.name)).toEqual(["alpha", "zeta"]);
+  });
+});
+
+describe("computeAgentPluginContainers", () => {
+  test("includes project containers only for trusted projects with absolute roots", () => {
+    const trusted = computeAgentPluginContainers({
+      muxHome: "/home/u/.mux",
+      projectRoot: "/repo",
+      projectTrusted: true,
+    });
+    expect(trusted.filter((c) => c.scope === "project").map((c) => c.path)).toEqual([
+      path.join("/repo", ".mux", "plugins"),
+      path.join("/repo", ".agents", "plugins"),
+    ]);
+
+    const untrusted = computeAgentPluginContainers({
+      muxHome: "/home/u/.mux",
+      projectRoot: "/repo",
+      projectTrusted: false,
+    });
+    expect(untrusted.every((c) => c.scope === "global")).toBe(true);
+
+    const relative = computeAgentPluginContainers({
+      muxHome: "/home/u/.mux",
+      projectRoot: "repo",
+      projectTrusted: true,
+    });
+    expect(relative.every((c) => c.scope === "global")).toBe(true);
+  });
+
+  test("always includes the muxHome global container", () => {
+    const containers = computeAgentPluginContainers({
+      muxHome: "/home/u/.mux",
+      projectTrusted: false,
+    });
+    expect(containers.some((c) => c.path === path.join("/home/u/.mux", "plugins"))).toBe(true);
   });
 });

@@ -42,6 +42,7 @@ import {
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type {
   ActiveTurnThinkingOverride,
+  RebuildFirstStepForThinkingLevel,
   RebuildProviderOptionsForThinkingLevel,
 } from "@/node/services/thinkingOverride";
 import type { NestedToolCall } from "@/common/orpc/schemas/message";
@@ -219,6 +220,11 @@ interface StreamRequestConfig {
    * options for the stream's model. `null` ⇒ not applicable / no-op.
    */
   rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel;
+  /**
+   * Step-0 message rebuild for overrides that raced stream construction; see
+   * RebuildFirstStepForThinkingLevel. Also emits the superseding envelope.
+   */
+  rebuildFirstStepForThinkingLevel?: RebuildFirstStepForThinkingLevel;
   /** First step must call one of these tools; later steps restore the full toolset. */
   forcedFirstStepToolNames?: string[];
 }
@@ -257,7 +263,18 @@ export interface PreparedModelFallback {
    * options for the wrong model).
    */
   rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel;
+  /** Step-0 message rebuild bound to the fallback request's build inputs. */
+  rebuildFirstStepForThinkingLevel?: RebuildFirstStepForThinkingLevel;
   forcedFirstStepToolNames?: string[];
+  /**
+   * Invoked once the fallback stream has been constructed successfully (but
+   * before it is consumed). Durable side effects that must describe the
+   * request that actually streams — e.g. the superseding turn envelope —
+   * belong here, not in prepare(): a prepare that succeeds but whose stream
+   * construction fails must leave no trace, or replay verification would
+   * attribute an unstarted fallback identity. Must not throw.
+   */
+  onStreamConstructed?: () => Promise<void>;
   /**
    * Pinned providers-config snapshot the fallback request was built from
    * (see AIService's pinCoderWireProvidersConfig). The swap's request-config
@@ -1661,7 +1678,8 @@ export class StreamManager extends EventEmitter {
     thinkingOverrideState?: ActiveTurnThinkingOverride,
     rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel,
     forcedFirstStepToolNames?: string[],
-    providersConfigSnapshot?: ProvidersConfigMap
+    providersConfigSnapshot?: ProvidersConfigMap,
+    rebuildFirstStepForThinkingLevel?: RebuildFirstStepForThinkingLevel
   ): StreamRequestConfig {
     // The request's pinned providers-config snapshot (when the caller has
     // one): cache wrappers and type-derived output limits below must resolve
@@ -1759,6 +1777,7 @@ export class StreamManager extends EventEmitter {
       thinkingOverrideState,
       forcedFirstStepToolNames,
       rebuildProviderOptionsForThinkingLevel,
+      rebuildFirstStepForThinkingLevel,
     };
   }
 
@@ -1910,6 +1929,53 @@ export class StreamManager extends EventEmitter {
         // Mid-turn thinking-level change: consume a pending override before
         // this step's provider request is built.
         const thinkingOverride = this.applyPendingThinkingOverride(request);
+        // Step 0: an override consumed here raced stream setup (written during
+        // startStream's awaits, after AIService's pre-construction quiescence
+        // fold). Message preparation is thinking-level-dependent (Anthropic
+        // signed-reasoning transforms), so rebuild the first-step messages
+        // under the applied level too; the closure also emits a superseding
+        // turn envelope so wire, envelope, and replay agree.
+        let rebuiltFirstStepMessages: ModelMessage[] | undefined;
+        const appliedLevel = request.thinkingOverrideState?.applied;
+        if (
+          thinkingOverride !== undefined &&
+          stepNumber === 0 &&
+          request.rebuildFirstStepForThinkingLevel != null &&
+          appliedLevel != null
+        ) {
+          try {
+            const rebuilt = await request.rebuildFirstStepForThinkingLevel(
+              appliedLevel,
+              thinkingOverride
+            );
+            // buildStreamRequestConfig may have moved the system prompt into
+            // messages[0] as a cached system row (Anthropic prompt caching
+            // sets request.system to undefined). The rebuild closure returns
+            // history messages only — re-prepend that row or the replacement
+            // would drop the entire system prompt from the first request.
+            const cachedSystemRow =
+              request.system === undefined && request.messages[0]?.role === "system"
+                ? [request.messages[0]]
+                : [];
+            // Same per-step transforms the construction-time messages receive.
+            rebuiltFirstStepMessages = await extractToolMediaAsUserMessagesFromModelMessages(
+              stripWorkflowRunRecordsFromModelMessages([...cachedSystemRow, ...rebuilt])
+            );
+            if (stepTracker) {
+              stepTracker.latestMessages = rebuiltFirstStepMessages;
+            }
+            // onStepMessages fired above with the pre-rebuild transcript;
+            // re-notify so consumers (advisor transcript ref) track the
+            // messages this step actually sends.
+            request.onStepMessages?.(rebuiltFirstStepMessages);
+          } catch (error) {
+            // Fail open to the options-only rebuild rather than killing the
+            // turn; the envelope then still matches the options change.
+            log.warn("First-step message rebuild for thinking override failed", {
+              error: getErrorMessage(error),
+            });
+          }
+        }
         if (
           rewritten === stepMessages &&
           activeTools === undefined &&
@@ -1918,7 +1984,11 @@ export class StreamManager extends EventEmitter {
           return undefined;
         }
         return {
-          ...(rewritten === stepMessages ? {} : { messages: rewritten }),
+          ...(rebuiltFirstStepMessages != null
+            ? { messages: rebuiltFirstStepMessages }
+            : rewritten === stepMessages
+              ? {}
+              : { messages: rewritten }),
           ...(forceFirstStepTools !== undefined ? { toolChoice: "required" as const } : {}),
           ...(activeTools !== undefined ? { activeTools } : {}),
           // Defense in depth: the in-place request mutation is authoritative
@@ -1973,7 +2043,8 @@ export class StreamManager extends EventEmitter {
     thinkingOverrideState?: ActiveTurnThinkingOverride,
     rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel,
     forcedFirstStepToolNames?: string[],
-    providersConfigSnapshot?: ProvidersConfigMap
+    providersConfigSnapshot?: ProvidersConfigMap,
+    rebuildFirstStepForThinkingLevel?: RebuildFirstStepForThinkingLevel
   ): WorkspaceStreamInfo {
     // abortController is created and linked to the caller-provided abortSignal in startStream().
 
@@ -2000,7 +2071,8 @@ export class StreamManager extends EventEmitter {
       thinkingOverrideState,
       rebuildProviderOptionsForThinkingLevel,
       forcedFirstStepToolNames,
-      providersConfigSnapshot
+      providersConfigSnapshot,
+      rebuildFirstStepForThinkingLevel
     );
 
     // Start streaming - this can throw immediately if API key is missing
@@ -2734,7 +2806,8 @@ export class StreamManager extends EventEmitter {
       streamInfo.request.thinkingOverrideState,
       prepared.data.rebuildProviderOptionsForThinkingLevel,
       prepared.data.forcedFirstStepToolNames,
-      prepared.data.providersConfig
+      prepared.data.providersConfig,
+      prepared.data.rebuildFirstStepForThinkingLevel
     );
     // createStreamResult may eagerly prepare the first fallback step and update
     // latestMessages. Clear stale source-step messages before starting it so a
@@ -2757,6 +2830,10 @@ export class StreamManager extends EventEmitter {
         terminalNote: `Configured fallback model ${nextModelString} could not be started: ${getErrorMessage(error)}`,
       };
     }
+
+    // The fallback stream exists now; durable side effects describing this
+    // request identity (superseding turn envelope) may be recorded.
+    await prepared.data.onStreamConstructed?.();
 
     workspaceLog.warn(
       preserveParts
@@ -4270,7 +4347,15 @@ export class StreamManager extends EventEmitter {
     // Pinned providers-config snapshot the request was assembled from (see
     // AIService's pinCoderWireProvidersConfig): request-config building and
     // metadata resolution must not re-read live config after model creation.
-    providersConfigSnapshot?: ProvidersConfigMap
+    providersConfigSnapshot?: ProvidersConfigMap,
+    // Invoked once the stream is constructed and registered (before
+    // processing). Durable side effects describing this request — the turn
+    // envelope — belong here: earlier emission persists phantom rows when
+    // setup aborts or fails before any provider request exists. Must not throw.
+    onStreamConstructed?: () => Promise<void>,
+    // Step-0 message rebuild for thinking overrides that race stream setup
+    // (see RebuildFirstStepForThinkingLevel).
+    rebuildFirstStepForThinkingLevel?: RebuildFirstStepForThinkingLevel
   ): Promise<Result<StreamToken, SendMessageError>> {
     const typedWorkspaceId = workspaceId as WorkspaceId;
 
@@ -4358,7 +4443,8 @@ export class StreamManager extends EventEmitter {
           thinkingOverrideState,
           rebuildProviderOptionsForThinkingLevel,
           forcedFirstStepToolNames,
-          providersConfigSnapshot
+          providersConfigSnapshot,
+          rebuildFirstStepForThinkingLevel
         );
 
         // Guard against a narrow race:
@@ -4373,6 +4459,28 @@ export class StreamManager extends EventEmitter {
 
         streamInfo.unlinkAbortSignal = unlinkAbortSignal;
         streamRegistered = true;
+
+        // Stream constructed + registered: durable request-describing side
+        // effects (turn envelope) may be recorded now.
+        await onStreamConstructed?.();
+
+        // A hard interrupt during the awaited envelope write finds the
+        // registered STARTING stream, aborts it, awaits its placeholder
+        // processingPromise, and deletes the registration — a replacement
+        // stream may already occupy this workspace's slot. Launching
+        // processing now would emit stream-start after the abort and its
+        // cleanup would later delete that replacement. Bail out; the finally
+        // block releases this never-processed stream's resources.
+        if (
+          streamAbortController.signal.aborted ||
+          this.workspaceStreams.get(typedWorkspaceId) !== streamInfo
+        ) {
+          if (this.workspaceStreams.get(typedWorkspaceId) === streamInfo) {
+            this.workspaceStreams.delete(typedWorkspaceId);
+          }
+          streamRegistered = false;
+          return Ok(streamToken);
+        }
 
         // Step 5: Track the processing promise for guaranteed cleanup
         // This allows cancelStreamSafely to wait for full exit

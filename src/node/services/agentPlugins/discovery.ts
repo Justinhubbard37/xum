@@ -1,4 +1,5 @@
 import * as fsPromises from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 
 import { getErrorMessage } from "@/common/utils/errors";
@@ -26,6 +27,13 @@ import {
 
 export type AgentPluginScope = "project" | "global";
 
+/**
+ * Tilde-form universal plugins container (`~/.agents/plugins`). Shared by
+ * loader default-roots computations (skills, agent definitions) that resolve
+ * tilde paths through a LocalRuntime.
+ */
+export const UNIVERSAL_AGENT_PLUGINS_CONTAINER = "~/.agents/plugins";
+
 export interface AgentPluginContainer {
   /** Absolute host path of the container directory (e.g. `<projectRoot>/.mux/plugins`). */
   path: string;
@@ -46,6 +54,16 @@ export interface AgentPluginInfo {
   skillsDir?: string;
   /** Canonical `mcp.json` path; present only when it exists, is a regular file, and stays inside the root (§6.2). */
   mcpConfigPath?: string;
+  /** Canonical `hooks.js` path (Tier-1 sandboxed plugin hooks, agent-plugins
+   * experiment); present only when it exists, is a regular file, and stays
+   * inside the root. Resolved with the same §6.2 component rules as mcp.json. */
+  hooksPath?: string;
+  /** Canonical `agents/` directory (Mux contributes extension: agents/*.md
+   * agent definitions). Same §6.2 component rules as skills/. */
+  agentsDir?: string;
+  /** Canonical `workflows/` directory (Mux contributes extension: workflows/*.js
+   * scripts resolvable as `plugin://<name>/...`). Same §6.2 component rules as skills/. */
+  workflowsDir?: string;
 }
 
 export interface AgentPluginDiagnostic {
@@ -216,23 +234,28 @@ async function discoverPluginAt(args: {
     );
   }
 
-  const skillsDir = await resolveComponentPath({
-    rootReal,
-    relativePath: "skills",
-    expectKind: "directory",
-    componentLabel: "skills/",
-    scope,
-    diagnostics,
-  });
+  // Manifest `contributes` path members override the conventional component
+  // locations; the manifest validator already restricted them to safe relative
+  // paths, and resolveComponentPath re-enforces realpath containment.
+  const contributes = validation.manifest.contributes;
+  const resolveComponent = (
+    relativePath: string,
+    expectKind: "file" | "directory"
+  ): Promise<string | undefined> =>
+    resolveComponentPath({
+      rootReal,
+      relativePath,
+      expectKind,
+      componentLabel: expectKind === "directory" ? `${relativePath}/` : relativePath,
+      scope,
+      diagnostics,
+    });
 
-  const mcpConfigPath = await resolveComponentPath({
-    rootReal,
-    relativePath: "mcp.json",
-    expectKind: "file",
-    componentLabel: "mcp.json",
-    scope,
-    diagnostics,
-  });
+  const skillsDir = await resolveComponent(contributes?.skills ?? "skills", "directory");
+  const mcpConfigPath = await resolveComponent(contributes?.mcp ?? "mcp.json", "file");
+  const hooksPath = await resolveComponent(contributes?.hooks ?? "hooks.js", "file");
+  const agentsDir = await resolveComponent(contributes?.agents ?? "agents", "directory");
+  const workflowsDir = await resolveComponent(contributes?.workflows ?? "workflows", "directory");
 
   return {
     name: validation.manifest.name,
@@ -243,7 +266,70 @@ async function discoverPluginAt(args: {
     manifest: validation.manifest,
     ...(skillsDir !== undefined ? { skillsDir } : {}),
     ...(mcpConfigPath !== undefined ? { mcpConfigPath } : {}),
+    ...(hooksPath !== undefined ? { hooksPath } : {}),
+    ...(agentsDir !== undefined ? { agentsDir } : {}),
+    ...(workflowsDir !== undefined ? { workflowsDir } : {}),
   };
+}
+
+/**
+ * Canonical container list for one discovery pass (shared by plugin MCP config
+ * and plugin hooks so both consult identical locations with identical Project
+ * Trust gating): project containers are consulted only for trusted projects
+ * with an absolute host checkout root; global containers always apply.
+ */
+export function computeAgentPluginContainers(args: {
+  muxHome: string;
+  projectRoot?: string;
+  projectTrusted: boolean;
+}): AgentPluginContainer[] {
+  const containers: AgentPluginContainer[] = [];
+  if (args.projectRoot !== undefined && args.projectTrusted && path.isAbsolute(args.projectRoot)) {
+    containers.push({ path: path.join(args.projectRoot, ".mux", "plugins"), scope: "project" });
+    containers.push({ path: path.join(args.projectRoot, ".agents", "plugins"), scope: "project" });
+  }
+  containers.push({ path: path.join(args.muxHome, "plugins"), scope: "global" });
+  containers.push({ path: path.join(os.homedir(), ".agents", "plugins"), scope: "global" });
+  return containers;
+}
+
+/**
+ * Workspace-level plugin discovery for host-local consumers (contributed slash
+ * commands, composition inspector): canonical containers with Project Trust
+ * gating, plus the repo-symlink posture check on project plugin roots (a
+ * committed .mux/plugins/<name> symlink must not resolve outside the checkout).
+ */
+export async function discoverWorkspaceAgentPlugins(args: {
+  workspacePath: string;
+  muxHome: string;
+  projectTrusted: boolean;
+}): Promise<DiscoverAgentPluginsResult> {
+  const containers = computeAgentPluginContainers({
+    muxHome: args.muxHome,
+    projectRoot: args.workspacePath,
+    projectTrusted: args.projectTrusted,
+  });
+  const { plugins, diagnostics } = await discoverAgentPlugins(containers);
+
+  const contained: AgentPluginInfo[] = [];
+  for (const plugin of plugins) {
+    if (plugin.scope === "project") {
+      try {
+        await ensurePathContained(args.workspacePath, plugin.rootPath);
+      } catch (error) {
+        diagnostics.push({
+          path: plugin.rootPath,
+          scope: plugin.scope,
+          severity: "error",
+          message: `Plugin root escapes the project checkout; skipping: ${getErrorMessage(error)}`,
+        });
+        continue;
+      }
+    }
+    contained.push(plugin);
+  }
+
+  return { plugins: contained, diagnostics };
 }
 
 /**

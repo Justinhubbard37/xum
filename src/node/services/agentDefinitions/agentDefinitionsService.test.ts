@@ -211,6 +211,31 @@ describe("agentDefinitionsService", () => {
     expect(bar!.scope).toBe("global");
   });
 
+  test("dedupeById: false keeps precedence order within same-ID groups despite name sorting", async () => {
+    using project = new DisposableTempDir("agent-defs-project");
+    const projectAgentsRoot = path.join(project.path, ".mux", "agents");
+    const globalAgentsRoot = path.join(project.path, "global-agents");
+    // Same ID, different display names, chosen so a per-row name sort would
+    // place the lower-precedence global row ("Alpha") BEFORE the project
+    // winner ("Zulu"). Composition consumers treat the first row per ID as
+    // effective, so precedence must survive the sort.
+    await writeAgent(projectAgentsRoot, "dup", "Zulu (project)");
+    await writeAgent(globalAgentsRoot, "dup", "Alpha (global)");
+
+    const roots = { projectRoot: projectAgentsRoot, globalRoot: globalAgentsRoot };
+    const runtime = new LocalRuntime(project.path);
+    const agents = await discoverAgentDefinitions(runtime, project.path, {
+      roots,
+      dedupeById: false,
+    });
+
+    const dupRows = agents.filter((agent) => agent.id === "dup");
+    expect(dupRows.map((agent) => agent.scope)).toEqual(["project", "global"]);
+    // Same-ID rows stay adjacent (grouped) rather than scattered by name.
+    const dupIndices = agents.flatMap((agent, index) => (agent.id === "dup" ? [index] : []));
+    expect(dupIndices[1]).toBe(dupIndices[0] + 1);
+  });
+
   test("readAgentDefinition resolves project before global", async () => {
     using project = new DisposableTempDir("agent-defs-project");
     using global = new DisposableTempDir("agent-defs-global");
@@ -794,5 +819,106 @@ base: a
     expect(resolveAgentFrontmatter(runtime, tempDir.path, "a", { roots })).rejects.toThrow(
       "Circular agent inheritance detected"
     );
+  });
+
+  describe("agent plugin contributions", () => {
+    async function writePluginWithAgent(
+      containerPath: string,
+      pluginName: string,
+      agentId: string,
+      agentName: string
+    ): Promise<void> {
+      const pluginDir = path.join(containerPath, pluginName);
+      await fs.mkdir(path.join(pluginDir, "agents"), { recursive: true });
+      await fs.writeFile(
+        path.join(pluginDir, "plugin.json"),
+        JSON.stringify({
+          $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+          name: pluginName,
+        }),
+        "utf-8"
+      );
+      await writeAgent(path.join(pluginDir, "agents"), agentId, agentName);
+    }
+
+    test("plugin agents are discovered with plugin attribution at lowest project precedence", async () => {
+      using project = new DisposableTempDir("agent-defs-plugin-project");
+      using global = new DisposableTempDir("agent-defs-plugin-global");
+
+      const projectAgentsRoot = path.join(project.path, ".mux", "agents");
+      const pluginContainer = path.join(project.path, ".mux", "plugins");
+
+      await writePluginWithAgent(pluginContainer, "my-plugin", "helper", "Helper (plugin)");
+      await writePluginWithAgent(pluginContainer, "my-plugin", "shared", "Shared (plugin)");
+      await writeAgent(projectAgentsRoot, "shared", "Shared (project)");
+
+      const roots = {
+        projectRoot: projectAgentsRoot,
+        globalRoot: global.path,
+        projectPluginRoots: [pluginContainer],
+      };
+      const runtime = new LocalRuntime(project.path);
+
+      const agents = await discoverAgentDefinitions(runtime, project.path, { roots });
+
+      const helper = agents.find((a) => a.id === "helper");
+      expect(helper).toBeDefined();
+      expect(helper?.scope).toBe("project");
+      expect(helper?.pluginName).toBe("my-plugin");
+
+      // The project agent shadows the plugin agent of the same id.
+      const shared = agents.filter((a) => a.id === "shared");
+      expect(shared).toHaveLength(1);
+      expect(shared[0]?.name).toBe("Shared (project)");
+      expect(shared[0]?.pluginName).toBeUndefined();
+    });
+
+    test("dedupeById: false returns shadowed plugin agents in precedence order", async () => {
+      using project = new DisposableTempDir("agent-defs-plugin-project");
+      using global = new DisposableTempDir("agent-defs-plugin-global");
+
+      const projectAgentsRoot = path.join(project.path, ".mux", "agents");
+      const pluginContainer = path.join(project.path, ".mux", "plugins");
+
+      await writePluginWithAgent(pluginContainer, "my-plugin", "shared", "Shared");
+      await writeAgent(projectAgentsRoot, "shared", "Shared");
+
+      const roots = {
+        projectRoot: projectAgentsRoot,
+        globalRoot: global.path,
+        projectPluginRoots: [pluginContainer],
+      };
+      const runtime = new LocalRuntime(project.path);
+
+      const agents = await discoverAgentDefinitions(runtime, project.path, {
+        roots,
+        dedupeById: false,
+      });
+
+      const shared = agents.filter((a) => a.id === "shared");
+      expect(shared).toHaveLength(2);
+      // Precedence order within the same name: project first, plugin second.
+      expect(shared[0]?.pluginName).toBeUndefined();
+      expect(shared[1]?.pluginName).toBe("my-plugin");
+    });
+
+    test("readAgentDefinition falls back to a plugin agent when no project/global agent exists", async () => {
+      using project = new DisposableTempDir("agent-defs-plugin-project");
+      using global = new DisposableTempDir("agent-defs-plugin-global");
+
+      const pluginContainer = path.join(project.path, ".mux", "plugins");
+      await writePluginWithAgent(pluginContainer, "my-plugin", "helper", "Helper (plugin)");
+
+      const roots = {
+        projectRoot: path.join(project.path, ".mux", "agents"),
+        globalRoot: global.path,
+        projectPluginRoots: [pluginContainer],
+      };
+      const runtime = new LocalRuntime(project.path);
+
+      const pkg = await readAgentDefinition(runtime, project.path, "helper", { roots });
+      expect(pkg.scope).toBe("project");
+      expect(pkg.frontmatter.name).toBe("Helper (plugin)");
+    });
   });
 });

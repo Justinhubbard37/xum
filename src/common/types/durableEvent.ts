@@ -32,9 +32,47 @@ export const TurnEnvelopeDataSchema = z.object({
   systemPromptHash: BlobRefSchema,
   /** Sorted by tool name; schemaHash fingerprints the tool's input schema. */
   toolsetManifest: z.array(z.object({ name: z.string(), schemaHash: z.string() })),
+  /**
+   * Tool names the agent-transition sentinel advertised, when they differ from
+   * the wire manifest: forced first-step scoping (e.g. xAI search) narrows the
+   * wire toolset while the sentinel still lists the full active set, so replay
+   * cannot derive one from the other.
+   */
+  sentinelToolNames: z.array(z.string()).optional(),
   modelString: z.string(),
   providerOptionsHash: z.string(),
   thinkingLevel: z.string(),
+  // The fields below are optional so rows written by older binaries stay
+  // readable (z.object strips unknown keys, so newer rows also stay readable
+  // by older binaries — upgrade↔downgrade safe).
+  /**
+   * The request's requestHistorySequence (max historySequence of the chat.jsonl
+   * rows the request was built from). Join key that re-anchors this envelope to
+   * its assistant row and its recorded devtools run — array-index pairing
+   * breaks on retries, devtools toggling, and compaction.
+   */
+  requestHistorySequence: z.number().int().nonnegative().optional(),
+  /**
+   * Resolved wire provider name (providerModelFactory). Coder instance-typed
+   * gateway strings cannot be name-canonicalized to a wire provider offline,
+   * so replay needs the resolved value logged.
+   */
+  wireProviderName: z.string().optional(),
+  /** Per-send Anthropic cache TTL override ("5m" | "1h"); absent = default. */
+  anthropicCacheTtl: z.string().optional(),
+  /** Plan content injected on a plan→exec handoff (blob-stored, model-visible). */
+  planTransitionContentHash: BlobRefSchema.optional(),
+  /** Plan file path referenced by the plan→exec handoff injection. */
+  planTransitionFilePath: z.string().optional(),
+  /** JSON-serialized PostCompactionAttachment[] injected this turn (blob-stored). */
+  postCompactionAttachmentsHash: BlobRefSchema.optional(),
+  /**
+   * JSON-serialized MuxMessage: the partial-output continuation a refusal
+   * fallback appended to its request (blob-stored). The turn's eventual
+   * assistant row lands after requestHistorySequence, so replay cannot
+   * recover this message from chat.jsonl alone.
+   */
+  partialContinuationHash: BlobRefSchema.optional(),
 });
 
 /**

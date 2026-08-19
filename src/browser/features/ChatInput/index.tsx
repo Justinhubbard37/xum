@@ -160,6 +160,7 @@ import {
 
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
+import type { PluginSlashCommandDescriptor } from "@/common/orpc/schemas/agentPlugins";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import {
   coerceThinkingLevel,
@@ -320,6 +321,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     EXPERIMENT_IDS.WORKSPACE_HEARTBEATS
   );
   const memoryExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
+  const agentPluginsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_PLUGINS);
   const memoryConsolidationExperimentEnabled = useExperimentValue(
     EXPERIMENT_IDS.MEMORY_CONSOLIDATION
   );
@@ -476,6 +478,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const lastSymbolQueryRef = useRef<string>("");
   const [agentSkillDescriptors, setAgentSkillDescriptors] = useState<AgentSkillDescriptor[]>([]);
   const [mcpPromptDescriptors, setMcpPromptDescriptors] = useState<MCPPromptDescriptor[]>([]);
+  // Agent Plugins: manifest-contributed slash commands (empty when the experiment is off).
+  const [pluginCommandDescriptors, setPluginCommandDescriptors] = useState<
+    PluginSlashCommandDescriptor[]
+  >([]);
   const [toast, setToast] = useState<Toast | null>(null);
   // State for destructive command confirmation modal (currently only /clear).
   const [pendingDestructiveCommand, setPendingDestructiveCommand] = useState(false);
@@ -1717,6 +1723,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     const suggestions = getSlashCommandSuggestions(input, {
       agentSkills: agentSkillDescriptors,
       mcpPrompts: mcpPromptDescriptors,
+      pluginCommands: pluginCommandDescriptors,
       variant,
       isExperimentEnabled: (experimentId) =>
         resolveSlashCommandExperimentValue(experimentId, {
@@ -1732,6 +1739,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     input,
     agentSkillDescriptors,
     mcpPromptDescriptors,
+    pluginCommandDescriptors,
     variant,
     workspaceHeartbeatsExperimentEnabled,
     dynamicWorkflowsExperimentEnabled,
@@ -1893,7 +1901,38 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     atMentionProjectPath,
     sendMessageOptions.disableWorkspaceAgents,
     transferredDraftProjectDiscovery,
+    // The backend gates plugin-contributed skills on this experiment, so a
+    // toggle must refetch /skill suggestions like it reloads plugin commands.
+    agentPluginsExperimentEnabled,
   ]);
+
+  // Agent Plugins: load manifest-contributed slash commands for suggestions.
+  // Subscribes to the reactive experiment value so toggling agent-plugins in
+  // Settings immediately loads/clears commands without remounting the composer
+  // (the backend also returns [] while the experiment is disabled).
+  useEffect(() => {
+    let isMounted = true;
+
+    const loadPluginCommands = async () => {
+      if (!api || variant !== "workspace" || !workspaceId || !agentPluginsExperimentEnabled) {
+        if (isMounted) setPluginCommandDescriptors([]);
+        return;
+      }
+      try {
+        const commands = await api.workspace.plugins.slashCommands.list({ workspaceId });
+        if (isMounted) setPluginCommandDescriptors(commands);
+      } catch {
+        // Plugin command discovery must never break the composer.
+        if (isMounted) setPluginCommandDescriptors([]);
+      }
+    };
+
+    void loadPluginCommands();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [api, variant, workspaceId, agentPluginsExperimentEnabled]);
 
   // Voice input: track transcription provider availability (subscribe to provider config changes)
   useEffect(() => {

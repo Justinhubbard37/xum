@@ -18,6 +18,7 @@ import type { ToolSearchStreamState } from "@/common/utils/tools/toolCatalog";
 import { StreamManager, type ModelFallbackPrepareOptions } from "./streamManager";
 import type {
   ActiveTurnThinkingOverride,
+  RebuildFirstStepForThinkingLevel,
   RebuildProviderOptionsForThinkingLevel,
 } from "./thinkingOverride";
 import { stripEncryptedContent } from "@/node/utils/messages/stripEncryptedContent";
@@ -982,6 +983,8 @@ describe("StreamManager - OpenAI GPT-5.6 cached system instructions", () => {
     workspaceId: string;
     staleRouteProvider: string;
     initialMetadataPatch?: Record<string, unknown>;
+    onStreamConstructed?: () => Promise<void>;
+    failStreamConstruction?: boolean;
   }): Promise<Record<string, unknown>> {
     const streamManager = new StreamManager(
       historyService,
@@ -999,15 +1002,18 @@ describe("StreamManager - OpenAI GPT-5.6 cached system instructions", () => {
     await appendPartialAssistantForTests(options.workspaceId, messageId, historySequence);
     const processStreamWithCleanup = getProcessStreamWithCleanupForTests(streamManager);
 
-    const createStreamResult = mock(() =>
-      createStreamResultForTests(
+    const createStreamResult = mock(() => {
+      if (options.failStreamConstruction) {
+        throw new Error("stream construction failed for tests");
+      }
+      return createStreamResultForTests(
         (async function* () {
           await Promise.resolve();
           yield { type: "text-delta", text: "fallback answer" };
           yield { type: "finish", finishReason: "stop" };
         })()
-      )
-    );
+      );
+    });
     expect(Reflect.set(streamManager, "createStreamResult", createStreamResult)).toBe(true);
 
     const prepare = mock((nextModelString: string, _options?: ModelFallbackPrepareOptions) =>
@@ -1021,6 +1027,9 @@ describe("StreamManager - OpenAI GPT-5.6 cached system instructions", () => {
           thinkingLevel: "off",
           ...(options.initialMetadataPatch
             ? { initialMetadataPatch: options.initialMetadataPatch }
+            : {}),
+          ...(options.onStreamConstructed
+            ? { onStreamConstructed: options.onStreamConstructed }
             : {}),
         })
       )
@@ -1081,6 +1090,28 @@ describe("StreamManager - OpenAI GPT-5.6 cached system instructions", () => {
     });
 
     expect(request.system).toBe("You are a helpful assistant");
+  });
+
+  test("onStreamConstructed fires after successful construction, never on failure", async () => {
+    // Durable side effects hung on this callback (the superseding fallback
+    // turn envelope) must describe a stream that exists: called exactly once
+    // on success, not at all when createStreamResult throws.
+    const onSuccess = mock(() => Promise.resolve());
+    await runRefusalFallbackForTests({
+      workspaceId: "fallback-envelope-success-workspace",
+      staleRouteProvider: "openai",
+      onStreamConstructed: onSuccess,
+    });
+    expect(onSuccess).toHaveBeenCalledTimes(1);
+
+    const onFailure = mock(() => Promise.resolve());
+    await runRefusalFallbackForTests({
+      workspaceId: "fallback-envelope-failure-workspace",
+      staleRouteProvider: "openai",
+      onStreamConstructed: onFailure,
+      failStreamConstruction: true,
+    });
+    expect(onFailure).not.toHaveBeenCalled();
   });
 });
 
@@ -1625,6 +1656,71 @@ describe("StreamManager - language model cleanup", () => {
     );
 
     expect(result.success).toBe(true);
+    expect(getCleanupCalls()).toBe(1);
+  });
+
+  test("interrupt during onStreamConstructed skips processing and preserves a replacement registration", async () => {
+    const streamManager = new StreamManager(historyService);
+    streamManager.on("error", () => undefined);
+    const { model, getCleanupCalls } = createCleanupModel("constructed-abort-model");
+    const startEvents: unknown[] = [];
+    streamManager.on("stream-start", (event) => startEvents.push(event));
+
+    const workspaceId = "constructed-abort-workspace";
+    const replacementSentinel = { replacement: true };
+    const onStreamConstructed = async (): Promise<void> => {
+      // Hard interrupt racing the awaited envelope write: stopStream aborts
+      // the registered STARTING stream, awaits its placeholder
+      // processingPromise, and deletes the registration…
+      await streamManager.stopStream(workspaceId);
+      // …after which a replacement stream can occupy the workspace slot.
+      const streams = Reflect.get(streamManager, "workspaceStreams") as Map<string, unknown>;
+      streams.set(workspaceId, replacementSentinel);
+    };
+
+    const result = await streamManager.startStream(
+      workspaceId,
+      [{ role: "user", content: "hello" }],
+      model,
+      "openai:gpt-4.1-mini",
+      1,
+      "system",
+      runtime,
+      "constructed-abort-message",
+      undefined, // abortSignal
+      undefined, // tools
+      undefined, // initialMetadata
+      undefined, // providerOptions
+      undefined, // maxOutputTokens
+      undefined, // toolPolicy
+      undefined, // providedStreamToken
+      undefined, // hasQueuedMessages
+      undefined, // workspaceName
+      undefined, // thinkingLevel
+      undefined, // headers
+      undefined, // anthropicCacheTtlOverride
+      undefined, // callSettingsOverrides
+      undefined, // onChunk
+      undefined, // onStepMessages
+      undefined, // providedRuntimeTempDir
+      undefined, // modelFallback
+      undefined, // toolSearchState
+      undefined, // thinkingOverrideState
+      undefined, // rebuildProviderOptionsForThinkingLevel
+      undefined, // forcedFirstStepToolNames
+      undefined, // providersConfigSnapshot
+      onStreamConstructed
+    );
+
+    expect(result.success).toBe(true);
+    // The canceled stream must never start processing: stream-start after the
+    // abort would leave the UI stuck streaming with no abort/end to follow.
+    expect(startEvents).toHaveLength(0);
+    // The replacement registration survives (the canceled stream's cleanup
+    // must not delete another stream's slot).
+    const streams = Reflect.get(streamManager, "workspaceStreams") as Map<string, unknown>;
+    expect(streams.get(workspaceId)).toBe(replacementSentinel);
+    // The never-processed stream's model still gets cleaned up.
     expect(getCleanupCalls()).toBe(1);
   });
 
@@ -5374,6 +5470,8 @@ describe("StreamManager - mid-turn thinking override", () => {
     providerOptions?: Record<string, unknown>;
     thinkingOverrideState?: ActiveTurnThinkingOverride;
     rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel;
+    rebuildFirstStepForThinkingLevel?: RebuildFirstStepForThinkingLevel;
+    onStepMessages?: (stepMessages: ModelMessage[]) => void;
   }
 
   type BuildStreamRequestConfig = (...args: unknown[]) => OverrideRequestForTests;
@@ -5381,7 +5479,10 @@ describe("StreamManager - mid-turn thinking override", () => {
     request: OverrideRequestForTests,
     abortController: AbortController
   ) => unknown;
-  type CapturedPrepareStep = (options: { messages: ModelMessage[] }) => Promise<
+  type CapturedPrepareStep = (options: {
+    messages: ModelMessage[];
+    stepNumber?: number;
+  }) => Promise<
     | {
         messages?: ModelMessage[];
         activeTools?: string[];
@@ -5491,6 +5592,53 @@ describe("StreamManager - mid-turn thinking override", () => {
     // Without a new pending value the next step is a no-op again.
     expect(await prepareStep({ messages })).toBeUndefined();
     expect(rebuild).toHaveBeenCalledTimes(1);
+  });
+
+  test("step-0 message rebuild preserves the cached system row when the system prompt lives in messages", async () => {
+    const streamManager = new StreamManager(historyService);
+    const { createStreamResult } = getRequestHelpers(streamManager);
+    const streamTextSpy = setupStreamTextSpy();
+
+    // Anthropic prompt-cache shape from buildStreamRequestConfig: the system
+    // prompt is messages[0] with cache control and request.system is
+    // undefined. The rebuild closure returns history messages only, so the
+    // step-0 replacement must re-prepend this row or the first provider
+    // request loses the entire system prompt.
+    const cachedSystemRow: ModelMessage = {
+      role: "system",
+      content: "cached system prompt",
+      providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } },
+    };
+    const state: ActiveTurnThinkingOverride = { pending: "high" };
+    const rebuildOptions = mock(() => ({
+      effectiveLevel: "high" as const,
+      providerOptions: { anthropic: { thinking: { type: "enabled" } } },
+    }));
+    const rebuiltHistory: ModelMessage[] = [{ role: "user", content: "rebuilt hello" }];
+    const rebuildMessages = mock(() => Promise.resolve(rebuiltHistory));
+    const stepMessageBatches: ModelMessage[][] = [];
+
+    const request: OverrideRequestForTests = {
+      model,
+      messages: [cachedSystemRow, ...messages],
+      system: undefined,
+      providerOptions: {},
+      thinkingOverrideState: state,
+      rebuildProviderOptionsForThinkingLevel:
+        rebuildOptions as unknown as RebuildProviderOptionsForThinkingLevel,
+      rebuildFirstStepForThinkingLevel:
+        rebuildMessages as unknown as RebuildFirstStepForThinkingLevel,
+      onStepMessages: (stepMessages) => stepMessageBatches.push(stepMessages),
+    };
+    createStreamResult(request, new AbortController());
+    const prepareStep = capturePrepareStep(streamTextSpy);
+
+    const step = await prepareStep({ messages: request.messages, stepNumber: 0 });
+    expect(rebuildMessages).toHaveBeenCalledTimes(1);
+    expect(step?.messages).toEqual([cachedSystemRow, ...rebuiltHistory]);
+    // Consumers (advisor transcript ref) must end on the rebuilt transcript,
+    // not the pre-rebuild messages announced at the top of prepareStep.
+    expect(stepMessageBatches.at(-1)).toEqual([cachedSystemRow, ...rebuiltHistory]);
   });
 
   test("clears pending without touching options when the rebuild reports not-applicable", async () => {

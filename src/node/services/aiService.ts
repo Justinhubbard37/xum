@@ -23,6 +23,11 @@ import type { ModelMessage, MuxMessage, MuxMessageMetadata } from "@/common/type
 import { createMuxMessage } from "@/common/types/message";
 import type { Config } from "@/node/config";
 import { StreamManager, type ModelFallbackOptions, type StreamTextOnChunk } from "./streamManager";
+import { emitTurnEnvelope } from "./turnEnvelope";
+import {
+  sharedDurableEventJournal,
+  type DurableEventJournal,
+} from "@/node/utils/journal/durableEventJournal";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
 import type { InitStateManager } from "./initStateManager";
 import type { SendMessageError } from "@/common/types/errors";
@@ -36,6 +41,7 @@ import {
 import { getGoalToolAvailability } from "@/common/utils/tools/toolAvailability";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
+import { agentPluginHookService } from "@/node/services/agentPlugins/hookService";
 import { resolveAgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
 import {
   createRuntimeContextForWorkspace,
@@ -60,7 +66,7 @@ import type { CodexOauthService } from "@/node/services/codexOauthService";
 import type { CoderOauthService } from "@/node/services/coderOauthService";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
-import type { FileState, EditedFileAttachment } from "@/node/services/agentSession";
+import type { FileState } from "@/node/services/agentSession";
 import { log } from "./log";
 import {
   addInterruptedSentinel,
@@ -138,6 +144,7 @@ import {
 } from "@/common/utils/thinking/policy";
 import type {
   ActiveTurnThinkingOverride,
+  RebuildFirstStepForThinkingLevel,
   RebuildProviderOptionsForThinkingLevel,
 } from "@/node/services/thinkingOverride";
 
@@ -231,7 +238,12 @@ export function prepareProviderRequestMessages(
   };
 }
 
-function replaceOrAppendMessageById(messages: MuxMessage[], replacement: MuxMessage): MuxMessage[] {
+// Exported for the replay builder: fallback requests append the refusal's
+// partial continuation the same way production does.
+export function replaceOrAppendMessageById(
+  messages: MuxMessage[],
+  replacement: MuxMessage
+): MuxMessage[] {
   const index = messages.findIndex((message) => message.id === replacement.id);
   if (index === -1) {
     return [...messages, replacement];
@@ -269,7 +281,6 @@ export interface StreamMessageOptions {
   /** Tool names that should be delegated back to ACP clients for this request. */
   delegatedToolNames?: string[];
   recordFileState?: (filePath: string, state: FileState) => Promise<void>;
-  changedFileAttachments?: EditedFileAttachment[];
   postCompactionAttachments?: PostCompactionAttachment[] | null;
   /**
    * Resolver for the session-segment memory context (memory experiment):
@@ -943,6 +954,15 @@ export class AIService extends EventEmitter {
     }
   }
 
+  /**
+   * Journal for the workspace's session dir — always the process-shared
+   * instance so sequence assignment stays coordinated with the sandbox host's
+   * vars-snapshot writer (independent instances would corrupt seq ordering).
+   */
+  private durableEventJournalFor(workspaceId: string): DurableEventJournal {
+    return sharedDurableEventJournal(this.config.getSessionDir(workspaceId));
+  }
+
   isMockModeEnabled(): boolean {
     return this.mockModeEnabled;
   }
@@ -1368,7 +1388,6 @@ export class AIService extends EventEmitter {
       acpPromptId,
       delegatedToolNames,
       recordFileState,
-      changedFileAttachments,
       postCompactionAttachments,
       resolveMemoryContext,
       experiments,
@@ -1876,6 +1895,7 @@ export class AIService extends EventEmitter {
         cfg,
         emitError: (event) => this.emit("error", event),
         isAdvisorExperimentEnabled: advisorExperimentEnabled,
+        includeAgentPlugins: agentPluginsExperimentEnabled,
       });
       recordStartupPhaseTiming("resolveAgentForStreamMs", resolveAgentForStreamStartedAt);
       if (!agentResult.success) {
@@ -1944,6 +1964,25 @@ export class AIService extends EventEmitter {
       const agentPluginsMcpContext = hostCheckoutRoot
         ? resolveAgentPluginsMcpContext(metadata, hostCheckoutRoot)
         : null;
+
+      // Tier-1 plugin hooks (agent-plugins experiment): reconcile discovered
+      // hooks.js modules with the event spine BEFORE request assembly so both
+      // request.assemble and tool.execute middleware are in place for this
+      // turn. Failure posture: a broken plugin never blocks a send.
+      try {
+        await agentPluginHookService.ensureWorkspaceHooks({
+          workspaceId,
+          sessionDir: this.config.getSessionDir(workspaceId),
+          journal: this.durableEventJournalFor(workspaceId),
+          enabled: this.isAgentPluginsEnabled(),
+          muxHome: this.config.rootDir,
+          // Project containers follow the same off-host gating as plugin MCP.
+          projectRoot: agentPluginsMcpContext?.projectRoot,
+          projectTrusted,
+        });
+      } catch (error) {
+        log.warn("Agent plugin hooks: ensure failed; continuing without plugin hooks", { error });
+      }
 
       // Fetch MCP server config for system prompt (before building message).
       const listMcpServersStartedAt = Date.now();
@@ -2324,6 +2363,7 @@ export class AIService extends EventEmitter {
                   runtime,
                   workspacePath,
                   projectTrusted: getWorkflowProjectTrusted(),
+                  includeAgentPlugins: this.isAgentPluginsEnabled(),
                 }),
               // Background workflow tools outlive the model turn that started them. Feed the
               // terminal result back as a hidden user turn so the parent agent continues
@@ -2908,11 +2948,7 @@ export class AIService extends EventEmitter {
         toolNamesForSentinel,
         planContentForTransition,
         planFilePath,
-        changedFileAttachments,
         postCompactionAttachments,
-        runtime,
-        workspacePath,
-        abortSignal: combinedAbortSignal,
         providerForMessages: wireProviderName,
         effectiveThinkingLevel,
         modelString,
@@ -3173,9 +3209,14 @@ export class AIService extends EventEmitter {
       // buildProviderOptions → providers.jsonc extras merge). Consumed by
       // StreamManager's prepareStep; `null` ⇒ skip (no-op or model-swap level).
       const currentEffectiveLevelRef = { current: effectiveThinkingLevel };
-      const rebuildProviderOptionsForThinkingLevel: RebuildProviderOptionsForThinkingLevel = (
-        level
-      ) => {
+      // Pure recompute shared by the mid-turn rebuild closure and the turn
+      // envelope's pending-override fold: no ref mutation, so envelope
+      // emission can preview the step-0 result without making prepareStep
+      // think the level was already applied.
+      const computeRebuiltProviderOptions = (
+        level: ThinkingLevel,
+        currentLevel: ThinkingLevel
+      ): { effectiveLevel: ThinkingLevel; providerOptions: Record<string, unknown> } | null => {
         const clamped = enforceThinkingPolicy(
           modelString,
           level,
@@ -3187,18 +3228,12 @@ export class AIService extends EventEmitter {
           clamped,
           requestProvidersConfig
         );
-        if (effective === currentEffectiveLevelRef.current) {
+        if (effective === currentLevel) {
           return null;
         }
         // off ↔ non-off on grok-4-1-fast selects a different model instance —
         // not expressible via provider options on the in-flight stream.
-        if (
-          isXaiGrokFastVariantSwap(
-            canonicalModelString,
-            currentEffectiveLevelRef.current,
-            effective
-          )
-        ) {
+        if (isXaiGrokFastVariantSwap(canonicalModelString, currentLevel, effective)) {
           return null;
         }
         const rebuilt = buildProviderOptions(
@@ -3215,8 +3250,16 @@ export class AIService extends EventEmitter {
           reasoningMode
         );
         const merged = mergeModelParameterExtras(rebuilt as Record<string, unknown>);
-        currentEffectiveLevelRef.current = effective;
         return { effectiveLevel: effective, providerOptions: merged };
+      };
+      const rebuildProviderOptionsForThinkingLevel: RebuildProviderOptionsForThinkingLevel = (
+        level
+      ) => {
+        const result = computeRebuiltProviderOptions(level, currentEffectiveLevelRef.current);
+        if (result != null) {
+          currentEffectiveLevelRef.current = result.effectiveLevel;
+        }
+        return result;
       };
 
       // Debug dump: Log the complete LLM request when MUX_DEBUG_LLM_REQUEST is set
@@ -3300,6 +3343,9 @@ export class AIService extends EventEmitter {
             effectiveToolPolicy != null && effectiveToolPolicy.length > 0
               ? effectiveToolPolicy
               : undefined,
+          // Join key for the replay verifier: re-anchors this recorded run to
+          // its turn-envelope row and assistant message (see DevToolsRun).
+          ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
         });
         this.trackPendingDevToolsRunMetadata(assistantMessageId, workspaceId, pendingRunMetadataId);
         requestHeaders = {
@@ -3610,11 +3656,7 @@ export class AIService extends EventEmitter {
                     toolNamesForSentinel: nextToolNamesForSentinel,
                     planContentForTransition,
                     planFilePath,
-                    changedFileAttachments,
                     postCompactionAttachments,
-                    runtime,
-                    workspacePath,
-                    abortSignal: combinedAbortSignal,
                     providerForMessages: next.wireProviderName,
                     effectiveThinkingLevel: nextThinkingLevel,
                     // RAW fallback identity, matching the main path's raw
@@ -3761,7 +3803,96 @@ export class AIService extends EventEmitter {
                       return { effectiveLevel: effective, providerOptions: merged };
                     };
 
+                  // Shared with the return payload below: the fallback stream
+                  // restarts at step 0, where StreamManager scopes to these
+                  // forced tools when present.
+                  const nextForcedFirstStepToolNames =
+                    next.routeProvider === "xai"
+                      ? getForcedXaiSearchToolNames(
+                          nextCapabilityModelString,
+                          effectiveMuxProviderOptions.xai?.searchParameters
+                        )?.filter((toolName) => toolName in nextTools)
+                      : undefined;
+
+                  // The fallback request is a different request identity
+                  // (model, system prompt, toolset, provider options), so it
+                  // needs its own envelope: pairSessionTurns compares the LAST
+                  // envelope per requestHistorySequence, so this row supersedes
+                  // the primary one and replay-verify/cache-audit see the
+                  // request that actually streamed. Deferred to
+                  // onStreamConstructed: a prepare whose stream construction
+                  // later fails must not supersede the primary envelope.
+                  // Same step-0 scoping as the primary envelope: fingerprint
+                  // only the tools the first fallback step actually sends.
+                  const nextFirstStepToolNames = new Set(
+                    nextForcedFirstStepToolNames?.length
+                      ? nextForcedFirstStepToolNames
+                      : nextToolNamesForSentinel
+                  );
+                  const emitFallbackEnvelopeWith = async (
+                    thinkingLevelForEnvelope: string,
+                    providerOptionsForEnvelope: unknown
+                  ): Promise<void> => {
+                    await emitTurnEnvelope({
+                      journal: this.durableEventJournalFor(workspaceId),
+                      workspaceId,
+                      systemMessage: nextSystem,
+                      tools: Object.fromEntries(
+                        Object.entries(nextTools).filter(([name]) =>
+                          nextFirstStepToolNames.has(name)
+                        )
+                      ),
+                      modelString: nextModelString,
+                      thinkingLevel: thinkingLevelForEnvelope,
+                      providerOptions: providerOptionsForEnvelope,
+                      requestHistorySequence,
+                      sentinelToolNames: nextToolNamesForSentinel,
+                      wireProviderName: next.wireProviderName,
+                      anthropicCacheTtl:
+                        effectiveMuxProviderOptions.anthropic?.cacheTtl ?? undefined,
+                      planContentForTransition,
+                      planFilePath,
+                      postCompactionAttachments,
+                      // The continuation never reaches chat.jsonl at this
+                      // sequence (the assistant row lands later), so replay
+                      // needs the envelope's durable copy to rebuild the
+                      // fallback request.
+                      partialContinuationMessage: prepareOptions?.continuation?.assistantMessage,
+                    });
+                  };
+                  const emitFallbackEnvelope = (): Promise<void> =>
+                    emitFallbackEnvelopeWith(nextThinkingLevel, nextMergedProviderOptions);
+                  // Same step-0 race closure as the primary path, bound to the
+                  // fallback request's own build inputs.
+                  const rebuildNextFirstStepForThinkingLevel: RebuildFirstStepForThinkingLevel =
+                    async (effectiveLevel, providerOptionsForEnvelope) => {
+                      const { providerRequestMessages: racedNextMessages } =
+                        prepareProviderRequestMessages(
+                          fallbackSourceMessages,
+                          next.wireProviderName,
+                          effectiveLevel
+                        );
+                      const rebuiltFinal = await prepareMessagesForProvider({
+                        messagesWithSentinel: addInterruptedSentinel(racedNextMessages),
+                        effectiveAgentId,
+                        toolNamesForSentinel: nextToolNamesForSentinel,
+                        planContentForTransition,
+                        planFilePath,
+                        postCompactionAttachments,
+                        providerForMessages: next.wireProviderName,
+                        effectiveThinkingLevel: effectiveLevel,
+                        modelString: nextModelString,
+                        providersConfig: nextProvidersConfig,
+                        anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl,
+                        workspaceId,
+                      });
+                      await emitFallbackEnvelopeWith(effectiveLevel, providerOptionsForEnvelope);
+                      return rebuiltFinal;
+                    };
+
                   return Ok({
+                    onStreamConstructed: emitFallbackEnvelope,
+                    rebuildFirstStepForThinkingLevel: rebuildNextFirstStepForThinkingLevel,
                     model: next.model,
                     // RAW identity (matching the main path's raw modelString):
                     // StreamManager keys createCachedSystemMessage /
@@ -3777,13 +3908,7 @@ export class AIService extends EventEmitter {
                     callSettingsOverrides: nextOverrides.standard,
                     anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl ?? undefined,
                     thinkingLevel: nextThinkingLevel,
-                    forcedFirstStepToolNames:
-                      next.routeProvider === "xai"
-                        ? getForcedXaiSearchToolNames(
-                            nextCapabilityModelString,
-                            effectiveMuxProviderOptions.xai?.searchParameters
-                          )?.filter((toolName) => toolName in nextTools)
-                        : undefined,
+                    forcedFirstStepToolNames: nextForcedFirstStepToolNames,
                     rebuildProviderOptionsForThinkingLevel:
                       rebuildNextProviderOptionsForThinkingLevel,
                     // Pinned snapshot for the swap's request-config rebuild
@@ -3817,11 +3942,143 @@ export class AIService extends EventEmitter {
             )?.filter((toolName) => toolName in toolsForStream)
           : undefined;
 
+      // Durable turn envelope: fingerprint the FINAL request identity (post
+      // request.assemble middleware, post tool-policy rebuild). Deferred to
+      // StreamManager's construction boundary (like the fallback envelope):
+      // aborts or setup errors before a stream exists must not persist a
+      // phantom request row. Emission never fails the turn.
+      // Step-0 wire truth: StreamManager sends only the first step's active
+      // tools (forced xAI search set, else the tool-search active subset), so
+      // the envelope fingerprints that subset — deferred tools never reach
+      // this request and would otherwise show as false replay divergences.
+      const firstStepToolNames = new Set(
+        forcedFirstStepToolNames?.length
+          ? forcedFirstStepToolNames
+          : (computeActiveToolNames(toolSearchRuntime?.state) ?? Object.keys(toolsForStream))
+      );
+
+      // Fold PREPARING-window pending thinking overrides into the ACTUAL
+      // request build, not just the envelope: message preparation is
+      // thinking-level-dependent (Anthropic signed-reasoning transforms), so
+      // recording the new level while streaming old-level messages would make
+      // wire and replay diverge — or send an invalid extended-thinking
+      // request. Consuming pending here (applied set below) is safe:
+      // createStreamAtomically seeds streamInfo.thinkingLevel from `applied`,
+      // and prepareStep simply sees no pending to re-apply.
+      // Loop until pending is quiescent: setActiveTurnThinkingLevel can write
+      // a NEW pending while the awaited message rebuild runs, and stamping the
+      // first level after the await would leave step 0 rebuilding only
+      // provider options while the messages stay at the stale level.
+      let streamThinkingLevel = effectiveThinkingLevel;
+      let streamProviderOptions = mergedProviderOptions;
+      let streamFinalMessages = finalMessages;
+      while (activeTurnThinkingOverride?.pending != null) {
+        const pendingPreparingLevel = activeTurnThinkingOverride.pending;
+        activeTurnThinkingOverride.pending = undefined;
+        const folded = computeRebuiltProviderOptions(pendingPreparingLevel, streamThinkingLevel);
+        if (folded == null) {
+          // No-op fold (same effective level / non-foldable variant swap):
+          // re-check pending — a change may have raced the previous rebuild.
+          continue;
+        }
+        const { providerRequestMessages: foldedRequestMessages } = prepareProviderRequestMessages(
+          messages,
+          wireProviderName,
+          folded.effectiveLevel
+        );
+        streamFinalMessages = await prepareMessagesForProvider({
+          messagesWithSentinel: addInterruptedSentinel(foldedRequestMessages),
+          effectiveAgentId,
+          toolNamesForSentinel,
+          planContentForTransition,
+          planFilePath,
+          postCompactionAttachments,
+          providerForMessages: wireProviderName,
+          effectiveThinkingLevel: folded.effectiveLevel,
+          modelString,
+          providersConfig: requestProvidersConfig,
+          anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl,
+          workspaceId,
+        });
+        streamProviderOptions = folded.providerOptions;
+        streamThinkingLevel = folded.effectiveLevel;
+        activeTurnThinkingOverride.applied = folded.effectiveLevel;
+        // Keep the mid-turn rebuild baseline in sync so a later identical
+        // request is correctly treated as a no-op.
+        currentEffectiveLevelRef.current = folded.effectiveLevel;
+        // Loop re-checks pending: a change during the awaits above re-folds
+        // against the level just applied.
+      }
+
+      const emitPrimaryEnvelopeWith = async (
+        thinkingLevel: string,
+        providerOptions: unknown
+      ): Promise<void> => {
+        await emitTurnEnvelope({
+          journal: this.durableEventJournalFor(workspaceId),
+          workspaceId,
+          systemMessage,
+          tools: Object.fromEntries(
+            Object.entries(toolsForStream).filter(([name]) => firstStepToolNames.has(name))
+          ),
+          modelString,
+          thinkingLevel,
+          providerOptions,
+          // Replay pairing key + request-time inputs that are model-visible but
+          // not derivable from chat.jsonl: the resolved wire provider (instance-
+          // typed gateways need live metadata), the per-send Anthropic cache TTL,
+          // and the injected plan-transition / post-compaction content.
+          requestHistorySequence,
+          // Sentinel names are recorded separately: forced first-step scoping
+          // narrows the wire manifest while the sentinel lists the full active
+          // set, so replay cannot derive one from the other.
+          sentinelToolNames: toolNamesForSentinel,
+          wireProviderName,
+          anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl ?? undefined,
+          planContentForTransition,
+          planFilePath,
+          postCompactionAttachments,
+        });
+      };
+      const emitPrimaryEnvelope = (): Promise<void> =>
+        emitPrimaryEnvelopeWith(streamThinkingLevel, streamProviderOptions);
+      // Step-0 rebuild for a thinking override that raced stream setup
+      // (written during startStream's awaits, after the quiescence loop):
+      // rebuild the wire messages under the consumed level and supersede the
+      // envelope so replay pairing (last row per sequence) sees the request
+      // that actually streamed.
+      const rebuildFirstStepForThinkingLevel: RebuildFirstStepForThinkingLevel = async (
+        effectiveLevel,
+        providerOptions
+      ) => {
+        const { providerRequestMessages: racedRequestMessages } = prepareProviderRequestMessages(
+          messages,
+          wireProviderName,
+          effectiveLevel
+        );
+        const rebuiltFinal = await prepareMessagesForProvider({
+          messagesWithSentinel: addInterruptedSentinel(racedRequestMessages),
+          effectiveAgentId,
+          toolNamesForSentinel,
+          planContentForTransition,
+          planFilePath,
+          postCompactionAttachments,
+          providerForMessages: wireProviderName,
+          effectiveThinkingLevel: effectiveLevel,
+          modelString,
+          providersConfig: requestProvidersConfig,
+          anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl,
+          workspaceId,
+        });
+        await emitPrimaryEnvelopeWith(effectiveLevel, providerOptions);
+        return rebuiltFinal;
+      };
+
       emitStartupBreadcrumb("starting_stream");
       const startStreamStartedAt = Date.now();
       const streamResult = await this.streamManager.startStream(
         workspaceId,
-        finalMessages,
+        streamFinalMessages,
         modelResult.data.model,
         modelString,
         historySequence,
@@ -3844,13 +4101,13 @@ export class AIService extends EventEmitter {
           ...(acpPromptId != null ? { acpPromptId } : {}),
           ...(modelCostsIncluded(modelResult.data.model) ? { costsIncluded: true } : {}),
         },
-        mergedProviderOptions,
+        streamProviderOptions,
         maxOutputTokens,
         effectiveToolPolicy,
         streamToken, // Pass the pre-generated stream token
         hasQueuedMessages,
         metadata.name,
-        effectiveThinkingLevel,
+        streamThinkingLevel,
         requestHeaders,
         effectiveMuxProviderOptions.anthropic?.cacheTtl ?? undefined,
         resolvedOverrides.standard,
@@ -3869,7 +4126,9 @@ export class AIService extends EventEmitter {
         activeTurnThinkingOverride,
         rebuildProviderOptionsForThinkingLevel,
         forcedFirstStepToolNames,
-        requestProvidersConfig
+        requestProvidersConfig,
+        emitPrimaryEnvelope,
+        rebuildFirstStepForThinkingLevel
       );
       recordStartupPhaseTiming("startStreamMs", startStreamStartedAt);
 

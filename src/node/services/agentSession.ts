@@ -51,6 +51,7 @@ import {
 } from "@/node/services/utils/messageIds";
 import {
   FileChangeTracker,
+  createFileChangeNotificationMessage,
   type FileState,
   type EditedFileAttachment,
 } from "@/node/services/utils/fileChangeTracker";
@@ -4043,6 +4044,29 @@ export class AgentSession {
       return Ok(undefined);
     }
 
+    // Detect external file edits (timestamp-based polling) BEFORE reading history
+    // and append the <system-file-update> notification as a durable row. The
+    // provider request is built purely from chat.jsonl, so anything the model
+    // sees must be logged first — there is no request-time injection path.
+    // Detection is side-effect-free; tracker state advances via commit() only
+    // AFTER the notification row is durably appended. A retry after a startup
+    // abort or append failure therefore re-detects the same change (nothing is
+    // dropped), while a successful append cannot produce a duplicate row.
+    const fileChangeDetection = await this.fileChangeTracker.getChangedAttachments();
+    if (isStartupAbortRequested()) {
+      return Ok(undefined);
+    }
+    if (fileChangeDetection.attachments.length > 0) {
+      const notificationAppendResult = await this.historyService.appendToHistory(
+        this.workspaceId,
+        createFileChangeNotificationMessage(fileChangeDetection.attachments)
+      );
+      if (!notificationAppendResult.success) {
+        return Err(createUnknownSendMessageError(notificationAppendResult.error));
+      }
+      fileChangeDetection.commit();
+    }
+
     const historyResult = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
     if (isStartupAbortRequested()) {
       return Ok(undefined);
@@ -4087,7 +4111,14 @@ export class AgentSession {
     }
 
     // Capture the current user message id so retries are stable across assistant message ids.
-    const lastUserMessage = [...requestMessages].reverse().find((m) => m.role === "user");
+    // Retry-eligible rows only: startup recovery matches this persisted ID
+    // against shouldUseUserMessageForRetry candidates, so selecting an
+    // invisible synthetic row (file-update notification, [CONTINUE] sentinel,
+    // snapshot) would persist non-retryable failures against a row recovery
+    // never selects and break the tail match after restart.
+    const lastUserMessage = [...requestMessages]
+      .reverse()
+      .find((m) => this.shouldUseUserMessageForRetry(m));
     this.activeStreamUserMessageId = lastUserMessage?.id;
 
     this.activeCompactionRequest = this.resolveCompactionRequest(
@@ -4095,13 +4126,6 @@ export class AgentSession {
       modelString,
       options
     );
-
-    if (isStartupAbortRequested()) {
-      return Ok(undefined);
-    }
-
-    // Check for external file edits (timestamp-based polling)
-    const changedFileAttachments = await this.fileChangeTracker.getChangedAttachments();
 
     if (isStartupAbortRequested()) {
       return Ok(undefined);
@@ -4196,8 +4220,6 @@ export class AgentSession {
       delegatedToolNames,
       muxMetadata: streamMuxMetadata,
       recordFileState,
-      changedFileAttachments:
-        changedFileAttachments.length > 0 ? changedFileAttachments : undefined,
       postCompactionAttachments,
       // Invoked by AIService after runtime.ensureReady() (project-scope
       // listing needs a running runtime). Still ordered after the
@@ -6744,9 +6766,9 @@ export class AgentSession {
     }
   }
 
-  /** Delegate to FileChangeTracker for external file change detection. */
+  /** Delegate to FileChangeTracker for external file change detection (side-effect-free). */
   async getChangedFileAttachments(): Promise<EditedFileAttachment[]> {
-    return this.fileChangeTracker.getChangedAttachments();
+    return (await this.fileChangeTracker.getChangedAttachments()).attachments;
   }
 
   async appendHeartbeatContextResetBoundary(params: {
