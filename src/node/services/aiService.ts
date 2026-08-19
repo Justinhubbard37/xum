@@ -124,6 +124,7 @@ import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/prov
 import { isCustomOpenAICompatibleProviderConfig } from "@/common/utils/providers/customProviders";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
+import { excludeKeepRecentTailForCompactionRequest } from "@/common/utils/messages/keepRecentTail";
 import { getProjects, isMultiProject } from "@/common/utils/multiProject";
 import { uniqueSuffix } from "@/common/utils/hasher";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
@@ -223,8 +224,12 @@ export function prepareProviderRequestMessages(
 } {
   // Workflow display rows are durable UI history, not main-agent context.
   const messagesWithoutWorkflowDisplay = filterWorkflowDisplayOnlyMessages(messages);
-  const activeContextMessages = sliceMessagesForProviderFromLatestContextBoundary(
-    messagesWithoutWorkflowDisplay
+  // RLM keep-recent floor: a stamped compaction request summarizes only the
+  // older head; the stamped tail is preserved verbatim after the boundary.
+  // No-op (same reference) unless the trailing user row carries the durable
+  // stamp, so RLM-off requests and replay stay byte-identical.
+  const activeContextMessages = excludeKeepRecentTailForCompactionRequest(
+    sliceMessagesForProviderFromLatestContextBoundary(messagesWithoutWorkflowDisplay)
   );
   const contextBoundarySlicedCount =
     messagesWithoutWorkflowDisplay.length - activeContextMessages.length;

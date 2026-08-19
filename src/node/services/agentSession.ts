@@ -88,6 +88,10 @@ import {
   type ReviewNoteDataForDisplay,
   type StartupRetrySendOptions,
 } from "@/common/types/message";
+import { selectKeepRecentTailStartIndex } from "@/common/utils/messages/keepRecentTail";
+import { extractReadFilePaths, mergeReadFilePaths } from "@/common/utils/messages/extractReadFiles";
+import { isNonNegativeInteger } from "@/common/utils/numbers";
+import { RLM_KEEP_RECENT_FLOOR_TOKENS } from "@/constants/rlmCompaction";
 import {
   createRuntimeContextForWorkspace,
   createRuntimeForWorkspace,
@@ -532,6 +536,13 @@ export class AgentSession {
   private postCompactionLoadedSkills: LoadedSkillSnapshot[] = [];
 
   /**
+   * Cumulative read-file paths from summarized epochs, mirrored like
+   * postCompactionLoadedSkills so periodic re-injections keep the pre-boundary
+   * reads after the pending on-disk state is acknowledged. RLM-only surface.
+   */
+  private postCompactionReadFilePaths: string[] = [];
+
+  /**
    * When true, clear any persisted post-compaction state after the next successful non-compaction stream.
    *
    * This is intentionally delayed until stream-end so a crash mid-stream doesn't lose the diffs.
@@ -665,6 +676,15 @@ export class AgentSession {
     source?: "idle-compaction" | "auto-compaction";
   };
 
+  /**
+   * RLM keep-recent floor: summary ID of the just-completed compaction whose
+   * preserved-tail copies were appended after the boundary. With copies, the
+   * summary is no longer the last history row, so the stream-end follow-up
+   * dispatch must target it by ID; null for default (RLM-off) compactions so
+   * their "last message is the summary" staleness guard stays byte-identical.
+   */
+  private pendingCompactionFollowUpSummaryId: string | null = null;
+
   constructor(options: AgentSessionOptions) {
     assert(options, "AgentSession requires options");
     const {
@@ -704,7 +724,15 @@ export class AgentSession {
       sessionDir: this.config.getSessionDir(this.workspaceId),
       telemetryService,
       emitter: this.emitter,
-      onCompactionComplete,
+      onCompactionComplete: (metadata) => {
+        // RLM keep-recent floor: tail copies after the boundary mean the
+        // summary is no longer the last row; stash its ID so the stream-end
+        // follow-up dispatch can target it directly.
+        if ((metadata.preservedTailMessageCount ?? 0) > 0) {
+          this.pendingCompactionFollowUpSummaryId = metadata.summaryMessageId;
+        }
+        onCompactionComplete?.(metadata);
+      },
       onIdleCompactionOutcome,
     });
 
@@ -2927,6 +2955,14 @@ export class AgentSession {
       ...(delegatedToolNames != null ? { delegatedToolNames } : {}),
     });
 
+    // RLM keep-recent floor: stamp compaction requests (manual /compact,
+    // mid-stream forced, idle) with the durable tail-start sequence before the
+    // row is persisted. No-op when RLM is off.
+    const stampedMuxMetadata =
+      isCompactionRequest && typedMuxMetadata?.type === "compaction-request"
+        ? await this.withKeepRecentTailStamp(typedMuxMetadata, optionsForStream)
+        : typedMuxMetadata;
+
     const userMessage = createMuxMessage(
       messageId,
       "user",
@@ -2936,7 +2972,7 @@ export class AgentSession {
         toolPolicy: typedToolPolicy,
         disableWorkspaceAgents: options?.disableWorkspaceAgents,
         retrySendOptions: pickStartupRetrySendOptions(optionsForStream, agentInitiated, goalKind),
-        muxMetadata: typedMuxMetadata, // Pass through frontend metadata as black-box
+        muxMetadata: stampedMuxMetadata, // Pass through frontend metadata as black-box
         ...(acpPromptId != null ? { acpPromptId } : {}),
         ...(goalKind != null ? { kind: goalKind } : {}),
         // Auto-resume and other system-generated messages are synthetic + UI-visible
@@ -3043,6 +3079,15 @@ export class AgentSession {
           baseOptions: optionsForStream,
           reason: "on-send",
         });
+
+        // RLM keep-recent floor: stamp on-send auto-compaction requests with
+        // the durable tail-start sequence. No-op when RLM is off.
+        if (autoCompactionRequest.metadata.type === "compaction-request") {
+          autoCompactionRequest.metadata = await this.withKeepRecentTailStamp(
+            autoCompactionRequest.metadata,
+            optionsForStream
+          );
+        }
 
         autoCompactionMessage = createMuxMessage(
           createUserMessageId(),
@@ -3772,6 +3817,80 @@ export class AgentSession {
     }
   }
 
+  /**
+   * True when RLM-mode compaction behavior (keep-recent floor) applies.
+   *
+   * RLM is a sub-experiment of Programmatic Tool Calling: without a PTC parent
+   * flag it stays inert (matching the experiments registry). Frontend sends
+   * carry experiments in send options; backend-initiated compaction sends
+   * (idle loop) do not, so fall back to the persisted machine overrides the
+   * renderer syncs into Settings.
+   */
+  private isRlmCompactionEnabled(options: SendMessageOptions | undefined): boolean {
+    const experiments = options?.experiments;
+    if (
+      experiments?.rlm === true &&
+      (experiments.programmaticToolCalling === true ||
+        experiments.programmaticToolCallingExclusive === true)
+    ) {
+      return true;
+    }
+
+    // Guard for test mocks that may not implement isExperimentEnabled.
+    if (typeof this.aiService.isExperimentEnabled !== "function") {
+      return false;
+    }
+    return (
+      this.aiService.isExperimentEnabled(EXPERIMENT_IDS.RLM) &&
+      (this.aiService.isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING) ||
+        this.aiService.isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE))
+    );
+  }
+
+  /**
+   * Compute the durable keep-recent stamp for a compaction request (RLM mode).
+   *
+   * The stamp records the historySequence where the preserved tail starts so
+   * live request assembly, compaction completion, and replay all derive the
+   * exact same tail from durable rows. Returns undefined when RLM is off,
+   * when history cannot be read (self-healing: compaction proceeds without a
+   * tail), or when the tail clamps away entirely.
+   */
+  private async computeKeepRecentTailStamp(
+    options: SendMessageOptions | undefined
+  ): Promise<{ startHistorySequence: number } | undefined> {
+    if (!this.isRlmCompactionEnabled(options)) {
+      return undefined;
+    }
+
+    const historyResult = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
+    if (!historyResult.success) {
+      return undefined;
+    }
+
+    const messages = historyResult.data;
+    const startIndex = selectKeepRecentTailStartIndex(messages, RLM_KEEP_RECENT_FLOOR_TOKENS);
+    if (startIndex === -1) {
+      return undefined;
+    }
+
+    const startHistorySequence = messages[startIndex].metadata?.historySequence;
+    assert(
+      isNonNegativeInteger(startHistorySequence),
+      "keep-recent tail selector must only pick rows with a valid historySequence"
+    );
+    return { startHistorySequence };
+  }
+
+  /** Stamp a compaction-request metadata payload with the keep-recent tail (no-op when RLM is off). */
+  private async withKeepRecentTailStamp(
+    metadata: Extract<MuxMessageMetadata, { type: "compaction-request" }>,
+    options: SendMessageOptions | undefined
+  ): Promise<MuxMessageMetadata> {
+    const stamp = await this.computeKeepRecentTailStamp(options);
+    return stamp === undefined ? metadata : { ...metadata, keepRecentTail: stamp };
+  }
+
   private buildAutoCompactionRequest(params: {
     followUpContent: CompactionFollowUpRequest;
     baseOptions: SendMessageOptions;
@@ -4135,7 +4254,7 @@ export class AgentSession {
     const postCompactionAttachments =
       disablePostCompactionAttachments === true
         ? null
-        : await this.getPostCompactionAttachmentsIfNeeded();
+        : await this.getPostCompactionAttachmentsIfNeeded(this.isRlmCompactionEnabled(options));
     if (isStartupAbortRequested()) {
       return Ok(undefined);
     }
@@ -4553,6 +4672,7 @@ export class AgentSession {
 
     // The post-compaction context is likely the culprit; discard it so we don't loop.
     this.postCompactionLoadedSkills = [];
+    this.postCompactionReadFilePaths = [];
     try {
       await this.compactionHandler.discardPendingState("context_exceeded");
       this.onPostCompactionStateChange?.();
@@ -5111,7 +5231,11 @@ export class AgentSession {
         if (handled) {
           // Dispatch follow-up AFTER reset so it can set its own stream state. Child lifecycle
           // settlement defers only when this durable continuation was actually accepted.
-          continuedAfterCompaction = await this.dispatchPendingFollowUp();
+          // RLM keep-recent floor: when tail copies were appended the summary is
+          // not the last row, so target it by ID (stashed in onCompactionComplete).
+          const rlmSummaryId = this.pendingCompactionFollowUpSummaryId;
+          this.pendingCompactionFollowUpSummaryId = null;
+          continuedAfterCompaction = await this.dispatchPendingFollowUp(rlmSummaryId ?? undefined);
         }
 
         // Stream end: auto-send queued messages (for user messages typed during streaming)
@@ -5960,6 +6084,31 @@ export class AgentSession {
         return false;
       }
       summaryMessage = historyResult.data[0];
+
+      // RLM keep-recent floor: preserved-tail copies sit after the boundary,
+      // so "compaction just completed" means the epoch is exactly
+      // [summary, ...tail copies]. Any non-copy row after the summary means
+      // something else happened and the follow-up must not fire (same
+      // staleness guard as the plain "last message is the summary" check).
+      if (summaryMessage.metadata?.rlmPreservedTailCopy === true) {
+        const epochResult = await this.historyService.getHistoryFromLatestBoundary(
+          this.workspaceId
+        );
+        if (!epochResult.success) {
+          throw new Error(
+            `Failed to read epoch for preserved-tail follow-up recovery: ${epochResult.error}`
+          );
+        }
+        const epoch = epochResult.data;
+        const boundary = epoch[0];
+        const onlyTailCopiesAfterBoundary = epoch
+          .slice(1)
+          .every((message) => message.metadata?.rlmPreservedTailCopy === true);
+        if (boundary === undefined || !onlyTailCopiesAfterBoundary) {
+          return false;
+        }
+        summaryMessage = boundary;
+      }
     }
 
     const lastMessage = summaryMessage;
@@ -6185,7 +6334,9 @@ export class AgentSession {
    *
    * @returns Attachments to inject, or null if none needed
    */
-  private async getPostCompactionAttachmentsIfNeeded(): Promise<PostCompactionAttachment[] | null> {
+  private async getPostCompactionAttachmentsIfNeeded(
+    includeReadFiles: boolean
+  ): Promise<PostCompactionAttachment[] | null> {
     // Check if compaction just occurred (immediate injection with cached post-compaction state)
     const pendingState = await this.compactionHandler.peekPendingState();
     if (pendingState !== null) {
@@ -6193,6 +6344,7 @@ export class AgentSession {
       this.compactionOccurred = true;
       this.turnsSinceLastAttachment = 0;
       this.postCompactionLoadedSkills = pendingState.loadedSkills;
+      this.postCompactionReadFilePaths = pendingState.readFiles;
       // Compaction boundary: invalidate the session-cached memory context so
       // the next stream recomputes the index and hot set from current
       // files/pins/usage stats.
@@ -6203,6 +6355,9 @@ export class AgentSession {
       return this.buildAttachmentsFromContext({
         diffs: pendingState.diffs,
         loadedSkills: pendingState.loadedSkills,
+        // Read tracking is internal bookkeeping in both modes but only ever
+        // model-visible in RLM mode, keeping RLM-off prompts byte-identical.
+        readFilePaths: includeReadFiles ? pendingState.readFiles : [],
         // Compaction just completed, so every already-completed report predates the boundary.
         reportsCompletedBeforeMs: Date.now(),
       });
@@ -6214,7 +6369,7 @@ export class AgentSession {
     // Check cooldown for subsequent injections (re-read from current history)
     if (this.compactionOccurred && this.turnsSinceLastAttachment >= TURNS_BETWEEN_ATTACHMENTS) {
       this.turnsSinceLastAttachment = 0;
-      return this.generatePostCompactionAttachments();
+      return this.generatePostCompactionAttachments(includeReadFiles);
     }
 
     return null;
@@ -6223,7 +6378,9 @@ export class AgentSession {
   /**
    * Generate post-compaction attachments by extracting diffs and loaded skills from message history.
    */
-  private async generatePostCompactionAttachments(): Promise<PostCompactionAttachment[]> {
+  private async generatePostCompactionAttachments(
+    includeReadFiles: boolean
+  ): Promise<PostCompactionAttachment[]> {
     // getHistoryFromLatestBoundary already returns only the active compaction epoch,
     // so no further boundary slicing is needed.
     const historyResult = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
@@ -6236,6 +6393,14 @@ export class AgentSession {
       ...this.postCompactionLoadedSkills,
       ...extractLoadedSkillSnapshotsFromMessages(historyResult.data),
     ]);
+    // Mirror loadedSkills: cumulative pre-boundary reads carried in memory,
+    // merged with reads from the current epoch (newest-first, capped).
+    const readFilePaths = includeReadFiles
+      ? mergeReadFilePaths(
+          this.postCompactionReadFilePaths,
+          extractReadFilePaths(historyResult.data)
+        )
+      : [];
 
     // Reports completed before the latest boundary had their tool results summarized away;
     // anything newer is still visible in the active epoch and would be redundant.
@@ -6246,6 +6411,7 @@ export class AgentSession {
     return this.buildAttachmentsFromContext({
       diffs: fileDiffs,
       loadedSkills,
+      readFilePaths,
       reportsCompletedBeforeMs: boundaryTimestampMs ?? Date.now(),
     });
   }
@@ -6258,6 +6424,8 @@ export class AgentSession {
   private async buildAttachmentsFromContext(context: {
     diffs: FileEditDiff[];
     loadedSkills: LoadedSkillSnapshot[];
+    /** RLM read tracking (already gated by the caller); empty means "do not surface". */
+    readFilePaths: string[];
     /** Cutoff for the completed-reports index: reports completed before this were summarized away. */
     reportsCompletedBeforeMs: number;
   }): Promise<PostCompactionAttachment[]> {
@@ -6271,6 +6439,10 @@ export class AgentSession {
       completedBeforeMs: context.reportsCompletedBeforeMs,
     });
 
+    const readFilesAttachment = AttachmentService.generateReadFilesAttachment(
+      context.readFilePaths
+    );
+
     const metadataResult = await this.aiService.getWorkspaceMetadata(this.workspaceId);
     if (!metadataResult.success) {
       // Can't get metadata — skip plan reference but still include other attachments.
@@ -6282,6 +6454,10 @@ export class AgentSession {
 
       if (completedReportsAttachment) {
         attachments.push(completedReportsAttachment);
+      }
+
+      if (readFilesAttachment) {
+        attachments.push(readFilesAttachment);
       }
 
       const loadedSkillsAttachment = AttachmentService.generateLoadedSkillsAttachment(
@@ -6321,6 +6497,10 @@ export class AgentSession {
     if (completedReportsAttachment) {
       // Final injection order is decided by the renderer's priority sort.
       attachments.push(completedReportsAttachment);
+    }
+
+    if (readFilesAttachment) {
+      attachments.push(readFilesAttachment);
     }
 
     return attachments;

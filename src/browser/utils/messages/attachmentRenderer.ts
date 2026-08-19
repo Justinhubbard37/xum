@@ -5,6 +5,7 @@ import type {
   LoadedSkillsSnapshotAttachment,
   EditedFilesReferenceAttachment,
   CompletedReportsIndexAttachment,
+  ReadFilesReferenceAttachment,
 } from "@/common/types/attachment";
 import {
   AGENT_SKILL_BODY_TRUNCATION_NOTE,
@@ -124,6 +125,14 @@ function renderCompletedReportsIndexWithBudget(
 }
 
 /**
+ * Render the RLM read-files list compactly: paths only (newest-first), so the
+ * model knows which files it has already seen without re-reading them.
+ */
+function renderReadFilesReference(attachment: ReadFilesReferenceAttachment): string {
+  return `Files previously read (contents summarized away; re-read only if needed): ${attachment.paths.join(", ")}`;
+}
+
+/**
  * Render an edited files reference attachment to content string.
  */
 function renderEditedFilesReference(attachment: EditedFilesReferenceAttachment): string {
@@ -157,6 +166,8 @@ export function renderAttachmentToContent(attachment: PostCompactionAttachment):
       return renderEditedFilesReference(attachment);
     case "completed_reports_index":
       return renderCompletedReportsIndex(attachment);
+    case "read_files_reference":
+      return renderReadFilesReference(attachment);
   }
 }
 
@@ -320,8 +331,9 @@ function sortAttachmentsForInjection(
     // Small, high-value handles go before the bulky skill/diff blocks so budget
     // truncation cannot drop them.
     completed_reports_index: 2,
-    loaded_skills_snapshot: 3,
-    edited_files_reference: 4,
+    read_files_reference: 3,
+    loaded_skills_snapshot: 4,
+    edited_files_reference: 5,
   };
 
   return attachments
@@ -409,6 +421,15 @@ export function renderAttachmentsToContentWithBudget(
       omittedLoadedSkills += omittedSkills;
 
       if (content) {
+        addBlock(wrapSystemUpdate(content));
+      }
+      continue;
+    }
+
+    if (attachment.type === "read_files_reference") {
+      // Compact one-liner (paths only) — include whole or not at all.
+      const content = renderReadFilesReference(attachment);
+      if (content.length <= remainingForContent) {
         addBlock(wrapSystemUpdate(content));
       }
       continue;
