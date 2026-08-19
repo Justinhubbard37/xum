@@ -2114,12 +2114,16 @@ export class HistoryService {
    *
    * By default this removes the target message and all subsequent messages. Callers can retain the
    * target message when branching a new workspace from a specific reply.
+   *
+   * Returns the removed tail (in history order) so branch-point callers (fork,
+   * edit-resend) can summarize the abandoned segment; computed under the
+   * history lock so it exactly matches what was cut.
    */
   async truncateAfterMessage(
     workspaceId: string,
     messageId: string,
     options?: { keepTargetMessage?: boolean }
-  ): Promise<Result<void>> {
+  ): Promise<Result<{ removedMessages: MuxMessage[] }>> {
     return this.withRecoveredHistoryResultLock(
       workspaceId,
       "Failed to truncate history",
@@ -2139,16 +2143,16 @@ export class HistoryService {
             return this.truncateAfterArchivedMessageUnlocked(
               workspaceId,
               messageId,
-              keepTargetMessage
+              keepTargetMessage,
+              messages
             );
           }
 
           // Response-level forks branch from the selected assistant turn, so they retain the target
           // message while discarding anything that came after it.
-          const truncatedMessages = messages.slice(
-            0,
-            keepTargetMessage ? messageIndex + 1 : messageIndex
-          );
+          const cutIndex = keepTargetMessage ? messageIndex + 1 : messageIndex;
+          const truncatedMessages = messages.slice(0, cutIndex);
+          const removedMessages = messages.slice(cutIndex);
 
           // Rewrite the history file with truncated messages
           const historyPath = this.getChatHistoryPath(workspaceId);
@@ -2192,7 +2196,7 @@ export class HistoryService {
           );
           this.sequenceCounters.set(workspaceId, nextSeq);
 
-          return Ok(undefined);
+          return Ok({ removedMessages });
         } catch (error) {
           const message = getErrorMessage(error);
           return Err(`Failed to truncate history: ${message}`);
@@ -2210,8 +2214,10 @@ export class HistoryService {
   private async truncateAfterArchivedMessageUnlocked(
     workspaceId: string,
     messageId: string,
-    keepTargetMessage: boolean
-  ): Promise<Result<void>> {
+    keepTargetMessage: boolean,
+    /** Active-epoch messages already read by the caller; all of them are discarded on this branch. */
+    activeEpochMessages: MuxMessage[]
+  ): Promise<Result<{ removedMessages: MuxMessage[] }>> {
     try {
       const archiveMessages = await this.readArchivedHistory(workspaceId);
       const messageIndex = archiveMessages.findIndex((msg) => msg.id === messageId);
@@ -2220,10 +2226,10 @@ export class HistoryService {
         return Err(`Message with ID ${messageId} not found in history`);
       }
 
-      const truncatedMessages = archiveMessages.slice(
-        0,
-        keepTargetMessage ? messageIndex + 1 : messageIndex
-      );
+      const cutIndex = keepTargetMessage ? messageIndex + 1 : messageIndex;
+      const truncatedMessages = archiveMessages.slice(0, cutIndex);
+      // The removed tail spans the archive remainder plus the whole active epoch.
+      const removedMessages = [...archiveMessages.slice(cutIndex), ...activeEpochMessages];
 
       await this.rewriteHistoryFilesUnlocked(
         workspaceId,
@@ -2262,7 +2268,7 @@ export class HistoryService {
       );
       this.sequenceCounters.set(workspaceId, nextSeq);
 
-      return Ok(undefined);
+      return Ok({ removedMessages });
     } catch (error) {
       const message = getErrorMessage(error);
       return Err(`Failed to truncate history: ${message}`);

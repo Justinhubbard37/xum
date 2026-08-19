@@ -41,6 +41,10 @@ export const createCompactionSummaryMessageId = (): string =>
 export const createPreservedTailCopyMessageId = (): string =>
   `rlm-tail-${Date.now()}-${randomSuffix(9)}`;
 
+/** Abandoned-branch summary IDs (rlm-mode fork/edit truncation): branch-summary-{timestamp}-{random} */
+export const createBranchSummaryMessageId = (): string =>
+  `branch-summary-${Date.now()}-${randomSuffix(9)}`;
+
 /** Context reset boundary IDs: context-reset-{timestamp}-{random} */
 export const createContextResetBoundaryMessageId = (): string =>
   `context-reset-${Date.now()}-${randomSuffix(9)}`;

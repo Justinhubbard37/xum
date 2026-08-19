@@ -596,6 +596,14 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
         type: "goal-pause-boundary";
       }
     | {
+        // Durable, provider-visible summary of an abandoned history branch
+        // (rlm-mode experiment): appended after a fork-from-message or an
+        // edit-resend truncation so the new branch retains context from the
+        // discarded tail. The labeled summary stays in the message text for
+        // the model; this marker identifies the row for UI/tests.
+        type: "branch-summary";
+      }
+    | {
         type: "heartbeat-request";
         /** Synthetic heartbeat follow-ups use an explicit marker so future backend dispatch stays inspectable. */
         source?: "heartbeat";
