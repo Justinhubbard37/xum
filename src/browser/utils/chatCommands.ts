@@ -815,6 +815,46 @@ export async function processSlashCommand(
           });
         return { clearInput: true, toastShown: true };
       }
+      case "refine": {
+        if (!context.workspaceId) throw new Error("Workspace ID required");
+        const refineClient = requireClient();
+        if (!refineClient) {
+          return { clearInput: false, toastShown: true };
+        }
+        // Fire-and-forget like /dream: the pass runs in the background and
+        // posts its own labeled summary row into the chat when edits were
+        // applied. Only the settle toast is shown — an optimistic "started"
+        // toast would flash green-then-red when the backend rejects
+        // immediately (RLM off, run already in flight).
+        const refineWorkspaceId = context.workspaceId;
+        void refineClient.refinements
+          .run({ workspaceId: refineWorkspaceId })
+          .then((result) => {
+            context.setToast(
+              result.success
+                ? {
+                    id: Date.now().toString(),
+                    type: "success",
+                    message: result.data.noOp
+                      ? "Refine: nothing worth distilling"
+                      : `Refine: ${result.data.applied.length} edit(s) applied (see chat summary)`,
+                  }
+                : {
+                    id: Date.now().toString(),
+                    type: "error",
+                    message: `Refine failed: ${result.error}`,
+                  }
+            );
+          })
+          .catch((error: unknown) => {
+            context.setToast({
+              id: Date.now().toString(),
+              type: "error",
+              message: `Refine failed: ${String(error)}`,
+            });
+          });
+        return { clearInput: true, toastShown: true };
+      }
       case "fork":
         if (!requireClient()) {
           return { clearInput: false, toastShown: true };

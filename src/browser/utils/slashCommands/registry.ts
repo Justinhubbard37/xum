@@ -122,6 +122,14 @@ const dreamCommandDefinition: SlashCommandDefinition = {
   handler: (): ParsedCommand => ({ type: "dream" }),
 };
 
+const refineCommandDefinition: SlashCommandDefinition = {
+  key: "refine",
+  experimentGate: EXPERIMENT_IDS.RLM,
+  description:
+    "Distill durable lessons from this workspace's trajectory into memory/skills (auto-applied, rollbackable)",
+  handler: (): ParsedCommand => ({ type: "refine" }),
+};
+
 const compactCommandDefinition: SlashCommandDefinition = {
   key: "compact",
   description:
@@ -678,6 +686,7 @@ export const SLASH_COMMAND_DEFINITIONS: readonly SlashCommandDefinition[] = [
   clearCommandDefinition,
   compactCommandDefinition,
   dreamCommandDefinition,
+  refineCommandDefinition,
   modelCommandDefinition,
   planCommandDefinition,
 
