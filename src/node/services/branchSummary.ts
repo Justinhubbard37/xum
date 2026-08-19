@@ -53,20 +53,23 @@ export interface RlmExperimentFlags {
 /**
  * True when RLM mode applies. RLM is a sub-experiment of Programmatic Tool
  * Calling: without a PTC parent flag it stays inert (matching the experiments
- * registry). Send-option experiments win when present (frontend sends carry
- * them); backend-initiated operations without send options (fork IPC) fall
- * back to the persisted machine overrides the renderer syncs into Settings.
+ * registry). Send-option experiments are AUTHORITATIVE when present — the
+ * frontend always sends the full boolean set (useSendMessageOptions /
+ * sendOptions.ts), so an explicit `rlm: false` must win over machine
+ * overrides, never fall through to them. Only backend-initiated operations
+ * without send options (fork IPC) fall back to the persisted machine
+ * overrides the renderer syncs into Settings.
  */
 export function isRlmModeEnabled(
   experiments: RlmExperimentFlags | undefined,
   isExperimentEnabled: ((experimentId: ExperimentId) => boolean) | undefined
 ): boolean {
-  if (
-    experiments?.rlm === true &&
-    (experiments.programmaticToolCalling === true ||
-      experiments.programmaticToolCallingExclusive === true)
-  ) {
-    return true;
+  if (experiments !== undefined) {
+    return (
+      experiments.rlm === true &&
+      (experiments.programmaticToolCalling === true ||
+        experiments.programmaticToolCallingExclusive === true)
+    );
   }
   // Guard for test mocks that may not implement isExperimentEnabled.
   if (typeof isExperimentEnabled !== "function") {
@@ -137,7 +140,10 @@ export function buildAbandonedBranchTranscript(messages: MuxMessage[]): string {
     totalChars -= formatted[drop].length;
     drop += 1;
   }
-  return formatted.slice(drop).join("\n\n");
+  // A single oversized message can still exceed the cap after dropping all
+  // older ones; hard-clamp from the end (newest content carries the most
+  // context) so the transcript never blows a small side-channel model's window.
+  return formatted.slice(drop).join("\n\n").slice(-BRANCH_SUMMARY_MAX_TRANSCRIPT_CHARS);
 }
 
 /**

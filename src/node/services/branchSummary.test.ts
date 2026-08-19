@@ -6,7 +6,10 @@ import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
-import { BRANCH_SUMMARY_MIN_SEGMENT_TOKENS } from "@/constants/branchSummary";
+import {
+  BRANCH_SUMMARY_MAX_TRANSCRIPT_CHARS,
+  BRANCH_SUMMARY_MIN_SEGMENT_TOKENS,
+} from "@/constants/branchSummary";
 
 import {
   BRANCH_SUMMARY_LABEL,
@@ -117,6 +120,16 @@ describe("isRlmModeEnabled", () => {
     expect(isRlmModeEnabled(undefined, (id) => id === EXPERIMENT_IDS.RLM)).toBe(false);
     expect(isRlmModeEnabled(undefined, undefined)).toBe(false);
   });
+
+  test("explicit send-option experiments win over machine overrides", () => {
+    // Frontend sends carry the full boolean set, so a provided experiments
+    // object is authoritative: rlm: false must NOT fall through to machine
+    // overrides that have RLM enabled.
+    const allOn = () => true;
+    expect(isRlmModeEnabled({ rlm: false, programmaticToolCalling: true }, allOn)).toBe(false);
+    expect(isRlmModeEnabled({ rlm: true, programmaticToolCalling: false }, allOn)).toBe(false);
+    expect(isRlmModeEnabled({ rlm: true, programmaticToolCalling: true }, () => false)).toBe(true);
+  });
 });
 
 describe("buildAbandonedBranchTranscript", () => {
@@ -141,6 +154,19 @@ describe("buildAbandonedBranchTranscript", () => {
     expect(transcript).toContain("Assistant: I ran the tests");
     expect(transcript).toContain("[tool bash]");
     expect(transcript).not.toContain("secret chain of thought");
+  });
+
+  test("clamps a single message that exceeds the transcript cap, keeping the tail", () => {
+    const oversized = createMuxMessage(
+      "big-1",
+      "user",
+      `${"x".repeat(BRANCH_SUMMARY_MAX_TRANSCRIPT_CHARS + 10_000)}TAIL-MARKER`,
+      { timestamp: 1 }
+    );
+    const transcript = buildAbandonedBranchTranscript([oversized]);
+    expect(transcript.length).toBe(BRANCH_SUMMARY_MAX_TRANSCRIPT_CHARS);
+    // Clamped from the end: the newest content survives.
+    expect(transcript.endsWith("TAIL-MARKER")).toBe(true);
   });
 });
 
