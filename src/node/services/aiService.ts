@@ -78,7 +78,7 @@ import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { HistoryService } from "./historyService";
 import { delegatedToolCallManager } from "./delegatedToolCallManager";
 import { createErrorEvent, formatSendMessageError } from "./utils/sendMessageError";
-import { resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
+import { findWorkspaceEntry, resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
 import { createAssistantMessageId } from "./utils/messageIds";
 import type { SessionUsageService } from "./sessionUsageService";
 import { sumUsageHistory, getTotalCost } from "@/common/utils/tokens/usageAggregator";
@@ -2662,6 +2662,15 @@ export class AIService extends EventEmitter {
         enableGoalTools: goalToolAvailability,
         // Only child workspaces (tasks) can report to a parent.
         enableAgentReport: Boolean(metadata.parentWorkspaceId),
+        // RLM family messaging: gate on the rlm flag persisted on the task record at
+        // spawn — NOT the live send-options experiments — so a child spawned under RLM
+        // keeps task_message_parent/task_message_sibling across app restarts and
+        // frontend experiment toggles. Workflow-owned workers are excluded: they hand
+        // results to WorkflowRunner through the journal path.
+        enableFamilyMessaging:
+          Boolean(metadata.parentWorkspaceId) &&
+          metadata.workflowTask == null &&
+          findWorkspaceEntry(cfg, workspaceId)?.workspace.taskExperiments?.rlm === true,
         workflowAgentOutputSchema: metadata.workflowTask?.outputSchema,
         allowLegacyInvalidWorkflowAgentOutputSchema,
         // External edit detection callback
