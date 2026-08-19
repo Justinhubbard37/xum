@@ -542,6 +542,15 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
          * - auto-compaction: threshold-triggered compaction (on-send / mid-stream)
          */
         source?: "idle-compaction" | "auto-compaction";
+        /**
+         * RLM keep-recent floor (rlm-mode experiment): history rows at or after
+         * this historySequence are excluded from the summarization request and
+         * preserved verbatim (re-appended after the boundary) instead of being
+         * summarized. Stamped at request-persist time so live assembly,
+         * compaction completion, and replay all derive the same tail from
+         * durable rows. Absent when RLM is off — behavior is then unchanged.
+         */
+        keepRecentTail?: { startHistorySequence: number };
         /** Transient status to display in sidebar during this operation */
         displayStatus?: DisplayStatus;
       }
@@ -778,6 +787,15 @@ export interface MuxMetadata {
    * match terminal events to the originating ACP request in shared workspaces.
    */
   acpPromptId?: string;
+
+  /**
+   * RLM keep-recent floor: marks a sanitized copy of a pre-compaction message
+   * re-appended after its compaction boundary so the model keeps the recent
+   * tail verbatim. Copies are synthetic (UI-hidden — the originals remain
+   * visible above the boundary) and carry no usage/cost metadata so session
+   * usage rebuilds never double-count them.
+   */
+  rlmPreservedTailCopy?: boolean;
 
   /**
    * @file mention snapshot token(s) this message provides content for.

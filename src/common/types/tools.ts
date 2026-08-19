@@ -240,6 +240,13 @@ export const FILE_EDIT_TOOL_NAMES = [
 ] as const;
 
 /**
+ * Read-flavored tools whose successful results mark a workspace file as
+ * "already seen" for RLM post-compaction read tracking (paths only, never
+ * contents).
+ */
+export const FILE_READ_TOOL_NAMES = ["file_read"] as const;
+
+/**
  * Prefix for edit failure notes (agent-only messages).
  * This prefix signals to the agent that the file was not modified.
  */
