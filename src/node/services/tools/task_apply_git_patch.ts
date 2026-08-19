@@ -37,7 +37,13 @@ export type TaskApplyGitPatchResult = z.infer<typeof TaskApplyGitPatchToolResult
 
 export type TaskApplyGitPatchConfiguration = Pick<
   ToolConfiguration,
-  "workspaceId" | "cwd" | "runtime" | "runtimeTempDir" | "workspaceSessionDir" | "trusted"
+  | "workspaceId"
+  | "cwd"
+  | "runtime"
+  | "runtimeTempDir"
+  | "workspaceSessionDir"
+  | "trusted"
+  | "taskService"
 >;
 
 interface AppliedCommit {
@@ -291,6 +297,7 @@ export async function findGitPatchArtifactInWorkspaceOrAncestors(params: {
   artifact: SubagentGitPatchArtifact;
   artifactWorkspaceId: string;
   artifactSessionDir: string;
+  relation: "direct" | "descendant" | "ancestor";
   note?: string;
 } | null> {
   assert(
@@ -311,6 +318,7 @@ export async function findGitPatchArtifactInWorkspaceOrAncestors(params: {
     return {
       artifact: direct,
       artifactWorkspaceId: params.workspaceId,
+      relation: "direct",
       artifactSessionDir: params.workspaceSessionDir,
     };
   }
@@ -350,6 +358,44 @@ export async function findGitPatchArtifactInWorkspaceOrAncestors(params: {
     }
   }
 
+  const childParentWorkspaceId = parentById.get(params.childTaskId);
+  if (childParentWorkspaceId && childParentWorkspaceId !== params.workspaceId) {
+    const descendantVisited = new Set<string>([params.childTaskId]);
+    let currentDescendant = params.childTaskId;
+    for (let i = 0; i < MAX_PARENT_WORKSPACE_DEPTH; i++) {
+      const parent = parentById.get(currentDescendant);
+      if (!parent) break;
+      if (parent === params.workspaceId) {
+        const artifactSessionDir = configService.getSessionDir(childParentWorkspaceId);
+        const artifact = await readSubagentGitPatchArtifact(artifactSessionDir, params.childTaskId);
+        if (artifact) {
+          return {
+            artifact,
+            artifactWorkspaceId: childParentWorkspaceId,
+            relation: "descendant",
+            artifactSessionDir,
+            note: `Patch artifact loaded from descendant parent workspace ${childParentWorkspaceId}.`,
+          };
+        }
+        break;
+      }
+      if (descendantVisited.has(parent)) {
+        log.warn(
+          "task_apply_git_patch: possible parentWorkspaceId cycle during descendant lookup",
+          {
+            workspaceId: params.workspaceId,
+            childTaskId: params.childTaskId,
+            current: currentDescendant,
+            parent,
+          }
+        );
+        break;
+      }
+      descendantVisited.add(parent);
+      currentDescendant = parent;
+    }
+  }
+
   const visited = new Set<string>();
   visited.add(params.workspaceId);
 
@@ -378,6 +424,7 @@ export async function findGitPatchArtifactInWorkspaceOrAncestors(params: {
       return {
         artifact,
         artifactWorkspaceId: parent,
+        relation: "ancestor",
         artifactSessionDir: parentSessionDir,
         note: `Patch artifact loaded from ancestor workspace ${parent}.`,
       };
@@ -1532,6 +1579,26 @@ export async function applyTaskGitPatchArtifact(
     pendingGenerationOnPoll?: () => void;
   } = {}
 ): Promise<TaskApplyGitPatchResult> {
+  const parsedArgs = TaskApplyGitPatchToolArgsSchema.parse(args);
+  if (config.taskService == null) {
+    return await applyTaskGitPatchArtifactUnlocked(config, parsedArgs, options);
+  }
+  return await config.taskService.withGitPatchArtifactOperationLock(parsedArgs.task_id, async () =>
+    applyTaskGitPatchArtifactUnlocked(config, parsedArgs, options)
+  );
+}
+
+async function applyTaskGitPatchArtifactUnlocked(
+  config: TaskApplyGitPatchConfiguration,
+  args: TaskApplyGitPatchArgs,
+  options: {
+    abortSignal?: AbortSignal;
+    allowAlreadyApplied?: boolean;
+    pendingGenerationWaitMs?: number;
+    pendingGenerationPollIntervalMs?: number;
+    pendingGenerationOnPoll?: () => void;
+  }
+): Promise<TaskApplyGitPatchResult> {
   const workspaceId = requireWorkspaceId(config, "task_apply_git_patch");
   assert(config.cwd, "task_apply_git_patch requires cwd");
   assert(config.runtimeTempDir, "task_apply_git_patch requires runtimeTempDir");
@@ -1583,7 +1650,10 @@ export async function applyTaskGitPatchArtifact(
   let artifact = artifactLookup.artifact;
   const artifactWorkspaceId = artifactLookup.artifactWorkspaceId;
   const artifactSessionDir = artifactLookup.artifactSessionDir;
-  const isReplay = artifactWorkspaceId !== workspaceId;
+  // Applying a descendant's patch from an ancestor is the canonical integration path and must
+  // persist its applied watermark. Only applying an ancestor-owned artifact into a descendant is
+  // replay behavior that leaves the source metadata unchanged.
+  const isReplay = artifactLookup.relation === "ancestor";
   const artifactLookupNote = artifactLookup.note;
 
   if (artifact.parentWorkspaceId !== artifactWorkspaceId) {

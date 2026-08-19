@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach, mock } from "bun:test";
 import * as fsPromises from "fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -9,6 +9,7 @@ import type { ToolExecutionOptions } from "ai";
 import {
   applyTaskGitPatchArtifact,
   createTaskApplyGitPatchTool,
+  findGitPatchArtifactInWorkspaceOrAncestors,
 } from "@/node/services/tools/task_apply_git_patch";
 import {
   getSubagentGitPatchArtifactsFilePath,
@@ -17,6 +18,7 @@ import {
   upsertSubagentGitPatchArtifact,
 } from "@/node/services/subagentGitPatchArtifacts";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
+import type { TaskService } from "@/node/services/taskService";
 import { getTestDeps } from "@/node/services/tools/testHelpers";
 
 const mockToolCallOptions: ToolExecutionOptions<unknown> = {
@@ -166,6 +168,208 @@ describe("task_apply_git_patch tool", () => {
   afterEach(async () => {
     await fsPromises.rm(rootDir, { recursive: true, force: true });
   });
+
+  it("serializes apply through the stable child patch-operation lock", async () => {
+    const taskId = "child-lock-test";
+    const withGitPatchArtifactOperationLock = mock(
+      async <T>(lockedTaskId: string, operation: () => Promise<T>): Promise<T> => {
+        expect(lockedTaskId).toBe(taskId);
+        return await operation();
+      }
+    );
+    const targetRepo = path.join(rootDir, "lock-target");
+    const sessionDir = path.join(rootDir, "lock-session");
+    await fsPromises.mkdir(targetRepo, { recursive: true });
+    await fsPromises.mkdir(sessionDir, { recursive: true });
+
+    const result = await applyTaskGitPatchArtifact(
+      {
+        workspaceId: "lock-workspace",
+        cwd: targetRepo,
+        runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
+        runtimeTempDir: path.join(rootDir, "lock-tmp"),
+        workspaceSessionDir: sessionDir,
+        taskService: { withGitPatchArtifactOperationLock } as unknown as TaskService,
+      },
+      { task_id: taskId, three_way: true }
+    );
+
+    expect(withGitPatchArtifactOperationLock).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({
+      success: false,
+      taskId,
+      error: "No git patch artifact found for this taskId.",
+    });
+  });
+
+  it("finds a nested descendant patch in its direct parent session", async () => {
+    const muxRoot = path.join(rootDir, "nested-mux");
+    const sessionsDir = path.join(muxRoot, "sessions");
+    const rootWorkspaceId = "root-coordinator";
+    const intermediateWorkspaceId = "intermediate-coordinator";
+    const childTaskId = "nested-exec-child";
+    const rootSessionDir = path.join(sessionsDir, rootWorkspaceId);
+    const intermediateSessionDir = path.join(sessionsDir, intermediateWorkspaceId);
+    await fsPromises.mkdir(rootSessionDir, { recursive: true });
+    await fsPromises.mkdir(intermediateSessionDir, { recursive: true });
+    await fsPromises.writeFile(
+      path.join(muxRoot, "config.json"),
+      JSON.stringify({
+        projects: [
+          [
+            rootDir,
+            {
+              workspaces: [
+                {
+                  id: rootWorkspaceId,
+                  name: "root",
+                  path: rootDir,
+                  runtimeConfig: { type: "local" },
+                },
+                {
+                  id: intermediateWorkspaceId,
+                  name: "intermediate",
+                  path: rootDir,
+                  parentWorkspaceId: rootWorkspaceId,
+                  runtimeConfig: { type: "local" },
+                },
+                {
+                  id: childTaskId,
+                  name: "child",
+                  path: rootDir,
+                  parentWorkspaceId: intermediateWorkspaceId,
+                  runtimeConfig: { type: "local" },
+                },
+              ],
+            },
+          ],
+        ],
+      }),
+      "utf-8"
+    );
+    await writePatchArtifact({
+      sessionDir: intermediateSessionDir,
+      workspaceId: intermediateWorkspaceId,
+      childTaskId,
+      projectArtifacts: [
+        {
+          projectPath: rootDir,
+          projectName: "repo",
+          storageKey: "repo",
+          status: "skipped",
+          commitCount: 0,
+        },
+      ],
+    });
+
+    const lookup = await findGitPatchArtifactInWorkspaceOrAncestors({
+      workspaceId: rootWorkspaceId,
+      workspaceSessionDir: rootSessionDir,
+      childTaskId,
+    });
+
+    expect(lookup).toMatchObject({
+      artifactWorkspaceId: intermediateWorkspaceId,
+      artifactSessionDir: intermediateSessionDir,
+      relation: "descendant",
+      artifact: { childTaskId, parentWorkspaceId: intermediateWorkspaceId },
+    });
+  });
+
+  it("marks nested descendant artifacts applied when an ancestor integrates them", async () => {
+    const childRepo = path.join(rootDir, "nested-child");
+    const targetRepo = path.join(rootDir, "nested-target");
+    for (const repo of [childRepo, targetRepo]) {
+      await fsPromises.mkdir(repo, { recursive: true });
+      initGitRepo(repo);
+    }
+    await commitFile(childRepo, "README.md", "hello", "base");
+    await commitFile(targetRepo, "README.md", "hello", "base");
+    const baseSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
+    await commitFile(childRepo, "README.md", "hello\nnested", "nested child change");
+    const headSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
+
+    const muxRoot = path.join(rootDir, "nested-integration-mux");
+    const sessionsDir = path.join(muxRoot, "sessions");
+    const rootWorkspaceId = "root-integrator";
+    const intermediateWorkspaceId = "intermediate-parent";
+    const childTaskId = "nested-editing-child";
+    const rootSessionDir = path.join(sessionsDir, rootWorkspaceId);
+    const intermediateSessionDir = path.join(sessionsDir, intermediateWorkspaceId);
+    await fsPromises.mkdir(rootSessionDir, { recursive: true });
+    await fsPromises.mkdir(intermediateSessionDir, { recursive: true });
+    await fsPromises.writeFile(
+      path.join(muxRoot, "config.json"),
+      JSON.stringify({
+        projects: [
+          [
+            targetRepo,
+            {
+              workspaces: [
+                {
+                  id: rootWorkspaceId,
+                  name: "root",
+                  path: targetRepo,
+                  runtimeConfig: { type: "local" },
+                },
+                {
+                  id: intermediateWorkspaceId,
+                  name: "intermediate",
+                  path: targetRepo,
+                  parentWorkspaceId: rootWorkspaceId,
+                  runtimeConfig: { type: "local" },
+                },
+                {
+                  id: childTaskId,
+                  name: "child",
+                  path: childRepo,
+                  parentWorkspaceId: intermediateWorkspaceId,
+                  runtimeConfig: { type: "local" },
+                },
+              ],
+            },
+          ],
+        ],
+      }),
+      "utf-8"
+    );
+    await writePatchArtifact({
+      sessionDir: intermediateSessionDir,
+      workspaceId: intermediateWorkspaceId,
+      childTaskId,
+      projectArtifacts: [
+        await buildReadyProjectArtifact({
+          sessionDir: intermediateSessionDir,
+          childTaskId,
+          storageKey: "nested-target",
+          projectPath: targetRepo,
+          projectName: "nested-target",
+          childRepo,
+          baseSha,
+          headSha,
+        }),
+      ],
+    });
+
+    const result = await applyTaskGitPatchArtifact(
+      {
+        workspaceId: rootWorkspaceId,
+        cwd: targetRepo,
+        runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
+        runtimeTempDir: path.join(rootDir, "nested-integration-tmp"),
+        workspaceSessionDir: rootSessionDir,
+      },
+      { task_id: childTaskId, three_way: true }
+    );
+
+    expect(result.success).toBe(true);
+    expect(execSync("git log -1 --format=%s", { cwd: targetRepo, encoding: "utf-8" }).trim()).toBe(
+      "nested child change"
+    );
+    const artifact = await readSubagentGitPatchArtifact(intermediateSessionDir, childTaskId);
+    expect(artifact?.projectArtifacts[0]?.appliedAtMs).toBeDefined();
+    expect(await readSubagentGitPatchArtifact(rootSessionDir, childTaskId)).toBeNull();
+  }, 20_000);
 
   it("applies all ready project patches in primary-first order", async () => {
     const childRepoA = path.join(rootDir, "child-a");
