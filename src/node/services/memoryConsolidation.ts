@@ -86,6 +86,33 @@ function classifyMutation(input: MemoryCommandInput): MutationTarget | null {
 }
 
 /**
+ * Run-scoped mutation budget. Check + reservation happen in ONE synchronous
+ * call (tryConsume): the AI SDK runs parallel tool calls concurrently, so an
+ * await between check and increment would let two calls at budget-1 both
+ * pass. Shared so the refine pass (r11) can charge memory AND skill mutations
+ * against a single budget.
+ */
+export interface MutationBudget {
+  readonly limit: number;
+  used(): number;
+  /** Reserve one mutation; false when the budget is exhausted. */
+  tryConsume(): boolean;
+}
+
+export function createMutationBudget(limit: number): MutationBudget {
+  let used = 0;
+  return {
+    limit,
+    used: () => used,
+    tryConsume: () => {
+      if (used >= limit) return false;
+      used++;
+      return true;
+    },
+  };
+}
+
+/**
  * Build the guarded memory tool for one consolidation run. Exported separately
  * from runMemoryConsolidation so the rails are testable without a model.
  */
@@ -96,9 +123,11 @@ export function createConsolidationMemoryTool(args: {
   dryRun: boolean;
   /** Run-scoped journal; the tool appends every mutating command to it. */
   journal: MemoryConsolidationOp[];
+  /** Injectable budget (refine shares one across memory + skill tools). */
+  budget?: MutationBudget;
 }): { tool: Tool; getMutationCount: () => number } {
   const { memoryService, metaService, ctx, dryRun, journal } = args;
-  let mutationCount = 0;
+  const budget = args.budget ?? createMutationBudget(MEMORY_CONSOLIDATION_OP_BUDGET);
 
   const guard = async (target: MutationTarget): Promise<string | null> => {
     // Whitelist, not blacklist, so scopes added later stay out of bounds by default.
@@ -141,11 +170,13 @@ export function createConsolidationMemoryTool(args: {
       "Manage the persistent memory directory you are consolidating. " +
       TOOL_DEFINITIONS.memory.description,
     inputSchema: TOOL_DEFINITIONS.memory.schema,
-    execute: async (input): Promise<MemoryToolResult> => {
+    // toolCallId is threaded into the r2 refinement journal rows so callers
+    // (refine, r11) can correlate this run's edits to their journaled ids.
+    execute: async (input, { toolCallId }): Promise<MemoryToolResult> => {
       const target = classifyMutation(input);
       if (target === null) {
         // Reads (and malformed inputs, which fail validation inside) pass through.
-        return executeMemoryCommand(memoryService, ctx, input, () => null);
+        return executeMemoryCommand(memoryService, ctx, input, () => null, toolCallId);
       }
 
       let rejection: string | null;
@@ -160,24 +191,21 @@ export function createConsolidationMemoryTool(args: {
         return { success: false, error: rejection };
       }
 
-      // Budget check + reservation in ONE synchronous block: the AI SDK runs
-      // parallel tool calls concurrently, so an await between check and
-      // increment would let two calls at budget-1 both pass. Budget is
-      // consumed by every accepted mutation — including dry-run and dispatch
-      // failures — so dry-run mirrors a real run.
-      if (mutationCount >= MEMORY_CONSOLIDATION_OP_BUDGET) {
-        const note = `Mutation budget exhausted (${MEMORY_CONSOLIDATION_OP_BUDGET} per run); stop and summarize.`;
+      // Budget is consumed by every accepted mutation — including dry-run and
+      // dispatch failures — so dry-run mirrors a real run (check+reserve
+      // atomicity lives in MutationBudget.tryConsume).
+      if (!budget.tryConsume()) {
+        const note = `Mutation budget exhausted (${budget.limit} per run); stop and summarize.`;
         journal.push({ ...target, applied: false, note });
         return { success: false, error: note };
       }
-      mutationCount++;
 
       if (dryRun) {
         journal.push({ ...target, applied: false, note: "dry-run" });
         return { success: true, output: `[dry-run] recorded ${target.command} ${target.path}` };
       }
 
-      const result = await executeMemoryCommand(memoryService, ctx, input, () => null);
+      const result = await executeMemoryCommand(memoryService, ctx, input, () => null, toolCallId);
       journal.push({
         ...target,
         applied: result.success,
@@ -186,7 +214,7 @@ export function createConsolidationMemoryTool(args: {
       return result;
     },
   });
-  return { tool: memoryTool, getMutationCount: () => mutationCount };
+  return { tool: memoryTool, getMutationCount: () => budget.used() };
 }
 
 /**
