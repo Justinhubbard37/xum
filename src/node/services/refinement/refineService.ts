@@ -21,7 +21,7 @@
  * stream failure returns an error so the user knows the pass did not finish.
  */
 import * as os from "node:os";
-import type { Tool } from "ai";
+import type { LanguageModel, Tool } from "ai";
 
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import type { RefineAppliedEditPayload, RefineRecordPayload } from "@/common/orpc/schemas/api";
@@ -40,9 +40,9 @@ import {
   REFINE_TIMELINE_EVENT_LIMIT,
   REFINE_TIMEOUT_MS,
 } from "@/constants/refine";
+import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { Config } from "@/node/config";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-import type { AIService } from "@/node/services/aiService";
 import { buildAbandonedBranchTranscript, isRlmModeEnabled } from "@/node/services/branchSummary";
 import type { HistoryService } from "@/node/services/historyService";
 import { log } from "@/node/services/log";
@@ -73,8 +73,17 @@ interface ExperimentsCheck {
   isExperimentEnabled(experimentId: ExperimentId): boolean;
 }
 
-/** Structural AIService subset (model creation + runtime metadata). */
-type RefineAiService = Pick<AIService, "createModelWithPinnedMetadata" | "getWorkspaceMetadata">;
+/**
+ * Structural AIService subset (model creation + runtime metadata), mirroring
+ * the dream service's ModelFactoryLike so tests can pass lightweight fakes.
+ */
+export interface RefineAiService {
+  createModelWithPinnedMetadata(
+    modelString: string,
+    opts?: { agentInitiated?: boolean; workspaceId?: string }
+  ): Promise<Result<{ model: LanguageModel; metadataModel: string }, { type: string }>>;
+  getWorkspaceMetadata(workspaceId: string): Promise<Result<WorkspaceMetadata>>;
+}
 
 interface RefineServiceOptions {
   timelineService?: Pick<TimelineService, "list">;
