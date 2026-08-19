@@ -161,6 +161,144 @@ describe("SandboxHostService", () => {
     await host.disposeScope("ws-async");
   });
 
+  test("postTaskTerminalEvent: sub-threshold report is queued inline and drained by the guest", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const host = new SandboxHostService();
+    await host.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-terminal",
+      sessionDir: tmp.path,
+    });
+
+    await host.postTaskTerminalEvent("ws-terminal", {
+      taskId: "child-1",
+      status: "completed",
+      reportMarkdown: "All done.",
+    });
+
+    const mount = await host.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-terminal",
+      sessionDir: tmp.path,
+    });
+    const drained = await mount.runtime.eval("return drainHostEvents();");
+    expect(drained.success).toBe(true);
+    expect(drained.result).toEqual([
+      {
+        type: "task-terminal",
+        taskId: "child-1",
+        status: "completed",
+        reportMarkdown: "All done.",
+      },
+    ]);
+    await host.disposeScope("ws-terminal");
+  });
+
+  test("postTaskTerminalEvent: no live mount for the scope is a harmless no-op", async () => {
+    const host = new SandboxHostService();
+    // Must not throw or create any mount — the durable wake is the fallback.
+    await host.postTaskTerminalEvent("ws-nobody", {
+      taskId: "child-1",
+      status: "completed",
+      reportMarkdown: "report",
+    });
+    expect(host.hasScope("ws-nobody")).toBe(false);
+  });
+
+  test("postTaskTerminalEvent: dropped without the hostEvents grant", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const host = new SandboxHostService();
+    const mount = await host.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-terminal-denied",
+      sessionDir: tmp.path,
+      grants: LEAST_PRIVILEGE_GRANTS,
+    });
+    await host.postTaskTerminalEvent("ws-terminal-denied", {
+      taskId: "child-1",
+      status: "completed",
+      reportMarkdown: "report",
+    });
+    expect(mount.drainHostEvents()).toEqual([]);
+    await host.disposeScope("ws-terminal-denied");
+  });
+
+  test("postTaskTerminalEvent: oversized report is offloaded to an r4 handle + blob + durable event", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const host = new SandboxHostService();
+    const mount = await host.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-terminal-big",
+      sessionDir: tmp.path,
+    });
+
+    const bigReport = "R".repeat(20_000); // over the 16KB offload threshold
+    await host.postTaskTerminalEvent("ws-terminal-big", {
+      taskId: "child-big",
+      status: "completed",
+      reportMarkdown: bigReport,
+    });
+
+    const drained = await mount.runtime.eval("return drainHostEvents();");
+    expect(drained.success).toBe(true);
+    const events = drained.result as Array<{
+      type: string;
+      taskId: string;
+      status: string;
+      reportMarkdown?: string;
+      reportHandle?: { handle: string; preview: string; size: number };
+    }>;
+    expect(events).toHaveLength(1);
+    const event = events[0];
+    expect(event.type).toBe("task-terminal");
+    expect(event.taskId).toBe("child-big");
+    expect(event.reportMarkdown).toBeUndefined();
+    expect(event.reportHandle?.handle).toBe("vars.__h1");
+    expect(event.reportHandle?.size).toBe(20_000);
+    expect(event.reportHandle?.preview).toContain("middle truncated");
+
+    // The full report is readable at the handle in a later eval.
+    const followUp = await mount.runtime.eval("return vars.__h1.length;");
+    expect(followUp.result).toBe(20_000);
+
+    // Blob + result-handle durable event mirror the guest-visible record.
+    const journal = new DurableEventJournal(tmp.path);
+    const journaled = await journal.read();
+    const handleEvents = journaled.filter((e) => e.kind === "result-handle");
+    expect(handleEvents).toHaveLength(1);
+    const handleEvent = handleEvents[0];
+    if (handleEvent.kind !== "result-handle") throw new Error("unreachable");
+    expect(handleEvent.data.handle).toBe("vars.__h1");
+    expect(await journal.blobs.getText(handleEvent.data.blobHash)).toBe(JSON.stringify(bigReport));
+    // The vars mutation was snapshotted (handle numbering must stay monotonic
+    // on disk even though no eval ran).
+    expect(journaled.some((e) => e.kind === "sandbox-vars-snapshot")).toBe(true);
+    await host.disposeScope("ws-terminal-big");
+  });
+
+  test("postHostEvent drops oldest events beyond the queue cap", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const host = new SandboxHostService();
+    const mount = await host.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-cap",
+      sessionDir: tmp.path,
+    });
+    for (let i = 0; i < 260; i++) {
+      mount.postHostEvent({ n: i });
+    }
+    const drained = mount.drainHostEvents() as Array<{ n: number }>;
+    expect(drained).toHaveLength(256);
+    expect(drained[0]).toEqual({ n: 4 }); // 0-3 dropped oldest-first
+    expect(drained[255]).toEqual({ n: 259 });
+    await host.disposeScope("ws-cap");
+  });
+
   test("least-privilege grants disable vars and host events on the mount", async () => {
     using tmp = new DisposableTempDir("sandbox-host-test");
     const host = new SandboxHostService();

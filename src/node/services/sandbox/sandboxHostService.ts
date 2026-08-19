@@ -30,8 +30,29 @@ import {
 } from "@/node/utils/journal/durableEventJournal";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import { log } from "@/node/services/log";
+import { TASK_TERMINAL_EVENT_TYPE } from "@/constants/sandboxEvents";
+import {
+  buildHandlePreview,
+  RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES,
+  RESULT_HANDLE_VARS_CAP_BYTES,
+} from "@/constants/resultHandles";
 
 export type SandboxMountLifetime = "ephemeral" | "persistent";
+
+/**
+ * Cap on undrained host events per mount. Guests that never call
+ * mux.events() must not grow the queue unboundedly across a long-lived
+ * workspace; oldest events are dropped first (the queue is best-effort —
+ * the durable terminal wake still reports every completion).
+ */
+const HOST_EVENT_QUEUE_CAP = 256;
+
+/** Terminal report of a spawned child task, delivered into the guest queue. */
+export interface TaskTerminalEventArgs {
+  taskId: string;
+  status: "completed";
+  reportMarkdown: string;
+}
 
 /** Payload for durably persisting an offloaded result handle (blob + event). */
 export interface ResultHandlePersistArgs {
@@ -132,6 +153,11 @@ export class SandboxMount {
   postHostEvent(event: unknown): void {
     this.assertNotDisposed("postHostEvent");
     assert(this.grants.hostEvents, "postHostEvent requires the hostEvents grant");
+    // Drop-oldest beyond the cap: a guest that never drains must not grow
+    // the queue unboundedly, and newer terminal events matter more.
+    while (this.hostEventQueue.length >= HOST_EVENT_QUEUE_CAP) {
+      this.hostEventQueue.shift();
+    }
     this.hostEventQueue.push(event);
   }
 
@@ -426,6 +452,106 @@ export class SandboxHostService {
     const mount = this.persistentMounts.get(scopeKey);
     if (!mount || mount.isDisposed) return;
     await mount.persistVars();
+  }
+
+  /**
+   * Best-effort task-terminal delivery into a live persistent mount's
+   * host→guest queue (fire-and-forget sub-agents, Track 2 r5). No live mount
+   * / missing hostEvents grant => silently dropped: the queue is in-kernel
+   * ACCELERATION only — the durable top-level terminal wake still reports
+   * every completion, and an app restart dropping queued events is harmless
+   * for the same reason.
+   *
+   * Sub-threshold reports post synchronously (plain array push, no lock:
+   * single-threaded and drained only from inside guest evals). Oversized
+   * reports are offloaded to an r4 result handle, which requires guest evals
+   * under the scope lock — callers must NOT await behind that (a long-running
+   * eval may hold the lock), so the returned promise is intended to be
+   * consumed fire-and-forget with `.catch`.
+   */
+  async postTaskTerminalEvent(scopeKey: string, event: TaskTerminalEventArgs): Promise<void> {
+    assert(scopeKey.length > 0, "postTaskTerminalEvent requires a scopeKey");
+    assert(event.taskId.length > 0, "postTaskTerminalEvent requires a taskId");
+    const mount = this.persistentMounts.get(scopeKey);
+    if (!mount || mount.isDisposed || !mount.grants.hostEvents) return;
+
+    const size = Buffer.byteLength(event.reportMarkdown, "utf8");
+    if (size <= RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES) {
+      mount.postHostEvent({
+        type: TASK_TERMINAL_EVENT_TYPE,
+        taskId: event.taskId,
+        status: event.status,
+        reportMarkdown: event.reportMarkdown,
+      });
+      return;
+    }
+    await this.offloadTaskTerminalEvent(scopeKey, event, size);
+  }
+
+  /** Oversized-report path: store the full report at an r4 vars handle and
+   * post a {handle, preview, size} event instead of the full text. */
+  private async offloadTaskTerminalEvent(
+    scopeKey: string,
+    event: TaskTerminalEventArgs,
+    size: number
+  ): Promise<void> {
+    await using _guard = await this.lockFor(scopeKey).acquire();
+    // Re-resolve under the lock: the mount may have been rebuilt or disposed
+    // while we waited (grant change, archive). Vars survive rebuilds via
+    // snapshot/restore, so posting to the CURRENT mount stays correct.
+    const mount = this.persistentMounts.get(scopeKey);
+    if (!mount || mount.isDisposed || !mount.grants.hostEvents) return;
+
+    const preview = buildHandlePreview(event.reportMarkdown, size);
+    const base = { type: TASK_TERMINAL_EVENT_TYPE, taskId: event.taskId, status: event.status };
+    if (!mount.grants.vars) {
+      // No vars grant => nowhere to store the full report; deliver the
+      // bounded preview only (the preview text marks itself as truncated).
+      mount.postHostEvent({ ...base, reportMarkdown: preview });
+      return;
+    }
+    try {
+      const serialized = JSON.stringify(event.reportMarkdown);
+      const key = await mount.storeResultHandle(serialized, RESULT_HANDLE_VARS_CAP_BYTES);
+      const handle = `vars.${key}`;
+      try {
+        await mount.persistResultHandle({ handle, preview, serialized });
+      } catch (error) {
+        // Journaling failure only degrades durability of the FULL report; the
+        // guest handle and event still work (self-healing doctrine).
+        log.warn("SandboxHostService: task-terminal handle journaling failed; continuing", {
+          scopeKey,
+          error,
+        });
+      }
+      try {
+        // The handle mutated vars outside an eval: persist so vars.__handleSeq
+        // stays monotonic on disk (a stale snapshot could reuse a handle
+        // number an earlier result-handle event already references).
+        await mount.persistVars();
+      } catch (error) {
+        // Same contract as the post-eval path: memory and disk must agree, so
+        // dispose and let the next acquire restore the last durable snapshot.
+        // The event is dropped with the runtime (best-effort queue).
+        log.warn(
+          "SandboxHostService: vars snapshot after task-terminal offload failed; disposing mount",
+          { scopeKey, error }
+        );
+        mount.dispose();
+        return;
+      }
+      mount.postHostEvent({ ...base, reportHandle: { handle, preview, size } });
+    } catch (error) {
+      // Handle storage failed (e.g. guest memory limit): fall back to the
+      // bounded preview so the guest still learns of the completion.
+      log.warn("SandboxHostService: task-terminal offload failed; posting bounded preview", {
+        scopeKey,
+        error,
+      });
+      if (!mount.isDisposed) {
+        mount.postHostEvent({ ...base, reportMarkdown: preview });
+      }
+    }
   }
 
   /**

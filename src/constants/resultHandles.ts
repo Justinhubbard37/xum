@@ -17,6 +17,18 @@ export const RESULT_HANDLE_PREVIEW_HEAD_CHARS = 1024;
 export const RESULT_HANDLE_PREVIEW_TAIL_CHARS = 256;
 
 /**
+ * Build the bounded head/tail preview for an offloaded value. Shared by
+ * code_execution (oversized tool results / return values) and
+ * SandboxHostService (oversized task-terminal report events) so every handle
+ * consumer sees one preview format.
+ */
+export function buildHandlePreview(serialized: string, size: number): string {
+  const head = serialized.slice(0, RESULT_HANDLE_PREVIEW_HEAD_CHARS);
+  const tail = serialized.slice(-RESULT_HANDLE_PREVIEW_TAIL_CHARS);
+  return `${head}…[${size} bytes total; middle truncated]…${tail}`;
+}
+
+/**
  * Cap on the TOTAL bytes retained by handle vars in one scope. Handles live
  * in `vars`, which is snapshotted after every call — without a cap the
  * snapshot (and guest memory) would grow unboundedly. Oldest handles are

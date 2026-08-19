@@ -18,9 +18,8 @@ import { analyzeCode } from "@/node/services/ptc/staticAnalysis";
 import { log } from "@/node/services/log";
 import { getCachedXumTypes, clearTypeCache } from "@/node/services/ptc/typeGenerator";
 import {
+  buildHandlePreview,
   RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES,
-  RESULT_HANDLE_PREVIEW_HEAD_CHARS,
-  RESULT_HANDLE_PREVIEW_TAIL_CHARS,
   RESULT_HANDLE_VARS_CAP_BYTES,
 } from "@/constants/resultHandles";
 
@@ -103,12 +102,6 @@ export interface OffloadedValueRecord {
   size: number;
   /** One-line follow-up hint (offloaded top-level return values only). */
   hint?: string;
-}
-
-function buildHandlePreview(serialized: string, size: number): string {
-  const head = serialized.slice(0, RESULT_HANDLE_PREVIEW_HEAD_CHARS);
-  const tail = serialized.slice(-RESULT_HANDLE_PREVIEW_TAIL_CHARS);
-  return `${head}…[${size} bytes total; middle truncated]…${tail}`;
 }
 
 /**
