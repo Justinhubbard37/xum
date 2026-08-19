@@ -1120,6 +1120,36 @@ export const memory = {
   },
 };
 
+/** /refine (RLM r11): one applied self-modification, correlated to its r2 journal row. */
+export const RefineAppliedEditSchema = z.object({
+  /** Envelope id of the refinement journal row (rollback address for r6). */
+  refinementId: z.string(),
+  /** Human-readable action, e.g. "memory str_replace /memories/project/x.md". */
+  description: z.string(),
+});
+
+export const RefineRecordSchema = z.object({
+  applied: z.array(RefineAppliedEditSchema),
+  /** Model's closing text (per-edit rationales, or the no-op statement). */
+  summary: z.string(),
+  /** True when the pass finished cleanly without applying any edit. */
+  noOp: z.boolean(),
+  usage: z.object({ inputTokens: z.number(), outputTokens: z.number() }).optional(),
+});
+
+// Node-side types derive from these schemas (z.infer single source) so fields
+// can never silently be stripped by output validation.
+export type RefineAppliedEditPayload = z.infer<typeof RefineAppliedEditSchema>;
+export type RefineRecordPayload = z.infer<typeof RefineRecordSchema>;
+
+export const refinements = {
+  /** Manual /refine trajectory-distillation pass (RLM mode only; the backend refuses otherwise). */
+  run: {
+    input: z.object({ workspaceId: z.string() }),
+    output: ResultSchema(RefineRecordSchema, z.string()),
+  },
+};
+
 /**
  * Programmatic workspace tag keys must be non-blank. Enforced at the schema
  * boundary so callers get a structured validation error instead of the

@@ -4225,6 +4225,19 @@ export const router = (authToken?: string) => {
           }
         }),
     },
+    refinements: {
+      // /refine trajectory distillation (RLM r11). Gating lives in the
+      // service: it refuses when the rlm-mode machine overrides are off.
+      run: t
+        .input(schemas.refinements.run.input)
+        .output(schemas.refinements.run.output)
+        .handler(async ({ context, input }) => {
+          const result = await context.refineService.run(input.workspaceId);
+          return result.success
+            ? { success: true as const, data: result.data }
+            : { success: false as const, error: result.error };
+        }),
+    },
     workspace: {
       list: t
         .input(schemas.workspace.list.input)

@@ -24,6 +24,7 @@ import * as os from "node:os";
 import type { Tool } from "ai";
 
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
+import type { RefineAppliedEditPayload, RefineRecordPayload } from "@/common/orpc/schemas/api";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import {
   MemoryRefinementActionSchema,
@@ -63,22 +64,10 @@ import { createAgentSkillWriteTool } from "@/node/services/tools/agent_skill_wri
 import { sharedDurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { createRefineSummaryMessageId } from "@/node/services/utils/messageIds";
 
-/** One applied self-modification, correlated to its r2 journal row. */
-export interface RefineAppliedEdit {
-  /** Envelope id of the refinement journal row (rollback address for r6). */
-  refinementId: string;
-  /** Human-readable action, e.g. "memory str_replace /memories/project/x.md". */
-  description: string;
-}
-
-export interface RefineRecord {
-  applied: RefineAppliedEdit[];
-  /** Model's closing text (per-edit rationales, or the no-op statement). */
-  summary: string;
-  /** True when the pass finished cleanly without applying any edit. */
-  noOp: boolean;
-  usage?: { inputTokens: number; outputTokens: number };
-}
+// Types derive from the oRPC schemas (z.infer single source) so node-side
+// fields can never silently be stripped by output validation.
+export type RefineAppliedEdit = RefineAppliedEditPayload;
+export type RefineRecord = RefineRecordPayload;
 
 interface ExperimentsCheck {
   isExperimentEnabled(experimentId: ExperimentId): boolean;
