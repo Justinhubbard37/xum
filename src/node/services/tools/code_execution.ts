@@ -17,6 +17,12 @@ import type { SandboxMount } from "@/node/services/sandbox/sandboxHostService";
 import { analyzeCode } from "@/node/services/ptc/staticAnalysis";
 import { log } from "@/node/services/log";
 import { getCachedXumTypes, clearTypeCache } from "@/node/services/ptc/typeGenerator";
+import {
+  RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES,
+  RESULT_HANDLE_PREVIEW_HEAD_CHARS,
+  RESULT_HANDLE_PREVIEW_TAIL_CHARS,
+  RESULT_HANDLE_VARS_CAP_BYTES,
+} from "@/constants/resultHandles";
 
 // Default limits
 const DEFAULT_MEMORY_BYTES = 64 * 1024 * 1024; // 64MB
@@ -87,6 +93,96 @@ export function retargetCodeExecutionTool(target: Tool, donor: Tool): boolean {
   return true;
 }
 
+/** Model-visible replacement for an offloaded oversized value. */
+export interface OffloadedValueRecord {
+  /** Guest expression holding the full value, e.g. "vars.__h3". */
+  handle: string;
+  /** Bounded head/tail excerpt of the serialized value. */
+  preview: string;
+  /** Full serialized size in bytes. */
+  size: number;
+  /** One-line follow-up hint (offloaded top-level return values only). */
+  hint?: string;
+}
+
+function buildHandlePreview(serialized: string, size: number): string {
+  const head = serialized.slice(0, RESULT_HANDLE_PREVIEW_HEAD_CHARS);
+  const tail = serialized.slice(-RESULT_HANDLE_PREVIEW_TAIL_CHARS);
+  return `${head}…[${size} bytes total; middle truncated]…${tail}`;
+}
+
+/**
+ * Offload one oversized value to the persistent kernel. Returns the
+ * model-visible replacement record, or null when the value is sub-threshold
+ * or could not be offloaded (in which case it must stay inline).
+ */
+async function offloadValue(
+  mount: SandboxMount,
+  value: unknown
+): Promise<OffloadedValueRecord | null> {
+  let serialized: string | undefined;
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    // Non-JSON values cannot live in vars (data-only contract); keep inline.
+    return null;
+  }
+  if (typeof serialized !== "string") return null;
+  const size = Buffer.byteLength(serialized, "utf8");
+  if (size <= RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES) return null;
+
+  // Store in vars FIRST: if the guest assignment fails, the model record must
+  // keep the full inline value — never point the model at a missing handle.
+  let handleKey: string;
+  try {
+    handleKey = await mount.storeResultHandle(serialized, RESULT_HANDLE_VARS_CAP_BYTES);
+  } catch (error) {
+    log.warn("code_execution: result-handle vars assignment failed; keeping full value inline", {
+      error,
+    });
+    return null;
+  }
+  const handle = `vars.${handleKey}`;
+  const preview = buildHandlePreview(serialized, size);
+  try {
+    await mount.persistResultHandle({ handle, preview, serialized });
+  } catch (error) {
+    // The model-visible preview is durably logged with the tool result in
+    // chat.jsonl either way; a journaling failure only degrades durability of
+    // the FULL value and must never fail the call (self-healing doctrine).
+    log.warn("code_execution: result-handle journaling failed; continuing", { error });
+  }
+  return { handle, preview, size };
+}
+
+/**
+ * RLM context offloading: values above the threshold stop entering the model
+ * context. The running guest code already received each full value (in-kernel
+ * data is free); here the MODEL-VISIBLE records are replaced by
+ * { handle, preview, size } while the full value lands in vars.__hN (guest),
+ * the blob store, and one result-handle durable event. Mutates `result` in
+ * place; nested UI events already streamed the full values live.
+ */
+async function offloadOversizedResults(
+  mount: SandboxMount,
+  result: PTCExecutionResult
+): Promise<void> {
+  for (const record of result.toolCalls) {
+    if (record.result === undefined) continue;
+    const offloaded = await offloadValue(mount, record.result);
+    if (offloaded !== null) record.result = offloaded;
+  }
+  if (result.result !== undefined) {
+    const offloaded = await offloadValue(mount, result.result);
+    if (offloaded !== null) {
+      result.result = {
+        ...offloaded,
+        hint: `Return value exceeded the inline limit; the full value is stored in the kernel — access or slice ${offloaded.handle} in a follow-up code_execution call.`,
+      } satisfies OffloadedValueRecord;
+    }
+  }
+}
+
 export async function createCodeExecutionTool(
   runtimeFactory: IJSRuntimeFactory,
   toolBridge: ToolBridge,
@@ -108,7 +204,7 @@ export async function createCodeExecutionTool(
       ? ""
       : `
 
-**Persistent kernel:** the global \`vars\` object persists across code_execution calls and turns (JSON-serializable values only) and survives restarts via snapshots. Stash intermediate results in \`vars\` instead of re-fetching or re-computing them.`;
+**Persistent kernel:** the global \`vars\` object persists across code_execution calls and turns (JSON-serializable values only) and survives restarts via snapshots. Stash intermediate results in \`vars\` instead of re-fetching or re-computing them. Oversized values (>${Math.floor(RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES / 1024)}KB serialized) are offloaded: the visible record becomes {handle, preview, size} while the full value stays in the kernel at that handle (e.g. \`vars.__h1\`) — read or slice it in a follow-up call.`;
 
   const codeExecutionTool = tool({
     description: `Execute sandboxed JavaScript to batch tools and transform outputs.
@@ -221,6 +317,14 @@ ${xumTypes}
 
           // Execute the code
           const result = await runtime.eval(code);
+
+          // RLM context offloading BEFORE the vars snapshot below, so the
+          // handle vars land in the same durable snapshot the model's
+          // {handle, preview, size} records rely on. Runs even for failed
+          // evals: partial toolCalls records are model-visible too.
+          if (mount?.lifetime === "persistent" && mount.grants.vars) {
+            await offloadOversizedResults(mount, result);
+          }
 
           // Persist the shared vars namespace after each call on persistent
           // mounts so state survives crashes/restarts (turn-boundary snapshots

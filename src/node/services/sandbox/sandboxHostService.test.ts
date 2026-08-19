@@ -531,4 +531,94 @@ describe("SandboxHostService", () => {
     expect(read.result).toEqual({});
     await host2.disposeScope("ws-heal");
   });
+
+  test("storeResultHandle assigns monotonic vars handles and persistResultHandle journals blob + event", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const host = new SandboxHostService();
+    const mount = await host.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-handles",
+      sessionDir: tmp.path,
+    });
+
+    const big = JSON.stringify({ data: "x".repeat(100) });
+    expect(await mount.storeResultHandle(big, 10_000)).toBe("__h1");
+    expect(await mount.storeResultHandle(JSON.stringify({ n: 2 }), 10_000)).toBe("__h2");
+
+    // The full value is guest-accessible under the handle var.
+    const read = await mount.runtime.eval("return vars.__h1.data.length;");
+    expect(read.success).toBe(true);
+    expect(read.result).toBe(100);
+
+    await mount.persistResultHandle({ handle: "vars.__h1", preview: "head…tail", serialized: big });
+    const journal = new DurableEventJournal(tmp.path);
+    const events = await journal.read();
+    const handleEvent = events.find((e) => e.kind === "result-handle");
+    expect(handleEvent).toBeDefined();
+    if (handleEvent?.kind !== "result-handle") throw new Error("unreachable");
+    expect(handleEvent.data.handle).toBe("vars.__h1");
+    expect(handleEvent.data.preview).toBe("head…tail");
+    expect(handleEvent.data.size).toBe(big.length);
+    // The blob is the durable full value.
+    expect(await journal.blobs.getText(handleEvent.data.blobHash)).toBe(big);
+    await host.disposeScope("ws-handles");
+  });
+
+  test("handle sequence survives a simulated restart via the vars snapshot", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const host1 = new SandboxHostService();
+    const mount1 = await host1.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-handle-seq",
+      sessionDir: tmp.path,
+    });
+    expect(await mount1.storeResultHandle(JSON.stringify({ a: 1 }), 10_000)).toBe("__h1");
+    await host1.disposeScope("ws-handle-seq"); // snapshots vars incl. __handleSeq
+
+    const host2 = new SandboxHostService();
+    const mount2 = await host2.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-handle-seq",
+      sessionDir: tmp.path,
+    });
+    // Monotonic across the restart: a fresh handle must not clobber __h1.
+    expect(await mount2.storeResultHandle(JSON.stringify({ b: 2 }), 10_000)).toBe("__h2");
+    const read = await mount2.runtime.eval("return [vars.__h1.a, vars.__h2.b];");
+    expect(read.result).toEqual([1, 2]);
+    await host2.disposeScope("ws-handle-seq");
+  });
+
+  test("storeResultHandle evicts oldest handles beyond the cap but never the newest", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const host = new SandboxHostService();
+    const mount = await host.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-evict",
+      sessionDir: tmp.path,
+    });
+
+    // Each entry serializes to 402 chars; cap 1000 holds two.
+    const entry = (c: string) => JSON.stringify(c.repeat(400));
+    await mount.storeResultHandle(entry("a"), 1000); // __h1
+    await mount.storeResultHandle(entry("b"), 1000); // __h2 (804 total, fits)
+    await mount.storeResultHandle(entry("c"), 1000); // __h3 → evicts __h1
+    const afterThird = await mount.runtime.eval(
+      "return [typeof vars.__h1, typeof vars.__h2, typeof vars.__h3];"
+    );
+    expect(afterThird.result).toEqual(["undefined", "string", "string"]);
+
+    // A single value larger than the cap is still retained (never evict the
+    // newest: the model was just told the handle exists) while all older
+    // handles are dropped.
+    await mount.storeResultHandle(entry("d".repeat(13)), 1000); // __h4, ~5202 chars
+    const afterFourth = await mount.runtime.eval(
+      "return [typeof vars.__h2, typeof vars.__h3, vars.__h4.length];"
+    );
+    expect(afterFourth.result).toEqual(["undefined", "undefined", 5200]);
+    await host.disposeScope("ws-evict");
+  });
 });

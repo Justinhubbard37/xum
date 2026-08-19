@@ -16,6 +16,7 @@ import type { PTCEvent, PTCExecutionResult } from "@/node/services/ptc/types";
 import { z } from "zod";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { SandboxHostService } from "@/node/services/sandbox/sandboxHostService";
+import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 
 const mockToolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
@@ -801,6 +802,184 @@ describe("createCodeExecutionTool", () => {
       const tool = await createCodeExecutionTool(runtimeFactory, new ToolBridge(mockTools));
       const desc = (tool as { description?: string }).description ?? "";
       expect(desc).toContain("function file_read");
+    });
+  });
+
+  describe("result handle offloading (RLM persistent kernel)", () => {
+    // Serializes to well over the 16KB offload threshold.
+    const bigPayload = { data: "x".repeat(20_000) };
+    const bigSerialized = JSON.stringify(bigPayload);
+
+    const bigFetchTools: Record<string, Tool> = {
+      big_fetch: createMockTool("big_fetch", z.object({}), () => bigPayload),
+    };
+
+    const persistentRunner = (host: SandboxHostService, scopeKey: string, sessionDir: string) =>
+      ((fn) =>
+        host.withPersistentMount(
+          { lifetime: "persistent", runtimeFactory, scopeKey, sessionDir },
+          fn
+        )) satisfies MountRunner;
+
+    it("offloads oversized nested tool results: handle var + blob + event + preview-only model record", async () => {
+      using tmp = new DisposableTempDir("code-exec-offload");
+      const host = new SandboxHostService();
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(bigFetchTools),
+        undefined,
+        persistentRunner(host, "ws-offload", tmp.path)
+      );
+
+      const result = (await tool.execute!(
+        { code: "const r = mux.big_fetch({}); return r.data.length;" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      // The running guest code received the FULL value (in-kernel data is free).
+      expect(result.result).toBe(20_000);
+
+      // The model-visible record is preview-only.
+      const record = result.toolCalls[0].result as {
+        handle: string;
+        preview: string;
+        size: number;
+      };
+      expect(record.handle).toBe("vars.__h1");
+      expect(record.size).toBe(bigSerialized.length);
+      expect(record.preview.length).toBeLessThan(2000);
+      expect(record.preview).toContain(bigSerialized.slice(0, 100));
+      expect(record.preview).toContain(bigSerialized.slice(-50));
+
+      // Guest code in a LATER call can slice the handle var.
+      const followUp = (await tool.execute!(
+        { code: "return vars.__h1.data.slice(0, 5);" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(followUp.success).toBe(true);
+      expect(followUp.result).toBe("xxxxx");
+
+      // Blob + result-handle durable event mirror the model-visible record.
+      const journal = new DurableEventJournal(tmp.path);
+      const events = await journal.read();
+      const handleEvents = events.filter((e) => e.kind === "result-handle");
+      expect(handleEvents).toHaveLength(1);
+      const event = handleEvents[0];
+      if (event.kind !== "result-handle") throw new Error("unreachable");
+      expect(event.data.handle).toBe(record.handle);
+      expect(event.data.preview).toBe(record.preview);
+      expect(event.data.size).toBe(record.size);
+      expect(await journal.blobs.getText(event.data.blobHash)).toBe(bigSerialized);
+      await host.disposeScope("ws-offload");
+    });
+
+    it("handle vars survive a simulated restart: a later eval after remount can slice vars.__hN", async () => {
+      using tmp = new DisposableTempDir("code-exec-offload");
+      const host = new SandboxHostService();
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(bigFetchTools),
+        undefined,
+        persistentRunner(host, "ws-offload-restart", tmp.path)
+      );
+      const first = (await tool.execute!(
+        { code: "mux.big_fetch({}); return 'ok';" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(first.success).toBe(true);
+
+      // Simulated restart: fresh host restores the vars snapshot.
+      await host.disposeScope("ws-offload-restart");
+      const host2 = new SandboxHostService();
+      const tool2 = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(bigFetchTools),
+        undefined,
+        persistentRunner(host2, "ws-offload-restart", tmp.path)
+      );
+      const after = (await tool2.execute!(
+        { code: "return vars.__h1.data.length;" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(after.success).toBe(true);
+      expect(after.result).toBe(20_000);
+      await host2.disposeScope("ws-offload-restart");
+    });
+
+    it("keeps sub-threshold nested results inline with no result-handle events", async () => {
+      using tmp = new DisposableTempDir("code-exec-offload");
+      const host = new SandboxHostService();
+      const smallTools: Record<string, Tool> = {
+        small_fetch: createMockTool("small_fetch", z.object({}), () => ({ data: "small" })),
+      };
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(smallTools),
+        undefined,
+        persistentRunner(host, "ws-small", tmp.path)
+      );
+      const result = (await tool.execute!(
+        { code: "const r = mux.small_fetch({}); return r;" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      expect(result.result).toEqual({ data: "small" });
+      expect(result.toolCalls[0].result).toEqual({ data: "small" });
+
+      const journal = new DurableEventJournal(tmp.path);
+      const events = await journal.read();
+      expect(events.filter((e) => e.kind === "result-handle")).toHaveLength(0);
+      await host.disposeScope("ws-small");
+    });
+
+    it("offloads oversized return values with a follow-up hint", async () => {
+      using tmp = new DisposableTempDir("code-exec-offload");
+      const host = new SandboxHostService();
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge({}),
+        undefined,
+        persistentRunner(host, "ws-return", tmp.path)
+      );
+      const result = (await tool.execute!(
+        { code: "return { data: 'y'.repeat(20000) };" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      const record = result.result as {
+        handle: string;
+        preview: string;
+        size: number;
+        hint: string;
+      };
+      expect(record.handle).toBe("vars.__h1");
+      expect(record.size).toBeGreaterThan(20_000);
+      expect(record.hint).toContain("vars.__h1");
+
+      const followUp = (await tool.execute!(
+        { code: "return vars.__h1.data.length;" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(followUp.result).toBe(20_000);
+
+      const journal = new DurableEventJournal(tmp.path);
+      const events = await journal.read();
+      const handleEvents = events.filter((e) => e.kind === "result-handle");
+      expect(handleEvents).toHaveLength(1);
+      await host.disposeScope("ws-return");
+    });
+
+    it("does not offload without a persistent mount (RLM off): full results stay inline", async () => {
+      const tool = await createCodeExecutionTool(runtimeFactory, new ToolBridge(bigFetchTools));
+      const result = (await tool.execute!(
+        { code: "const r = mux.big_fetch({}); return r;" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      // Both the return value and the nested record carry the full value,
+      // byte-identical to pre-RLM behavior.
+      expect(result.result).toEqual(bigPayload);
+      expect(result.toolCalls[0].result).toEqual(bigPayload);
     });
   });
 });

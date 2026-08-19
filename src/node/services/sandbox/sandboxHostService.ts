@@ -33,6 +33,16 @@ import { log } from "@/node/services/log";
 
 export type SandboxMountLifetime = "ephemeral" | "persistent";
 
+/** Payload for durably persisting an offloaded result handle (blob + event). */
+export interface ResultHandlePersistArgs {
+  /** Model-visible guest expression for the handle, e.g. "vars.__h3". */
+  handle: string;
+  /** Bounded excerpt; must be exactly the model-visible preview string. */
+  preview: string;
+  /** Full serialized value (JSON text) to store in the blob store. */
+  serialized: string;
+}
+
 export interface AcquireMountOptions {
   lifetime: SandboxMountLifetime;
   /**
@@ -74,7 +84,10 @@ export class SandboxMount {
      * serializes against scope disposal; ephemeral mounts get their own. */
     private readonly mutex: AsyncMutex = new AsyncMutex(),
     /** Effective bridge configuration identity; see AcquireMountOptions. */
-    public readonly bridgeKey?: string
+    public readonly bridgeKey?: string,
+    /** Bound by the host service; persists an offloaded result handle
+     * (full value blob + one result-handle durable event). */
+    private readonly persistHandle?: (args: ResultHandlePersistArgs) => Promise<void>
   ) {
     // Late capability settlements (fire-and-forget guest code) must not
     // re-enter the shared runtime while a later eval holds it: route their
@@ -165,6 +178,84 @@ export class SandboxMount {
     );
     const varsJson = await this.snapshotVars();
     await this.persistSnapshot(varsJson);
+  }
+
+  /**
+   * Store an offloaded value in the guest `vars` namespace under the next
+   * monotonic handle key (__h1, __h2, ...). The sequence counter lives in
+   * vars.__handleSeq so it snapshots/restores with vars — handles stay
+   * monotonic per scope across restarts. Returns the handle key.
+   *
+   * Also enforces `capBytes` on the total bytes retained by handle vars,
+   * evicting oldest-first (sizes measured as JSON string length — close
+   * enough to bytes for a cap). The just-stored handle is never evicted even
+   * when it alone exceeds the cap: the model is about to be told the handle
+   * exists and a follow-up call must find it, so the cap is soft by one
+   * entry. Eviction only drops the guest-local copy — the blob store keeps
+   * the durable one.
+   */
+  async storeResultHandle(serializedValue: string, capBytes: number): Promise<string> {
+    this.assertNotDisposed("storeResultHandle");
+    assert(this.lifetime === "persistent", "storeResultHandle requires a persistent mount");
+    assert(this.grants.vars, "storeResultHandle requires the vars grant");
+    assert(
+      Number.isSafeInteger(capBytes) && capBytes > 0,
+      "storeResultHandle: capBytes must be a positive integer"
+    );
+    const literal = JSON.stringify(serializedValue);
+    const result = await this.runtime.eval(
+      `
+      const value = JSON.parse(${literal});
+      const seqRaw = vars.__handleSeq;
+      // Tolerate a guest-clobbered counter (vars is guest-writable): restart
+      // numbering rather than crashing the offload.
+      const seq = (typeof seqRaw === "number" && isFinite(seqRaw) ? Math.floor(seqRaw) : 0) + 1;
+      vars.__handleSeq = seq;
+      const key = "__h" + seq;
+      vars[key] = value;
+      const others = [];
+      for (const k of Object.keys(vars)) {
+        if (k === key) continue;
+        const m = /^__h(\\d+)$/.exec(k);
+        if (m === null) continue;
+        let bytes = 0;
+        // Unmeasurable (guest mutated a handle into a cycle) counts as 0;
+        // snapshotVars is where cycles crash-fast.
+        try {
+          bytes = JSON.stringify(vars[k]).length;
+        } catch (err) {
+          bytes = 0;
+        }
+        others.push({ key: k, n: Number(m[1]), bytes });
+      }
+      others.sort((a, b) => a.n - b.n);
+      let total = ${serializedValue.length};
+      for (const h of others) total += h.bytes;
+      for (const h of others) {
+        if (total <= ${capBytes}) break;
+        delete vars[h.key];
+        total -= h.bytes;
+      }
+      return key;
+      `
+    );
+    assert(result.success, `storeResultHandle failed: ${result.error ?? "unknown error"}`);
+    const key = result.result;
+    assert(
+      typeof key === "string" && /^__h\d+$/.test(key),
+      "storeResultHandle: expected a handle key result"
+    );
+    return key;
+  }
+
+  /** Durably persist an offloaded result: full-value blob + result-handle event. */
+  async persistResultHandle(args: ResultHandlePersistArgs): Promise<void> {
+    this.assertNotDisposed("persistResultHandle");
+    assert(
+      this.persistHandle,
+      "persistResultHandle is only available on persistent mounts with a session dir"
+    );
+    await this.persistHandle(args);
   }
 
   /** Per-call release: disposes ephemeral mounts, keeps persistent ones alive. */
@@ -301,7 +392,17 @@ export class SandboxHostService {
         });
       },
       lock,
-      options.bridgeKey
+      options.bridgeKey,
+      async ({ handle, preview, serialized }) => {
+        // The blob is the durable copy of the full offloaded value; the event
+        // row carries exactly the model-visible {handle, preview, size}.
+        const { ref, size } = await journal.blobs.put(serialized);
+        await journal.append({
+          workspaceId: scopeKey,
+          kind: "result-handle",
+          data: { handle, preview, blobHash: ref, size },
+        });
+      }
     );
 
     if (grants.vars) {
