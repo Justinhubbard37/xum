@@ -51,7 +51,11 @@ describe("debug refinements command", () => {
       expect(process.exitCode).toBeUndefined();
       expect(lines.some((line) => line === `deleted ${skillFile}`)).toBe(true);
       expect(lines.some((line) => line.includes(`rollbackOf ${rowId}`))).toBe(true);
-      await expect(fsPromises.access(skillFile)).rejects.toThrow();
+      const stillExists = await fsPromises.access(skillFile).then(
+        () => true,
+        () => false
+      );
+      expect(stillExists).toBe(false);
 
       // The list now shows the rollback row with its lineage.
       lines.length = 0;

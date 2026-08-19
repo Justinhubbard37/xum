@@ -207,7 +207,11 @@ describe("persistent kernel graduation (RLM mode)", () => {
       expect(result.success).toBe(true);
       expect(result.rollbackOf).toBe(rows[0].id);
       expect(result.deleted).toEqual([skillFile]);
-      await expect(fsPromises.access(skillFile)).rejects.toThrow();
+      const stillExists = await fsPromises.access(skillFile).then(
+        () => true,
+        () => false
+      );
+      expect(stillExists).toBe(false);
     } finally {
       await sandboxHostService.disposeScope(scopeKey);
     }
