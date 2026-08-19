@@ -232,8 +232,9 @@ async function generateAbandonedBranchSummaryText(input: {
         maxOutputTokens: BRANCH_SUMMARY_MAX_OUTPUT_TOKENS,
         abortSignal,
       });
-      const textPromise = stream.text;
-      // The race below can abandon this promise; keep its eventual rejection handled.
+      // stream.text is a PromiseLike; wrap it so the race below can abandon it
+      // while keeping its eventual rejection handled.
+      const textPromise = Promise.resolve(stream.text);
       textPromise.catch(() => undefined);
       const racedText = await Promise.race([textPromise, deadline]);
       if (racedText === null) {

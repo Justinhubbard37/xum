@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
 
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
-import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
+import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider";
 
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import { BRANCH_SUMMARY_MIN_SEGMENT_TOKENS } from "@/constants/branchSummary";
@@ -37,16 +37,22 @@ function summaryModel(text: string, capturePrompt?: (prompt: string) => void): M
     finishChunk(),
   ];
   return new MockLanguageModelV3({
-    doStream: (options) => {
-      capturePrompt?.(
-        options.prompt
-          .flatMap((message) => message.content)
-          .map((part) => (part.type === "text" ? part.text : ""))
-          .join("\n")
-      );
+    doStream: (options: LanguageModelV3CallOptions) => {
+      capturePrompt?.(promptText(options));
       return Promise.resolve({ stream: simulateReadableStream({ chunks }) });
     },
   });
+}
+
+function promptText(options: LanguageModelV3CallOptions): string {
+  const parts: string[] = [];
+  for (const message of options.prompt) {
+    if (message.role !== "user") continue;
+    for (const part of message.content) {
+      if (part.type === "text") parts.push(part.text);
+    }
+  }
+  return parts.join("\n");
 }
 
 /** Fake AIService: returns the given model, or an api-key error when null. */
@@ -103,7 +109,10 @@ describe("isRlmModeEnabled", () => {
   });
 
   test("falls back to machine overrides when send options carry no experiments", () => {
-    const machineFlags = new Set([EXPERIMENT_IDS.RLM, EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]);
+    const machineFlags = new Set<ExperimentId>([
+      EXPERIMENT_IDS.RLM,
+      EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING,
+    ]);
     expect(isRlmModeEnabled(undefined, (id) => machineFlags.has(id))).toBe(true);
     expect(isRlmModeEnabled(undefined, (id) => id === EXPERIMENT_IDS.RLM)).toBe(false);
     expect(isRlmModeEnabled(undefined, undefined)).toBe(false);
@@ -117,7 +126,7 @@ describe("buildAbandonedBranchTranscript", () => {
       role: "assistant",
       parts: [
         { type: "reasoning", text: "secret chain of thought" },
-        { type: "text", text: "I ran the tests", state: "done" },
+        { type: "text", text: "I ran the tests" },
         {
           type: "dynamic-tool",
           toolCallId: "call-1",
