@@ -29,7 +29,10 @@ async function seedFixture(root: string): Promise<{ sessionDir: string; skillFil
 
 describe("debug refinements command", () => {
   afterEach(() => {
-    process.exitCode = undefined;
+    // Reset to 0, not undefined: in Bun, assigning undefined does NOT clear a
+    // previously set nonzero exit code, which would leak a failing exit status
+    // into otherwise-green multi-file test runs.
+    process.exitCode = 0;
   });
 
   it("lists rows and performs a rollback with lineage output", async () => {
@@ -48,7 +51,9 @@ describe("debug refinements command", () => {
 
       lines.length = 0;
       await refinementsCommand("ws-cli", { sessionDir, rollback: rowId });
-      expect(process.exitCode).toBeUndefined();
+      // Earlier test files in the same process may have reset exitCode to 0,
+      // so assert "not failing" rather than "never touched".
+      expect(process.exitCode ?? 0).toBe(0);
       expect(lines.some((line) => line === `deleted ${skillFile}`)).toBe(true);
       expect(lines.some((line) => line.includes(`rollbackOf ${rowId}`))).toBe(true);
       const stillExists = await fsPromises.access(skillFile).then(
