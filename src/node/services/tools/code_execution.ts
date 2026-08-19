@@ -185,19 +185,29 @@ export async function createCodeExecutionTool(
   const bridgeableTools = toolBridge.getBridgeableTools();
   const state: RetargetableState = { toolBridge, withMount };
 
+  // Kernel mode = persistent mount available (RLM experiment, or the
+  // XUM_SANDBOX_PERSISTENT_MOUNTS dev override that rides the same path).
+  // Gates every model-visible kernel surface below so RLM-off requests stay
+  // byte-identical to today.
+  const kernel = withMount !== undefined;
+
   // Generate xum types for type validation and documentation (cached by tool set hash)
-  const xumTypes = await getCachedXumTypes(bridgeableTools);
+  const xumTypes = await getCachedXumTypes(bridgeableTools, { kernel });
 
   // Persistent-kernel addendum: only advertised when this instance runs on a
-  // persistent mount (RLM mode or MUX_SANDBOX_PERSISTENT_MOUNTS). Ephemeral
+  // persistent mount (RLM mode or XUM_SANDBOX_PERSISTENT_MOUNTS). Ephemeral
   // instances must keep today's description byte-identical so RLM-off
   // provider requests are unchanged.
-  const persistentKernelNotes =
-    withMount === undefined
-      ? ""
-      : `
+  const persistentKernelNotes = !kernel
+    ? ""
+    : `
 
-**Persistent kernel:** the global \`vars\` object persists across code_execution calls and turns (JSON-serializable values only) and survives restarts via snapshots. Stash intermediate results in \`vars\` instead of re-fetching or re-computing them. Oversized values (>${Math.floor(RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES / 1024)}KB serialized) are offloaded: the visible record becomes {handle, preview, size} while the full value stays in the kernel at that handle (e.g. \`vars.__h1\`) — read or slice it in a follow-up call.`;
+**Persistent kernel:** the global \`vars\` object persists across code_execution calls and turns (JSON-serializable values only) and survives restarts via snapshots. Stash intermediate results in \`vars\` instead of re-fetching or re-computing them. Oversized values (>${Math.floor(RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES / 1024)}KB serialized) are offloaded: the visible record becomes {handle, preview, size} while the full value stays in the kernel at that handle (e.g. \`vars.__h1\`) — read or slice it in a follow-up call.${
+        "task" in bridgeableTools
+          ? `
+**Fire-and-forget sub-agents:** \`xum.task_spawn(args)\` (same args as \`xum.task\`) returns immediately with {taskId, status:"spawned"} once the child is admitted. Terminal reports are queued in the kernel — drain with \`xum.events()\` in a later call. The queue is best-effort (an app restart may drop it); every report still reaches you via the normal task wake.`
+          : ""
+      }`;
 
   const codeExecutionTool = tool({
     description: `Execute sandboxed JavaScript to batch tools and transform outputs.
@@ -295,8 +305,14 @@ ${xumTypes}
           // builds a fresh ToolBridge from the CURRENT policy + grants, and a
           // stale bridge would keep exposing tools after permissions narrowed.
           // Registration just overwrites the guest's `xum`/`mux` globals, so this is
-          // cheap and idempotent.
-          activeBridge.register(runtime);
+          // cheap and idempotent. Persistent mounts get the kernel extras
+          // (xum.task_spawn / xum.events) bound to this mount's event queue.
+          activeBridge.register(
+            runtime,
+            mount?.lifetime === "persistent"
+              ? { drainHostEvents: () => mount.drainHostEvents() }
+              : undefined
+          );
 
           // Handle abort signal - interrupt sandbox and cancel nested tools
           if (abortSignal) {

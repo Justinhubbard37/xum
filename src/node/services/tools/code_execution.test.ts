@@ -982,4 +982,111 @@ describe("createCodeExecutionTool", () => {
       expect(result.toolCalls[0].result).toEqual(bigPayload);
     });
   });
+
+  describe("RLM kernel: fire-and-forget spawn + host events", () => {
+    const taskSchema = z.object({
+      prompt: z.string(),
+      title: z.string(),
+      run_in_background: z.boolean().nullish(),
+    });
+
+    const kernelRunner = (host: SandboxHostService, scopeKey: string, sessionDir: string) =>
+      ((fn) =>
+        host.withPersistentMount(
+          { lifetime: "persistent", runtimeFactory, scopeKey, sessionDir },
+          fn
+        )) satisfies MountRunner;
+
+    it("mux.task_spawn returns in-eval while the child is still pending; a later eval drains the terminal event", async () => {
+      using tmp = new DisposableTempDir("code-exec-kernel");
+      const host = new SandboxHostService();
+      let receivedArgs: unknown;
+      const taskTool = createMockTool("task", taskSchema, (args) => {
+        receivedArgs = args;
+        // Background admission result: the child keeps running after this.
+        return { status: "queued", taskId: "child-1" };
+      });
+
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge({ task: taskTool }),
+        undefined,
+        kernelRunner(host, "ws-kernel", tmp.path)
+      );
+
+      // Spawn + drain in ONE eval: the admission handle comes back while the
+      // child has not completed, so no terminal event exists yet.
+      const spawn = (await tool.execute!(
+        {
+          code: 'const h = mux.task_spawn({ prompt: "p", title: "T" }); return { h, events: mux.events() };',
+        },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(spawn.success).toBe(true);
+      expect(spawn.result).toEqual({ h: { taskId: "child-1", status: "spawned" }, events: [] });
+      // Guest cannot opt out of background admission.
+      expect((receivedArgs as { run_in_background?: boolean }).run_in_background).toBe(true);
+
+      // Child reaches its terminal report (taskService finalize path).
+      await host.postTaskTerminalEvent("ws-kernel", {
+        taskId: "child-1",
+        status: "completed",
+        reportMarkdown: "done",
+      });
+
+      const drain = (await tool.execute!(
+        { code: "return mux.events();" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(drain.success).toBe(true);
+      expect(drain.result).toEqual([
+        { type: "task-terminal", taskId: "child-1", status: "completed", reportMarkdown: "done" },
+      ]);
+
+      // Queue drained: subsequent evals see nothing.
+      const empty = (await tool.execute!(
+        { code: "return mux.events();" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(empty.result).toEqual([]);
+      await host.disposeScope("ws-kernel");
+    });
+
+    it("RLM off (no mount): task_spawn and events are absent from namespace, types, and description", async () => {
+      const taskTool = createMockTool("task", taskSchema, () => ({
+        status: "queued",
+        taskId: "x",
+      }));
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge({ task: taskTool })
+      );
+      expect(tool.description).not.toContain("task_spawn");
+
+      const probe = (await tool.execute!(
+        { code: "return { spawn: typeof mux.task_spawn, events: typeof mux.events };" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(probe.success).toBe(true);
+      expect(probe.result).toEqual({ spawn: "undefined", events: "undefined" });
+    });
+
+    it("kernel mode advertises task_spawn/events in the type defs embedded in the description", async () => {
+      using tmp = new DisposableTempDir("code-exec-kernel");
+      const host = new SandboxHostService();
+      const taskTool = createMockTool("task", taskSchema, () => ({
+        status: "queued",
+        taskId: "x",
+      }));
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge({ task: taskTool }),
+        undefined,
+        kernelRunner(host, "ws-kernel-desc", tmp.path)
+      );
+      expect(tool.description).toContain("function task_spawn(args: TaskArgs): TaskSpawnResult;");
+      expect(tool.description).toContain("function events(): HostEvent[];");
+      await host.disposeScope("ws-kernel-desc");
+    });
+  });
 });
