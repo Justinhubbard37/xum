@@ -604,6 +604,15 @@ export type SendAgentTaskMessageError =
   | { code: "not_active"; taskStatus: AgentTaskStatus | "unknown"; message?: string }
   | { code: "send_failed"; message: string };
 
+/** Result of a child->parent family message (RLM family messaging). */
+export interface SendParentAgentMessageResult {
+  parentWorkspaceId: string;
+}
+
+export type SendParentAgentMessageError =
+  | { code: "invalid_scope"; message: string }
+  | { code: "send_failed"; message: string };
+
 export interface TerminateAgentTaskResult {
   /** Task IDs terminated (includes descendants). */
   terminatedTaskIds: string[];
@@ -4484,7 +4493,15 @@ export class TaskService {
     ancestorWorkspaceId: string,
     taskId: string,
     message: string,
-    queueDispatchMode: TaskMessageQueueDispatchMode
+    queueDispatchMode: TaskMessageQueueDispatchMode,
+    options?: {
+      /**
+       * Transcript label prefixed to the delivered message. Defaults to the
+       * parent-guidance label; sibling family messages override it so the
+       * receiving child can attribute the sender.
+       */
+      messageLabel?: string;
+    }
   ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
     assert(
       ancestorWorkspaceId.length > 0,
@@ -4496,6 +4513,10 @@ export class TaskService {
       trimmedMessage.length > 0,
       "sendMessageToDescendantAgentTask: message must be non-empty"
     );
+    const messageLabel = options?.messageLabel ?? "Updated guidance from parent";
+    // Keep the labeled message explicit in the child transcript so it cannot be confused
+    // with the original brief, whoever the sender is.
+    const labeledMessage = `${messageLabel}:\n\n${trimmedMessage}`;
 
     const queuedUpdateResult = await (async (): Promise<
       Result<SendAgentTaskMessageResult | null, SendAgentTaskMessageError>
@@ -4534,7 +4555,7 @@ export class TaskService {
         });
       }
       await this.editWorkspaceEntry(taskId, (workspace) => {
-        workspace.taskPrompt = `${initialPrompt}\n\nUpdated guidance from parent:\n\n${trimmedMessage}`;
+        workspace.taskPrompt = `${initialPrompt}\n\n${labeledMessage}`;
       });
       return Ok({ delivery: "queued" as const });
     })();
@@ -4591,13 +4612,12 @@ export class TaskService {
           if (refreshedEntry == null) {
             return Err({ code: "not_found" as const });
           }
-          const updatedGuidance = `Updated guidance from parent:\n\n${trimmedMessage}`;
           const preservedQueuedPrompt = coerceNonEmptyString(refreshedEntry.workspace.taskPrompt);
           const execution = await this.createWorkspaceTurn({
             ownerWorkspaceId: ancestorWorkspaceId,
             prompt: preservedQueuedPrompt
-              ? `${preservedQueuedPrompt}\n\n${updatedGuidance}`
-              : updatedGuidance,
+              ? `${preservedQueuedPrompt}\n\n${labeledMessage}`
+              : labeledMessage,
             title:
               coerceNonEmptyString(refreshedEntry.workspace.title) ??
               coerceNonEmptyString(refreshedEntry.workspace.name) ??
@@ -4642,7 +4662,14 @@ export class TaskService {
           (workspace) => {
             workspace.taskPendingGuidance = [
               ...(workspace.taskPendingGuidance ?? []),
-              { id: guidanceId, message: trimmedMessage, queueDispatchMode },
+              {
+                id: guidanceId,
+                // Startup-recovery replay presents reservations as parent guidance, so
+                // non-default labels (sibling messages) must keep their attribution in
+                // the durable record.
+                message: options?.messageLabel != null ? labeledMessage : trimmedMessage,
+                queueDispatchMode,
+              },
             ];
             if (workspace.taskStatus == null || previousStatus === "awaiting_report") {
               // Persist the legacy implicit-running state so startup recovery can replay this durable
@@ -4681,10 +4708,9 @@ export class TaskService {
         let accepted = false;
         const sendResult = await this.workspaceService.sendMessage(
           taskId,
-          // Keep the correction explicit in the child transcript so it cannot be confused with the
-          // original brief, while synthetic metadata avoids treating parent orchestration as a direct
-          // human intervention in child-only features such as goals and interactive questions.
-          `Updated guidance from parent:\n\n${trimmedMessage}`,
+          // Synthetic metadata avoids treating parent/sibling orchestration as a direct human
+          // intervention in child-only features such as goals and interactive questions.
+          labeledMessage,
           {
             model:
               coerceNonEmptyString(activeAiSettings?.model) ??
@@ -7229,72 +7255,247 @@ export class TaskService {
           ? { structuredOutput: report.structuredOutput }
           : {}),
       });
-      const resumeOptions = await this.resolveParentAutoResumeOptions(
-        parentWorkspaceId,
-        parentEntry,
-        defaultModel
-      );
-      const workspaceTurnMuxMetadata =
-        await this.getActiveWorkspaceTurnMuxMetadataForWorkspace(parentWorkspaceId);
-
       // A progress report is itself the wake-up message. Unlike terminal attention, it must be
       // allowed through while this child is still active so review findings and other incremental
       // results can immediately background a foreground wait or queue behind a busy parent turn.
-      const sendResult = await this.workspaceService.sendMessage(
+      const wakeResult = await this.wakeParentWorkspaceWithSyntheticMessage({
         parentWorkspaceId,
-        reportContent,
-        {
-          model: resumeOptions.model,
-          agentId: resumeOptions.agentId,
-          thinkingLevel: resumeOptions.thinkingLevel,
-          reasoningMode: resumeOptions.reasoningMode,
-          ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
-        },
-        {
-          skipAutoResumeReset: true,
-          synthetic: true,
-          agentInitiated: true,
-          startStreamInBackground: true,
-          workspaceTurnContinuation: workspaceTurnMuxMetadata != null,
-          queueDedupeKey: `agent-report:${childWorkspaceId}:${toolCallId}`,
-          removableQueueDedupeKey: true,
-          ...(workspaceTurnMuxMetadata != null
-            ? {
-                onCanceled: async (reason: string) => {
-                  await this.settleWorkspaceTurnContinuationFailure(
-                    parentWorkspaceId,
-                    workspaceTurnMuxMetadata,
-                    "interrupted",
-                    reason
-                  );
-                },
-                onAcceptedPreStreamFailure: async (error: SendMessageError) => {
-                  await this.settleWorkspaceTurnContinuationFailure(
-                    parentWorkspaceId,
-                    workspaceTurnMuxMetadata,
-                    "error",
-                    formatSendMessageError(error).message
-                  );
-                },
-              }
-            : {}),
-        }
-      );
-      if (!sendResult.success) {
-        const formattedError = formatSendMessageError(sendResult.error);
-        if (workspaceTurnMuxMetadata != null) {
-          await this.settleWorkspaceTurnContinuationFailure(
-            parentWorkspaceId,
-            workspaceTurnMuxMetadata,
-            "error",
-            formattedError.message
-          );
-        }
-        throw new Error(
-          `agent_report failed to wake the parent workspace: ${formattedError.message}`
-        );
+        parentEntry,
+        content: reportContent,
+        queueDedupeKey: `agent-report:${childWorkspaceId}:${toolCallId}`,
+      });
+      if (!wakeResult.success) {
+        throw new Error(`agent_report failed to wake the parent workspace: ${wakeResult.error}`);
       }
     });
+  }
+
+  /**
+   * Wake a parent workspace with a synthetic child-originated message. Shared by
+   * agent_report progress updates and RLM family messaging (task_message_parent).
+   * The message travels through the parent's normal send/queue mechanics, so it is
+   * durably logged like any user turn, coalesces behind a busy parent stream, and
+   * carries workspace-turn continuation metadata when the parent itself runs as a
+   * delegated workspace turn.
+   */
+  private async wakeParentWorkspaceWithSyntheticMessage(params: {
+    parentWorkspaceId: string;
+    parentEntry: {
+      workspace: {
+        aiSettingsByAgent?: Record<string, ResolvedWorkspaceAiSettings>;
+        aiSettings?: ResolvedWorkspaceAiSettings;
+      };
+    };
+    content: string;
+    /** Coalesces repeated wakes for the same source (e.g. one agent_report tool call). */
+    queueDedupeKey?: string;
+    queueDispatchMode?: TaskMessageQueueDispatchMode;
+  }): Promise<Result<void, string>> {
+    assert(params.parentWorkspaceId.length > 0, "wakeParentWorkspace: parent ID required");
+    assert(params.content.length > 0, "wakeParentWorkspace: content required");
+    const { parentWorkspaceId } = params;
+    const resumeOptions = await this.resolveParentAutoResumeOptions(
+      parentWorkspaceId,
+      params.parentEntry,
+      defaultModel
+    );
+    const workspaceTurnMuxMetadata =
+      await this.getActiveWorkspaceTurnMuxMetadataForWorkspace(parentWorkspaceId);
+
+    const sendResult = await this.workspaceService.sendMessage(
+      parentWorkspaceId,
+      params.content,
+      {
+        model: resumeOptions.model,
+        agentId: resumeOptions.agentId,
+        thinkingLevel: resumeOptions.thinkingLevel,
+        reasoningMode: resumeOptions.reasoningMode,
+        ...(params.queueDispatchMode != null
+          ? { queueDispatchMode: params.queueDispatchMode }
+          : {}),
+        ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
+      },
+      {
+        skipAutoResumeReset: true,
+        synthetic: true,
+        agentInitiated: true,
+        startStreamInBackground: true,
+        workspaceTurnContinuation: workspaceTurnMuxMetadata != null,
+        ...(params.queueDedupeKey != null
+          ? { queueDedupeKey: params.queueDedupeKey, removableQueueDedupeKey: true }
+          : {}),
+        ...(workspaceTurnMuxMetadata != null
+          ? {
+              onCanceled: async (reason: string) => {
+                await this.settleWorkspaceTurnContinuationFailure(
+                  parentWorkspaceId,
+                  workspaceTurnMuxMetadata,
+                  "interrupted",
+                  reason
+                );
+              },
+              onAcceptedPreStreamFailure: async (error: SendMessageError) => {
+                await this.settleWorkspaceTurnContinuationFailure(
+                  parentWorkspaceId,
+                  workspaceTurnMuxMetadata,
+                  "error",
+                  formatSendMessageError(error).message
+                );
+              },
+            }
+          : {}),
+      }
+    );
+    if (!sendResult.success) {
+      const formattedError = formatSendMessageError(sendResult.error);
+      if (workspaceTurnMuxMetadata != null) {
+        await this.settleWorkspaceTurnContinuationFailure(
+          parentWorkspaceId,
+          workspaceTurnMuxMetadata,
+          "error",
+          formattedError.message
+        );
+      }
+      return Err(formattedError.message);
+    }
+    return Ok(undefined);
+  }
+
+  /**
+   * Child -> parent family message (RLM family messaging, task_message_parent).
+   *
+   * Appends a clearly-labeled child message into the PARENT workspace's queue using
+   * the same synthetic send/queue mechanics task_send_message uses toward children.
+   * Loop safety: the message coalesces in the parent's existing queue and creates no
+   * automatic reply obligation or delivery receipt — agent_report remains the
+   * terminal/progress reporting channel.
+   */
+  async sendMessageToParentFromAgentTask(
+    childWorkspaceId: string,
+    message: string,
+    queueDispatchMode: TaskMessageQueueDispatchMode
+  ): Promise<Result<SendParentAgentMessageResult, SendParentAgentMessageError>> {
+    assert(
+      childWorkspaceId.length > 0,
+      "sendMessageToParentFromAgentTask: childWorkspaceId must be non-empty"
+    );
+    const trimmedMessage = message.trim();
+    assert(
+      trimmedMessage.length > 0,
+      "sendMessageToParentFromAgentTask: message must be non-empty"
+    );
+
+    const cfg = this.config.loadConfigOrDefault();
+    const childEntry = findWorkspaceEntry(cfg, childWorkspaceId);
+    const parentWorkspaceId = childEntry?.workspace.parentWorkspaceId;
+    if (!childEntry || !parentWorkspaceId) {
+      return Err({
+        code: "invalid_scope" as const,
+        message: "task_message_parent is only available from a sub-agent task workspace.",
+      });
+    }
+    if (childEntry.workspace.workflowTask != null) {
+      // Workflow-owned workers hand results to WorkflowRunner through the journal path;
+      // waking the owner here would background a foreground workflow wait (same rationale
+      // as the agent_report workflow carve-out above).
+      return Err({
+        code: "invalid_scope" as const,
+        message: "Workflow-owned tasks communicate through the workflow journal, not messaging.",
+      });
+    }
+    const parentEntry = findWorkspaceEntry(cfg, parentWorkspaceId);
+    if (!parentEntry) {
+      return Err({
+        code: "send_failed" as const,
+        message: "Parent workspace no longer exists.",
+      });
+    }
+
+    const childTitle =
+      coerceNonEmptyString(childEntry.workspace.title) ??
+      coerceNonEmptyString(childEntry.workspace.name) ??
+      "sub-agent";
+    // Structured label prefix so the parent transcript clearly attributes the queued
+    // user-role message to a child task (mirrors the "Updated guidance from parent"
+    // labeling in the parent->child direction).
+    const content = `Message from child task ${childWorkspaceId} (${childTitle}):\n\n${trimmedMessage}`;
+
+    const wakeResult = await this.wakeParentWorkspaceWithSyntheticMessage({
+      parentWorkspaceId,
+      parentEntry,
+      content,
+      queueDispatchMode,
+    });
+    if (!wakeResult.success) {
+      return Err({ code: "send_failed" as const, message: wakeResult.error });
+    }
+    return Ok({ parentWorkspaceId });
+  }
+
+  /**
+   * Sibling -> sibling family message (RLM family messaging, task_message_sibling).
+   *
+   * NUCLEAR-FAMILY SCOPING: the target must share the sender's DIRECT parent —
+   * exactly one hop up plus one hop down. Grandparents, grandchildren, uncles, and
+   * unrelated tasks are refused with invalid_scope. Restricting messaging to the
+   * nuclear family keeps the parent the coordination hub and prevents global-mailbox
+   * chaos across the task tree.
+   */
+  async sendMessageToSiblingAgentTask(
+    senderWorkspaceId: string,
+    targetTaskId: string,
+    message: string,
+    queueDispatchMode: TaskMessageQueueDispatchMode
+  ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
+    assert(
+      senderWorkspaceId.length > 0,
+      "sendMessageToSiblingAgentTask: senderWorkspaceId must be non-empty"
+    );
+    assert(
+      targetTaskId.length > 0,
+      "sendMessageToSiblingAgentTask: targetTaskId must be non-empty"
+    );
+    assert(message.trim().length > 0, "sendMessageToSiblingAgentTask: message must be non-empty");
+
+    const cfg = this.config.loadConfigOrDefault();
+    const senderEntry = findWorkspaceEntry(cfg, senderWorkspaceId);
+    const index = this.buildAgentTaskIndex(cfg);
+    const sharedParentId = index.parentById.get(senderWorkspaceId);
+    if (!senderEntry || !sharedParentId) {
+      return Err({ code: "invalid_scope" as const });
+    }
+    if (findWorkspaceEntry(cfg, targetTaskId) == null) {
+      return Err({ code: "not_found" as const });
+    }
+    if (
+      targetTaskId === senderWorkspaceId ||
+      index.parentById.get(targetTaskId) !== sharedParentId
+    ) {
+      return Err({ code: "invalid_scope" as const });
+    }
+    if (
+      this.isWorkflowOwnedTaskUsingIndex(index, targetTaskId) ||
+      this.isWorkflowOwnedTaskUsingIndex(index, senderWorkspaceId)
+    ) {
+      // Workflow workers are runner-orchestrated; sibling injection could corrupt
+      // step outputs the runner is waiting on.
+      return Err({ code: "invalid_scope" as const });
+    }
+
+    const senderTitle =
+      coerceNonEmptyString(senderEntry.workspace.title) ??
+      coerceNonEmptyString(senderEntry.workspace.name) ??
+      "sub-agent";
+    // Reuse the parent->child delivery machinery (queueing, dispatch boundaries,
+    // reactivation) with the shared parent as the authorizing ancestor; only the
+    // transcript label differs so the sibling can attribute the sender.
+    return this.sendMessageToDescendantAgentTask(
+      sharedParentId,
+      targetTaskId,
+      message,
+      queueDispatchMode,
+      { messageLabel: `Message from sibling task ${senderWorkspaceId} (${senderTitle})` }
+    );
   }
 
   async requestAgentFinalReportForTimeout(
