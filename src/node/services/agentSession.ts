@@ -156,7 +156,8 @@ import {
   SKILL_DYNAMIC_COMMAND_TIMEOUT_MS,
   SKILL_DYNAMIC_OUTPUT_CAP_BYTES,
 } from "@/node/services/agentSkills/skillDynamicContext";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
+import { isRlmModeEnabled, maybeAppendAbandonedBranchSummary } from "@/node/services/branchSummary";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { renderAgentSkillSnapshotText } from "@/common/utils/agentSkills/skillSnapshot";
@@ -2897,6 +2898,27 @@ export class AgentSession {
         } else {
           return Err(createUnknownSendMessageError(truncateResult.error));
         }
+      } else {
+        // RLM mode: summarize the truncated tail into a durable labeled row
+        // BEFORE the edited user message is appended and this turn's request is
+        // built (log purity by construction). Best-effort with a hard deadline —
+        // never blocks or fails the edit beyond that bound.
+        const branchSummaryMessage = await maybeAppendAbandonedBranchSummary({
+          historyService: this.historyService,
+          aiService: this.aiService,
+          workspaceId: this.workspaceId,
+          abandonedMessages: truncateResult.data.removedMessages,
+          experiments: options?.experiments,
+          isExperimentEnabled:
+            typeof this.aiService.isExperimentEnabled === "function"
+              ? (experimentId) => this.aiService.isExperimentEnabled(experimentId)
+              : undefined,
+        });
+        if (branchSummaryMessage) {
+          // The renderer just truncated its visible chat; surface the durable
+          // summary row without requiring a history reload.
+          this.emitChatEvent({ ...branchSummaryMessage, type: "message" });
+        }
       }
     }
 
@@ -3818,33 +3840,19 @@ export class AgentSession {
   }
 
   /**
-   * True when RLM-mode compaction behavior (keep-recent floor) applies.
-   *
-   * RLM is a sub-experiment of Programmatic Tool Calling: without a PTC parent
-   * flag it stays inert (matching the experiments registry). Frontend sends
-   * carry experiments in send options; backend-initiated compaction sends
-   * (idle loop) do not, so fall back to the persisted machine overrides the
+   * True when RLM-mode history behaviors (keep-recent compaction floor,
+   * abandoned-branch summaries) apply. Frontend sends carry experiments in
+   * send options; backend-initiated compaction sends (idle loop) do not, so
+   * the shared gate falls back to the persisted machine overrides the
    * renderer syncs into Settings.
    */
   private isRlmCompactionEnabled(options: SendMessageOptions | undefined): boolean {
-    const experiments = options?.experiments;
-    if (
-      experiments?.rlm === true &&
-      (experiments.programmaticToolCalling === true ||
-        experiments.programmaticToolCallingExclusive === true)
-    ) {
-      return true;
-    }
-
     // Guard for test mocks that may not implement isExperimentEnabled.
-    if (typeof this.aiService.isExperimentEnabled !== "function") {
-      return false;
-    }
-    return (
-      this.aiService.isExperimentEnabled(EXPERIMENT_IDS.RLM) &&
-      (this.aiService.isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING) ||
-        this.aiService.isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE))
-    );
+    const isExperimentEnabled =
+      typeof this.aiService.isExperimentEnabled === "function"
+        ? (experimentId: ExperimentId) => this.aiService.isExperimentEnabled(experimentId)
+        : undefined;
+    return isRlmModeEnabled(options?.experiments, isExperimentEnabled);
   }
 
   /**

@@ -82,6 +82,7 @@ import { isNonNegativeInteger, isPositiveInteger } from "@/common/utils/numbers"
 import { deriveTodoStatus } from "@/common/utils/todoList";
 import { createContextResetBoundaryMessageId } from "@/node/services/utils/messageIds";
 import { fileExists } from "@/node/utils/runtime/fileExists";
+import { maybeAppendAbandonedBranchSummary } from "@/node/services/branchSummary";
 import { orchestrateFork } from "@/node/services/utils/forkOrchestrator";
 import {
   ADDITIONAL_SYSTEM_CONTEXT_DISABLED_FILENAME,
@@ -8141,6 +8142,18 @@ export class WorkspaceService extends EventEmitter {
           } else {
             await fsPromises.rm(path.join(newSessionDir, "session-timing.json"), { force: true });
           }
+
+          // RLM mode: summarize the abandoned tail into a durable labeled row on
+          // the fork BEFORE its first request can be built. Fork IPC carries no
+          // send-option experiments, so gating falls back to the persisted machine
+          // overrides. Best-effort with a hard deadline — never fails the fork.
+          await maybeAppendAbandonedBranchSummary({
+            historyService: this.historyService,
+            aiService: this.aiService,
+            workspaceId: newWorkspaceId,
+            abandonedMessages: truncateResult.data.removedMessages,
+            isExperimentEnabled: (experimentId) => this.isExperimentEnabled(experimentId),
+          });
         }
 
         await materializeForkedPartialSnapshot({
