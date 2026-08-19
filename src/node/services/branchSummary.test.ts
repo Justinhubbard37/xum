@@ -4,27 +4,34 @@ import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider";
 
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
+import { WORDS_TO_TOKENS_RATIO } from "@/common/constants/ui";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import {
+  BRANCH_SUMMARY_MAX_OUTPUT_TOKENS,
   BRANCH_SUMMARY_MAX_TRANSCRIPT_CHARS,
   BRANCH_SUMMARY_MIN_SEGMENT_TOKENS,
+  BRANCH_SUMMARY_TARGET_WORDS,
+  BRANCH_SUMMARY_TIMEOUT_MS,
 } from "@/constants/branchSummary";
 
 import {
   BRANCH_SUMMARY_LABEL,
+  awaitPendingBranchSummary,
   buildAbandonedBranchSummaryPrompt,
   buildAbandonedBranchTranscript,
   isRlmModeEnabled,
   maybeAppendAbandonedBranchSummary,
+  startAbandonedBranchSummaryInBackground,
+  trimSummaryToBoundary,
   type BranchSummaryAiService,
 } from "./branchSummary";
 import { createTestHistoryService } from "./testHistoryService";
 
-function finishChunk(): LanguageModelV3StreamPart {
+function finishChunk(unified: "stop" | "length" = "stop"): LanguageModelV3StreamPart {
   return {
     type: "finish",
-    finishReason: { unified: "stop", raw: "stop" },
+    finishReason: { unified, raw: unified },
     usage: {
       inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
       outputTokens: { total: 1, text: 1, reasoning: 0 },
@@ -32,12 +39,16 @@ function finishChunk(): LanguageModelV3StreamPart {
   };
 }
 
-function summaryModel(text: string, capturePrompt?: (prompt: string) => void): MockLanguageModelV3 {
+function summaryModel(
+  text: string,
+  capturePrompt?: (prompt: string) => void,
+  finishReason: "stop" | "length" = "stop"
+): MockLanguageModelV3 {
   const chunks: LanguageModelV3StreamPart[] = [
     { type: "text-start", id: "t1" },
     { type: "text-delta", id: "t1", delta: text },
     { type: "text-end", id: "t1" },
-    finishChunk(),
+    finishChunk(finishReason),
   ];
   return new MockLanguageModelV3({
     doStream: (options: LanguageModelV3CallOptions) => {
@@ -167,6 +178,52 @@ describe("buildAbandonedBranchTranscript", () => {
     expect(transcript.length).toBe(BRANCH_SUMMARY_MAX_TRANSCRIPT_CHARS);
     // Clamped from the end: the newest content survives.
     expect(transcript.endsWith("TAIL-MARKER")).toBe(true);
+  });
+});
+
+describe("branch summary budget invariants", () => {
+  // Regression guard for the dogfooded failure mode where the constants were
+  // individually plausible but jointly impossible: a word target at the token
+  // cap forces stop_reason=max_tokens (every summary truncated mid-sentence),
+  // and a deadline shorter than the cap's worst-case stream time makes every
+  // real generation miss it.
+  test("word target leaves natural-stop headroom below the output cap", () => {
+    const targetTokens = BRANCH_SUMMARY_TARGET_WORDS * WORDS_TO_TOKENS_RATIO;
+    expect(targetTokens).toBeLessThanOrEqual(BRANCH_SUMMARY_MAX_OUTPUT_TOKENS * 0.8);
+  });
+
+  test("deadline covers a worst-case max_tokens stream at dogfooded throughput", () => {
+    // Measured on the side-channel candidate (haiku): ~102 tok/s, ~550ms TTFB.
+    const measuredTokensPerSecond = 102;
+    const measuredTtfbMs = 550;
+    const worstCaseStreamMs =
+      measuredTtfbMs + (BRANCH_SUMMARY_MAX_OUTPUT_TOKENS / measuredTokensPerSecond) * 1000;
+    expect(worstCaseStreamMs).toBeLessThanOrEqual(BRANCH_SUMMARY_TIMEOUT_MS);
+  });
+});
+
+describe("trimSummaryToBoundary", () => {
+  test("cuts a mid-sentence tail back to the last complete sentence", () => {
+    expect(trimSummaryToBoundary("Root cause found in the parser. Then the assistant")).toBe(
+      "Root cause found in the parser."
+    );
+  });
+
+  test("uses a newline boundary for list-style output", () => {
+    expect(trimSummaryToBoundary("- fixed the race\n- started refactoring the")).toBe(
+      "- fixed the race"
+    );
+  });
+
+  test("keeps naturally terminated text unchanged", () => {
+    expect(trimSummaryToBoundary("All work landed. Tests pass.")).toBe(
+      "All work landed. Tests pass."
+    );
+  });
+
+  test("returns empty when no boundary exists", () => {
+    expect(trimSummaryToBoundary("a fragment that never ends")).toBe("");
+    expect(trimSummaryToBoundary("   ")).toBe("");
   });
 });
 
@@ -309,6 +366,93 @@ describe("maybeAppendAbandonedBranchSummary", () => {
       await cleanup();
     }
   });
+
+  test("deadline salvages complete sentences already streamed", async () => {
+    const { historyService, cleanup } = await createTestHistoryService();
+    try {
+      // Streams a complete sentence plus a dangling fragment, then stalls:
+      // the deadline must still buy a row containing only whole sentences.
+      const slowModel = new MockLanguageModelV3({
+        doStream: () =>
+          Promise.resolve({
+            stream: new ReadableStream<LanguageModelV3StreamPart>({
+              start: (controller) => {
+                controller.enqueue({ type: "text-start", id: "t1" });
+                controller.enqueue({
+                  type: "text-delta",
+                  id: "t1",
+                  delta: "Root cause identified in the parser. Then the assistant began",
+                });
+                // Never closes; only the deadline can end this attempt.
+              },
+            }),
+          }),
+      });
+      const appended = await maybeAppendAbandonedBranchSummary({
+        historyService,
+        aiService: fakeAiService(slowModel),
+        workspaceId: "ws-salvage",
+        abandonedMessages: meatyExchange("salvage"),
+        experiments: RLM_ON,
+        timeoutMs: 200,
+      });
+      expect(appended).not.toBeNull();
+      const text = appended!.parts.find((part) => part.type === "text");
+      expect(text?.type === "text" && text.text).toContain("Root cause identified in the parser.");
+      expect(text?.type === "text" && text.text).not.toContain("began");
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("a max_tokens (length) stop is trimmed to a statement boundary", async () => {
+    const { historyService, cleanup } = await createTestHistoryService();
+    try {
+      const appended = await maybeAppendAbandonedBranchSummary({
+        historyService,
+        aiService: fakeAiService(
+          summaryModel("Fixed the flaky test. The remaining work cov", undefined, "length")
+        ),
+        workspaceId: "ws-length",
+        abandonedMessages: meatyExchange("length"),
+        experiments: RLM_ON,
+      });
+      expect(appended).not.toBeNull();
+      const text = appended!.parts.find((part) => part.type === "text");
+      expect(text?.type === "text" && text.text.endsWith("Fixed the flaky test.")).toBe(true);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("tail guard drops the summary when history advanced past the branch point", async () => {
+    const { historyService, cleanup } = await createTestHistoryService();
+    try {
+      const ws = "ws-guard-lost";
+      const branchPoint = createMuxMessage("bp-1", "assistant", "branch point", { timestamp: 1 });
+      expect((await historyService.appendToHistory(ws, branchPoint)).success).toBe(true);
+      // The user's first turn wins the race before generation completes.
+      const firstTurn = createMuxMessage("u-1", "user", "already moved on", { timestamp: 2 });
+      expect((await historyService.appendToHistory(ws, firstTurn)).success).toBe(true);
+
+      const appended = await maybeAppendAbandonedBranchSummary({
+        historyService,
+        aiService: fakeAiService(summaryModel("Summary that must be dropped.")),
+        workspaceId: ws,
+        abandonedMessages: meatyExchange("guard"),
+        experiments: RLM_ON,
+        guardTailMessageId: "bp-1",
+      });
+      expect(appended).toBeNull();
+
+      const history = await historyService.getHistoryFromLatestBoundary(ws);
+      expect(history.success).toBe(true);
+      if (!history.success) return;
+      expect(history.data.map((m) => m.id)).toEqual(["bp-1", "u-1"]);
+    } finally {
+      await cleanup();
+    }
+  });
 });
 
 describe("branch summary placement on fork/truncate flows", () => {
@@ -328,7 +472,8 @@ describe("branch summary placement on fork/truncate flows", () => {
       }
 
       // Mirror WorkspaceService.fork(): copy the snapshot, cut at the branch
-      // point on the NEW workspace, then summarize the removed tail.
+      // point on the NEW workspace, then start summarization in the BACKGROUND
+      // (fork returns without waiting on generation).
       const copyResult = await historyService.copyHistorySnapshotToNewWorkspace(source, fork);
       expect(copyResult.success).toBe(true);
       const truncateResult = await historyService.truncateAfterMessage(fork, "m2", {
@@ -341,19 +486,30 @@ describe("branch summary placement on fork/truncate flows", () => {
         "abandoned-assistant",
       ]);
 
-      const appended = await maybeAppendAbandonedBranchSummary({
+      startAbandonedBranchSummaryInBackground({
         historyService,
         aiService: fakeAiService(summaryModel("The abandoned attempt explored a race condition.")),
         workspaceId: fork,
         abandonedMessages: truncateResult.data.removedMessages,
         experiments: RLM_ON,
+        guardTailMessageId: "m2",
       });
+
+      // Mirror AgentSession.sendMessage on the fork's FIRST send: await the
+      // pending summary before appending the user message / building the
+      // request, so the row keeps its before-the-next-request position.
+      const appended = await awaitPendingBranchSummary(fork);
       expect(appended).not.toBeNull();
+      // The registration is consumed once settled.
+      expect(await awaitPendingBranchSummary(fork)).toBeNull();
+
+      const firstSend = createMuxMessage("m3", "user", "continuing on the fork", { timestamp: 5 });
+      expect((await historyService.appendToHistory(fork, firstSend)).success).toBe(true);
 
       const forkHistory = await historyService.getHistoryFromLatestBoundary(fork);
       expect(forkHistory.success).toBe(true);
       if (!forkHistory.success) return;
-      expect(forkHistory.data.map((m) => m.id)).toEqual(["m1", "m2", appended!.id]);
+      expect(forkHistory.data.map((m) => m.id)).toEqual(["m1", "m2", appended!.id, "m3"]);
       // Exactly one summary row.
       expect(
         forkHistory.data.filter((m) => m.metadata?.muxMetadata?.type === "branch-summary").length
