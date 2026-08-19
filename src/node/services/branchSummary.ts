@@ -196,6 +196,16 @@ async function generateAbandonedBranchSummaryText(input: {
   // One shared deadline across all candidates: the caller blocks on this, so
   // the total wait must stay bounded regardless of how many models fail over.
   const abortSignal = AbortSignal.timeout(input.timeoutMs);
+  // Defensive double-bound: abortSignal cancels well-behaved providers, but a
+  // provider that ignores abort must not hold the fork/edit operation hostage,
+  // so every await below also races against this deadline promise.
+  const deadline = new Promise<null>((resolve) => {
+    if (abortSignal.aborted) {
+      resolve(null);
+      return;
+    }
+    abortSignal.addEventListener("abort", () => resolve(null), { once: true });
+  });
   const maxAttempts = Math.min(input.candidates.length, 3);
 
   for (let i = 0; i < maxAttempts; i++) {
@@ -222,7 +232,15 @@ async function generateAbandonedBranchSummaryText(input: {
         maxOutputTokens: BRANCH_SUMMARY_MAX_OUTPUT_TOKENS,
         abortSignal,
       });
-      const text = (await stream.text).trim();
+      const textPromise = stream.text;
+      // The race below can abandon this promise; keep its eventual rejection handled.
+      textPromise.catch(() => undefined);
+      const racedText = await Promise.race([textPromise, deadline]);
+      if (racedText === null) {
+        log.debug("Branch summary: generation deadline reached", { modelString });
+        break;
+      }
+      const text = racedText.trim();
       if (text.length > 0) {
         return text;
       }
