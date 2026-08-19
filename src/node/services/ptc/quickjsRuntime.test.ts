@@ -172,6 +172,41 @@ describe("QuickJSRuntime", () => {
       expect(result.toolCalls).toHaveLength(1);
       expect(result.toolCalls[0].toolName).toBe("fileRead");
     });
+
+    it("sync methods are callable from post-await continuations", async () => {
+      // Asyncified methods cannot be called after `await capability()` (the
+      // asyncify stack is gone); sync namespace methods must keep working
+      // there — this is the contract mux.events() relies on.
+      const queue: unknown[] = [{ type: "task-terminal", taskId: "t1" }];
+      runtime.registerPromiseFunction("cap", () => Promise.resolve("ok"));
+      runtime.registerObject("mux", {}, { events: () => queue.splice(0, queue.length) });
+
+      const result = await runtime.eval(`
+        return (async () => {
+          await cap();
+          return mux.events();
+        })();
+      `);
+      expect(result.success).toBe(true);
+      expect(result.result).toEqual([{ type: "task-terminal", taskId: "t1" }]);
+    });
+
+    it("sync methods dispatch late-bound: saved references see re-registration", async () => {
+      runtime.registerObject("mux", {}, { events: () => ["old"] });
+      const save = await runtime.eval("globalThis.saved = mux.events; return saved();");
+      expect(save.result).toEqual(["old"]);
+
+      runtime.registerObject("mux", {}, { events: () => ["new"] });
+      const result = await runtime.eval("return saved();");
+      expect(result.success).toBe(true);
+      expect(result.result).toEqual(["new"]);
+    });
+
+    it("rejects a name registered as both async and sync method", () => {
+      expect(() =>
+        runtime.registerObject("mux", { events: () => Promise.resolve(1) }, { events: () => 2 })
+      ).toThrow(/both async and sync/);
+    });
   });
 
   describe("console capture", () => {

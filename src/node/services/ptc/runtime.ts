@@ -38,8 +38,18 @@ export interface IJSRuntime extends Disposable {
   /**
    * Register an object with methods (for namespaced tools like mux.bash).
    * Each method on the object becomes callable from the sandbox.
+   *
+   * `syncMethods` are registered as plain synchronous host functions (no
+   * asyncify). Asyncified methods can only suspend inside the evalCodeAsync
+   * stack, so guest continuations resumed after `await somePromise` cannot
+   * call them — namespace members that must stay callable post-await (e.g.
+   * mux.events) go here instead.
    */
-  registerObject(name: string, obj: Record<string, (...args: unknown[]) => Promise<unknown>>): void;
+  registerObject(
+    name: string,
+    obj: Record<string, (...args: unknown[]) => Promise<unknown>>,
+    syncMethods?: Record<string, (...args: unknown[]) => unknown>
+  ): void;
 
   /**
    * Register a host function that returns a real Promise INTO the guest

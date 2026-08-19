@@ -203,6 +203,12 @@ export class QuickJSRuntime implements IJSRuntime {
     string,
     Record<string, (...args: unknown[]) => Promise<unknown>>
   >();
+  /** Same late-bound dispatch for registerObject sync methods: guest-saved
+   * references must never pin a replaced implementation. */
+  private readonly registeredObjectSyncMethods = new Map<
+    string,
+    Record<string, (...args: unknown[]) => unknown>
+  >();
 
   // Execution state (reset per eval)
   private toolCalls: PTCToolCallRecord[] = [];
@@ -542,9 +548,17 @@ export class QuickJSRuntime implements IJSRuntime {
 
   registerObject(
     name: string,
-    obj: Record<string, (...args: unknown[]) => Promise<unknown>>
+    obj: Record<string, (...args: unknown[]) => Promise<unknown>>,
+    syncMethods?: Record<string, (...args: unknown[]) => unknown>
   ): void {
     this.assertNotDisposed("registerObject");
+    for (const methodName of Object.keys(syncMethods ?? {})) {
+      // Impossible-by-construction guard: one name cannot be both asyncified
+      // and sync — the last setProp would silently win.
+      if (methodName in obj) {
+        throw new Error(`registerObject: method ${name}.${methodName} is both async and sync`);
+      }
+    }
 
     // Store the CURRENT registration: guest-side methods dispatch through
     // this map at call time, so re-registering (persistent mounts re-register
@@ -553,6 +567,7 @@ export class QuickJSRuntime implements IJSRuntime {
     // can therefore never pin a replaced tool or bypass a wrapper installed
     // by a later registration.
     this.registeredObjects.set(name, obj);
+    this.registeredObjectSyncMethods.set(name, syncMethods ?? {});
 
     // Create object in QuickJS
     const objHandle = this.ctx.newObject();
@@ -629,6 +644,26 @@ export class QuickJSRuntime implements IJSRuntime {
         }
       });
 
+      this.ctx.setProp(objHandle, methodName, fnHandle);
+      fnHandle.dispose();
+    }
+
+    // Sync methods: plain (non-asyncified) host functions. Asyncified methods
+    // can only suspend inside the evalCodeAsync stack, so guest continuations
+    // resumed via executePendingJobs (code after `await capability()`) cannot
+    // call them — asyncify replays the call and returns garbage. Sync methods
+    // never suspend, so they stay safe post-await (see registerSyncFunction).
+    for (const methodName of Object.keys(syncMethods ?? {})) {
+      const fnHandle = this.ctx.newFunction(methodName, (...argHandles) => {
+        // Late-bound dispatch (see registeredObjects note above).
+        const fn = this.registeredObjectSyncMethods.get(name)?.[methodName];
+        if (fn === undefined) {
+          throw new Error(`${name}.${methodName} is no longer available in this sandbox`);
+        }
+        const args: unknown[] = argHandles.map((h) => this.ctx.dump(h) as unknown);
+        // Host exceptions propagate to the guest as thrown errors.
+        return this.marshal(fn(...args));
+      });
       this.ctx.setProp(objHandle, methodName, fnHandle);
       fnHandle.dispose();
     }
