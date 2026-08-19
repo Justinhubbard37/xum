@@ -7809,6 +7809,43 @@ describe("TaskService", () => {
     expect(tasks.map((task) => task.taskSticky)).toEqual([undefined, undefined]);
   });
 
+  test("createMany stamps the rlm experiment on admitted and queued task records", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["rlma000001", "rlmq000002"], "rlmfb00003");
+
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    await config.editConfig((cfg) => {
+      cfg.taskSettings = { maxParallelAgentTasks: 1, maxTaskNestingDepth: 3 };
+      return cfg;
+    });
+
+    const sendMessage = mock(() => new Promise<Result<void>>(() => undefined));
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const result = await taskService.createMany(
+      ["one", "two"].map((prompt, index) => ({
+        parentWorkspaceId: parentId,
+        kind: "agent" as const,
+        agentId: "explore",
+        prompt,
+        title: `Task ${index + 1}`,
+        // RLM children must keep family messaging across restarts even when the
+        // frontend experiment toggles off, so the spawn stamp is the durable gate.
+        experiments: { rlm: true, programmaticToolCalling: true },
+      }))
+    );
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.data.map((task) => task.status)).toEqual(["starting", "queued"]);
+
+    const tasks = Array.from(config.loadConfigOrDefault().projects.values())
+      .flatMap((project) => project.workspaces)
+      .filter((workspace) => workspace.parentWorkspaceId === parentId);
+    expect(tasks.map((task) => task.taskExperiments?.rlm)).toEqual([true, true]);
+  });
+
   test("resolveWorkspaceModelFallbackChain honors taskOnRefusal opt-out", async () => {
     const config = await createTestConfig(rootDir);
 
@@ -13067,6 +13104,249 @@ describe("TaskService", () => {
     );
     expect(execution?.title).toBe("React lifecycle expert");
     expect(reactivated.data.executionTaskId).toMatch(/^wst_/);
+  });
+
+  test("sendMessageToParentFromAgentTask queues a labeled child message into the parent workspace", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-family-msg";
+    const childTaskId = "child-family-msg";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId, {
+          aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
+        }),
+        projectWorkspace(projectPath, "child", childTaskId, {
+          parentWorkspaceId,
+          title: "Schema researcher",
+          taskStatus: "running",
+          taskExperiments: { rlm: true },
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const result = await taskService.sendMessageToParentFromAgentTask(
+      childTaskId,
+      "Found a blocking schema drift.",
+      "tool-end"
+    );
+
+    expect(result).toEqual(Ok({ parentWorkspaceId }));
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).toHaveBeenCalledWith(
+      parentWorkspaceId,
+      `Message from child task ${childTaskId} (Schema researcher):\n\nFound a blocking schema drift.`,
+      expect.objectContaining({ queueDispatchMode: "tool-end" }),
+      expect.objectContaining({
+        synthetic: true,
+        agentInitiated: true,
+        startStreamInBackground: true,
+        skipAutoResumeReset: true,
+      })
+    );
+  });
+
+  test("sendMessageToParentFromAgentTask refuses non-child and workflow-owned callers", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-family-scope";
+    const standaloneId = "standalone-family-scope";
+    const workflowChildId = "workflow-child-family-scope";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId),
+        projectWorkspace(projectPath, "standalone", standaloneId),
+        projectWorkspace(projectPath, "workflow-child", workflowChildId, {
+          parentWorkspaceId,
+          taskStatus: "running",
+          workflowTask: { runId: "wfr_family", stepId: "step" },
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const standaloneResult = await taskService.sendMessageToParentFromAgentTask(
+      standaloneId,
+      "hello",
+      "tool-end"
+    );
+    expect(standaloneResult.success).toBe(false);
+    if (standaloneResult.success) return;
+    expect(standaloneResult.error.code).toBe("invalid_scope");
+
+    const workflowResult = await taskService.sendMessageToParentFromAgentTask(
+      workflowChildId,
+      "hello",
+      "tool-end"
+    );
+    expect(workflowResult.success).toBe(false);
+    if (workflowResult.success) return;
+    expect(workflowResult.error.code).toBe("invalid_scope");
+
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("sendMessageToSiblingAgentTask delivers to a same-parent sibling with sender attribution", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-sibling-msg";
+    const senderTaskId = "sender-sibling-msg";
+    const targetTaskId = "target-sibling-msg";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId),
+        projectWorkspace(projectPath, "sender", senderTaskId, {
+          parentWorkspaceId,
+          title: "Researcher A",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "target", targetTaskId, {
+          parentWorkspaceId,
+          agentId: "explore",
+          agentType: "explore",
+          taskStatus: "running",
+          taskModelString: "openai:gpt-5.2",
+          aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+      sendMessage: mock(
+        async (
+          _workspaceId: string,
+          _message: string,
+          _options: unknown,
+          internal?: { onAccepted?: () => Promise<void> | void }
+        ): Promise<Result<void>> => {
+          await internal?.onAccepted?.();
+          return Ok(undefined);
+        }
+      ),
+    });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const result = await taskService.sendMessageToSiblingAgentTask(
+      senderTaskId,
+      targetTaskId,
+      "Heads up: the fixture moved.",
+      "tool-end"
+    );
+
+    expect(result).toEqual(Ok({ delivery: "accepted" }));
+    expect(sendMessage).toHaveBeenCalledWith(
+      targetTaskId,
+      `Message from sibling task ${senderTaskId} (Researcher A):\n\nHeads up: the fixture moved.`,
+      expect.objectContaining({ queueDispatchMode: "tool-end" }),
+      expect.objectContaining({
+        synthetic: true,
+        agentInitiated: true,
+        startStreamInBackground: true,
+      })
+    );
+  });
+
+  test("sendMessageToSiblingAgentTask enforces nuclear-family scoping", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    // Family tree: grandparent -> parent -> {sender, sibling, workflowSibling};
+    // sender -> grandchild; grandparent -> uncle.
+    const grandparentId = "family-grandparent";
+    const parentId = "family-parent";
+    const senderId = "family-sender";
+    const siblingId = "family-sibling";
+    const workflowSiblingId = "family-workflow-sibling";
+    const grandchildId = "family-grandchild";
+    const uncleId = "family-uncle";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "grandparent", grandparentId),
+        projectWorkspace(projectPath, "parent", parentId, {
+          parentWorkspaceId: grandparentId,
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "sender", senderId, {
+          parentWorkspaceId: parentId,
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "sibling", siblingId, {
+          parentWorkspaceId: parentId,
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "workflow-sibling", workflowSiblingId, {
+          parentWorkspaceId: parentId,
+          taskStatus: "running",
+          workflowTask: { runId: "wfr_family_scope", stepId: "step" },
+        }),
+        projectWorkspace(projectPath, "grandchild", grandchildId, {
+          parentWorkspaceId: senderId,
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "uncle", uncleId, {
+          parentWorkspaceId: grandparentId,
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+      sendMessage: mock(
+        async (
+          _workspaceId: string,
+          _message: string,
+          _options: unknown,
+          internal?: { onAccepted?: () => Promise<void> | void }
+        ): Promise<Result<void>> => {
+          await internal?.onAccepted?.();
+          return Ok(undefined);
+        }
+      ),
+    });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const sendToSibling = (from: string, to: string) =>
+      taskService.sendMessageToSiblingAgentTask(from, to, "ping", "tool-end");
+
+    // Only the same-direct-parent sibling is reachable.
+    expect(await sendToSibling(senderId, siblingId)).toEqual(Ok({ delivery: "accepted" }));
+    // One hop up (parent), two hops up (grandparent), one hop down (grandchild),
+    // uncle (parent's sibling), self, and workflow-owned siblings are all refused.
+    expect(await sendToSibling(senderId, parentId)).toEqual(Err({ code: "invalid_scope" }));
+    expect(await sendToSibling(senderId, grandparentId)).toEqual(Err({ code: "invalid_scope" }));
+    expect(await sendToSibling(senderId, grandchildId)).toEqual(Err({ code: "invalid_scope" }));
+    expect(await sendToSibling(senderId, uncleId)).toEqual(Err({ code: "invalid_scope" }));
+    expect(await sendToSibling(senderId, senderId)).toEqual(Err({ code: "invalid_scope" }));
+    expect(await sendToSibling(senderId, workflowSiblingId)).toEqual(
+      Err({ code: "invalid_scope" })
+    );
+    // A top-level workspace (no parent) cannot send sibling messages at all.
+    expect(await sendToSibling(grandparentId, parentId)).toEqual(Err({ code: "invalid_scope" }));
+    // Unknown targets are reported as missing rather than scope violations.
+    expect(await sendToSibling(senderId, "family-missing")).toEqual(Err({ code: "not_found" }));
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage.mock.calls[0]?.[0]).toBe(siblingId);
   });
 
   test("reawakening a stopped queued child replays its preserved initial brief", async () => {
