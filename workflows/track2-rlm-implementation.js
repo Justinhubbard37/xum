@@ -36,6 +36,7 @@ const CONTEXT = [
   "## Working rules (mandatory)",
   "- Your fork is a sibling worktree at the parent's committed HEAD. Gitignored dirs (node_modules) do NOT propagate: run 'bun install' first if modules are missing.",
   "- Commit ALL work with 'git add -A && git commit'. Uncommitted files are silently dropped at integration. Every commit subject MUST start with the phase key prefix given below (e.g. 'r1: ...').",
+  "- Commit INCREMENTALLY: commit each coherent piece as soon as it compiles/passes its tests instead of one big commit at the end. If you are interrupted or time out before committing, ALL uncommitted work is lost and the whole phase fails patch integration.",
   "- Minimal, surgical diffs per AGENTS.md. Comments explain why. No 'as any'. Tool input schemas use .nullish(). No tautological tests. No PR creation. No pushing.",
   "- Validation before reporting: MUX_ESLINT_CONCURRENCY=1 make static-check, plus the targeted test suites listed for the phase. QuickJS-heavy suites (WorkflowRunner, sandboxHostService, quickjsRuntime, code_execution) must be run individually in fresh bun processes, never in broad filters.",
 ].join("\n");
