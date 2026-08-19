@@ -49,8 +49,12 @@ export interface RefinementEmitArgs {
   evidence: { toolName: string; toolCallId?: string; actor?: string };
 }
 
-/** Offload large captured contents to the blob store; small ones stay inline. */
-async function resolveInverse(
+/**
+ * Offload large captured contents to the blob store; small ones stay inline.
+ * Exported so the rollback service (refinementRollback.ts) resolves the
+ * inverses of its own rollback rows through the identical offload policy.
+ */
+export async function resolveRefinementInverse(
   blobs: BlobStore,
   draft: RefinementInverseDraft
 ): Promise<RefinementInverse> {
@@ -78,7 +82,7 @@ export async function appendRefinementEvent(args: RefinementEmitArgs): Promise<v
     assert(args.sessionDir.length > 0, "refinement journal requires a session dir");
     assert(args.workspaceId.length > 0, "refinement journal requires a workspace id");
     const journal = sharedDurableEventJournal(args.sessionDir);
-    const inverse = await resolveInverse(journal.blobs, args.inverse);
+    const inverse = await resolveRefinementInverse(journal.blobs, args.inverse);
     // Optional fields are spread conditionally: an explicit `undefined` value
     // would fail the JsonValue schema validation on append and drop the row.
     const evidence: RefinementEvidence = {

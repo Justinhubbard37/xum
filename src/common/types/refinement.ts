@@ -67,6 +67,20 @@ export const SkillRefinementActionSchema = z.object({
 });
 export type SkillRefinementAction = z.infer<typeof SkillRefinementActionSchema>;
 
+/**
+ * Action payload for rollback rows (r6). A rollback applies the target row's
+ * inverse, so the row carries the same `kind` as its target (memory | skill)
+ * and is itself a legal rollback target (double inversion).
+ */
+export const RollbackRefinementActionSchema = z.object({
+  op: z.literal("rollback"),
+  /** Envelope `id` of the row this rollback applied the inverse of. */
+  of: z.string().min(1),
+  /** Caller-supplied justification (model tool calls record it here). */
+  reason: z.string().optional(),
+});
+export type RollbackRefinementAction = z.infer<typeof RollbackRefinementActionSchema>;
+
 /** Attribution for a refinement row: who/what performed the mutation. */
 export const RefinementEvidenceSchema = z.object({
   workspaceId: z.string().min(1),
