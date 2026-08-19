@@ -152,15 +152,18 @@ function resolveConfinementRoot(
       `Refusing rollback: path targets a memory scope root, not a file inside it: '${filePath}'`
     );
   }
-  // <muxRoot>/sessions/<ws>/memory/<file...> (workspace scope). Constrained to
-  // exactly the per-workspace memory subdir so a corrupted inverse can never
-  // touch session artifacts (chat.jsonl, journals) of any workspace.
-  const relToSessions = path.relative(layout.sessionsDir, resolved);
-  if (!relToSessions.startsWith("..") && !path.isAbsolute(relToSessions)) {
-    const parts = relToSessions.split(path.sep);
-    if (parts.length >= 3 && parts[1] === "memory") {
-      return path.join(layout.sessionsDir, parts[0], "memory");
+  // <sessionDir>/memory/<file...> (workspace scope). Constrained to exactly
+  // THIS session's memory subdir so a corrupted inverse can never touch other
+  // workspaces' memory or session artifacts (chat.jsonl, journals).
+  const workspaceMemoryRoot = path.join(path.resolve(sessionDir), "memory");
+  const relToWorkspaceMemory = path.relative(workspaceMemoryRoot, resolved);
+  if (!relToWorkspaceMemory.startsWith("..") && !path.isAbsolute(relToWorkspaceMemory)) {
+    if (relToWorkspaceMemory.length > 0) {
+      return workspaceMemoryRoot;
     }
+    throw new RollbackError(
+      `Refusing rollback: path targets a memory scope root, not a file inside it: '${filePath}'`
+    );
   }
   throw new RollbackError(
     `Refusing rollback: path is outside every memory scope root: '${filePath}'`
@@ -277,9 +280,18 @@ async function collectDivergence(
   const targetPaths = inversePaths(inverse);
 
   // Later journaled rows touching the same paths: the state the inverse
-  // expects has been superseded — roll the newest row back first.
+  // expects has been superseded — roll the newest row back first. Rollback
+  // lineage is netted out so LIFO multi-edit unrolling works without force:
+  // a row whose effect was itself rolled back is no longer on disk, and a
+  // live rollback chain only conflicts when its net effect differs from the
+  // state the target left behind (see liveRowConflictsWithTarget).
+  const rolledBackIds = new Set(
+    rows.map((row) => row.data.rollbackOf).filter((id): id is string => id !== undefined)
+  );
   for (const row of rows) {
     if (row.seq <= target.seq) continue;
+    if (rolledBackIds.has(row.id)) continue; // Effect undone by a later rollback row.
+    if (!liveRowConflictsWithTarget(rows, row, target)) continue;
     const parsed = RefinementInverseSchema.safeParse(row.data.inverse);
     if (!parsed.success) continue;
     const overlap = inversePaths(parsed.data).some((p) =>
@@ -342,6 +354,43 @@ async function collectDivergence(
     }
   }
   return complaints;
+}
+
+/**
+ * Whether a later row that is still live (not itself rolled back) leaves a
+ * net disk effect conflicting with the state the target row left behind.
+ * Plain rows always conflict — their edit is still on disk. A rollback chain
+ * nets out by parity: an even number of rollbacks re-applied the chain's root
+ * row, so the root's edit is back on disk (conflict). An odd chain rewound
+ * the paths to just before its root, which matches the target's expectation
+ * only when the root came after the target (the LIFO unroll case); rewinding
+ * to before the target is a conflict. Live rows between target and root are
+ * evaluated as their own chains, so "just before the root" is enough here.
+ */
+function liveRowConflictsWithTarget(
+  rows: RefinementEvent[],
+  row: RefinementEvent,
+  target: RefinementEvent
+): boolean {
+  if (row.data.rollbackOf === undefined) {
+    return true; // Plain later row: its edit is live on disk.
+  }
+  let rollbackCount = 0;
+  let current: RefinementEvent = row;
+  const seen = new Set<string>([row.id]);
+  while (current.data.rollbackOf !== undefined) {
+    const original = rows.find((r) => r.id === current.data.rollbackOf);
+    if (original === undefined || seen.has(original.id)) {
+      return true; // Corrupt chain (missing root or cycle): assume conflict.
+    }
+    seen.add(original.id);
+    rollbackCount += 1;
+    current = original;
+  }
+  if (rollbackCount % 2 === 0) {
+    return true; // Even chain: the root row's edit was re-applied.
+  }
+  return current.seq <= target.seq; // Odd chain: rewound to just before root.
 }
 
 async function dirExists(target: string): Promise<boolean> {

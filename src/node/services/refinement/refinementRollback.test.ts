@@ -193,6 +193,77 @@ describe("refinementRollback", () => {
     expect(refused.error).toContain("later refinement row");
   });
 
+  it("unrolls multiple edits LIFO without force once later rows are rolled back", async () => {
+    using fixture = await createFixture();
+    await fixture.service.create(fixture.ctx, "/memories/global/lifo.md", "v1\n", "agent");
+    await fixture.service.strReplace(fixture.ctx, "/memories/global/lifo.md", "v1", "v2", "agent");
+    const edit1 = await lastRow(fixture.sessionDir);
+    await fixture.service.strReplace(fixture.ctx, "/memories/global/lifo.md", "v2", "v3", "agent");
+    const edit2 = await lastRow(fixture.sessionDir);
+
+    const newest = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: edit2.id,
+      evidence: EVIDENCE,
+    });
+    expect(newest.success).toBe(true);
+    // edit2 is rolled back (and its rollback row rewound past nothing older),
+    // so unrolling edit1 next must not flag divergence or require force.
+    const older = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: edit1.id,
+      evidence: EVIDENCE,
+    });
+    expect(older.success).toBe(true);
+    const physicalPath = path.join(fixture.muxHome, "memory", "global", "lifo.md");
+    expect(await fsPromises.readFile(physicalPath, "utf-8")).toBe("v1\n");
+  });
+
+  it("still refuses when a rolled-back rollback re-applied a later edit", async () => {
+    using fixture = await createFixture();
+    await fixture.service.create(fixture.ctx, "/memories/global/reapply.md", "v1\n", "agent");
+    await fixture.service.strReplace(
+      fixture.ctx,
+      "/memories/global/reapply.md",
+      "v1",
+      "v2",
+      "agent"
+    );
+    const edit1 = await lastRow(fixture.sessionDir);
+    await fixture.service.strReplace(
+      fixture.ctx,
+      "/memories/global/reapply.md",
+      "v2",
+      "v3",
+      "agent"
+    );
+    const edit2 = await lastRow(fixture.sessionDir);
+
+    const undo = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: edit2.id,
+      evidence: EVIDENCE,
+    });
+    expect(undo.success).toBe(true);
+    const undoRow = await lastRow(fixture.sessionDir);
+    // Roll back the rollback: edit2's content ("v3") is live on disk again.
+    const redo = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: undoRow.id,
+      evidence: EVIDENCE,
+    });
+    expect(redo.success).toBe(true);
+
+    const refused = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: edit1.id,
+      evidence: EVIDENCE,
+    });
+    expect(refused.success).toBe(false);
+    if (refused.success) throw new Error("unreachable");
+    expect(refused.error).toContain("later refinement row");
+  });
+
   it("rolls back a skill write via the delete-files inverse and back again", async () => {
     using fixture = await createFixture();
     const skillFile = path.join(fixture.checkout, ".mux", "skills", "my-skill", "SKILL.md");
@@ -276,6 +347,53 @@ describe("refinementRollback", () => {
       if (result.success) throw new Error("unreachable");
       expect(result.error).toContain("outside every memory scope root");
       expect(await pathExists(evilPath)).toBe(false);
+    });
+
+    it("refuses workspace memory paths that target another session's memory", async () => {
+      using fixture = await createFixture();
+      // Corrupted row: a memory-kind inverse pointing into a DIFFERENT
+      // workspace's memory dir under the same sessions root.
+      const foreign = path.join(fixture.muxHome, "sessions", "other-ws", "memory", "notes.md");
+      await appendRefinementEvent({
+        sessionDir: fixture.sessionDir,
+        workspaceId: WORKSPACE_ID,
+        kind: "memory",
+        action: { op: "str_replace", path: "/memories/workspace/notes.md" },
+        inverse: { op: "restore-files", files: [{ path: foreign, content: "pwned" }] },
+        evidence: { toolName: "memory" },
+      });
+      const row = await lastRow(fixture.sessionDir);
+      const result = await rollbackRefinement({
+        sessionDir: fixture.sessionDir,
+        id: row.id,
+        force: true,
+        evidence: EVIDENCE,
+      });
+      expect(result.success).toBe(false);
+      if (result.success) throw new Error("unreachable");
+      expect(result.error).toContain("outside every memory scope root");
+      expect(await pathExists(foreign)).toBe(false);
+    });
+
+    it("rolls back workspace-scope memory inside the current session", async () => {
+      using fixture = await createFixture();
+      await fixture.service.create(fixture.ctx, "/memories/workspace/w.md", "v1\n", "agent");
+      await fixture.service.strReplace(
+        fixture.ctx,
+        "/memories/workspace/w.md",
+        "v1",
+        "v2",
+        "agent"
+      );
+      const editRow = await lastRow(fixture.sessionDir);
+      const result = await rollbackRefinement({
+        sessionDir: fixture.sessionDir,
+        id: editRow.id,
+        evidence: EVIDENCE,
+      });
+      expect(result.success).toBe(true);
+      const physicalPath = path.join(fixture.sessionDir, "memory", "w.md");
+      expect(await fsPromises.readFile(physicalPath, "utf-8")).toBe("v1\n");
     });
 
     it("refuses traversal that escapes the memory root lexically", async () => {
