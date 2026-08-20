@@ -1077,6 +1077,16 @@ export class MCPServerManager {
    * probed against.
    */
   private readonly eraVerdicts = new Map<string, { prior: PriorDiscovery; cachedAtMs: number }>();
+  /**
+   * Monotonic clock for key-prefix invalidations (stopServersWithKeyPrefix).
+   * getToolsForWorkspace snapshots it before reading config; any prefix
+   * invalidated after that snapshot marks the startup's matching instances
+   * stale, because they may have launched from a plugin tree that was
+   * swapped/deleted mid-startup.
+   */
+  private prefixInvalidationClock = 0;
+  /** Latest invalidation epoch per key prefix. */
+  private readonly prefixInvalidations = new Map<string, number>();
   private readonly idleCheckInterval: ReturnType<typeof setInterval>;
   private inlineServers: Record<string, string> = {};
   private readonly policyService: PolicyService | null;
@@ -1526,6 +1536,11 @@ export class MCPServerManager {
     // reads so enablement repair can detect them.
     const configGenerationUsed = this.configService.configGeneration;
 
+    // Snapshot BEFORE reading config: a plugin swap that lands after this
+    // point may invalidate instances this call starts (see
+    // closeInvalidatedInstances).
+    const startupEpoch = this.prefixInvalidationClock;
+
     // Fetch full server info for project-level allowlists and server filtering
     const allServers = await this.getAllServers(projectPath, trusted, agentPlugins);
 
@@ -1640,19 +1655,33 @@ export class MCPServerManager {
             return this.getToolsForWorkspace(options);
           }
 
-          for (const [serverName, instance] of retriedInstances) {
-            existing.instances.set(serverName, instance);
-          }
+          // Drop retried instances whose plugin tree was swapped mid-startup;
+          // they rejoin the retry list below so the next call restarts them
+          // from the new tree (the filter would otherwise drop them: they
+          // were in retryingServerNames but have no live instance). The merge
+          // into the published entry happens inside the stable-clock callback
+          // so no invalidation can land between the final scan and the merge.
+          await this.closeInvalidatedInstancesThenPublish(
+            retriedInstances,
+            startupEpoch,
+            workspaceId,
+            (invalidatedRetryKeys) => {
+              for (const [serverName, instance] of retriedInstances) {
+                existing.instances.set(serverName, instance);
+              }
 
-          existing.timedOutServerNames = [
-            ...existing.timedOutServerNames.filter(
-              (serverName) =>
-                enabledServerNames.has(serverName) &&
-                !retryingServerNames.has(serverName) &&
-                !existing.instances.has(serverName)
-            ),
-            ...retryTimedOutNames,
-          ];
+              existing.timedOutServerNames = [
+                ...existing.timedOutServerNames.filter(
+                  (serverName) =>
+                    enabledServerNames.has(serverName) &&
+                    !retryingServerNames.has(serverName) &&
+                    !existing.instances.has(serverName)
+                ),
+                ...retryTimedOutNames,
+                ...invalidatedRetryKeys,
+              ];
+            }
+          );
 
           const failedServerNames = [
             ...existing.stats.failedServerNames.filter(
@@ -1770,9 +1799,23 @@ export class MCPServerManager {
         restartFailedNames = failedNames;
         restartTimedOutNames = timedOutNames;
 
-        for (const [serverName, instance] of restartedInstances) {
-          existing.instances.set(serverName, instance);
-        }
+        // Drop restarted instances whose plugin tree was swapped mid-startup;
+        // route them through the retry list so the entry (kept under its
+        // unchanged signature) restarts them on the next call. The merge into
+        // the published entry happens inside the stable-clock callback so no
+        // invalidation can land between the final scan and the merge.
+        await this.closeInvalidatedInstancesThenPublish(
+          restartedInstances,
+          startupEpoch,
+          workspaceId,
+          (invalidatedRestartKeys) => {
+            restartTimedOutNames = [...restartTimedOutNames, ...invalidatedRestartKeys];
+
+            for (const [serverName, instance] of restartedInstances) {
+              existing.instances.set(serverName, instance);
+            }
+          }
+        );
       }
 
       log.info("[MCP] Deferring MCP server restart while stream is active", {
@@ -1932,16 +1975,33 @@ export class MCPServerManager {
         return { tools: {}, toolServerNames: {}, stats, promptDescriptors: [] };
       }
 
-      const entry: WorkspaceServers = {
-        configSignature: signature,
+      // A plugin update/uninstall can swap the tree while startServers was
+      // running; its stopServersWithKeyPrefix scan cannot see instances that
+      // are not published yet, so close them here instead of publishing. The
+      // removed keys join the retry list: this entry is published under the
+      // full (unchanged) config signature, so without a retry marker the
+      // cached path would serve the reduced map indefinitely. Publication
+      // happens inside the stable-clock callback so no invalidation can land
+      // between the final scan and workspaceServers.set (see
+      // closeInvalidatedInstancesThenPublish).
+      let entry!: WorkspaceServers;
+      await this.closeInvalidatedInstancesThenPublish(
         instances,
-        enabledServerNames,
-        stats,
-        timedOutServerNames: startTimedOutNames,
-        retryingTimedOutServerNames: new Set(),
-        lastActivity: Date.now(),
-      };
-      this.workspaceServers.set(workspaceId, entry);
+        startupEpoch,
+        workspaceId,
+        (invalidatedKeys) => {
+          entry = {
+            configSignature: signature,
+            instances,
+            enabledServerNames,
+            stats: this.createWorkspaceStats(enabledEntries.length, instances, allFailedNames),
+            timedOutServerNames: [...startTimedOutNames, ...invalidatedKeys],
+            retryingTimedOutServerNames: new Set(),
+            lastActivity: Date.now(),
+          };
+          this.workspaceServers.set(workspaceId, entry);
+        }
+      );
 
       // Repair first so the awaited refresh never queries a server revoked
       // during startup, then again after it so mutations landing during the
@@ -1964,7 +2024,9 @@ export class MCPServerManager {
 
       return {
         ...this.collectTools(instances, fullServerInfo, overrides),
-        stats,
+        // entry.stats, not the pre-publication `stats`: invalidated instances
+        // were closed before publication and must not count as started.
+        stats: entry.stats,
         promptDescriptors: this.promptDescriptorsFor(entry),
       };
     });
@@ -2377,6 +2439,152 @@ export class MCPServerManager {
       text: truncateUtf8Bytes(text, MCP_PROMPT_MAX_TEXT_BYTES, MCP_PROMPT_TRUNCATION_MARKER),
       ...(result.description !== undefined ? { description: result.description } : {}),
     };
+  }
+
+  /**
+   * Recycle every workspace's server set that includes a running server whose
+   * config key starts with `prefix` (e.g. `plugin:<instanceId>:`).
+   *
+   * Used by the Agent Plugin installer on update/uninstall: plugin content
+   * can change behind an unchanged stdio command line, which the config
+   * signature (command/args/env/cwd) cannot detect — so recycling must be
+   * explicit. Stopped servers restart on the workspace's next MCP use.
+   */
+  async stopServersWithKeyPrefix(prefix: string): Promise<void> {
+    assert(prefix.length > 0, "stopServersWithKeyPrefix: prefix must be non-empty");
+    // Record the invalidation FIRST: a getToolsForWorkspace call currently
+    // inside startServers has not published its instances yet, so the scan
+    // below cannot see them — the publish paths compare their pre-startup
+    // epoch snapshot against this record and close matching instances
+    // instead of publishing them.
+    this.prefixInvalidations.set(prefix, ++this.prefixInvalidationClock);
+
+    // Close ONLY the matching instances. The rest of the workspace's servers
+    // stay running: a live agent stream may hold a lease or be mid tool call
+    // on an unrelated healthy client, so tearing down the whole workspace
+    // set here would close it underneath them.
+    for (const [workspaceId, entry] of this.workspaceServers) {
+      const removedKeys: string[] = [];
+      for (const [serverKey, instance] of [...entry.instances]) {
+        if (!serverKey.startsWith(prefix)) {
+          continue;
+        }
+        entry.instances.delete(serverKey);
+        removedKeys.push(serverKey);
+        try {
+          await instance.close();
+        } catch (error) {
+          log.warn("Failed to stop MCP server", { error, name: instance.name });
+        }
+      }
+      if (removedKeys.length === 0) {
+        continue;
+      }
+
+      log.info("[MCP] Stopped plugin servers for key prefix", { workspaceId, removedKeys });
+      // The workspace entry survives under its unchanged config signature, so
+      // subsequent calls hit the same-signature cache path — mark the removed
+      // servers for the timed-out retry machinery so that path restarts them
+      // (from the new plugin tree) instead of serving the reduced map forever.
+      this.markServersForRetry(entry, removedKeys);
+    }
+  }
+
+  /**
+   * Queue server keys for restart on the next same-signature
+   * getToolsForWorkspace call. Reuses the timed-out retry machinery: entries
+   * in `timedOutServerNames` that are enabled but have no live instance are
+   * restarted by the cached path (see getTimedOutServerNamesToRetry).
+   */
+  private markServersForRetry(entry: WorkspaceServers, serverKeys: string[]): void {
+    const pending = new Set(entry.timedOutServerNames);
+    for (const serverKey of serverKeys) {
+      if (!pending.has(serverKey)) {
+        entry.timedOutServerNames.push(serverKey);
+      }
+    }
+  }
+
+  /**
+   * Close and drop instances whose keys match a prefix invalidated after
+   * `startedAtEpoch` (the caller's pre-startup snapshot of the invalidation
+   * clock). Such instances may be running code from a plugin tree that was
+   * swapped or deleted while they were starting; the returned keys MUST be
+   * queued for retry by the caller (markServersForRetry) so the next MCP use
+   * restarts them from the current tree — publishing the reduced map under
+   * the unchanged config signature would otherwise cache them away forever.
+   */
+  private async closeInvalidatedInstances(
+    instances: Map<string, MCPServerInstance>,
+    startedAtEpoch: number,
+    workspaceId: string
+  ): Promise<string[]> {
+    const removedKeys: string[] = [];
+    for (const [serverKey, instance] of [...instances]) {
+      let invalidated = false;
+      for (const [prefix, epoch] of this.prefixInvalidations) {
+        if (epoch > startedAtEpoch && serverKey.startsWith(prefix)) {
+          invalidated = true;
+          break;
+        }
+      }
+      if (!invalidated) {
+        continue;
+      }
+
+      instances.delete(serverKey);
+      removedKeys.push(serverKey);
+      log.info("[MCP] Closing instance invalidated during startup (plugin tree swapped)", {
+        workspaceId,
+        serverKey,
+      });
+      try {
+        await instance.close();
+      } catch (error) {
+        log.warn("Failed to close invalidated MCP server instance", { error, serverKey });
+      }
+    }
+    return removedKeys;
+  }
+
+  /**
+   * Scan for invalidated instances until the invalidation clock is stable
+   * across a full scan, then invoke `publish` SYNCHRONOUSLY in the same
+   * continuation as the final clock check.
+   *
+   * Why the loop + sync callback: closeInvalidatedInstances is awaited, so
+   * there is a microtask yield between its final scan and any code that runs
+   * after it. A stopServersWithKeyPrefix continuation scheduled into that
+   * yield records its epoch AFTER the scan checked it and scans the published
+   * map BEFORE the caller publishes these instances — both mechanisms miss,
+   * and a server started from a removed/replaced plugin tree would stay
+   * alive. Re-checking the clock in the caller's continuation and publishing
+   * synchronously (no await between check and publish) closes the window:
+   * any invalidation that lands after the check runs its own scan strictly
+   * after publication, so it sees the published entry and closes matches.
+   *
+   * `publish` MUST NOT await; it receives every key closed across all scans
+   * and must queue them for retry (see closeInvalidatedInstances docs).
+   */
+  private async closeInvalidatedInstancesThenPublish(
+    instances: Map<string, MCPServerInstance>,
+    startedAtEpoch: number,
+    workspaceId: string,
+    publish: (invalidatedKeys: string[]) => void
+  ): Promise<void> {
+    const invalidatedKeys: string[] = [];
+    for (;;) {
+      const clockBeforeScan = this.prefixInvalidationClock;
+      invalidatedKeys.push(
+        ...(await this.closeInvalidatedInstances(instances, startedAtEpoch, workspaceId))
+      );
+      // Terminates: the clock only advances on stopServersWithKeyPrefix
+      // calls, which are finite user-driven plugin update/uninstall events.
+      if (this.prefixInvalidationClock === clockBeforeScan) {
+        publish(invalidatedKeys);
+        return;
+      }
+    }
   }
 
   async stopServers(

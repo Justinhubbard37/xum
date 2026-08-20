@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as path from "path";
 import * as jsonc from "jsonc-parser";
 import assert from "@/common/utils/assert";
@@ -91,6 +92,28 @@ function normalizeWorkspaceMcpOverrides(raw: unknown): WorkspaceMCPOverrides {
   }
 
   return normalized;
+}
+
+/**
+ * Opaque revision token for optimistic-concurrency saves. Derived from the
+ * normalized overrides content, so any successful write (including the Agent
+ * Plugin uninstaller pruning `plugin:` keys) changes the revision and stale
+ * snapshots held by an open Workspace MCP dialog are rejected instead of
+ * silently restoring removed entries.
+ */
+function computeOverridesRevision(overrides: WorkspaceMCPOverrides): string {
+  return createHash("sha256").update(JSON.stringify(overrides)).digest("hex").slice(0, 16);
+}
+
+/** Thrown when a save's expectedRevision no longer matches the stored overrides. */
+export class WorkspaceMcpOverridesConflictError extends Error {
+  constructor() {
+    super(
+      "Workspace MCP settings changed while this dialog was open. " +
+        "Close and reopen it to load the latest values, then reapply your changes."
+    );
+    this.name = "WorkspaceMcpOverridesConflictError";
+  }
 }
 
 function isEmptyOverrides(overrides: WorkspaceMCPOverrides): boolean {
@@ -314,8 +337,13 @@ export class WorkspaceMcpOverridesService {
     runtime: ReturnType<typeof createRuntime>,
     workspacePath: string
   ): Promise<void> {
-    // Best-effort: remove both file names so we never leave conflicting sources behind.
-    await execBuffered(
+    // Remove both file names so we never leave conflicting sources behind.
+    // The exit code MUST be checked: callers (e.g. the Agent Plugin
+    // uninstaller retiring override-prune tombstones) rely on
+    // setOverridesForWorkspace rejecting when clearing overrides failed —
+    // a swallowed `rm` failure would leave a stale enabledServers key that
+    // a plugin reinstall could silently reactivate.
+    const result = await execBuffered(
       runtime,
       `rm -f "${MCP_OVERRIDES_DIR}/${MCP_OVERRIDES_JSONC}" "${MCP_OVERRIDES_DIR}/${MCP_OVERRIDES_JSON}"`,
       {
@@ -323,6 +351,11 @@ export class WorkspaceMcpOverridesService {
         timeout: 10,
       }
     );
+    if (result.exitCode !== 0) {
+      throw new Error(
+        `Failed to remove workspace MCP overrides file: ${result.stderr.trim() || `rm exited with code ${result.exitCode}`}`
+      );
+    }
   }
 
   /**
@@ -330,8 +363,18 @@ export class WorkspaceMcpOverridesService {
    *
    * If the file doesn't exist, we fall back to legacy overrides stored in ~/.mux/config.json
    * and migrate them into the workspace-local file.
+   *
+   * The returned revision is an opaque token for setOverridesForWorkspace's
+   * expectedRevision check.
    */
-  async getOverridesForWorkspace(workspaceId: string): Promise<WorkspaceMCPOverrides> {
+  async getOverridesForWorkspace(
+    workspaceId: string
+  ): Promise<{ overrides: WorkspaceMCPOverrides; revision: string }> {
+    const overrides = await this.loadOverrides(workspaceId);
+    return { overrides, revision: computeOverridesRevision(overrides) };
+  }
+
+  private async loadOverrides(workspaceId: string): Promise<WorkspaceMCPOverrides> {
     const { metadata, runtime, workspacePath } = await this.getRuntimeAndWorkspacePath(workspaceId);
     const { jsoncPath, jsonPath } = this.getOverridesFilePaths(
       workspacePath,
@@ -383,31 +426,62 @@ export class WorkspaceMcpOverridesService {
   }
 
   /**
+   * All writes flow through this queue so the expectedRevision check-and-set
+   * in setOverridesForWorkspace is atomic within the main process (the only
+   * writer of these files).
+   */
+  private writeQueue: Promise<unknown> = Promise.resolve();
+
+  private runExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const run = () => fn();
+    const next = this.writeQueue.then(run, run);
+    this.writeQueue = next.catch(() => undefined);
+    return next;
+  }
+
+  /**
    * Persist workspace MCP overrides to <workspace>/.mux/mcp.local.jsonc.
    *
    * Empty overrides remove the workspace-local file.
+   *
+   * When options.expectedRevision is provided, the write is rejected with
+   * WorkspaceMcpOverridesConflictError if the stored overrides changed since
+   * that revision was read — a stale Workspace MCP dialog snapshot must not
+   * silently restore entries removed by a concurrent writer (e.g. the Agent
+   * Plugin uninstaller pruning `plugin:<instanceId>:` keys).
    */
   async setOverridesForWorkspace(
     workspaceId: string,
-    overrides: WorkspaceMCPOverrides
+    overrides: WorkspaceMCPOverrides,
+    options?: { expectedRevision?: string }
   ): Promise<void> {
     assert(overrides && typeof overrides === "object", "overrides must be an object");
 
-    const { metadata, runtime, workspacePath } = await this.getRuntimeAndWorkspacePath(workspaceId);
-    const { jsoncPath } = this.getOverridesFilePaths(workspacePath, metadata.runtimeConfig);
+    return this.runExclusive(async () => {
+      if (options?.expectedRevision !== undefined) {
+        const current = await this.loadOverrides(workspaceId);
+        if (computeOverridesRevision(current) !== options.expectedRevision) {
+          throw new WorkspaceMcpOverridesConflictError();
+        }
+      }
 
-    const normalized = normalizeWorkspaceMcpOverrides(overrides);
+      const { metadata, runtime, workspacePath } =
+        await this.getRuntimeAndWorkspacePath(workspaceId);
+      const { jsoncPath } = this.getOverridesFilePaths(workspacePath, metadata.runtimeConfig);
 
-    // Always clear any legacy storage so we converge on the workspace-local file.
-    await this.clearLegacyOverridesInConfig(workspaceId);
+      const normalized = normalizeWorkspaceMcpOverrides(overrides);
 
-    if (isEmptyOverrides(normalized)) {
-      await this.removeOverridesFile(runtime, workspacePath);
-      return;
-    }
+      // Always clear any legacy storage so we converge on the workspace-local file.
+      await this.clearLegacyOverridesInConfig(workspaceId);
 
-    await this.ensureOverridesDir(runtime, workspacePath, metadata.runtimeConfig);
-    await writeFileString(runtime, jsoncPath, JSON.stringify(normalized, null, 2) + "\n");
-    await this.ensureOverridesGitignored(runtime, workspacePath, metadata.runtimeConfig);
+      if (isEmptyOverrides(normalized)) {
+        await this.removeOverridesFile(runtime, workspacePath);
+        return;
+      }
+
+      await this.ensureOverridesDir(runtime, workspacePath, metadata.runtimeConfig);
+      await writeFileString(runtime, jsoncPath, JSON.stringify(normalized, null, 2) + "\n");
+      await this.ensureOverridesGitignored(runtime, workspacePath, metadata.runtimeConfig);
+    });
   }
 }

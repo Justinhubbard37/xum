@@ -1954,8 +1954,9 @@ export class AIService extends EventEmitter {
       let mcpOverrides: WorkspaceMCPOverrides | undefined;
       const loadWorkspaceMcpOverridesStartedAt = Date.now();
       try {
-        mcpOverrides =
-          await this.workspaceMcpOverridesService.getOverridesForWorkspace(workspaceId);
+        mcpOverrides = (
+          await this.workspaceMcpOverridesService.getOverridesForWorkspace(workspaceId)
+        ).overrides;
       } catch (error) {
         log.warn("[MCP] Failed to load workspace MCP overrides; continuing without overrides", {
           workspaceId,

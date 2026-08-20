@@ -3187,6 +3187,81 @@ export const router = (authToken?: string) => {
           return result;
         }),
     },
+    // Managed Agent Plugin installs (agent-plugins experiment). The service
+    // gates every method on the experiment flag and throws user-facing
+    // errors; handlers translate them into Result values.
+    agentPlugins: {
+      preview: t
+        .input(schemas.agentPlugins.preview.input)
+        .output(schemas.agentPlugins.preview.output)
+        .handler(async ({ context, input }) => {
+          try {
+            const data = await context.agentPluginInstallService.preview({
+              input: input.input,
+              ref: input.ref ?? undefined,
+              subpath: input.subpath ?? undefined,
+            });
+            return { success: true, data };
+          } catch (error) {
+            return { success: false, error: getErrorMessage(error) };
+          }
+        }),
+      install: t
+        .input(schemas.agentPlugins.install.input)
+        .output(schemas.agentPlugins.install.output)
+        .handler(async ({ context, input }) => {
+          try {
+            const data = await context.agentPluginInstallService.install(input);
+            return { success: true, data };
+          } catch (error) {
+            return { success: false, error: getErrorMessage(error) };
+          }
+        }),
+      list: t
+        .input(schemas.agentPlugins.list.input)
+        .output(schemas.agentPlugins.list.output)
+        .handler(async ({ context }) => {
+          try {
+            const data = await context.agentPluginInstallService.list();
+            return { success: true, data };
+          } catch (error) {
+            return { success: false, error: getErrorMessage(error) };
+          }
+        }),
+      uninstall: t
+        .input(schemas.agentPlugins.uninstall.input)
+        .output(schemas.agentPlugins.uninstall.output)
+        .handler(async ({ context, input }) => {
+          try {
+            await context.agentPluginInstallService.uninstall(input);
+            return { success: true, data: undefined };
+          } catch (error) {
+            return { success: false, error: getErrorMessage(error) };
+          }
+        }),
+      checkUpdates: t
+        .input(schemas.agentPlugins.checkUpdates.input)
+        .output(schemas.agentPlugins.checkUpdates.output)
+        .handler(async ({ context }) => {
+          try {
+            const data = await context.agentPluginInstallService.checkUpdates();
+            return { success: true, data };
+          } catch (error) {
+            return { success: false, error: getErrorMessage(error) };
+          }
+        }),
+      update: t
+        .input(schemas.agentPlugins.update.input)
+        .output(schemas.agentPlugins.update.output)
+        .handler(async ({ context, input }) => {
+          try {
+            const data = await context.agentPluginInstallService.update(input);
+            return { success: true, data };
+          } catch (error) {
+            return { success: false, error: getErrorMessage(error) };
+          }
+        }),
+    },
     mcpOauth: {
       startDesktopFlow: t
         .input(schemas.mcpOauth.startDesktopFlow.input)
@@ -5629,7 +5704,7 @@ export const router = (authToken?: string) => {
               policy.mcp.allowUserDefined.remote === false;
 
             if (mcpDisabledByPolicy) {
-              return {};
+              return { overrides: {}, revision: "mcp-disabled-by-policy" };
             }
 
             try {
@@ -5637,8 +5712,10 @@ export const router = (authToken?: string) => {
                 input.workspaceId
               );
             } catch {
-              // Defensive: overrides must never brick workspace UI.
-              return {};
+              // Defensive: overrides must never brick workspace UI. The
+              // sentinel revision never matches a real one, so a save from
+              // this unknown state is rejected instead of clobbering data.
+              return { overrides: {}, revision: "unavailable" };
             }
           }),
         prompts: {
@@ -5674,9 +5751,10 @@ export const router = (authToken?: string) => {
               if (!readyResult.ready) {
                 throw new Error(readyResult.error);
               }
-              const overrides = await context.workspaceMcpOverridesService.getOverridesForWorkspace(
-                input.workspaceId
-              );
+              const { overrides } =
+                await context.workspaceMcpOverridesService.getOverridesForWorkspace(
+                  input.workspaceId
+                );
               // Match streamMessage and the prompt-invocation resolver: multi-project
               // workspaces need every project's secrets, not just the primary's.
               const projectSecrets = await secretsToRecord(
@@ -5710,7 +5788,8 @@ export const router = (authToken?: string) => {
             try {
               await context.workspaceMcpOverridesService.setOverridesForWorkspace(
                 input.workspaceId,
-                input.overrides
+                input.overrides,
+                { expectedRevision: input.expectedRevision }
               );
               // Prompt invocation can hit cached servers before the next stream
               // recomputes enablement, so sync the manager's view immediately.

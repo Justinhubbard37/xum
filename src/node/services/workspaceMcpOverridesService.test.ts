@@ -5,7 +5,10 @@ import * as path from "path";
 import { Config } from "@/node/config";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { execBuffered } from "@/node/utils/runtime/helpers";
-import { WorkspaceMcpOverridesService } from "./workspaceMcpOverridesService";
+import {
+  WorkspaceMcpOverridesConflictError,
+  WorkspaceMcpOverridesService,
+} from "./workspaceMcpOverridesService";
 
 function getWorkspacePath(args: {
   srcDir: string;
@@ -64,7 +67,7 @@ describe("WorkspaceMcpOverridesService", () => {
     });
 
     const service = new WorkspaceMcpOverridesService(config);
-    const overrides = await service.getOverridesForWorkspace(workspaceId);
+    const { overrides } = await service.getOverridesForWorkspace(workspaceId);
 
     expect(overrides).toEqual({});
     expect(await pathExists(path.join(workspacePath, ".mux", "mcp.local.jsonc"))).toBe(false);
@@ -165,10 +168,72 @@ describe("WorkspaceMcpOverridesService", () => {
     expect(await pathExists(filePath)).toBe(true);
 
     const roundTrip = await service.getOverridesForWorkspace(workspaceId);
-    expect(roundTrip).toEqual({
+    expect(roundTrip.overrides).toEqual({
       disabledServers: ["server-a"],
       toolAllowlist: { "server-b": ["tool1"] },
     });
+  });
+
+  it("rejects saves with a stale revision instead of clobbering newer overrides", async () => {
+    const projectPath = "/fake/project";
+    const workspaceId = "ws-id";
+    const workspaceName = "branch";
+
+    const workspacePath = getWorkspacePath({
+      srcDir: config.srcDir,
+      projectName: "project",
+      workspaceName,
+    });
+    await fs.mkdir(workspacePath, { recursive: true });
+
+    await config.editConfig((cfg) => {
+      cfg.projects.set(projectPath, {
+        workspaces: [
+          {
+            path: workspacePath,
+            id: workspaceId,
+            name: workspaceName,
+            runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+          },
+        ],
+      });
+      return cfg;
+    });
+
+    const service = new WorkspaceMcpOverridesService(config);
+    await service.setOverridesForWorkspace(workspaceId, {
+      enabledServers: ["plugin:abc:server"],
+    });
+
+    // Dialog snapshot taken here...
+    const snapshot = await service.getOverridesForWorkspace(workspaceId);
+
+    // ...then a concurrent writer (e.g. plugin uninstall prune) removes the key.
+    await service.setOverridesForWorkspace(
+      workspaceId,
+      {},
+      { expectedRevision: snapshot.revision }
+    );
+
+    // Replaying the stale snapshot must fail, not restore the pruned key.
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(
+      service.setOverridesForWorkspace(workspaceId, snapshot.overrides, {
+        expectedRevision: snapshot.revision,
+      })
+    ).rejects.toThrow(WorkspaceMcpOverridesConflictError);
+
+    const current = await service.getOverridesForWorkspace(workspaceId);
+    expect(current.overrides).toEqual({});
+
+    // A save with the CURRENT revision goes through.
+    await service.setOverridesForWorkspace(
+      workspaceId,
+      { disabledServers: ["other"] },
+      { expectedRevision: current.revision }
+    );
+    const after = await service.getOverridesForWorkspace(workspaceId);
+    expect(after.overrides).toEqual({ disabledServers: ["other"] });
   });
 
   it("removes workspace-local file when overrides are set to empty", async () => {
@@ -241,7 +306,7 @@ describe("WorkspaceMcpOverridesService", () => {
     });
 
     const service = new WorkspaceMcpOverridesService(config);
-    const overrides = await service.getOverridesForWorkspace(workspaceId);
+    const { overrides } = await service.getOverridesForWorkspace(workspaceId);
 
     expect(overrides).toEqual({
       disabledServers: ["server-a"],
