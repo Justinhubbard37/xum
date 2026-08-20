@@ -569,41 +569,61 @@ export class WorkspaceMcpOverridesService {
         if (!(await statIsFile(runtime, filePath, "strict"))) {
           continue;
         }
-        const parsed = await this.readOverridesFile(runtime, filePath, "strict");
+        // Strict read: unreadable/unparseable content must throw so the
+        // caller keeps its retry tombstone (mirrors readOverridesFile).
+        const original = await readFileString(runtime, filePath);
+        const parseErrors: jsonc.ParseError[] = [];
+        const parsed: unknown = jsonc.parse(original, parseErrors) as unknown;
+        if (parseErrors.length > 0) {
+          throw new Error(`Workspace MCP overrides file has JSONC parse errors: ${filePath}`);
+        }
         if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
           continue;
         }
-        const raw = { ...(parsed as Record<string, unknown>) };
-        let changed = false;
+
+        // Targeted jsonc edits, NOT JSON.stringify of the parsed object: the
+        // .jsonc file is user-maintained and may carry comments/formatting a
+        // wholesale rewrite would erase.
+        let text = original;
+        const removeAt = (jsonPath: jsonc.JSONPath): void => {
+          text = jsonc.applyEdits(
+            text,
+            jsonc.modify(text, jsonPath, undefined, {
+              formattingOptions: { insertSpaces: true, tabSize: 2 },
+            })
+          );
+        };
 
         for (const field of ["enabledServers", "disabledServers"] as const) {
-          const value = raw[field];
-          if (!Array.isArray(value)) {
-            continue;
-          }
-          const filtered = value.filter(
-            (key) => !(typeof key === "string" && key.startsWith(keyPrefix))
-          );
-          if (filtered.length !== value.length) {
-            raw[field] = filtered;
-            changed = true;
+          // Re-parse after each removal: array indices shift as items go.
+          for (;;) {
+            const current = jsonc.parse(text) as Record<string, unknown>;
+            const value = current[field];
+            if (!Array.isArray(value)) {
+              break;
+            }
+            const index = value.findIndex(
+              (key) => typeof key === "string" && key.startsWith(keyPrefix)
+            );
+            if (index === -1) {
+              break;
+            }
+            removeAt([field, index]);
           }
         }
 
-        const allowlist = raw.toolAllowlist;
+        const allowlist = (jsonc.parse(text) as Record<string, unknown>).toolAllowlist;
         if (allowlist !== null && typeof allowlist === "object" && !Array.isArray(allowlist)) {
-          const entries = Object.entries(allowlist as Record<string, unknown>);
-          const kept = entries.filter(([key]) => !key.startsWith(keyPrefix));
-          if (kept.length !== entries.length) {
-            raw.toolAllowlist = Object.fromEntries(kept);
-            changed = true;
+          for (const key of Object.keys(allowlist)) {
+            if (key.startsWith(keyPrefix)) {
+              removeAt(["toolAllowlist", key]);
+            }
           }
         }
 
-        if (!changed) {
-          continue;
+        if (text !== original) {
+          await writeFileString(runtime, filePath, text);
         }
-        await writeFileString(runtime, filePath, JSON.stringify(raw, null, 2) + "\n");
       }
     });
   }

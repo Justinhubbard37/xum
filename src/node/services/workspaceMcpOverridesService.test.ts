@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import * as fs from "fs/promises";
+import { parse as jsoncParse } from "jsonc-parser";
 import * as os from "os";
 import * as path from "path";
 import { Config } from "@/node/config";
@@ -345,6 +346,66 @@ describe("WorkspaceMcpOverridesService", () => {
     // workspace-local files).
     await fs.rm(filePath);
     await service.prunePluginOverrideKeys(workspaceId, "plugin:abc:");
+  });
+
+  it("prunePluginOverrideKeys preserves JSONC comments and formatting", async () => {
+    const projectPath = "/fake/project";
+    const workspaceId = "ws-id";
+    const workspaceName = "branch";
+
+    const workspacePath = getWorkspacePath({
+      srcDir: config.srcDir,
+      projectName: "project",
+      workspaceName,
+    });
+    const filePath = path.join(workspacePath, ".mux", "mcp.local.jsonc");
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    // User-maintained .jsonc: comments must survive the prune (only the
+    // plugin's keys may be edited out — no wholesale JSON.stringify rewrite).
+    await fs.writeFile(
+      filePath,
+      `{
+  // Keep me: explains why other-server is enabled.
+  "enabledServers": [
+    "plugin:abc:echo",
+    "other-server" // trailing comment survives too
+  ],
+  /* block comment */
+  "toolAllowlist": {
+    "plugin:abc:echo": ["t1"],
+    "other-server": ["t2"]
+  }
+}
+`
+    );
+
+    await config.editConfig((cfg) => {
+      cfg.projects.set(projectPath, {
+        workspaces: [
+          {
+            path: workspacePath,
+            id: workspaceId,
+            name: workspaceName,
+            runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+          },
+        ],
+      });
+      return cfg;
+    });
+
+    const service = new WorkspaceMcpOverridesService(config);
+    await service.prunePluginOverrideKeys(workspaceId, "plugin:abc:");
+
+    const after = await fs.readFile(filePath, "utf-8");
+    expect(after).toContain("// Keep me: explains why other-server is enabled.");
+    expect(after).toContain("// trailing comment survives too");
+    expect(after).toContain("/* block comment */");
+    expect(after).not.toContain("plugin:abc:echo");
+    const parsed = jsoncParse(after) as Record<string, unknown>;
+    expect(parsed).toEqual({
+      enabledServers: ["other-server"],
+      toolAllowlist: { "other-server": ["t2"] },
+    });
   });
 
   it("removes workspace-local file when overrides are set to empty", async () => {
