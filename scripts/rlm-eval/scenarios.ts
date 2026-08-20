@@ -155,6 +155,54 @@ export const SCENARIOS: EvalScenario[] = [
     },
   },
   {
+    id: "shard-pipeline",
+    description:
+      "Multi-source aggregation over 6 JSONL shards (each ~40KB, above the file_read cap): rewards batching all reads + compute into one kernel program instead of one eval per file.",
+    setup: (fixtureDir) => {
+      const rng = mulberry32(9001);
+      fs.mkdirSync(path.join(fixtureDir, "shards"), { recursive: true });
+      const regions = ["emea", "amer", "apac"] as const;
+      const totals: Record<string, number> = { emea: 0, amer: 0, apac: 0 };
+      for (let s = 0; s < 6; s++) {
+        const lines: string[] = [];
+        for (let i = 0; i < 250; i++) {
+          const region = regions[Math.floor(rng() * 3)];
+          const status = rng() < 0.6 ? "ok" : "void";
+          const items = Array.from({ length: 1 + Math.floor(rng() * 3) }, () => ({
+            qty: 1 + Math.floor(rng() * 5),
+            cents: 100 + Math.floor(rng() * 9900),
+          }));
+          // Integer cents keep the ground truth exact — no float formatting drift.
+          const value = items.reduce((a, it) => a + it.qty * it.cents, 0);
+          if (status === "ok") totals[region] += value;
+          lines.push(
+            JSON.stringify({ id: `S${s}-${i.toString().padStart(4, "0")}`, region, status, items })
+          );
+        }
+        fs.writeFileSync(
+          path.join(fixtureDir, "shards", `shard-${s}.jsonl`),
+          lines.join("\n") + "\n"
+        );
+      }
+      return {
+        emea: String(totals.emea),
+        amer: String(totals.amer),
+        apac: String(totals.apac),
+      };
+    },
+    turns: (_truth, fixtureDir) => [
+      `The directory ${fixtureDir}/shards/ contains 6 JSONL shard files (shard-0.jsonl .. shard-5.jsonl). Each line is an order: {id, region, status, items:[{qty, cents}]}. An order's value is the sum of qty*cents over its items (integer cents). Compute the total value of status="ok" orders per region across ALL shards. End your reply with "EMEA=<n> AMER=<n> APAC=<n>" (integers, no separators).`,
+    ],
+    verify: (truth, texts) => {
+      const t = texts[0] ?? "";
+      const ok =
+        t.includes(`EMEA=${truth.emea}`) &&
+        t.includes(`AMER=${truth.amer}`) &&
+        t.includes(`APAC=${truth.apac}`);
+      return { pass: ok, detail: ok ? "totals:ok" : "totals:FAIL" };
+    },
+  },
+  {
     id: "control-quick",
     description:
       "Trivial task where kernel features are unnecessary: detects over-adoption overhead and prompt-cost regressions.",
@@ -192,5 +240,18 @@ export const CONFIGS: EvalConfig[] = [
       "When you use code_execution, persist any data you might need in later turns in `vars` " +
       "(for example `vars.data = ...`) instead of re-reading files, and answer follow-up " +
       "questions from `vars` when the data is already there.",
+  },
+  // Batching lever: does an explicit composition incentive raise the
+  // nested-calls-per-eval ratio (one program instead of one wrapped tool call
+  // per eval), and does that translate into fewer provider round-trips?
+  {
+    id: "rlm-batch",
+    experiments: { programmaticToolCalling: true, rlm: true },
+    nudge:
+      "In code_execution, write complete programs: batch ALL steps of a task — every file " +
+      "load, transformation, and check — into a single call using loops and in-code error " +
+      "handling (try/catch), instead of one tool call per code_execution. Only split into " +
+      "separate calls when a later step genuinely depends on your own review of intermediate " +
+      "output.",
   },
 ];
