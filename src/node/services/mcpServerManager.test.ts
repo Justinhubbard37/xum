@@ -3386,9 +3386,11 @@ describe("wrapMCPTools", () => {
   });
 
   describe("argument sanitization", () => {
+    const makeExecuteMock = () => mock((_args: unknown) => Promise.resolve({ content: [] }));
+
     // Mirrors how mcpClient builds MCP tools: jsonSchema() wrapping the
     // server-declared input schema.
-    const makeTool = (executeMock: ReturnType<typeof mock>, required: string[] = []) =>
+    const makeTool = (executeMock: ReturnType<typeof makeExecuteMock>, required: string[] = []) =>
       ({
         inputSchema: jsonSchema({
           type: "object",
@@ -3406,7 +3408,7 @@ describe("wrapMCPTools", () => {
       }) as unknown as Tool;
 
     test("strips top-level empty strings for optional params before invoking the server", async () => {
-      const executeMock = mock(() => Promise.resolve({ content: [] }));
+      const executeMock = makeExecuteMock();
       const wrapped = wrapMCPTools({ myTool: makeTool(executeMock, ["project_id"]) });
 
       await wrapped.myTool.execute!(
@@ -3424,7 +3426,7 @@ describe("wrapMCPTools", () => {
     });
 
     test("preserves empty string for schema-required params", async () => {
-      const executeMock = mock(() => Promise.resolve({ content: [] }));
+      const executeMock = makeExecuteMock();
       const wrapped = wrapMCPTools({ myTool: makeTool(executeMock, ["project_id"]) });
 
       await wrapped.myTool.execute!({ project_id: "", assignee_id: "" }, {} as never);
@@ -3433,7 +3435,7 @@ describe("wrapMCPTools", () => {
     });
 
     test("passes args through unchanged when no empty strings are present", async () => {
-      const executeMock = mock(() => Promise.resolve({ content: [] }));
+      const executeMock = makeExecuteMock();
       const wrapped = wrapMCPTools({ myTool: makeTool(executeMock) });
 
       const args = { project_id: "42332", search: "bug" };
@@ -3443,7 +3445,7 @@ describe("wrapMCPTools", () => {
     });
 
     test("strips empty strings when the tool has no readable schema", async () => {
-      const executeMock = mock(() => Promise.resolve({ content: [] }));
+      const executeMock = makeExecuteMock();
       const tool = { execute: executeMock } as unknown as Tool;
       const wrapped = wrapMCPTools({ myTool: tool });
 
@@ -3453,7 +3455,7 @@ describe("wrapMCPTools", () => {
     });
 
     test("leaves non-record args untouched", async () => {
-      const executeMock = mock(() => Promise.resolve({ content: [] }));
+      const executeMock = makeExecuteMock();
       const wrapped = wrapMCPTools({ myTool: makeTool(executeMock) });
 
       await wrapped.myTool.execute!(undefined, {} as never);

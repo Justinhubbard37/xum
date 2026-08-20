@@ -265,9 +265,7 @@ export function wrapMCPTools(
               ? (context as { abortSignal?: AbortSignal }).abortSignal
               : undefined;
 
-          const sanitizedArgs = sanitizeMCPToolArgs(args, tool.inputSchema) as Parameters<
-            typeof originalExecute
-          >[0];
+          const sanitizedArgs = sanitizeMCPToolArgs(args, tool.inputSchema);
           const result: unknown = await runMCPToolWithDeadline(
             () => Promise.resolve(originalExecute(sanitizedArgs, context)) as Promise<unknown>,
             { toolName, timeoutMs: MCP_TOOL_CALL_TIMEOUT_MS, signal: abortSignal }
