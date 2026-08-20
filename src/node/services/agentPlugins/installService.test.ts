@@ -1370,6 +1370,64 @@ describe("AgentPluginInstallService", () => {
     expect(await registry()).toHaveLength(1);
   });
 
+  test("install rollback invalidates servers even when deleting the promoted tree fails", async () => {
+    // A locked file (e.g. on Windows) can make the rollback deletion reject;
+    // the prefix invalidation must still run, or a server started from the
+    // briefly-visible tree survives an install that reported failure.
+    const stoppedPrefixes: string[] = [];
+    const mcpStub = {
+      stopServersWithKeyPrefix: (prefix: string) => {
+        stoppedPrefixes.push(prefix);
+        return Promise.resolve();
+      },
+    };
+    const serviceWithMcp = new AgentPluginInstallService(config, {
+      isEnabled: () => true,
+      mcpServerManager: mcpStub as unknown as MCPServerManager,
+    });
+    const preview = await serviceWithMcp.preview({ input: remoteDir });
+
+    const targetPath = path.join(pluginsDir(), "demo-plugin");
+    const internals = serviceWithMcp as unknown as {
+      writeRegistry: (envelope: Record<string, unknown>, entries: unknown[]) => Promise<void>;
+      removeDir: (dir: string) => Promise<void>;
+    };
+    const writeSpy = spyOn(internals, "writeRegistry").mockImplementationOnce(() =>
+      Promise.reject(new Error("ENOSPC: no space left on device"))
+    );
+    const realRemoveDir = internals.removeDir.bind(internals);
+    const removeSpy = spyOn(internals, "removeDir").mockImplementation((dir: string) =>
+      dir === targetPath ? Promise.reject(new Error("EBUSY: resource busy")) : realRemoveDir(dir)
+    );
+    try {
+      // Both failures surface in one error; the invalidation still ran.
+      await expect(
+        serviceWithMcp.install({ source: preview.source, expectedSha: preview.lockedSha })
+      ).rejects.toThrow(/persist the plugin registry.*could not be removed/s);
+    } finally {
+      writeSpy.mockRestore();
+      removeSpy.mockRestore();
+    }
+    const instanceId = computePluginInstanceId(targetPath);
+    expect(stoppedPrefixes).toEqual([`plugin:${instanceId}:`]);
+    expect(await registry()).toEqual([]);
+  });
+
+  test("install rejects a source URL with embedded credentials", async () => {
+    // parseAgentPluginSourceInput already rejects these, but a direct API
+    // request can hand install() a source that never went through the
+    // parser — and the URL would be persisted to plugins.json and rendered
+    // in Settings.
+    const preview = await service.preview({ input: remoteDir });
+    await expect(
+      service.install({
+        source: { ...preview.source, url: "https://user:token@example.com/repo.git" },
+        expectedSha: preview.lockedSha,
+      })
+    ).rejects.toThrow(/embedded credentials/);
+    expect(await registry()).toEqual([]);
+  });
+
   test("added plugin override keys are validated against discovered servers", async () => {
     // The overrides revision is content-derived, so a dialog opened before an
     // uninstall (overrides {}) sees an unchanged revision after it — only a

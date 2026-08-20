@@ -51,6 +51,24 @@ function isUrlLike(input: string): boolean {
 }
 
 /**
+ * Plugin sources are persisted verbatim in ~/.mux/plugins.json and rendered
+ * in Settings/consent previews, so a credential-bearing URL (userinfo or
+ * known token query parameters) would land on disk and on screen. Reject it
+ * up front — git credential helpers are the supported path for private
+ * repos. Same policy (and helper) as the persisted backup-repository URL.
+ * Enforced both at input parsing and at the install boundary, because a
+ * direct API request can hand `install` a source that never went through the
+ * parser.
+ */
+export function assertNoAgentPluginUrlCredentials(url: string): void {
+  if (hasUrlCredentials(url)) {
+    throw new Error(
+      "Remove the embedded credentials from the URL. Private repositories authenticate via git credential helpers or SSH."
+    );
+  }
+}
+
+/**
  * Parse the Add Plugin source input. Throws with a user-facing message when
  * the input matches no accepted form.
  */
@@ -60,16 +78,7 @@ export function parseAgentPluginSourceInput(rawInput: string): ParsedAgentPlugin
     throw new Error("Enter a git URL or owner/repo shorthand.");
   }
 
-  // Plugin sources are persisted verbatim in ~/.mux/plugins.json and rendered
-  // in Settings/consent previews, so a credential-bearing URL (userinfo or
-  // known token query parameters) would land on disk and on screen. Reject it
-  // up front — git credential helpers are the supported path for private
-  // repos. Same policy (and helper) as the persisted backup-repository URL.
-  if (hasUrlCredentials(input)) {
-    throw new Error(
-      "Remove the embedded credentials from the URL. Private repositories authenticate via git credential helpers or SSH."
-    );
-  }
+  assertNoAgentPluginUrlCredentials(input);
 
   if (isUrlLike(input)) {
     // Git is spawned without a shell, so `~` never expands on its own —

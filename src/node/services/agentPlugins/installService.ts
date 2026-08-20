@@ -43,7 +43,11 @@ import {
   isCanonicalPluginServerKeyPrefix,
   loadPluginMcpServers,
 } from "./mcpConfig";
-import { isFullCommitSha, parseAgentPluginSourceInput } from "./sourceInput";
+import {
+  assertNoAgentPluginUrlCredentials,
+  isFullCommitSha,
+  parseAgentPluginSourceInput,
+} from "./sourceInput";
 
 /**
  * Managed Agent Plugin installer (agent-plugins experiment; global scope only).
@@ -109,6 +113,10 @@ async function runGit(args: string[], opts?: { timeoutMs?: number }): Promise<st
   using proc = execFileAsync("git", args, {
     env: gitEnv(),
     timeoutMs: opts?.timeoutMs ?? CLONE_TIMEOUT_MS,
+    // Git spawns SSH/credential-helper children that inherit its pipes; a
+    // stalled helper would otherwise keep the promise pending past the
+    // timeout because only the direct child gets killed.
+    killTreeOnTermination: true,
   });
   const { stdout } = await proc.result;
   return stdout;
@@ -852,6 +860,11 @@ export class AgentPluginInstallService {
   }): Promise<AgentPluginInstallEntry> {
     this.assertEnabled();
     assert(isFullCommitSha(args.expectedSha), "install: expectedSha must be a full commit SHA");
+    // Re-checked here (not just in source-input parsing): a direct API
+    // request can hand install() a source that never went through the
+    // parser, and this URL is persisted to plugins.json and rendered in
+    // Settings.
+    assertNoAgentPluginUrlCredentials(args.source.url);
     if (args.source.subpath !== undefined) {
       throw new Error("Monorepo subpath installs land in v2.");
     }
@@ -894,16 +907,35 @@ export class AgentPluginInstallService {
           ]);
         } catch (error) {
           // No partial state: a promote without a registry entry would look
-          // like an unmanaged dir and block reinstall.
-          await this.removeDir(targetPath);
+          // like an unmanaged dir and block reinstall. Each cleanup step is
+          // isolated so a failure (e.g. a locked file on Windows) cannot
+          // skip the others or mask the registry error.
+          const cleanupNotes: string[] = [];
+          try {
+            await this.removeDir(targetPath);
+          } catch (cleanupError) {
+            cleanupNotes.push(
+              `the promoted plugin tree could not be removed — delete ${shortenHome(targetPath)} manually (${getErrorMessage(cleanupError)})`
+            );
+          }
           // A getToolsForWorkspace running during the promote↔rollback window
           // can have discovered the briefly-visible tree and be starting a
           // server from it; invalidate the prefix (same as update/uninstall)
-          // so it is closed instead of surviving the failed install.
-          await this.deps.mcpServerManager?.stopServersWithKeyPrefix(
-            `plugin:${this.instanceIdFor(name)}:`
+          // so it is closed instead of surviving the failed install. Must run
+          // even when the rollback deletion above failed.
+          try {
+            await this.deps.mcpServerManager?.stopServersWithKeyPrefix(
+              `plugin:${this.instanceIdFor(name)}:`
+            );
+          } catch (cleanupError) {
+            cleanupNotes.push(
+              `the plugin's MCP servers could not be stopped (${getErrorMessage(cleanupError)})`
+            );
+          }
+          const notes = cleanupNotes.length > 0 ? ` Additionally, ${cleanupNotes.join("; ")}.` : "";
+          throw new Error(
+            `Failed to persist the plugin registry: ${getErrorMessage(error)}${notes}`
           );
-          throw new Error(`Failed to persist the plugin registry: ${getErrorMessage(error)}`);
         }
         log.info(`Installed agent plugin '${name}' at ${args.expectedSha.slice(0, 12)}`);
         return entry;
