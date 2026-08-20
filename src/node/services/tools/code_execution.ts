@@ -165,7 +165,7 @@ async function offloadValue(
 async function offloadOversizedReturnValue(
   mount: SandboxMount,
   result: PTCExecutionResult
-): Promise<void> {
+): Promise<string | null> {
   if (result.result !== undefined) {
     const offloaded = await offloadValue(mount, result.result);
     if (offloaded !== null) {
@@ -173,8 +173,29 @@ async function offloadOversizedReturnValue(
         ...offloaded,
         hint: `Return value exceeded the inline limit; the full value is stored in the kernel — access or slice ${offloaded.handle} in a follow-up code_execution call.`,
       } satisfies OffloadedValueRecord;
+      // "vars.__hN" → "__hN": the bare vars key, for retention protection.
+      return offloaded.handle.replace(/^vars\./, "");
     }
   }
+  return null;
+}
+
+/**
+ * Keys successfully loaded by mux.load THIS call (r12): their compact records
+ * carry the {key, ...} summary result, failed loads carry only an error.
+ */
+function collectNewLoadKeys(result: PTCExecutionResult, loadActive: boolean): string[] {
+  if (!loadActive) return [];
+  const keys = new Set<string>();
+  for (const record of result.toolCalls) {
+    if (record.toolName !== "load" || record.error !== undefined) continue;
+    const key =
+      typeof record.result === "object" && record.result !== null
+        ? (record.result as { key?: unknown }).key
+        : undefined;
+    if (typeof key === "string" && key.length > 0) keys.add(key);
+  }
+  return [...keys];
 }
 
 /**
@@ -489,7 +510,28 @@ ${xumTypes}
           // handle vars land in the same durable snapshot the model's
           // {handle, preview, size} record relies on.
           if (mount?.lifetime === "persistent" && mount.grants.vars) {
-            await offloadOversizedReturnValue(mount, result);
+            const returnHandleKey = await offloadOversizedReturnValue(mount, result);
+
+            // r12: loads count toward the r4 vars retention cap — register
+            // this call's loaded keys and evict oldest managed entries
+            // (handles + loads) beyond the cap. Keys the model was JUST told
+            // about (new loads + the fresh return handle) are protected.
+            // Retention failure must never fail the call (self-healing).
+            const newLoadKeys = collectNewLoadKeys(result, loadActive);
+            if (newLoadKeys.length > 0 || returnHandleKey !== null) {
+              try {
+                await mount.enforceVarsRetention({
+                  newLoadKeys,
+                  protectedKeys:
+                    returnHandleKey !== null ? [...newLoadKeys, returnHandleKey] : newLoadKeys,
+                  capBytes: RESULT_HANDLE_VARS_CAP_BYTES,
+                });
+              } catch (error) {
+                log.warn("code_execution: vars retention enforcement failed; continuing", {
+                  error,
+                });
+              }
+            }
           }
 
           // Persist the shared vars namespace after each call on persistent

@@ -274,6 +274,96 @@ export class SandboxMount {
     return key;
   }
 
+  /**
+   * r12: loads count toward the r4 vars retention cap. Registers this call's
+   * mux.load keys in `vars.__loadMeta` (key → seq from the shared
+   * `__handleSeq` counter, so handles and loads share one age order), then
+   * measures the live bytes of ALL managed entries (__hN handles + load
+   * keys) and evicts oldest-first until the total fits `capBytes`.
+   *
+   * `protectedKeys` (this call's new loads + the return handle the model was
+   * just told about) are never evicted — same "soft by current entries"
+   * rationale as storeResultHandle: the model must be able to find what it
+   * was just promised in a follow-up call. Evicting an OLD load drops only
+   * the guest-local copy the model deliberately named; unlike handles there
+   * is no blob backup, so the model must re-load the file if it still needs
+   * it (the eviction is bounded-state over convenience, mirroring r4).
+   */
+  async enforceVarsRetention(args: {
+    newLoadKeys: string[];
+    protectedKeys: string[];
+    capBytes: number;
+  }): Promise<void> {
+    this.assertNotDisposed("enforceVarsRetention");
+    assert(this.lifetime === "persistent", "enforceVarsRetention requires a persistent mount");
+    assert(this.grants.vars, "enforceVarsRetention requires the vars grant");
+    assert(
+      Number.isSafeInteger(args.capBytes) && args.capBytes > 0,
+      "enforceVarsRetention: capBytes must be a positive integer"
+    );
+    const result = await this.runtime.eval(
+      `
+      const newLoads = ${JSON.stringify(args.newLoadKeys)};
+      const protectedKeys = ${JSON.stringify(args.protectedKeys)};
+      const cap = ${args.capBytes};
+      const metaRaw = vars.__loadMeta;
+      // Tolerate a guest-clobbered registry (vars is guest-writable).
+      const meta = typeof metaRaw === "object" && metaRaw !== null ? metaRaw : {};
+      vars.__loadMeta = meta;
+      for (const key of newLoads) {
+        const seqRaw = vars.__handleSeq;
+        const seq = (typeof seqRaw === "number" && isFinite(seqRaw) ? Math.floor(seqRaw) : 0) + 1;
+        vars.__handleSeq = seq;
+        meta[key] = seq;
+      }
+      // Drop registry entries whose key the guest already deleted.
+      for (const key of Object.keys(meta)) {
+        if (!Object.prototype.hasOwnProperty.call(vars, key)) delete meta[key];
+      }
+      const entries = [];
+      for (const k of Object.keys(vars)) {
+        const m = /^__h(\\d+)$/.exec(k);
+        if (m !== null) {
+          entries.push({ key: k, n: Number(m[1]), load: false, bytes: 0 });
+          continue;
+        }
+        if (Object.prototype.hasOwnProperty.call(meta, k)) {
+          const n = meta[k];
+          entries.push({
+            key: k,
+            n: typeof n === "number" && isFinite(n) ? n : 0,
+            load: true,
+            bytes: 0,
+          });
+        }
+      }
+      let total = 0;
+      for (const e of entries) {
+        // Unmeasurable (guest mutated an entry into a cycle) counts as 0;
+        // snapshotVars is where cycles crash-fast.
+        try {
+          e.bytes = JSON.stringify(vars[e.key]).length;
+        } catch (err) {
+          e.bytes = 0;
+        }
+        total += e.bytes;
+      }
+      entries.sort((a, b) => a.n - b.n);
+      const isProtected = {};
+      for (const k of protectedKeys) isProtected[k] = true;
+      for (const e of entries) {
+        if (total <= cap) break;
+        if (isProtected[e.key] === true) continue;
+        delete vars[e.key];
+        if (e.load) delete meta[e.key];
+        total -= e.bytes;
+      }
+      return true;
+      `
+    );
+    assert(result.success, `enforceVarsRetention failed: ${result.error ?? "unknown error"}`);
+  }
+
   /** Durably persist an offloaded result: full-value blob + result-handle event. */
   async persistResultHandle(args: ResultHandlePersistArgs): Promise<void> {
     this.assertNotDisposed("persistResultHandle");

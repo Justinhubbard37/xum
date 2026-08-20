@@ -759,4 +759,45 @@ describe("SandboxHostService", () => {
     expect(afterFourth.result).toEqual(["undefined", "undefined", 5200]);
     await host.disposeScope("ws-evict");
   });
+
+  test("enforceVarsRetention counts loads with handles and evicts oldest-first, protecting new keys", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const host = new SandboxHostService();
+    const mount = await host.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-load-evict",
+      sessionDir: tmp.path,
+    });
+
+    // Age order: __h1 (seq 1), then load "big" (seq 2), then __h3 (seq 3).
+    await mount.storeResultHandle(JSON.stringify("a".repeat(400)), 10_000); // __h1, 402
+    const seed = await mount.runtime.eval('vars.big = "x".repeat(398); return true;'); // 400 serialized
+    expect(seed.success).toBe(true);
+    await mount.enforceVarsRetention({
+      newLoadKeys: ["big"],
+      protectedKeys: ["big"],
+      capBytes: 10_000,
+    });
+    await mount.storeResultHandle(JSON.stringify("c".repeat(400)), 10_000); // __h3 (seq skips: load took 2)
+
+    // Total ~1204 > 900: the OLDEST managed entry (__h1) evicts first even
+    // though the load is not a handle; the load itself and __h3 survive.
+    await mount.enforceVarsRetention({ newLoadKeys: [], protectedKeys: [], capBytes: 900 });
+    const afterFirst = await mount.runtime.eval(
+      "return [typeof vars.__h1, typeof vars.big, typeof vars.__h3, vars.__loadMeta];"
+    );
+    expect(afterFirst.result).toEqual(["undefined", "string", "string", { big: 2 }]);
+
+    // Tighter cap: the load (now oldest) evicts too, and its registry entry
+    // goes with it — unless it is protected as a NEW key this call.
+    await mount.enforceVarsRetention({ newLoadKeys: [], protectedKeys: ["big"], capBytes: 300 });
+    const stillProtected = await mount.runtime.eval("return [typeof vars.big, typeof vars.__h3];");
+    expect(stillProtected.result).toEqual(["string", "undefined"]);
+
+    await mount.enforceVarsRetention({ newLoadKeys: [], protectedKeys: [], capBytes: 300 });
+    const afterSecond = await mount.runtime.eval("return [typeof vars.big, vars.__loadMeta];");
+    expect(afterSecond.result).toEqual(["undefined", {}]);
+    await host.disposeScope("ws-load-evict");
+  });
 });
