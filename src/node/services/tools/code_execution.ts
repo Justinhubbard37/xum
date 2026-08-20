@@ -13,6 +13,7 @@ import type { ToolBridge } from "@/node/services/ptc/toolBridge";
 import type { IJSRuntime, IJSRuntimeFactory } from "@/node/services/ptc/runtime";
 import type { PTCConsoleRecord, PTCEvent, PTCExecutionResult } from "@/node/services/ptc/types";
 import type { SandboxMount } from "@/node/services/sandbox/sandboxHostService";
+import type { KernelFileLoader } from "@/node/services/tools/kernelFileLoad";
 
 import { analyzeCode } from "@/node/services/ptc/staticAnalysis";
 import { log } from "@/node/services/log";
@@ -70,6 +71,8 @@ export type MountRunner = (
 interface RetargetableState {
   toolBridge: ToolBridge;
   withMount: MountRunner | undefined;
+  /** Host file loader backing mux.load (kernel mode only); see KernelBridgeOptions. */
+  loadFile: KernelFileLoader | undefined;
 }
 
 const retargetableStates = new WeakMap<object, RetargetableState>();
@@ -90,6 +93,7 @@ export function retargetCodeExecutionTool(target: Tool, donor: Tool): boolean {
   }
   targetState.toolBridge = donorState.toolBridge;
   targetState.withMount = donorState.withMount;
+  targetState.loadFile = donorState.loadFile;
   return true;
 }
 
@@ -183,9 +187,17 @@ async function offloadOversizedReturnValue(
  * visible (bounded — message only) so the model can retry intelligently.
  * Mutates `result` in place; nested UI events already streamed the full
  * values live.
+ *
+ * Exception: mux.load records stay as-is when the kernel load is active —
+ * their result is a bounded {key, bytes, lines, preview} summary by
+ * construction (the file content goes host-side straight into vars and never
+ * touches the record), and the model needs the key/shape it just created.
+ * When the kernel load is inactive, a bridged tool that happens to be named
+ * "load" gets no exception (its records are ordinary and must not leak).
  */
-function compactKernelToolCallRecords(result: PTCExecutionResult): void {
+function compactKernelToolCallRecords(result: PTCExecutionResult, loadActive: boolean): void {
   result.toolCalls = result.toolCalls.map((record) => {
+    if (loadActive && record.toolName === "load") return record;
     let bytes = 0;
     if (record.result !== undefined) {
       try {
@@ -270,6 +282,12 @@ export interface CodeExecutionToolOptions {
    * without a kernel would instruct the model to use APIs that don't exist.
    */
   kernelFirst?: boolean;
+  /**
+   * Host file loader backing mux.load (r12 bulk ingestion). Only honored in
+   * kernel mode with file_read bridged — same "never advertise a missing
+   * API" rule as kernelFirst.
+   */
+  loadFile?: KernelFileLoader;
 }
 
 export async function createCodeExecutionTool(
@@ -280,7 +298,7 @@ export async function createCodeExecutionTool(
   options?: CodeExecutionToolOptions
 ): Promise<Tool> {
   const bridgeableTools = toolBridge.getBridgeableTools();
-  const state: RetargetableState = { toolBridge, withMount };
+  const state: RetargetableState = { toolBridge, withMount, loadFile: options?.loadFile };
 
   // Kernel mode = persistent mount available (RLM experiment, or the
   // XUM_SANDBOX_PERSISTENT_MOUNTS dev override that rides the same path).
@@ -288,8 +306,14 @@ export async function createCodeExecutionTool(
   // byte-identical to today.
   const kernel = withMount !== undefined;
 
+  // xum.load availability: kernel mode + a host file loader + file_read
+  // bridged (load rides file_read's grant). Must match
+  // ToolBridge.addKernelMethods so types/description never advertise a
+  // missing member.
+  const loadEnabled = kernel && options?.loadFile !== undefined && "file_read" in bridgeableTools;
+
   // Generate xum types for type validation and documentation (cached by tool set hash)
-  const xumTypes = await getCachedXumTypes(bridgeableTools, { kernel });
+  const xumTypes = await getCachedXumTypes(bridgeableTools, { kernel, load: loadEnabled });
 
   // Persistent-kernel addendum: only advertised when this instance runs on a
   // persistent mount (RLM mode or XUM_SANDBOX_PERSISTENT_MOUNTS). Ephemeral
@@ -300,6 +324,11 @@ export async function createCodeExecutionTool(
     : `
 
 **Persistent kernel:** the global \`vars\` object persists across code_execution calls and turns (JSON-serializable values only) and survives restarts via snapshots. Nested tool results do NOT enter your context: each mux.* call's visible record is a compact {tool, ok, bytes} summary (plus the error message on failure). Data reaches you only through your \`return\` value (offloaded to a {handle, preview, size} vars handle like \`vars.__h1\` when >${Math.floor(RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES / 1024)}KB serialized — read or slice it in a follow-up call), \`console\` output (capped at ${Math.floor(KERNEL_CONSOLE_CAP_BYTES / 1024)}KB per execution), and \`vars\`. Keep working data in \`vars\` and return only what you need to see. Note \`mux.file_read\` errors beyond its ~16KB/1000-line per-call cap (it does not offload).${
+        loadEnabled
+          ? `
+**Bulk file ingestion:** \`mux.load({path, key})\` reads a whole file host-side into \`vars[key]\` (string) and shows you only {key, bytes, lines, preview}. Use it instead of paginated \`mux.file_read\` for large files.`
+          : ""
+      }${
         "task" in bridgeableTools
           ? `
 **Fire-and-forget sub-agents:** \`xum.task_spawn(args)\` (same args as \`xum.task\`) returns immediately with {taskId, status:"spawned"} once the child is admitted. Terminal reports are queued in the kernel — drain with \`xum.events()\` in a later call. The queue is best-effort (an app restart may drop it); every report still reaches you via the normal task wake.`
@@ -366,7 +395,12 @@ ${xumTypes}
       // Late-bound dispatch: snapshot the CURRENT bridge + mount runner as a
       // pair so a retarget (see retargetCodeExecutionTool) lands atomically —
       // the whole call uses either the old pair or the new pair, never a mix.
-      const { toolBridge: activeBridge, withMount: activeMount } = state;
+      const { toolBridge: activeBridge, withMount: activeMount, loadFile: activeLoadFile } = state;
+
+      // Mirrors the creation-time loadEnabled gate against the ACTIVE bridge
+      // (a retarget may have narrowed file_read away).
+      const loadActive =
+        activeLoadFile !== undefined && activeBridge.getBridgeableToolNames().includes("file_read");
 
       // Static analysis before execution - catch syntax errors and sandbox-forbidden patterns.
       // TypeScript typing issues are intentionally non-blocking for one-off runtime scripts.
@@ -421,7 +455,10 @@ ${xumTypes}
           activeBridge.register(
             runtime,
             mount?.lifetime === "persistent"
-              ? { drainHostEvents: () => mount.drainHostEvents() }
+              ? {
+                  drainHostEvents: () => mount.drainHostEvents(),
+                  ...(activeLoadFile !== undefined ? { loadFile: activeLoadFile } : {}),
+                }
               : undefined
           );
 
@@ -444,7 +481,7 @@ ${xumTypes}
           // failed evals: partial toolCalls records are model-visible too and
           // must not leak either (their error messages stay visible).
           if (mount?.lifetime === "persistent") {
-            compactKernelToolCallRecords(result);
+            compactKernelToolCallRecords(result, loadActive);
             capKernelConsoleOutput(result);
           }
 

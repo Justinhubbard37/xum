@@ -26,6 +26,7 @@ import type { ToolBridge } from "@/node/services/ptc/toolBridge";
 import type { PTCExecutionResult } from "@/node/services/ptc/types";
 import { sandboxHostService, type SandboxMount } from "@/node/services/sandbox/sandboxHostService";
 import { createRefinementRollbackTool } from "@/node/services/tools/refinement_rollback";
+import type { KernelFileLoader } from "@/node/services/tools/kernelFileLoad";
 import { log } from "./log";
 import type { MCPWorkspaceStats } from "@/node/services/mcpServerManager";
 import type { TelemetryService } from "@/node/services/telemetryService";
@@ -139,8 +140,11 @@ export interface ApplyToolPolicyAndExperimentsOptions {
    * are enabled (RLM mode experiment or MUX_SANDBOX_PERSISTENT_MOUNTS=1),
    * code_execution reuses a per-workspace persistent mount (shared `vars`,
    * snapshot/restore) instead of an ephemeral per-call runtime.
+   * kernelFileLoader backs mux.load (r12 bulk ingestion) — built by the
+   * caller from the workspace cwd/runtime pair the file tools use; only
+   * honored in kernel mode with file_read bridged.
    */
-  sandbox?: { workspaceId: string; sessionDir: string };
+  sandbox?: { workspaceId: string; sessionDir: string; kernelFileLoader?: KernelFileLoader };
   /**
    * Capability grants for this assembly (registry-with-filters posture).
    * Omitted = session-scope full grants (identical to pre-grants behavior).
@@ -254,6 +258,7 @@ export async function applyToolPolicyAndExperiments(
         {
           kernelFirst:
             experiments?.rlm === true && experiments?.programmaticToolCallingExclusive === true,
+          loadFile: sandbox?.kernelFileLoader,
         }
       );
 

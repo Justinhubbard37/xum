@@ -25,6 +25,13 @@ export interface XumTypesOptions {
    * types, keeping non-kernel provider requests byte-identical.
    */
   kernel?: boolean;
+  /**
+   * mux.load available (kernel mode + a host file loader + file_read
+   * bridged): declare the bulk-ingestion member. Kept separate from `kernel`
+   * because load has an extra availability requirement (workspace file
+   * context) that task_spawn/events do not.
+   */
+  load?: boolean;
 }
 
 /**
@@ -93,7 +100,7 @@ export async function getCachedXumTypes(
   // Kernel mode changes the generated declarations, so it is part of the
   // cache identity — one workspace with RLM on must not serve another's
   // RLM-off types (or vice versa).
-  const hash = `${hashToolDefinitions(tools)}|kernel=${options?.kernel === true}`;
+  const hash = `${hashToolDefinitions(tools)}|kernel=${options?.kernel === true}|load=${options?.load === true}`;
   const cached = cache.fullTypes.get(hash);
   if (cached) {
     return cached;
@@ -330,6 +337,18 @@ export async function generateXumTypes(
     );
     lines.push("  function events(): HostEvent[];");
     lines.push("");
+    // mux.load: bulk file ingestion — keep in sync with
+    // ToolBridge.addKernelMethods and createKernelFileLoader.
+    if (options.load === true) {
+      lines.push(
+        "  /** Bulk file ingestion: reads the WHOLE file host-side into vars[key] as a string (no 16KB/1000-line pagination cap) and returns only this bounded summary — the content itself never enters your context. Same path resolution and capability grant as file_read. */"
+      );
+      lines.push(
+        "  type LoadResult = { key: string; bytes: number; lines: number; preview: string };"
+      );
+      lines.push("  function load(args: { path: string; key: string }): LoadResult;");
+      lines.push("");
+    }
   }
 
   // Add MCP result type if any MCP tools are present

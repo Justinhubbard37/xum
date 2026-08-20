@@ -546,6 +546,24 @@ export class QuickJSRuntime implements IJSRuntime {
     fnHandle.dispose();
   }
 
+  setVarsProperty(key: string, value: string): void {
+    this.assertNotDisposed("setVarsProperty");
+    const valueHandle = this.ctx.newString(value);
+    let varsHandle = this.ctx.getProp(this.ctx.global, "vars");
+    // vars is guest-writable: if the guest deleted or clobbered it (non-object
+    // or null), recreate the namespace instead of crashing the write mid-eval.
+    const clobbered =
+      this.ctx.typeof(varsHandle) !== "object" || this.ctx.eq(varsHandle, this.ctx.null);
+    if (clobbered) {
+      varsHandle.dispose();
+      varsHandle = this.ctx.newObject();
+      this.ctx.setProp(this.ctx.global, "vars", varsHandle);
+    }
+    this.ctx.setProp(varsHandle, key, valueHandle);
+    varsHandle.dispose();
+    valueHandle.dispose();
+  }
+
   registerObject(
     name: string,
     obj: Record<string, (...args: unknown[]) => Promise<unknown>>,

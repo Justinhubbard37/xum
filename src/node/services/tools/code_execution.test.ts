@@ -17,6 +17,10 @@ import { z } from "zod";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { SandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
+import { createKernelFileLoader } from "@/node/services/tools/kernelFileLoad";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import * as fs from "node:fs/promises";
+import * as nodePath from "node:path";
 
 const mockToolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
@@ -1214,6 +1218,202 @@ describe("createCodeExecutionTool", () => {
       expect(tool.description).toContain("function task_spawn(args: TaskArgs): TaskSpawnResult;");
       expect(tool.description).toContain("function events(): HostEvent[];");
       await host.disposeScope("ws-kernel-desc");
+    });
+  });
+
+  describe("RLM kernel: mux.load bulk ingestion", () => {
+    const fileReadSchema = z.object({
+      path: z.string(),
+      offset: z.number().nullish(),
+      limit: z.number().nullish(),
+    });
+    const fileReadTools = (): Record<string, Tool> => ({
+      file_read: createMockTool("file_read", fileReadSchema, () => mockResults.file_read),
+    });
+
+    const kernelRunner = (host: SandboxHostService, scopeKey: string, sessionDir: string) =>
+      ((fn) =>
+        host.withPersistentMount(
+          { lifetime: "persistent", runtimeFactory, scopeKey, sessionDir },
+          fn
+        )) satisfies MountRunner;
+
+    it("loads a >100KB file into vars with only {key, bytes, lines, preview} visible", async () => {
+      using tmp = new DisposableTempDir("code-exec-load");
+      // ~130KB, 2000 lines, with a needle that must never be model-visible.
+      const line = "x".repeat(64);
+      const contentLines = Array.from({ length: 2000 }, (_, i) =>
+        i === 1500 ? `NEEDLE_${i}_SECRET` : line
+      );
+      const content = contentLines.join("\n");
+      expect(Buffer.byteLength(content, "utf8")).toBeGreaterThan(100 * 1024);
+      await fs.writeFile(nodePath.join(tmp.path, "orders.jsonl"), content, "utf8");
+
+      const host = new SandboxHostService();
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(fileReadTools()),
+        undefined,
+        kernelRunner(host, "ws-load", tmp.path),
+        {
+          loadFile: createKernelFileLoader({ cwd: tmp.path, runtime: new LocalRuntime(tmp.path) }),
+        }
+      );
+
+      // Same-eval use: load then immediately compute over vars[key].
+      const result = (await tool.execute!(
+        {
+          code: 'const s = mux.load({ path: "orders.jsonl", key: "orders" }); return { s, len: vars.orders.length };',
+        },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      const returned = result.result as {
+        s: { key: string; bytes: number; lines: number; preview: string };
+        len: number;
+      };
+      expect(returned.len).toBe(content.length);
+      expect(returned.s.key).toBe("orders");
+      expect(returned.s.bytes).toBe(Buffer.byteLength(content, "utf8"));
+      expect(returned.s.lines).toBe(2000);
+      expect(returned.s.preview.length).toBeLessThanOrEqual(512);
+      expect(content.startsWith(returned.s.preview)).toBe(true);
+
+      // The load record keeps its bounded summary (exempt from compaction).
+      const loadRecord = result.toolCalls[0];
+      expect(loadRecord.toolName).toBe("load");
+      expect(loadRecord.result).toEqual(returned.s);
+
+      // Nothing model-visible contains the file body.
+      expect(JSON.stringify(result)).not.toContain("NEEDLE_1500_SECRET");
+
+      // Later evals (and the vars snapshot) retain the loaded content.
+      const followUp = (await tool.execute!(
+        { code: "return vars.orders.split('\\n')[1500];" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(followUp.result).toBe("NEEDLE_1500_SECRET");
+      await host.disposeScope("ws-load");
+    });
+
+    it("rejects reserved __ keys and surfaces loader errors as catchable guest errors", async () => {
+      using tmp = new DisposableTempDir("code-exec-load");
+      const host = new SandboxHostService();
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(fileReadTools()),
+        undefined,
+        kernelRunner(host, "ws-load-err", tmp.path),
+        {
+          loadFile: createKernelFileLoader({ cwd: tmp.path, runtime: new LocalRuntime(tmp.path) }),
+        }
+      );
+      const result = (await tool.execute!(
+        {
+          code: `
+            const errors = [];
+            try { mux.load({ path: "x.txt", key: "__h1" }); } catch (e) { errors.push(String(e)); }
+            try { mux.load({ path: "missing.txt", key: "data" }); } catch (e) { errors.push(String(e)); }
+            return errors;
+          `,
+        },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      const errors = result.result as string[];
+      expect(errors[0]).toContain("reserved");
+      expect(errors[1].length).toBeGreaterThan(0);
+      await host.disposeScope("ws-load-err");
+    });
+
+    it("honors grants: file_read denied => mux.load denied", async () => {
+      using tmp = new DisposableTempDir("code-exec-load");
+      const host = new SandboxHostService();
+      const grants = {
+        version: 1 as const,
+        bridgeTools: { allow: [] as string[] },
+        vars: true,
+        hostEvents: true,
+      };
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(fileReadTools(), grants),
+        undefined,
+        kernelRunner(host, "ws-load-denied", tmp.path),
+        {
+          loadFile: createKernelFileLoader({ cwd: tmp.path, runtime: new LocalRuntime(tmp.path) }),
+        }
+      );
+      const result = (await tool.execute!(
+        {
+          code: 'try { mux.load({ path: "x", key: "k" }); } catch (e) { return String(e); } return "no error";',
+        },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      expect(result.result).toContain("Capability denied");
+      await host.disposeScope("ws-load-denied");
+    });
+
+    it("ephemeral mode (RLM off): mux.load absent from namespace, types, and description", async () => {
+      const baseline = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(fileReadTools())
+      );
+      // Even with a loader configured, no persistent mount => no load.
+      const noMountTool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(fileReadTools()),
+        undefined,
+        undefined,
+        { loadFile: async () => ({ content: "", bytes: 0, lines: 0, preview: "" }) }
+      );
+      expect(noMountTool.description).not.toContain("function load(");
+      expect(noMountTool.description).not.toContain("Bulk file ingestion");
+      const probe = (await noMountTool.execute!(
+        { code: "return typeof mux.load;" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(probe.success).toBe(true);
+      expect(probe.result).toBe("undefined");
+      // Baseline instance without a loader matches byte-for-byte.
+      expect(noMountTool.description).toBe(baseline.description);
+    });
+
+    it("kernel mode advertises mux.load in type defs only when a loader exists and file_read is bridged", async () => {
+      using tmp = new DisposableTempDir("code-exec-load");
+      const host = new SandboxHostService();
+      const loader = createKernelFileLoader({ cwd: tmp.path, runtime: new LocalRuntime(tmp.path) });
+      const withLoader = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(fileReadTools()),
+        undefined,
+        kernelRunner(host, "ws-load-types", tmp.path),
+        { loadFile: loader }
+      );
+      expect(withLoader.description).toContain(
+        "function load(args: { path: string; key: string }): LoadResult;"
+      );
+      expect(withLoader.description).toContain("Bulk file ingestion");
+
+      const withoutLoader = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(fileReadTools()),
+        undefined,
+        kernelRunner(host, "ws-load-types", tmp.path)
+      );
+      expect(withoutLoader.description).not.toContain("function load(");
+
+      // file_read not bridged => load absent even with a loader.
+      const withoutFileRead = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge({}),
+        undefined,
+        kernelRunner(host, "ws-load-types", tmp.path),
+        { loadFile: loader }
+      );
+      expect(withoutFileRead.description).not.toContain("function load(");
+      await host.disposeScope("ws-load-types");
     });
   });
 });

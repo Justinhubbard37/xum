@@ -11,3 +11,6 @@
 
 /** Cap on total model-visible console bytes per execution (kernel mode only). */
 export const KERNEL_CONSOLE_CAP_BYTES = 16 * 1024;
+
+/** Bounded head shown for a mux.load ingestion ({key, bytes, lines, preview}). */
+export const KERNEL_LOAD_PREVIEW_CHARS = 512;

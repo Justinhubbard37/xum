@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect, mock } from "bun:test";
-import { ToolBridge } from "./toolBridge";
+import { ToolBridge, type KernelBridgeOptions } from "./toolBridge";
 import type { Tool } from "ai";
 import type { IJSRuntime, RuntimeLimits } from "./runtime";
 import type { PTCEvent, PTCExecutionResult } from "./types";
@@ -27,6 +27,7 @@ function createMockRuntime(overrides: Partial<IJSRuntime> = {}): IJSRuntime {
     ),
     registerPromiseFunction: mock((_name: string, _fn: () => Promise<unknown>) => undefined),
     registerSyncFunction: mock((_name: string, _fn: () => unknown) => undefined),
+    setVarsProperty: mock((_key: string, _value: string) => undefined),
     setPendingJobGate: mock((_gate: (run: () => void) => void) => undefined),
     setLimits: mock((_limits: RuntimeLimits) => undefined),
     onEvent: mock((_handler: (event: PTCEvent) => void) => undefined),
@@ -322,7 +323,11 @@ describe("ToolBridge", () => {
       sync: Record<string, (...args: unknown[]) => unknown>;
     }
 
-    function registerCapturing(bridge: ToolBridge, kernel?: { drainHostEvents: () => unknown[] }) {
+    function registerCapturing(
+      bridge: ToolBridge,
+      kernel?: KernelBridgeOptions,
+      runtimeOverrides: Partial<IJSRuntime> = {}
+    ) {
       const captured: Captured = { mux: {}, sync: {} };
       const mockRuntime = createMockRuntime({
         registerObject: (
@@ -335,6 +340,7 @@ describe("ToolBridge", () => {
             captured.sync = syncMethods ?? {};
           }
         },
+        ...runtimeOverrides,
       });
       bridge.register(mockRuntime, kernel);
       return captured;
@@ -422,6 +428,94 @@ describe("ToolBridge", () => {
       expect(() => deniedCaptured.sync.events()).toThrow(
         /Capability denied: mux\.events is not granted/
       );
+    });
+
+    describe("mux.load", () => {
+      const fileReadTool = () =>
+        createMockTool("file_read", z.object({ path: z.string() }), () => ({ content: "x" }));
+      const loaded = {
+        content: "line1\nline2",
+        bytes: 11,
+        lines: 2,
+        preview: "line1\nline2",
+      };
+
+      it("writes content into vars via the runtime and returns only the bounded summary", async () => {
+        const setVarsProperty = mock((_key: string, _value: string) => undefined);
+        const bridge = new ToolBridge({ file_read: fileReadTool() });
+        const captured = registerCapturing(
+          bridge,
+          { drainHostEvents: () => [], loadFile: () => Promise.resolve(loaded) },
+          { setVarsProperty }
+        );
+        const load = captured.mux.load as (...args: unknown[]) => Promise<unknown>;
+        const summary = await load({ path: "a.txt", key: "data" });
+        // Content reaches the guest heap through setVarsProperty only.
+        expect(setVarsProperty).toHaveBeenCalledWith("data", loaded.content);
+        expect(summary).toEqual({ key: "data", bytes: 11, lines: 2, preview: "line1\nline2" });
+      });
+
+      it("is absent without a loader, and absent when file_read is not bridged", () => {
+        const noLoader = registerCapturing(new ToolBridge({ file_read: fileReadTool() }), {
+          drainHostEvents: () => [],
+        });
+        expect(noLoader.mux.load).toBeUndefined();
+
+        const noFileRead = registerCapturing(new ToolBridge({}), {
+          drainHostEvents: () => [],
+          loadFile: () => Promise.resolve(loaded),
+        });
+        expect(noFileRead.mux.load).toBeUndefined();
+      });
+
+      it("is denied by file_read's grant and rejects reserved keys", async () => {
+        const denied = new ToolBridge(
+          { file_read: fileReadTool() },
+          { version: 1, bridgeTools: { allow: [] }, vars: true, hostEvents: true }
+        );
+        const deniedCaptured = registerCapturing(denied, {
+          drainHostEvents: () => [],
+          loadFile: () => Promise.resolve(loaded),
+        });
+        const deniedLoad = deniedCaptured.mux.load as (...args: unknown[]) => Promise<unknown>;
+        try {
+          await deniedLoad({ path: "a.txt", key: "data" });
+          expect.unreachable("Should have thrown");
+        } catch (e) {
+          expect(String(e)).toContain("Capability denied: mux.load is not granted");
+        }
+
+        const bridge = new ToolBridge({ file_read: fileReadTool() });
+        const captured = registerCapturing(bridge, {
+          drainHostEvents: () => [],
+          loadFile: () => Promise.resolve(loaded),
+        });
+        const load = captured.mux.load as (...args: unknown[]) => Promise<unknown>;
+        try {
+          await load({ path: "a.txt", key: "__handleSeq" });
+          expect.unreachable("Should have thrown");
+        } catch (e) {
+          expect(String(e)).toContain("reserved");
+        }
+      });
+
+      it("requires the vars grant (content has nowhere to live without it)", async () => {
+        const bridge = new ToolBridge(
+          { file_read: fileReadTool() },
+          { version: 1, bridgeTools: { allow: "all" }, vars: false, hostEvents: true }
+        );
+        const captured = registerCapturing(bridge, {
+          drainHostEvents: () => [],
+          loadFile: () => Promise.resolve(loaded),
+        });
+        const load = captured.mux.load as (...args: unknown[]) => Promise<unknown>;
+        try {
+          await load({ path: "a.txt", key: "data" });
+          expect.unreachable("Should have thrown");
+        } catch (e) {
+          expect(String(e)).toContain("requires the vars grant");
+        }
+      });
     });
   });
 });

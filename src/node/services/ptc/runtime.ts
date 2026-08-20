@@ -71,6 +71,16 @@ export interface IJSRuntime extends Disposable {
   registerSyncFunction(name: string, fn: (...args: unknown[]) => unknown): void;
 
   /**
+   * Write a string property onto the guest `vars` global from the host.
+   * Safe to call from inside a registered host function (the VM is suspended
+   * but the context is usable — the same window marshal/dump already use) or
+   * between evals. Recreates `vars` if the guest clobbered it. Used by
+   * mux.load (r12) to place bulk file content into the kernel without ever
+   * transiting the model-visible record.
+   */
+  setVarsProperty(key: string, value: string): void;
+
+  /**
    * Route late guest-continuation execution through a host-provided gate.
    * When a fire-and-forget capability (registerPromiseFunction) settles after
    * its originating eval() returned, the runtime must run pending guest jobs —

@@ -209,6 +209,27 @@ describe("QuickJSRuntime", () => {
     });
   });
 
+  describe("setVarsProperty", () => {
+    it("writes into vars from a host function mid-eval; recreates a clobbered vars", async () => {
+      // Host-side write during an asyncified host call — the window mux.load
+      // uses to place bulk content into the kernel without transiting records.
+      runtime.registerFunction("hostWrite", (...args: unknown[]) => {
+        runtime.setVarsProperty(String(args[0]), String(args[1]));
+        return Promise.resolve(true);
+      });
+      const result = await runtime.eval(`
+        globalThis.vars = {};
+        hostWrite("a", "hello");
+        const first = vars.a;
+        vars = null; // guest clobbers the namespace
+        hostWrite("b", "world");
+        return { first, second: vars.b };
+      `);
+      expect(result.success).toBe(true);
+      expect(result.result).toEqual({ first: "hello", second: "world" });
+    });
+  });
+
   describe("console capture", () => {
     it("captures console.log output", async () => {
       const result = await runtime.eval(`

@@ -3228,6 +3228,7 @@ describe("WorkflowRunner", () => {
             registerObject: noop,
             registerPromiseFunction: noop,
             registerSyncFunction: noop,
+            setVarsProperty: noop,
             setPendingJobGate: noop,
             onEvent: noop,
             abort: noop,

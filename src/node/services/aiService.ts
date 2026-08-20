@@ -188,6 +188,10 @@ import {
   reconcileHookReplacedCodeExecution,
   retargetCodeExecution,
 } from "./toolAssembly";
+import {
+  createKernelFileLoader,
+  type KernelFileLoader,
+} from "@/node/services/tools/kernelFileLoad";
 import { eventSpine, type RequestAssembleContext } from "@/node/services/events/eventSpine";
 import { getErrorMessage } from "@/common/utils/errors";
 import { validateJsonSchemaSubsetSchema } from "@/common/utils/jsonSchemaSubset";
@@ -1083,6 +1087,7 @@ export class AIService extends EventEmitter {
     experiments: SendMessageOptions["experiments"];
     emitNestedToolEvent: (event: PTCEventWithParent) => void;
     workspaceId: string;
+    kernelFileLoader: KernelFileLoader;
   }): Promise<Record<string, Tool>> {
     const { preHookTools, postHookTools, workspaceId } = opts;
     const hookReplacedCodeExecution =
@@ -1106,7 +1111,11 @@ export class AIService extends EventEmitter {
       effectiveToolPolicy: opts.effectiveToolPolicy,
       experiments: opts.experiments,
       emitNestedToolEvent: opts.emitNestedToolEvent,
-      sandbox: { workspaceId, sessionDir: this.config.getSessionDir(workspaceId) },
+      sandbox: {
+        workspaceId,
+        sessionDir: this.config.getSessionDir(workspaceId),
+        kernelFileLoader: opts.kernelFileLoader,
+      },
     });
     // Reinstate a middleware-provided code_execution replacement over the
     // freshly built instance — but first graft the rebuilt bridge/mount onto
@@ -2811,6 +2820,14 @@ export class AIService extends EventEmitter {
         }
       };
 
+      // Host file loader backing mux.load (r12 bulk kernel ingestion). Built
+      // from the same cwd/runtime pair the file tools use so path resolution
+      // matches mux.file_read. Only honored by kernel-mode code_execution.
+      const kernelFileLoader = createKernelFileLoader({
+        cwd: toolsForModelConfig.cwd,
+        runtime: toolsForModelConfig.runtime,
+      });
+
       // Apply tool policy and PTC experiments (lazy-loads PTC dependencies only when needed).
       const applyToolPolicyAndExperimentsStartedAt = Date.now();
       let tools = await applyToolPolicyAndExperiments({
@@ -2819,7 +2836,11 @@ export class AIService extends EventEmitter {
         effectiveToolPolicy,
         experiments,
         emitNestedToolEvent: emitNestedPtcToolEvent,
-        sandbox: { workspaceId, sessionDir: this.config.getSessionDir(workspaceId) },
+        sandbox: {
+          workspaceId,
+          sessionDir: this.config.getSessionDir(workspaceId),
+          kernelFileLoader,
+        },
       });
       recordStartupPhaseTiming(
         "applyToolPolicyAndExperimentsMs",
@@ -2937,6 +2958,7 @@ export class AIService extends EventEmitter {
             experiments,
             emitNestedToolEvent: emitNestedPtcToolEvent,
             workspaceId,
+            kernelFileLoader,
           });
         }
         // Tool-search state was classified from the pre-hook record; a hook
@@ -3560,7 +3582,11 @@ export class AIService extends EventEmitter {
                     effectiveToolPolicy,
                     experiments,
                     emitNestedToolEvent: emitNestedPtcToolEvent,
-                    sandbox: { workspaceId, sessionDir: this.config.getSessionDir(workspaceId) },
+                    sandbox: {
+                      workspaceId,
+                      sessionDir: this.config.getSessionDir(workspaceId),
+                      kernelFileLoader,
+                    },
                   });
                   // Tool search: keep the per-stream state consistent with the
                   // fallback model's re-assembled toolset. rebuildToolSearchState
@@ -3652,6 +3678,7 @@ export class AIService extends EventEmitter {
                         experiments,
                         emitNestedToolEvent: emitNestedPtcToolEvent,
                         workspaceId,
+                        kernelFileLoader,
                       });
                     }
                     // Same reconcile as the primary path: tool-search state

@@ -9,6 +9,7 @@
 import type { Tool } from "ai";
 import type { z } from "zod";
 import type { IJSRuntime } from "./runtime";
+import type { KernelFileLoader } from "@/node/services/tools/kernelFileLoad";
 import {
   FULL_GRANTS,
   isBridgeToolGranted,
@@ -18,12 +19,19 @@ import {
 /**
  * RLM kernel extras for register(): host bindings that only exist on
  * persistent mounts. Presence of this options object is the availability
- * gate — RLM off (no persistent mount) => mux.task_spawn / mux.events are
- * absent from the namespace entirely.
+ * gate — RLM off (no persistent mount) => mux.task_spawn / mux.events /
+ * mux.load are absent from the namespace entirely.
  */
 export interface KernelBridgeOptions {
   /** Drains the mount's host→guest event queue (bound to SandboxMount). */
   drainHostEvents: () => unknown[];
+  /**
+   * Host-side bulk file ingestion backing mux.load (r12). Present only when
+   * the assembly could resolve the workspace file context (cwd + runtime).
+   * mux.load additionally requires the file_read tool to be bridged — it
+   * rides file_read's capability grant.
+   */
+  loadFile?: KernelFileLoader;
 }
 
 /** Admission handle returned by mux.task_spawn (single or grouped spawn). */
@@ -56,6 +64,28 @@ function extractAdmissionHandle(result: unknown): TaskSpawnAdmissionHandle {
   // Impossible by construction: the task tool's background result always
   // carries taskId(s). Crash-fast so a contract drift surfaces immediately.
   throw new Error("task_spawn: task admission returned no taskId");
+}
+
+/**
+ * Validate mux.load arguments. Manual (no Zod): load is a hand-authored
+ * kernel member with no backing tool schema, mirroring task_spawn's style.
+ */
+function parseLoadArgs(args: unknown): { path: string; key: string } {
+  const record = typeof args === "object" && args !== null ? (args as Record<string, unknown>) : {};
+  const path = record.path;
+  const key = record.key;
+  if (typeof path !== "string" || path.length === 0) {
+    throw new Error("Invalid arguments for load: path must be a non-empty string");
+  }
+  if (typeof key !== "string" || key.length === 0) {
+    throw new Error("Invalid arguments for load: key must be a non-empty string");
+  }
+  // __-prefixed vars keys are reserved kernel bookkeeping (__hN handles,
+  // __handleSeq) — a load must not clobber them.
+  if (key.startsWith("__")) {
+    throw new Error('Invalid arguments for load: keys starting with "__" are reserved');
+  }
+  return { path, key };
 }
 
 /** Tools excluded from sandbox - UI-specific or would cause recursion */
@@ -187,6 +217,97 @@ export class ToolBridge {
     // Same object under both names so saved `mux.*` snippets keep working.
     runtime.registerObject("xum", xumObj, syncMethods);
     runtime.registerObject("mux", xumObj, syncMethods);
+  }
+
+  /**
+   * RLM kernel namespace members (persistent mounts only):
+   * - mux.task_spawn: fire-and-forget spawn. Same params as mux.task, forced
+   *   run_in_background so the underlying tool returns as soon as taskService
+   *   admits the child — an asyncified call that never waits for completion.
+   *   Rides the same capability grant as `task`.
+   * - mux.events: drains the mount's host→guest event queue (spawned-task
+   *   terminal reports). MUST be a sync method: guests call it from
+   *   continuations after `await`, where asyncified functions cannot suspend
+   *   (see IJSRuntime.registerObject / QuickJSRuntime asyncify docs).
+   */
+  private addKernelMethods(
+    shuxObj: Record<string, (...args: unknown[]) => Promise<unknown>>,
+    syncMethods: Record<string, (...args: unknown[]) => unknown>,
+    kernel: KernelBridgeOptions,
+    runtime: IJSRuntime
+  ): void {
+    const taskTool = this.bridgeableTools.get("task");
+    if (taskTool !== undefined) {
+      shuxObj.task_spawn = async (args: unknown) => {
+        // task_spawn is subject to the same grant as task (defense in depth,
+        // mirroring the per-call re-check on regular bridged tools).
+        if (!isBridgeToolGranted(this.grants, "task")) {
+          throw new Error("Capability denied: mux.task_spawn is not granted for this sandbox");
+        }
+        const abortSignal = runtime.getAbortSignal();
+        if (abortSignal?.aborted) {
+          throw new Error("Execution aborted");
+        }
+        const baseArgs = typeof args === "object" && args !== null ? args : {};
+        const validatedArgs = this.validateArgs("task", taskTool, {
+          ...baseArgs,
+          run_in_background: true,
+        });
+        const result: unknown = await taskTool.execute!(validatedArgs, {
+          abortSignal,
+          toolCallId: `ptc-task_spawn-${Date.now()}`,
+          messages: [],
+          context: undefined,
+        });
+        return extractAdmissionHandle(result);
+      };
+    } else if (this.deniedToolNames.has("task")) {
+      shuxObj.task_spawn = () =>
+        Promise.reject(
+          new Error("Capability denied: mux.task_spawn is not granted for this sandbox")
+        );
+    }
+
+    // mux.load (r12): honest bulk ingestion — the file content goes host-side
+    // straight into vars[key]; the guest return (and thus the model-visible
+    // record) only ever carries {key, bytes, lines, preview}. Rides the
+    // file_read capability grant, mirroring task_spawn riding task's.
+    const loadFile = kernel.loadFile;
+    if (loadFile !== undefined) {
+      if (this.bridgeableTools.has("file_read")) {
+        shuxObj.load = async (args: unknown) => {
+          // Defense in depth: same call-time re-checks as regular bridged tools.
+          if (!isBridgeToolGranted(this.grants, "file_read")) {
+            throw new Error("Capability denied: mux.load is not granted for this sandbox");
+          }
+          // Loaded content lives in vars — without the vars grant there is no
+          // namespace to load into.
+          if (!this.grants.vars) {
+            throw new Error("Capability denied: mux.load requires the vars grant");
+          }
+          const abortSignal = runtime.getAbortSignal();
+          if (abortSignal?.aborted) {
+            throw new Error("Execution aborted");
+          }
+          const { path, key } = parseLoadArgs(args);
+          const loaded = await loadFile({ path });
+          // Host-side write into the guest heap: the content reaches
+          // vars[key] without passing through the return value below (which
+          // is all the record, the events, and the model ever see).
+          runtime.setVarsProperty(key, loaded.content);
+          return { key, bytes: loaded.bytes, lines: loaded.lines, preview: loaded.preview };
+        };
+      } else if (this.deniedToolNames.has("file_read")) {
+        shuxObj.load = () =>
+          Promise.reject(new Error("Capability denied: mux.load is not granted for this sandbox"));
+      }
+    }
+
+    syncMethods.events = this.grants.hostEvents
+      ? () => kernel.drainHostEvents()
+      : () => {
+          throw new Error("Capability denied: mux.events is not granted for this sandbox");
+        };
   }
 
   private hasExecute(tool: Tool): tool is Tool & { execute: NonNullable<Tool["execute"]> } {
