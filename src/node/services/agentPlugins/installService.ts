@@ -1466,6 +1466,16 @@ export class AgentPluginInstallService {
         `The plugin registry (${shortenHome(this.registryFile)}) contains pending cleanup state written by a newer version of Mux. Install with that version, or let it finish its cleanup first.`
       );
     }
+    // Same reasoning per ITEM: an unrecognized array entry (a newer build's
+    // per-entry variant, or corrupted data) may reference this very instance
+    // ID — this build cannot rule that out, so it blocks installs too.
+    // (Uninstalls stay possible: appending this build's tombstone preserves
+    // unrecognized entries verbatim.)
+    if (this.rawPendingPrunes(envelope).some((item) => !this.isRecognizedPrune(item))) {
+      throw new Error(
+        `The plugin registry (${shortenHome(this.registryFile)}) contains pending cleanup records this version cannot read (written by a newer version of Mux, or corrupted). Install with that version, or repair the file's pendingOverridePrunes entries first.`
+      );
+    }
     const pending = this.parsePendingOverridePrunes(envelope);
     const match = pending.find((prune) => prune.prefix === serverKeyPrefix);
     if (!match) {

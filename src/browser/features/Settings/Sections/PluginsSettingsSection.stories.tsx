@@ -314,3 +314,74 @@ export const AddPluginConsentPreview: Story = {
     await canvas.findByRole("button", { name: /Install/ });
   },
 };
+
+/**
+ * Pinned phone viewport for the consent preview: the source URL and target
+ * path line carries a 64-char separator-free plugin dir name (no natural
+ * break points) and must wrap instead of overflowing the card
+ * (AGENTS.md Storybook responsive rule).
+ */
+export const AddPluginConsentPreviewPhoneViewport: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    layout: "fullscreen",
+    pixel: {
+      matrix: { themes: ["dark"], viewports: ["phone"] },
+    },
+  },
+  render: () => (
+    <PluginsSectionStoryShell
+      options={{
+        agentPlugins: {
+          items: [],
+          preview: {
+            source: {
+              type: "git",
+              url: `https://github.com/example/${MAX_LENGTH_NAME}.git`,
+              ref: "main",
+              refType: "branch",
+            },
+            lockedSha: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+            manifest: { name: MAX_LENGTH_NAME, version: "1.0.0" },
+            skills: [],
+            mcpServers: [],
+            agents: [],
+            workflows: [],
+            slashCommands: [],
+            warnings: [],
+            targetPath: `~/.mux/plugins/${MAX_LENGTH_NAME}`,
+          },
+        },
+      }}
+    >
+      {/* Fixed phone width so the play's overflow assertion holds in the CI
+          test-runner too, which ignores viewport globals (AGENTS.md). */}
+      <div style={{ width: 390 }}>
+        <PluginsSettingsSection />
+      </div>
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+
+    await userEvent.click(await canvas.findByRole("button", { name: /Add plugin/ }));
+    await userEvent.type(
+      await canvas.findByLabelText(/Git URL or owner\/repo/),
+      `example/${MAX_LENGTH_NAME}`
+    );
+    await userEvent.click(await canvas.findByRole("button", { name: /Preview/ }));
+
+    // The separator-free target path must wrap instead of overflowing the
+    // consent card's right edge at phone width.
+    const pathCode = await canvas.findByText(`~/.mux/plugins/${MAX_LENGTH_NAME}`);
+    const card = pathCode.closest("div[class*='rounded-md']");
+    if (!(card instanceof HTMLElement)) {
+      throw new Error("Consent preview card not found");
+    }
+    if (card.scrollWidth > card.clientWidth + 1) {
+      throw new Error("Consent preview overflows its card at phone width");
+    }
+  },
+};

@@ -183,7 +183,11 @@ const AddPluginPanel: React.FC<{
           {/* Consent preview: everything the plugin will contribute, before anything is written. */}
           <div className="space-y-1">
             <div className="flex flex-wrap items-baseline gap-2">
-              <span className="text-foreground text-sm font-medium">{preview.manifest.name}</span>
+              {/* break-all: a valid 64-char separator-free name has no natural
+                  break points and would overflow the card on phone widths. */}
+              <span className="text-foreground text-sm font-medium break-all">
+                {preview.manifest.name}
+              </span>
               {preview.manifest.version && (
                 <span className="text-muted text-xs">v{preview.manifest.version}</span>
               )}
@@ -194,7 +198,10 @@ const AddPluginPanel: React.FC<{
             {preview.manifest.description && (
               <p className="text-muted text-xs">{preview.manifest.description}</p>
             )}
-            <p className="text-muted text-[11px]">
+            {/* break-all: URLs and a 64-char separator-free plugin dir name
+                have no natural break points and would overflow the card on
+                phone widths. */}
+            <p className="text-muted text-[11px] break-all">
               {preview.source.url} @ {preview.source.ref} →{" "}
               <code className="text-accent">{preview.targetPath}</code>
               {preview.manifest.authorName ? ` · by ${preview.manifest.authorName}` : ""}

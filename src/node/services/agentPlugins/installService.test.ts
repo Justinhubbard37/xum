@@ -629,15 +629,20 @@ describe("AgentPluginInstallService", () => {
       workspaceIds: ["ws-gone"],
       reason: "future-field",
     };
-    await fsPromises.writeFile(
-      registryFile(),
-      JSON.stringify({ plugins: [], pendingOverridePrunes: [futureVariant, foreignPrune] })
-    );
+    // Install BEFORE seeding: the reinstall gate over-blocks installs while
+    // an unrecognized tombstone entry exists (it may reference the same
+    // instance ID), but uninstalls only append their own tombstone.
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const seeded = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as Record<
+      string,
+      unknown
+    >;
+    seeded.pendingOverridePrunes = [futureVariant, foreignPrune];
+    await fsPromises.writeFile(registryFile(), JSON.stringify(seeded));
 
     // A full uninstall cycle rewrites pendingOverridePrunes twice (commit +
     // shrink); the unknown variant must ride through verbatim.
-    const preview = await service.preview({ input: remoteDir });
-    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
     await service.uninstall({ name: "demo-plugin", deletePluginData: false });
 
     const doc = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
@@ -766,6 +771,27 @@ describe("AgentPluginInstallService", () => {
       pendingOverridePrunes?: unknown;
     };
     expect(after.pendingOverridePrunes).toEqual(opaque);
+  });
+
+  test("install is blocked while an unrecognized tombstone array entry exists", async () => {
+    // A newer build can keep the array shape but change the per-entry shape
+    // (or the entry may be corrupted, e.g. an invalid prefix). This build
+    // cannot rule out that it references the same instance ID, so the
+    // reinstall gate must over-block — while uninstalls (which merely append
+    // this build's tombstone) stay possible.
+    await fsPromises.writeFile(
+      registryFile(),
+      JSON.stringify({
+        plugins: [],
+        pendingOverridePrunes: [{ kind: "future-variant", instance: "?" }],
+      })
+    );
+
+    const preview = await service.preview({ input: remoteDir });
+    await expect(
+      service.install({ source: preview.source, expectedSha: preview.lockedSha })
+    ).rejects.toThrow(/cannot read/);
+    expect(await registry()).toEqual([]);
   });
 
   test("install is blocked while an opaque pendingOverridePrunes shape exists", async () => {
