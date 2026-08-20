@@ -1366,7 +1366,7 @@ describe("createCodeExecutionTool", () => {
         new ToolBridge(fileReadTools()),
         undefined,
         undefined,
-        { loadFile: async () => ({ content: "", bytes: 0, lines: 0, preview: "" }) }
+        { loadFile: () => Promise.resolve({ content: "", bytes: 0, lines: 0, preview: "" }) }
       );
       expect(noMountTool.description).not.toContain("function load(");
       expect(noMountTool.description).not.toContain("Bulk file ingestion");
