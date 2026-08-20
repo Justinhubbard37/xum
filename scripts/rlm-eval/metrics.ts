@@ -29,6 +29,16 @@ export interface CellMetrics {
   cacheCreateTokens: number;
   outputTokens: number;
   costUsd: number;
+  /** Wall-clock duration from session-timing.json (streaming + tools + TTFT). */
+  wallMs: number;
+  /** Time spent executing tools (session-timing.json). */
+  toolExecMs: number;
+  /** Peak per-request context: max over assistant rows of input+cached+cacheCreate. */
+  peakContextTokens: number;
+  /** Nested mux.* calls made inside code_execution executions. */
+  nestedToolCalls: number;
+  /** Compaction boundary rows observed in chat.jsonl. */
+  compactions: number;
   /** Concatenated assistant text per user turn, for scenario verifiers. */
   assistantTextPerTurn: string[];
 }
@@ -77,6 +87,11 @@ export function extractMetrics(sessionDir: string): CellMetrics {
     cacheCreateTokens: 0,
     outputTokens: 0,
     costUsd: 0,
+    wallMs: 0,
+    toolExecMs: 0,
+    peakContextTokens: 0,
+    nestedToolCalls: 0,
+    compactions: 0,
     assistantTextPerTurn: [],
   };
 
@@ -105,6 +120,29 @@ export function extractMetrics(sessionDir: string): CellMetrics {
       continue;
     }
     if (msg.role !== "assistant") continue;
+    // Compaction boundaries: summary rows the compaction handler writes carry
+    // a muxMetadata type marking them; count them as compaction events.
+    const meta = (row as Record<string, unknown>).metadata;
+    if (isRecord(meta)) {
+      const muxMeta = meta.muxMetadata;
+      if (
+        isRecord(muxMeta) &&
+        typeof muxMeta.type === "string" &&
+        muxMeta.type.includes("compact")
+      ) {
+        metrics.compactions += 1;
+      }
+      // Peak per-request context pressure from the per-row usage snapshot.
+      const usage = meta.usage;
+      if (isRecord(usage)) {
+        const num = (v: unknown): number => (typeof v === "number" ? v : 0);
+        const ctx =
+          num(usage.inputTokens) +
+          num(usage.cachedInputTokens) +
+          num(usage.cacheCreationInputTokens);
+        metrics.peakContextTokens = Math.max(metrics.peakContextTokens, ctx);
+      }
+    }
     for (const part of msg.parts ?? []) {
       const type = part.type ?? "";
       if (type === "text" && typeof part.text === "string") {
@@ -115,8 +153,15 @@ export function extractMetrics(sessionDir: string): CellMetrics {
       } else if (type === "dynamic-tool" || type.startsWith("tool-")) {
         const toolName =
           typeof part.toolName === "string" ? part.toolName : type.replace(/^tool-/, "");
-        if (toolName === "code_execution") metrics.codeExecutionCalls += 1;
-        else metrics.flatToolCalls += 1;
+        if (toolName === "code_execution") {
+          metrics.codeExecutionCalls += 1;
+          // Nested mux.* calls surface as toolCalls records on the output
+          // (compact summaries in kernel mode, full records otherwise).
+          const output = (part as Record<string, unknown>).output;
+          if (isRecord(output) && Array.isArray(output.toolCalls)) {
+            metrics.nestedToolCalls += output.toolCalls.length;
+          }
+        } else metrics.flatToolCalls += 1;
       }
     }
   }
@@ -155,6 +200,20 @@ export function extractMetrics(sessionDir: string): CellMetrics {
       }
     } catch {
       // Missing/corrupt usage file leaves token metrics at zero rather than failing the cell.
+    }
+  }
+
+  // session-timing.json: wall-clock + tool execution durations
+  const timingPath = path.join(sessionDir, "session-timing.json");
+  if (fs.existsSync(timingPath)) {
+    try {
+      const parsed: unknown = JSON.parse(fs.readFileSync(timingPath, "utf-8"));
+      const session = isRecord(parsed) && isRecord(parsed.session) ? parsed.session : {};
+      metrics.wallMs = typeof session.totalDurationMs === "number" ? session.totalDurationMs : 0;
+      metrics.toolExecMs =
+        typeof session.totalToolExecutionMs === "number" ? session.totalToolExecutionMs : 0;
+    } catch {
+      // Missing/corrupt timing file leaves durations at zero rather than failing the cell.
     }
   }
 
