@@ -42,9 +42,11 @@ function isUrlLike(input: string): boolean {
   if (input.startsWith("/") || input.startsWith("~") || /^[a-zA-Z]:[\\/]/.test(input)) {
     return true; // absolute local paths (incl. Windows drive letters)
   }
-  // Other SCP-style forms ([user@]host:path). Exclude `owner/repo@ref`
-  // shorthand, which has no colon.
-  return /^[a-zA-Z0-9._-]+@[^:]+:.+$/.test(input);
+  // Other SCP-style forms ([user@]host:path) — the user portion is optional
+  // per Git's documented grammar (git-clone#_git_urls). `owner/repo@ref`
+  // shorthand never matches: it has no colon, and the host char class
+  // excludes `/` (Git's own rule: no slash before the first colon).
+  return /^(?:[a-zA-Z0-9._-]+@)?[a-zA-Z0-9._-]+:.+$/.test(input);
 }
 
 /**

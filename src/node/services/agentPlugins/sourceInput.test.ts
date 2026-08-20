@@ -61,6 +61,13 @@ describe("parseAgentPluginSourceInput", () => {
     expect(parseAgentPluginSourceInput("ssh://git@git.corp:2222/x/y.git").url).toBe(
       "ssh://git@git.corp:2222/x/y.git"
     );
+    // SCP-style user portion is optional (git-clone#_git_urls): host-only
+    // remotes must reach git instead of failing shorthand parsing.
+    expect(parseAgentPluginSourceInput("git.example.com:team/plugin.git")).toEqual({
+      url: "git.example.com:team/plugin.git",
+    });
+    // ...while slash-before-colon inputs stay on the shorthand path.
+    expect(parseAgentPluginSourceInput("coder/mux@main").ref).toBe("main");
   });
 
   test("does not treat @ inside URLs as a ref separator", () => {

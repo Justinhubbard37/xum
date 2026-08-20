@@ -131,6 +131,31 @@ describe("AgentPluginInstallService", () => {
     expect(preview.warnings.some((warning) => warning.includes("skills/escaping"))).toBe(true);
   });
 
+  test("consent preview discloses executable hooks with their tool grants", async () => {
+    // hooks.js loads automatically after install and can rewrite/block tool
+    // calls — consent must surface it (with the grants the runtime honors).
+    expect((await service.preview({ input: remoteDir })).hook).toBeUndefined();
+
+    await fsPromises.writeFile(
+      path.join(remoteDir, "hooks.js"),
+      "({ 'tool.execute.before': () => undefined })\n"
+    );
+    await commitAll(remoteDir, "least-privilege hook");
+    const leastPrivilege = await service.preview({ input: remoteDir });
+    expect(leastPrivilege.hook).toEqual({ path: "hooks.js", toolGrants: [] });
+
+    const manifestPath = path.join(remoteDir, "plugin.json");
+    const manifest = JSON.parse(await fsPromises.readFile(manifestPath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    manifest.extensions = { mux: { hooks: { tools: ["bash", "file_read"] } } };
+    await fsPromises.writeFile(manifestPath, JSON.stringify(manifest, null, 2));
+    await commitAll(remoteDir, "hook with tool grants");
+    const granted = await service.preview({ input: remoteDir });
+    expect(granted.hook).toEqual({ path: "hooks.js", toolGrants: ["bash", "file_read"] });
+  });
+
   test("preview stages+validates without writing; install promotes and records the registry", async () => {
     const head = (await git(remoteDir, "rev-parse", "HEAD")).trim();
 

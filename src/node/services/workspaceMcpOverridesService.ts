@@ -9,6 +9,7 @@ import type { Config } from "@/node/config";
 import { type createRuntime } from "@/node/runtime/runtimeFactory";
 import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
 import { execBuffered, readFileString, writeFileString } from "@/node/utils/runtime/helpers";
+import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { log } from "@/node/services/log";
 import { getErrorMessage } from "@/common/utils/errors";
 
@@ -124,14 +125,33 @@ function isEmptyOverrides(overrides: WorkspaceMCPOverrides): boolean {
   );
 }
 
+/** True when the error (or its RuntimeError-wrapped cause) carries the fs code. */
+function hasFsCode(error: unknown, code: string): boolean {
+  if (hasErrorCode(error, code)) {
+    return true;
+  }
+  const cause = error instanceof Error ? error.cause : undefined;
+  return hasErrorCode(cause, code);
+}
+
 async function statIsFile(
   runtime: ReturnType<typeof createRuntime>,
-  filePath: string
+  filePath: string,
+  mode: "lenient" | "strict"
 ): Promise<boolean> {
   try {
     const stat = await runtime.stat(filePath);
     return !stat.isDirectory;
-  } catch {
+  } catch (error) {
+    // Strict callers must distinguish "file genuinely absent" (fine: no
+    // overrides) from "cannot tell" (EACCES, I/O error): treating the latter
+    // as absent would let the plugin uninstaller retire a prune tombstone
+    // against a file it never actually read. Strict reads only run against
+    // local/worktree runtimes, so node fs error codes are reliable here
+    // (RuntimeError wraps them as `cause`).
+    if (mode === "strict" && !hasFsCode(error, "ENOENT") && !hasFsCode(error, "ENOTDIR")) {
+      throw error;
+    }
     return false;
   }
 }
@@ -229,13 +249,22 @@ export class WorkspaceMcpOverridesService {
 
   private async readOverridesFile(
     runtime: ReturnType<typeof createRuntime>,
-    filePath: string
+    filePath: string,
+    mode: "lenient" | "strict"
   ): Promise<unknown> {
     try {
       const raw = await readFileString(runtime, filePath);
       const errors: jsonc.ParseError[] = [];
       const parsed: unknown = jsonc.parse(raw, errors) as unknown;
       if (errors.length > 0) {
+        // Strict callers (the plugin uninstaller's override prune) must not
+        // see "{}" for a file whose real content is unreadable: retiring a
+        // prune tombstone against that empty view would let the stale
+        // enabledServers key silently re-enable a reinstalled plugin's
+        // server once the file becomes readable again.
+        if (mode === "strict") {
+          throw new Error(`Workspace MCP overrides file has JSONC parse errors: ${filePath}`);
+        }
         log.warn("[MCP] Failed to parse workspace MCP overrides (JSONC parse errors)", {
           filePath,
           errorCount: errors.length,
@@ -244,6 +273,9 @@ export class WorkspaceMcpOverridesService {
       }
       return parsed;
     } catch (error) {
+      if (mode === "strict") {
+        throw error;
+      }
       // Treat any read failure as "no overrides".
       log.debug("[MCP] Failed to read workspace MCP overrides file", { filePath, error });
       return {};
@@ -368,13 +400,17 @@ export class WorkspaceMcpOverridesService {
    * expectedRevision check.
    */
   async getOverridesForWorkspace(
-    workspaceId: string
+    workspaceId: string,
+    options?: { mode?: "lenient" | "strict" }
   ): Promise<{ overrides: WorkspaceMCPOverrides; revision: string }> {
-    const overrides = await this.loadOverrides(workspaceId);
+    const overrides = await this.loadOverrides(workspaceId, options?.mode ?? "lenient");
     return { overrides, revision: computeOverridesRevision(overrides) };
   }
 
-  private async loadOverrides(workspaceId: string): Promise<WorkspaceMCPOverrides> {
+  private async loadOverrides(
+    workspaceId: string,
+    mode: "lenient" | "strict" = "lenient"
+  ): Promise<WorkspaceMCPOverrides> {
     const { metadata, runtime, workspacePath } = await this.getRuntimeAndWorkspacePath(workspaceId);
     const { jsoncPath, jsonPath } = this.getOverridesFilePaths(
       workspacePath,
@@ -382,15 +418,15 @@ export class WorkspaceMcpOverridesService {
     );
 
     // Prefer JSONC, then JSON.
-    const jsoncExists = await statIsFile(runtime, jsoncPath);
+    const jsoncExists = await statIsFile(runtime, jsoncPath, mode);
     if (jsoncExists) {
-      const parsed = await this.readOverridesFile(runtime, jsoncPath);
+      const parsed = await this.readOverridesFile(runtime, jsoncPath, mode);
       return normalizeWorkspaceMcpOverrides(parsed);
     }
 
-    const jsonExists = await statIsFile(runtime, jsonPath);
+    const jsonExists = await statIsFile(runtime, jsonPath, mode);
     if (jsonExists) {
-      const parsed = await this.readOverridesFile(runtime, jsonPath);
+      const parsed = await this.readOverridesFile(runtime, jsonPath, mode);
       return normalizeWorkspaceMcpOverrides(parsed);
     }
 

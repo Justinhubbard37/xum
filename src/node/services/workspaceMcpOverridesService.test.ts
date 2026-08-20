@@ -236,6 +236,54 @@ describe("WorkspaceMcpOverridesService", () => {
     expect(after.overrides).toEqual({ disabledServers: ["other"] });
   });
 
+  it("strict reads throw on unreadable content instead of reporting empty overrides", async () => {
+    const projectPath = "/fake/project";
+    const workspaceId = "ws-id";
+    const workspaceName = "branch";
+
+    const workspacePath = getWorkspacePath({
+      srcDir: config.srcDir,
+      projectName: "project",
+      workspaceName,
+    });
+    await fs.mkdir(path.join(workspacePath, ".mux"), { recursive: true });
+    // Content exists but is not parseable: the plugin uninstaller's prune
+    // must NOT see "{}" here — it would retire its tombstone against keys it
+    // never read, resurrecting stale enabledServers on reinstall.
+    await fs.writeFile(
+      path.join(workspacePath, ".mux", "mcp.local.jsonc"),
+      '{ "enabledServers": ["plugin:abc:echo"'
+    );
+
+    await config.editConfig((cfg) => {
+      cfg.projects.set(projectPath, {
+        workspaces: [
+          {
+            path: workspacePath,
+            id: workspaceId,
+            name: workspaceName,
+            runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+          },
+        ],
+      });
+      return cfg;
+    });
+
+    const service = new WorkspaceMcpOverridesService(config);
+    // Lenient (UI/list paths): degrade to empty.
+    const lenient = await service.getOverridesForWorkspace(workspaceId);
+    expect(lenient.overrides).toEqual({});
+    // Strict (prune path): fail loudly so the caller keeps its retry state.
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(service.getOverridesForWorkspace(workspaceId, { mode: "strict" })).rejects.toThrow(
+      /parse errors/
+    );
+    // Strict on a genuinely absent file is still fine (no overrides).
+    await fs.rm(path.join(workspacePath, ".mux", "mcp.local.jsonc"));
+    const absent = await service.getOverridesForWorkspace(workspaceId, { mode: "strict" });
+    expect(absent.overrides).toEqual({});
+  });
+
   it("removes workspace-local file when overrides are set to empty", async () => {
     const projectPath = "/fake/project";
     const workspaceId = "ws-id";

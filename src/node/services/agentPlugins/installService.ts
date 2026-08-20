@@ -14,10 +14,12 @@ import type {
   AgentPluginInstallPreview,
   AgentPluginListItem,
   AgentPluginManifestSummary,
+  AgentPluginPreviewHook,
   AgentPluginPreviewMcpServer,
   AgentPluginPreviewSkill,
   AgentPluginUpdateCheck,
 } from "@/common/orpc/schemas/agentPlugins";
+import { resolvePluginHookGrants } from "@/node/services/agentPlugins/hookSandbox";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { Config } from "@/node/config";
@@ -582,6 +584,27 @@ export class AgentPluginInstallService {
     return { plugin, warnings: diagnostics.map((d) => d.message) };
   }
 
+  /**
+   * Executable hooks.js disclosure for the consent preview: hooks load
+   * automatically before request assembly and can observe/rewrite/block tool
+   * calls, so installing one without disclosure would consent to less than
+   * what activates. toolGrants mirrors resolvePluginHookGrants — the exact
+   * grants the runtime will honor.
+   */
+  private collectHook(
+    plugin: Pick<AgentPluginInfo, "rootPath" | "hooksPath" | "manifest">
+  ): AgentPluginPreviewHook | undefined {
+    if (plugin.hooksPath === undefined) {
+      return undefined;
+    }
+    const grants = resolvePluginHookGrants(plugin.manifest);
+    assert(grants.bridgeTools.allow !== "all", "plugin hook grants must enumerate tools");
+    return {
+      path: path.relative(plugin.rootPath, plugin.hooksPath),
+      toolGrants: [...grants.bridgeTools.allow],
+    };
+  }
+
   private async collectSkills(
     plugin: Pick<AgentPluginInfo, "rootPath" | "skillsDir">,
     warnings: string[]
@@ -739,6 +762,7 @@ export class AgentPluginInstallService {
         this.instanceIdFor(plugin.name),
         warnings
       );
+      const hook = this.collectHook(plugin);
 
       if (resolved.refType === "tag" && sha !== resolved.sha) {
         warnings.push(
@@ -758,6 +782,7 @@ export class AgentPluginInstallService {
         manifest: manifestSummary(plugin.manifest),
         skills,
         mcpServers,
+        ...(hook !== undefined ? { hook } : {}),
         warnings,
         targetPath: shortenHome(targetPath),
       };
@@ -1166,8 +1191,13 @@ export class AgentPluginInstallService {
     for (const workspaceId of workspaceIds) {
       try {
         for (let attempt = 1; ; attempt++) {
-          const { overrides, revision } =
-            await overridesService.getOverridesForWorkspace(workspaceId);
+          // Strict read: a temporarily unreadable overrides file must FAIL
+          // this workspace's prune (preserving its tombstone for retry), not
+          // read as "{}" and retire the tombstone against keys never seen.
+          const { overrides, revision } = await overridesService.getOverridesForWorkspace(
+            workspaceId,
+            { mode: "strict" }
+          );
           const dropKey = (key: string) => key.startsWith(serverKeyPrefix);
           const enabledServers = overrides.enabledServers?.filter((key) => !dropKey(key));
           const disabledServers = overrides.disabledServers?.filter((key) => !dropKey(key));

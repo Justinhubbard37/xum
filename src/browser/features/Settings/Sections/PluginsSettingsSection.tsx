@@ -257,6 +257,24 @@ const AddPluginPanel: React.FC<{
             </p>
           </div>
 
+          {preview.hook && (
+            <div>
+              <h4 className="text-foreground mb-1 text-xs font-medium">Hooks</h4>
+              {/* Executable code that loads automatically: consent must say so. */}
+              <p className="text-xs">
+                <span className="text-foreground font-mono break-all">{preview.hook.path}</span>{" "}
+                <span className="text-muted">
+                  — runs sandboxed on every agent request and can observe, rewrite, or block tool
+                  calls
+                  {preview.hook.toolGrants.length > 0
+                    ? ` for: ${preview.hook.toolGrants.join(", ")}`
+                    : " (no tool visibility granted)"}
+                  .
+                </span>
+              </p>
+            </div>
+          )}
+
           {error && (
             <div className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm">
               <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
