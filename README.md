@@ -16,9 +16,7 @@
 </div>
 
 > [!IMPORTANT]
-> This project was renamed from Mux to Xum after Mux.com raised a trademark concern. “Mux” is a common technical abbreviation of “multiplexer” and we do not expect confusion between the projects, but chose to rename ours rather than spend more time on the dispute. “Xum” captures our reaction to the process and bears no other significance.
->
-> Xum is a desktop & browser application for parallel agentic development. It enables developers to plan and execute tasks with multiple AI agents on local or remote compute.
+> This project was renamed from Mux to Xum after Mux.com raised a trademark concern. “Mux” is a common technical abbreviation of “multiplexer” and we do not expect confusion between the projects, but chose to rename ours rather than spend more time on the dispute.
 
 <p><img src="./docs/img/mux-demo.gif" alt="Xum product demo" width="100%" /></p>
 
