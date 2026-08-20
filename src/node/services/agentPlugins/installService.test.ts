@@ -768,6 +768,23 @@ describe("AgentPluginInstallService", () => {
     expect(after.pendingOverridePrunes).toEqual(opaque);
   });
 
+  test("install is blocked while an opaque pendingOverridePrunes shape exists", async () => {
+    // A newer build's opaque cleanup state may reference this very instance
+    // ID; this build cannot tell. Installing anyway would reuse the instance
+    // ID, letting a stale enabledServers key silently reactivate the
+    // plugin's server — so the reinstall gate must over-block.
+    await fsPromises.writeFile(
+      registryFile(),
+      JSON.stringify({ plugins: [], pendingOverridePrunes: { version: 2 } })
+    );
+
+    const preview = await service.preview({ input: remoteDir });
+    await expect(
+      service.install({ source: preview.source, expectedSha: preview.lockedSha })
+    ).rejects.toThrow(/newer version of Mux/);
+    expect(await registry()).toEqual([]);
+  });
+
   test("uninstall refuses to clobber an opaque pendingOverridePrunes shape when cleanup must be recorded", async () => {
     const overridesStub = {
       prunePluginOverrideKeys: () => Promise.resolve(),

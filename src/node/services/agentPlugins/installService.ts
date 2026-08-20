@@ -1425,6 +1425,15 @@ export class AgentPluginInstallService {
   private async assertNoPendingOverridePrune(name: string): Promise<void> {
     const serverKeyPrefix = buildPluginServerKey(this.instanceIdFor(name), "");
     const { envelope, rawEntries } = await this.readRegistryDocument("strict");
+    // An opaque newer-build shape is unreadable here, so it may contain a
+    // pending cleanup for this very instance ID — reinstalling would reuse
+    // that ID and stale workspace overrides could silently re-enable its
+    // servers. Over-blocking until the newer build resolves it is safe.
+    if (this.hasOpaquePendingPrunes(envelope)) {
+      throw new Error(
+        `The plugin registry (${shortenHome(this.registryFile)}) contains pending cleanup state written by a newer version of Mux. Install with that version, or let it finish its cleanup first.`
+      );
+    }
     const pending = this.parsePendingOverridePrunes(envelope);
     const match = pending.find((prune) => prune.prefix === serverKeyPrefix);
     if (!match) {
