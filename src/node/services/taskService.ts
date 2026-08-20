@@ -68,6 +68,8 @@ import {
   createTaskReportMessageId,
 } from "@/node/services/utils/messageIds";
 import { defaultModel, normalizeSelectedModel } from "@/common/utils/ai/models";
+import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
+import type { AgentDefinitionFrontmatter } from "@/common/types/agentDefinition";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
@@ -1817,6 +1819,8 @@ export class TaskService {
     modelString?: string;
     thinkingLevel?: ParsedThinkingInput;
     parentRuntimeAiSettings?: { modelString?: string; thinkingLevel?: ThinkingLevel };
+    /** `ai` defaults from the agent's resolved .md frontmatter (base chain applied). */
+    agentDefinitionAiDefaults?: AgentDefinitionFrontmatter["ai"];
   }): {
     taskModelString: string;
     canonicalModel: string;
@@ -1829,10 +1833,29 @@ export class TaskService {
     const agentDefault = params.cfg.agentAiDefaults?.[params.agentId];
     const parentRuntimeAiSettings = params.parentRuntimeAiSettings;
 
+    // Agent definition `ai` defaults sit below config-level defaults (Settings
+    // stays authoritative per docs/agents "overridable by user settings") and
+    // above parent inheritance, so a definition-pinned model beats silently
+    // inheriting the parent's model. `ai.model` may be an abbreviation (e.g.
+    // "sonnet"); resolve aliases the same way the explicit task-tool override
+    // does. An invalid value falls through to parent inheritance instead of
+    // failing the spawn (a typo in a .md must not brick the agent).
+    const definitionDefaults = params.agentDefinitionAiDefaults;
+    const definitionModelRaw = coerceNonEmptyString(definitionDefaults?.model);
+    const definitionModel =
+      definitionModelRaw != null ? normalizeModelInput(definitionModelRaw).model : null;
+    if (definitionModelRaw != null && definitionModel == null) {
+      log.warn("resolveTaskAISettings: ignoring invalid agent definition ai.model", {
+        agentId: params.agentId,
+        model: definitionModelRaw,
+      });
+    }
+
     const taskModelString =
       coerceNonEmptyString(params.modelString) ??
       coerceNonEmptyString(subagentDefault?.modelString) ??
       coerceNonEmptyString(agentDefault?.modelString) ??
+      definitionModel ??
       coerceNonEmptyString(parentRuntimeAiSettings?.modelString) ??
       coerceNonEmptyString(parentAiSettings?.model) ??
       defaultModel;
@@ -1859,6 +1882,7 @@ export class TaskService {
       overrideThinkingLevel ??
       subagentDefault?.thinkingLevel ??
       agentDefault?.thinkingLevel ??
+      definitionDefaults?.thinkingLevel ??
       parentRuntimeAiSettings?.thinkingLevel ??
       parentAiSettings?.thinkingLevel ??
       "off";
@@ -2816,16 +2840,6 @@ export class TaskService {
         );
       }
 
-      const { taskModelString, canonicalModel, effectiveThinkingLevel, effectiveReasoningMode } =
-        this.resolveTaskAISettings({
-          cfg,
-          parentMeta,
-          agentId,
-          modelString: args.modelString,
-          thinkingLevel: args.thinkingLevel,
-          parentRuntimeAiSettings: args.parentRuntimeAiSettings,
-        });
-
       const parentRuntimeConfig = parentMeta.runtimeConfig;
       const taskRuntimeConfig: RuntimeConfig = parentRuntimeConfig;
       // Supply the parent's persisted path so override-aware runtimes (worktree/SSH) resolve the
@@ -2911,6 +2925,7 @@ export class TaskService {
       };
 
       let skipInitHook = false;
+      let agentDefinitionAiDefaults: AgentDefinitionFrontmatter["ai"];
       try {
         const frontmatter = await resolveAgentFrontmatter(runtime, parentWorkspacePath, agentId);
         if (!isAgentRunnableAsChild(frontmatter, { workflowOwned: args.workflowTask != null })) {
@@ -2924,10 +2939,22 @@ export class TaskService {
           return Err(`Task.createMany: agentId is disabled (${agentId}). ${hint}`);
         }
         skipInitHook = frontmatter.subagent?.skip_init_hook === true;
+        agentDefinitionAiDefaults = frontmatter.ai;
       } catch {
         const hint = await getRunnableHint();
         return Err(`Task.createMany: unknown agentId (${agentId}). ${hint}`);
       }
+
+      const { taskModelString, canonicalModel, effectiveThinkingLevel, effectiveReasoningMode } =
+        this.resolveTaskAISettings({
+          cfg,
+          parentMeta,
+          agentId,
+          modelString: args.modelString,
+          thinkingLevel: args.thinkingLevel,
+          parentRuntimeAiSettings: args.parentRuntimeAiSettings,
+          agentDefinitionAiDefaults,
+        });
 
       const status: "queued" | "starting" =
         reservedActiveCount >= taskSettings.maxParallelAgentTasks ? "queued" : "starting";
@@ -3966,16 +3993,6 @@ export class TaskService {
       );
     }
 
-    const { taskModelString, canonicalModel, effectiveThinkingLevel, effectiveReasoningMode } =
-      this.resolveTaskAISettings({
-        cfg,
-        parentMeta,
-        agentId,
-        modelString: args.modelString,
-        thinkingLevel: args.thinkingLevel,
-        parentRuntimeAiSettings: args.parentRuntimeAiSettings,
-      });
-
     const parentRuntimeConfig = parentMeta.runtimeConfig;
     const taskRuntimeConfig: RuntimeConfig = parentRuntimeConfig;
 
@@ -4076,6 +4093,7 @@ export class TaskService {
     };
 
     let skipInitHook = false;
+    let agentDefinitionAiDefaults: AgentDefinitionFrontmatter["ai"];
     try {
       const frontmatter = await resolveAgentFrontmatter(runtime, parentWorkspacePath, agentId);
       if (!isAgentRunnableAsChild(frontmatter, { workflowOwned: args.workflowTask != null })) {
@@ -4094,10 +4112,22 @@ export class TaskService {
         return Err(`Task.create: agentId is disabled (${agentId}). ${hint}`);
       }
       skipInitHook = frontmatter.subagent?.skip_init_hook === true;
+      agentDefinitionAiDefaults = frontmatter.ai;
     } catch {
       const hint = await getRunnableHint();
       return Err(`Task.create: unknown agentId (${agentId}). ${hint}`);
     }
+
+    const { taskModelString, canonicalModel, effectiveThinkingLevel, effectiveReasoningMode } =
+      this.resolveTaskAISettings({
+        cfg,
+        parentMeta,
+        agentId,
+        modelString: args.modelString,
+        thinkingLevel: args.thinkingLevel,
+        parentRuntimeAiSettings: args.parentRuntimeAiSettings,
+        agentDefinitionAiDefaults,
+      });
 
     const createdAt = getIsoNow();
 
