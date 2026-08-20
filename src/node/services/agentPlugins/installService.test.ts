@@ -692,6 +692,128 @@ describe("AgentPluginInstallService", () => {
     }
   });
 
+  test("duplicate tombstones for one prefix merge instead of dropping cleanup records", async () => {
+    const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
+    const prefix = `plugin:${instanceId}:`;
+    // Corrupted state: two recognized tombstones for the same prefix.
+    // ws-1's prune succeeds; ws-2's fails — its cleanup record must survive
+    // the per-prefix rewrite (which replaces every matching item) as one
+    // merged tombstone instead of being silently discarded.
+    const pruned: string[] = [];
+    const overridesStub = {
+      prunePluginOverrideKeys: (workspaceId: string) => {
+        if (workspaceId === "ws-2") {
+          return Promise.reject(new Error("checkout unavailable"));
+        }
+        pruned.push(workspaceId);
+        return Promise.resolve();
+      },
+    };
+    const serviceWithOverrides = new AgentPluginInstallService(config, {
+      isEnabled: () => true,
+      workspaceMcpOverridesService: overridesStub as unknown as WorkspaceMcpOverridesService,
+    });
+    const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
+      Promise.resolve([
+        { id: "ws-1", runtimeConfig: { type: "local" } },
+        { id: "ws-2", runtimeConfig: { type: "local" } },
+      ] as unknown as Awaited<ReturnType<Config["getAllWorkspaceMetadata"]>>)
+    );
+    try {
+      await fsPromises.writeFile(
+        registryFile(),
+        JSON.stringify({
+          plugins: [],
+          pendingOverridePrunes: [
+            { prefix, workspaceIds: ["ws-1"] },
+            { prefix, workspaceIds: ["ws-2"] },
+          ],
+        })
+      );
+
+      await serviceWithOverrides.list();
+
+      expect(pruned).toEqual(["ws-1"]);
+      const doc = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+        pendingOverridePrunes?: unknown[];
+      };
+      expect(doc.pendingOverridePrunes).toEqual([{ prefix, workspaceIds: ["ws-2"] }]);
+    } finally {
+      metadataSpy.mockRestore();
+    }
+  });
+
+  test("uninstall preserves an opaque pendingOverridePrunes shape from a newer build", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    // A newer build may represent pendingOverridePrunes with a non-array
+    // shape. It is opaque to this build and must ride through the uninstall
+    // commit write verbatim — deleting or replacing it would destroy that
+    // build's cleanup metadata on downgrade.
+    const opaque = { version: 2, queue: [{ prefix: "plugin:0000000000000000:" }] };
+    const doc = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as Record<
+      string,
+      unknown
+    >;
+    doc.pendingOverridePrunes = opaque;
+    await fsPromises.writeFile(registryFile(), JSON.stringify(doc));
+
+    await service.uninstall({ name: "demo-plugin", deletePluginData: false });
+
+    expect(await registry()).toEqual([]);
+    const after = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      pendingOverridePrunes?: unknown;
+    };
+    expect(after.pendingOverridePrunes).toEqual(opaque);
+  });
+
+  test("uninstall refuses to clobber an opaque pendingOverridePrunes shape when cleanup must be recorded", async () => {
+    const overridesStub = {
+      prunePluginOverrideKeys: () => Promise.resolve(),
+    };
+    const serviceWithOverrides = new AgentPluginInstallService(config, {
+      isEnabled: () => true,
+      workspaceMcpOverridesService: overridesStub as unknown as WorkspaceMcpOverridesService,
+    });
+    const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
+      Promise.resolve([{ id: "ws-1", runtimeConfig: { type: "local" } }] as unknown as Awaited<
+        ReturnType<Config["getAllWorkspaceMetadata"]>
+      >)
+    );
+    try {
+      const preview = await serviceWithOverrides.preview({ input: remoteDir });
+      await serviceWithOverrides.install({
+        source: preview.source,
+        expectedSha: preview.lockedSha,
+      });
+
+      const opaque = { version: 2 };
+      const doc = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as Record<
+        string,
+        unknown
+      >;
+      doc.pendingOverridePrunes = opaque;
+      await fsPromises.writeFile(registryFile(), JSON.stringify(doc));
+
+      // ws-1 needs pruning, so a pessimistic tombstone would have to be
+      // recorded — impossible without clobbering the opaque shape. The
+      // uninstall must refuse up-front with the install fully intact.
+      await expect(
+        serviceWithOverrides.uninstall({ name: "demo-plugin", deletePluginData: false })
+      ).rejects.toThrow(/newer version of Mux/);
+      expect((await registry()).map((entry) => (entry as { name: string }).name)).toEqual([
+        "demo-plugin",
+      ]);
+      const after = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+        pendingOverridePrunes?: unknown;
+      };
+      expect(after.pendingOverridePrunes).toEqual(opaque);
+    } finally {
+      metadataSpy.mockRestore();
+    }
+  });
+
   test("tombstone retries on list are serialized with registry mutations", async () => {
     const instanceId = computePluginInstanceId(path.join(pluginsDir(), "other-name"));
     // A tombstone whose prune blocks until released, so a mutation can be

@@ -1034,6 +1034,16 @@ export class AgentPluginInstallService {
       // Settings) instead of leaving stale overrides behind post-commit.
       const workspaceIdsToPrune = await this.listWorkspaceIdsForOverridePruning();
 
+      // A newer build's pendingOverridePrunes shape is opaque to this build,
+      // so the pessimistic tombstone below could only clobber it. Refuse
+      // up-front (install fully intact) rather than destroy that build's
+      // cleanup metadata — or silently skip recording our own.
+      if (workspaceIdsToPrune.length > 0 && this.hasOpaquePendingPrunes(envelope)) {
+        throw new Error(
+          `The plugin registry (${shortenHome(this.registryFile)}) contains pending cleanup state written by a newer version of Mux. Run the uninstall with that version, or let it finish its cleanup first.`
+        );
+      }
+
       // Stop running servers before deleting the tree out from under them.
       await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
 
@@ -1100,7 +1110,10 @@ export class AgentPluginInstallService {
         serverKeyPrefix,
         workspaceIdsToPrune
       );
-      if (pendingForCommit.length > 0) {
+      if (this.hasOpaquePendingPrunes(envelope)) {
+        // Opaque newer-build shape rides through verbatim (kept by the
+        // spread above; the up-front guard ensured nothing needs recording).
+      } else if (pendingForCommit.length > 0) {
         commitEnvelope.pendingOverridePrunes = pendingForCommit;
       } else {
         delete commitEnvelope.pendingOverridePrunes;
@@ -1284,38 +1297,74 @@ export class AgentPluginInstallService {
     return Array.isArray(raw) ? raw : [];
   }
 
-  /** Recognized tombstones only (for matching/retrying). */
+  /**
+   * True when `pendingOverridePrunes` exists with a shape this build does
+   * not understand (a newer release's representation). It is opaque: every
+   * rewrite must preserve it verbatim — deleting or replacing it would
+   * destroy that build's cleanup metadata on downgrade.
+   */
+  private hasOpaquePendingPrunes(envelope: Record<string, unknown>): boolean {
+    return (
+      envelope.pendingOverridePrunes !== undefined && !Array.isArray(envelope.pendingOverridePrunes)
+    );
+  }
+
+  /**
+   * Recognized tombstones only (for matching/retrying). Corrupted persisted
+   * state can carry several recognized tombstones for one prefix; they are
+   * merged (workspace-ID union) so per-prefix rewrites, which replace every
+   * matching item, can never silently drop a duplicate's cleanup record.
+   */
   private parsePendingOverridePrunes(
     envelope: Record<string, unknown>
   ): Array<{ prefix: string; workspaceIds: string[] }> {
-    return this.rawPendingPrunes(envelope)
-      .filter((item) => this.isRecognizedPrune(item))
-      .map((item) => ({ prefix: item.prefix, workspaceIds: item.workspaceIds }));
+    const merged = new Map<string, string[]>();
+    for (const item of this.rawPendingPrunes(envelope)) {
+      if (!this.isRecognizedPrune(item)) {
+        continue;
+      }
+      const existing = merged.get(item.prefix);
+      if (existing) {
+        for (const workspaceId of item.workspaceIds) {
+          if (!existing.includes(workspaceId)) {
+            existing.push(workspaceId);
+          }
+        }
+      } else {
+        merged.set(item.prefix, [...item.workspaceIds]);
+      }
+    }
+    return [...merged.entries()].map(([prefix, workspaceIds]) => ({ prefix, workspaceIds }));
   }
 
   /**
    * Set this build's tombstone for `prefix` within the raw item list:
-   * removes the recognized item for that prefix (merging its unknown fields
-   * into the replacement) and appends the new one when `workspaceIds` is
-   * non-empty. Unrecognized items are preserved verbatim.
+   * removes every recognized item for that prefix (merging their unknown
+   * fields into the replacement) and appends the new one when
+   * `workspaceIds` is non-empty. Unrecognized items are preserved verbatim.
    */
   private updateRawPendingPrunes(
     rawPending: unknown[],
     prefix: string,
     workspaceIds: string[]
   ): unknown[] {
-    const existing = rawPending.find(
-      (item) => this.isRecognizedPrune(item) && item.prefix === prefix
-    );
-    const next = rawPending.filter(
-      (item) => !(this.isRecognizedPrune(item) && item.prefix === prefix)
-    );
+    const matches: Array<Record<string, unknown>> = [];
+    const next: unknown[] = [];
+    for (const item of rawPending) {
+      if (this.isRecognizedPrune(item) && item.prefix === prefix) {
+        matches.push(item);
+      } else {
+        next.push(item);
+      }
+    }
     if (workspaceIds.length > 0) {
-      next.push({
-        ...((existing as Record<string, unknown> | undefined) ?? {}),
-        prefix,
-        workspaceIds,
-      });
+      const replacement: Record<string, unknown> = {};
+      for (const match of matches) {
+        Object.assign(replacement, match);
+      }
+      replacement.prefix = prefix;
+      replacement.workspaceIds = workspaceIds;
+      next.push(replacement);
     }
     return next;
   }
@@ -1327,7 +1376,16 @@ export class AgentPluginInstallService {
     rawPending: unknown[]
   ): Promise<void> {
     const nextEnvelope = { ...envelope };
-    if (rawPending.length > 0) {
+    if (this.hasOpaquePendingPrunes(envelope)) {
+      // A newer build's opaque shape rides through verbatim (kept by the
+      // spread above). Nothing can need recording here: recognized
+      // tombstones only ever come from an array shape, and uninstall
+      // refuses up-front when it would have to record one.
+      assert(
+        rawPending.length === 0,
+        "writePendingOverridePrunes: cannot merge tombstones into an opaque pendingOverridePrunes shape"
+      );
+    } else if (rawPending.length > 0) {
       nextEnvelope.pendingOverridePrunes = rawPending;
     } else {
       delete nextEnvelope.pendingOverridePrunes;
