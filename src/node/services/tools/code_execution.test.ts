@@ -894,7 +894,7 @@ describe("createCodeExecutionTool", () => {
           fn
         )) satisfies MountRunner;
 
-    it("offloads oversized nested tool results: handle var + blob + event + preview-only model record", async () => {
+    it("suppresses oversized nested results into compact records: no inline value, no handle machinery", async () => {
       using tmp = new DisposableTempDir("code-exec-offload");
       const host = new SandboxHostService();
       const tool = await createCodeExecutionTool(
@@ -912,37 +912,19 @@ describe("createCodeExecutionTool", () => {
       // The running guest code received the FULL value (in-kernel data is free).
       expect(result.result).toBe(20_000);
 
-      // The model-visible record is preview-only.
-      const record = result.toolCalls[0].result as {
-        handle: string;
-        preview: string;
-        size: number;
-      };
-      expect(record.handle).toBe("vars.__h1");
-      expect(record.size).toBe(bigSerialized.length);
-      expect(record.preview.length).toBeLessThan(2000);
-      expect(record.preview).toContain(bigSerialized.slice(0, 100));
-      expect(record.preview).toContain(bigSerialized.slice(-50));
+      // The model-visible record is a compact summary — never the value.
+      const record = result.toolCalls[0];
+      expect(record.result).toBeUndefined();
+      expect(record.error).toBeUndefined();
+      expect(record.ok).toBe(true);
+      expect(record.bytes).toBe(Buffer.byteLength(bigSerialized, "utf8"));
+      expect(record.toolName).toBe("big_fetch");
 
-      // Guest code in a LATER call can slice the handle var.
-      const followUp = (await tool.execute!(
-        { code: "return vars.__h1.data.slice(0, 5);" },
-        mockToolCallOptions
-      )) as PTCExecutionResult;
-      expect(followUp.success).toBe(true);
-      expect(followUp.result).toBe("xxxxx");
-
-      // Blob + result-handle durable event mirror the model-visible record.
+      // Nested records carry no payload, so no result-handle rows are created
+      // for them (r4 offload now applies to the top-level return value only).
       const journal = new DurableEventJournal(tmp.path);
       const events = await journal.read();
-      const handleEvents = events.filter((e) => e.kind === "result-handle");
-      expect(handleEvents).toHaveLength(1);
-      const event = handleEvents[0];
-      if (event.kind !== "result-handle") throw new Error("unreachable");
-      expect(event.data.handle).toBe(record.handle);
-      expect(event.data.preview).toBe(record.preview);
-      expect(event.data.size).toBe(record.size);
-      expect(await journal.blobs.getText(event.data.blobHash)).toBe(bigSerialized);
+      expect(events.filter((e) => e.kind === "result-handle")).toHaveLength(0);
       await host.disposeScope("ws-offload");
     });
 
@@ -955,8 +937,10 @@ describe("createCodeExecutionTool", () => {
         undefined,
         persistentRunner(host, "ws-offload-restart", tmp.path)
       );
+      // Handle vars come from RETURN-VALUE offload (nested records are
+      // compact summaries in kernel mode and create no handles).
       const first = (await tool.execute!(
-        { code: "mux.big_fetch({}); return 'ok';" },
+        { code: "return mux.big_fetch({});" },
         mockToolCallOptions
       )) as PTCExecutionResult;
       expect(first.success).toBe(true);
@@ -979,7 +963,7 @@ describe("createCodeExecutionTool", () => {
       await host2.disposeScope("ws-offload-restart");
     });
 
-    it("keeps sub-threshold nested results inline with no result-handle events", async () => {
+    it("suppresses even sub-threshold nested results (kernel records are never inline, any size)", async () => {
       using tmp = new DisposableTempDir("code-exec-offload");
       const host = new SandboxHostService();
       const smallTools: Record<string, Tool> = {
@@ -996,13 +980,83 @@ describe("createCodeExecutionTool", () => {
         mockToolCallOptions
       )) as PTCExecutionResult;
       expect(result.success).toBe(true);
+      // The sub-threshold RETURN value stays inline (the model's channel)...
       expect(result.result).toEqual({ data: "small" });
-      expect(result.toolCalls[0].result).toEqual({ data: "small" });
+      // ...but the nested record is a compact summary even below the r4
+      // offload threshold.
+      const record = result.toolCalls[0];
+      expect(record.result).toBeUndefined();
+      expect(record.ok).toBe(true);
+      expect(record.bytes).toBe(Buffer.byteLength(JSON.stringify({ data: "small" }), "utf8"));
 
       const journal = new DurableEventJournal(tmp.path);
       const events = await journal.read();
       expect(events.filter((e) => e.kind === "result-handle")).toHaveLength(0);
       await host.disposeScope("ws-small");
+    });
+
+    it("keeps the failing nested call's error visible in its compact record", async () => {
+      using tmp = new DisposableTempDir("code-exec-offload");
+      const host = new SandboxHostService();
+      const failTools: Record<string, Tool> = {
+        boom: createMockTool("boom", z.object({}), () => {
+          throw new Error("backend exploded");
+        }),
+      };
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(failTools),
+        undefined,
+        persistentRunner(host, "ws-fail", tmp.path)
+      );
+      const result = (await tool.execute!(
+        { code: "mux.boom({}); return 'unreachable';" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      // Execution failed; the error message and the failing call's compact
+      // record must stay model-visible so the model can retry intelligently.
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("backend exploded");
+      const record = result.toolCalls[0];
+      expect(record.result).toBeUndefined();
+      expect(record.ok).toBe(false);
+      expect(record.bytes).toBe(0);
+      expect(record.error).toContain("backend exploded");
+      await host.disposeScope("ws-fail");
+    });
+
+    it("caps kernel console output with a truncation notice; RLM-off console is untouched", async () => {
+      using tmp = new DisposableTempDir("code-exec-console");
+      const host = new SandboxHostService();
+      // Two oversized logs: the first is truncated at the cap boundary, the
+      // second is dropped entirely — both accounted for in the notice.
+      const code = "console.log('a'.repeat(20000)); console.log('b'.repeat(5000)); return 'done';";
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge({}),
+        undefined,
+        persistentRunner(host, "ws-console", tmp.path)
+      );
+      const result = (await tool.execute!({ code }, mockToolCallOptions)) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      expect(result.consoleOutput).toHaveLength(2);
+      const [head, notice] = result.consoleOutput;
+      expect(String(head.args[0])).toContain("…[truncated]");
+      expect(String(head.args[0]).length).toBeLessThan(17_000);
+      expect(notice.level).toBe("warn");
+      expect(String(notice.args[0])).toContain("console output truncated");
+      expect(String(notice.args[0])).toContain("2 record(s)");
+      await host.disposeScope("ws-console");
+
+      // RLM off (no mount): byte-identical console behavior — nothing capped.
+      const ephemeralTool = await createCodeExecutionTool(runtimeFactory, new ToolBridge({}));
+      const ephemeralResult = (await ephemeralTool.execute!(
+        { code },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(ephemeralResult.consoleOutput).toHaveLength(2);
+      expect(ephemeralResult.consoleOutput[0].args[0]).toBe("a".repeat(20000));
+      expect(ephemeralResult.consoleOutput[1].args[0]).toBe("b".repeat(5000));
     });
 
     it("offloads oversized return values with a follow-up hint", async () => {

@@ -11,7 +11,7 @@ import { z } from "zod";
 import type { Tool } from "ai";
 import type { ToolBridge } from "@/node/services/ptc/toolBridge";
 import type { IJSRuntime, IJSRuntimeFactory } from "@/node/services/ptc/runtime";
-import type { PTCEvent, PTCExecutionResult } from "@/node/services/ptc/types";
+import type { PTCConsoleRecord, PTCEvent, PTCExecutionResult } from "@/node/services/ptc/types";
 import type { SandboxMount } from "@/node/services/sandbox/sandboxHostService";
 
 import { analyzeCode } from "@/node/services/ptc/staticAnalysis";
@@ -22,6 +22,7 @@ import {
   RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES,
   RESULT_HANDLE_VARS_CAP_BYTES,
 } from "@/constants/resultHandles";
+import { KERNEL_CONSOLE_CAP_BYTES } from "@/constants/kernelOutput";
 
 // Default limits
 const DEFAULT_MEMORY_BYTES = 64 * 1024 * 1024; // 64MB
@@ -149,22 +150,18 @@ async function offloadValue(
 }
 
 /**
- * RLM context offloading: values above the threshold stop entering the model
- * context. The running guest code already received each full value (in-kernel
- * data is free); here the MODEL-VISIBLE records are replaced by
- * { handle, preview, size } while the full value lands in vars.__hN (guest),
- * the blob store, and one result-handle durable event. Mutates `result` in
- * place; nested UI events already streamed the full values live.
+ * RLM context offloading for the TOP-LEVEL return value: values above the
+ * threshold stop entering the model context. The model-visible result is
+ * replaced by { handle, preview, size } while the full value lands in
+ * vars.__hN (guest), the blob store, and one result-handle durable event.
+ * Nested records need no offload machinery in kernel mode — they carry no
+ * payload at all (see compactKernelToolCallRecords). Mutates `result` in
+ * place.
  */
-async function offloadOversizedResults(
+async function offloadOversizedReturnValue(
   mount: SandboxMount,
   result: PTCExecutionResult
 ): Promise<void> {
-  for (const record of result.toolCalls) {
-    if (record.result === undefined) continue;
-    const offloaded = await offloadValue(mount, record.result);
-    if (offloaded !== null) record.result = offloaded;
-  }
   if (result.result !== undefined) {
     const offloaded = await offloadValue(mount, result.result);
     if (offloaded !== null) {
@@ -174,6 +171,93 @@ async function offloadOversizedResults(
       } satisfies OffloadedValueRecord;
     }
   }
+}
+
+/**
+ * Kernel-mode record suppression (r12): the point of the persistent kernel is
+ * that in-kernel data does NOT transit the model context. Every nested
+ * mux.* record becomes a compact {toolName, args, ok, bytes, error?} summary —
+ * never an inline result, regardless of size. The running guest already
+ * received the full value; return value / console / vars are the model's
+ * deliberate channels for surfacing data. On failure the error message stays
+ * visible (bounded — message only) so the model can retry intelligently.
+ * Mutates `result` in place; nested UI events already streamed the full
+ * values live.
+ */
+function compactKernelToolCallRecords(result: PTCExecutionResult): void {
+  result.toolCalls = result.toolCalls.map((record) => {
+    let bytes = 0;
+    if (record.result !== undefined) {
+      try {
+        bytes = Buffer.byteLength(JSON.stringify(record.result) ?? "", "utf8");
+      } catch {
+        // Bridged results are JSON round-tripped, so this is unreachable in
+        // practice; size 0 is an honest fallback (nothing model-visible).
+        bytes = 0;
+      }
+    }
+    return {
+      toolName: record.toolName,
+      args: record.args,
+      ok: record.error === undefined,
+      bytes,
+      ...(record.error !== undefined ? { error: record.error } : {}),
+      duration_ms: record.duration_ms,
+    };
+  });
+}
+
+/**
+ * Kernel-mode console bound (r12): console output is the model's deliberate
+ * debug/print channel and stays visible, but it must not become a suppression
+ * bypass. Total console bytes per execution are capped; the crossing record
+ * keeps a bounded head and a final warn record reports what was dropped —
+ * never a silent drop. Byte accounting uses the JSON serialization of each
+ * record's args (what the model would see). Mutates `result` in place.
+ */
+function capKernelConsoleOutput(result: PTCExecutionResult): void {
+  let total = 0;
+  let droppedRecords = 0;
+  let droppedBytes = 0;
+  const kept: PTCConsoleRecord[] = [];
+  for (const record of result.consoleOutput) {
+    let serialized: string;
+    try {
+      serialized = JSON.stringify(record.args) ?? "";
+    } catch {
+      serialized = "";
+    }
+    const size = Buffer.byteLength(serialized, "utf8");
+    if (droppedRecords === 0 && total + size <= KERNEL_CONSOLE_CAP_BYTES) {
+      kept.push(record);
+      total += size;
+      continue;
+    }
+    droppedRecords += 1;
+    if (droppedRecords === 1 && total < KERNEL_CONSOLE_CAP_BYTES) {
+      // Crossing record: keep a bounded head (char-sliced — close enough to
+      // bytes for a soft cap) instead of dropping it whole.
+      const remaining = KERNEL_CONSOLE_CAP_BYTES - total;
+      kept.push({
+        level: record.level,
+        args: [`${serialized.slice(0, remaining)}…[truncated]`],
+        timestamp: record.timestamp,
+      });
+      droppedBytes += Math.max(0, size - remaining);
+      total = KERNEL_CONSOLE_CAP_BYTES;
+      continue;
+    }
+    droppedBytes += size;
+  }
+  if (droppedRecords === 0) return;
+  kept.push({
+    level: "warn",
+    args: [
+      `[console output truncated: ${KERNEL_CONSOLE_CAP_BYTES}-byte kernel cap reached; ${droppedRecords} record(s) / ~${droppedBytes} bytes dropped]`,
+    ],
+    timestamp: result.consoleOutput[result.consoleOutput.length - 1]?.timestamp ?? 0,
+  });
+  result.consoleOutput = kept;
 }
 
 /** Model-facing description options for createCodeExecutionTool. */
@@ -215,7 +299,7 @@ export async function createCodeExecutionTool(
     ? ""
     : `
 
-**Persistent kernel:** the global \`vars\` object persists across code_execution calls and turns (JSON-serializable values only) and survives restarts via snapshots. Stash intermediate results in \`vars\` instead of re-fetching or re-computing them. Oversized values (>${Math.floor(RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES / 1024)}KB serialized) are offloaded: the visible record becomes {handle, preview, size} while the full value stays in the kernel at that handle (e.g. \`vars.__h1\`) — read or slice it in a follow-up call.${
+**Persistent kernel:** the global \`vars\` object persists across code_execution calls and turns (JSON-serializable values only) and survives restarts via snapshots. Nested tool results do NOT enter your context: each mux.* call's visible record is a compact {tool, ok, bytes} summary (plus the error message on failure). Data reaches you only through your \`return\` value (offloaded to a {handle, preview, size} vars handle like \`vars.__h1\` when >${Math.floor(RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES / 1024)}KB serialized — read or slice it in a follow-up call), \`console\` output (capped at ${Math.floor(KERNEL_CONSOLE_CAP_BYTES / 1024)}KB per execution), and \`vars\`. Keep working data in \`vars\` and return only what you need to see. Note \`mux.file_read\` errors beyond its ~16KB/1000-line per-call cap (it does not offload).${
         "task" in bridgeableTools
           ? `
 **Fire-and-forget sub-agents:** \`xum.task_spawn(args)\` (same args as \`xum.task\`) returns immediately with {taskId, status:"spawned"} once the child is admitted. Terminal reports are queued in the kernel — drain with \`xum.events()\` in a later call. The queue is best-effort (an app restart may drop it); every report still reaches you via the normal task wake.`
@@ -227,7 +311,7 @@ export async function createCodeExecutionTool(
   // mount override keep their current descriptions byte-identical.
   const kernelFirstPreamble =
     kernel && options?.kernelFirst === true
-      ? `**Kernel-first workflow:** this is your primary tool — other tools are \`mux.*\` calls inside it. Persist state in \`vars\` across calls and turns; oversized results come back as {handle, preview, size} — read or slice the full value at its handle in a follow-up call${
+      ? `**Kernel-first workflow:** this is your primary tool — other tools are \`mux.*\` calls inside it. Persist state in \`vars\` across calls and turns; nested results stay in the kernel (you see compact {tool, ok, bytes} summaries), and an oversized return value comes back as {handle, preview, size} — read or slice the full value at its handle in a follow-up call${
           "task" in bridgeableTools
             ? "; spawn sub-agents with `mux.task_spawn(...)` and collect their reports with `mux.events()`"
             : ""
@@ -354,12 +438,21 @@ ${xumTypes}
           // Execute the code
           const result = await runtime.eval(code);
 
-          // RLM context offloading BEFORE the vars snapshot below, so the
+          // Kernel-mode context isolation (r12): nested records become compact
+          // summaries and console output is bounded, regardless of grants —
+          // suppression only drops data, it stores nothing. Runs even for
+          // failed evals: partial toolCalls records are model-visible too and
+          // must not leak either (their error messages stay visible).
+          if (mount?.lifetime === "persistent") {
+            compactKernelToolCallRecords(result);
+            capKernelConsoleOutput(result);
+          }
+
+          // RLM return-value offloading BEFORE the vars snapshot below, so the
           // handle vars land in the same durable snapshot the model's
-          // {handle, preview, size} records rely on. Runs even for failed
-          // evals: partial toolCalls records are model-visible too.
+          // {handle, preview, size} record relies on.
           if (mount?.lifetime === "persistent" && mount.grants.vars) {
-            await offloadOversizedResults(mount, result);
+            await offloadOversizedReturnValue(mount, result);
           }
 
           // Persist the shared vars namespace after each call on persistent
