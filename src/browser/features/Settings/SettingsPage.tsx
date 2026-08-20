@@ -147,6 +147,7 @@ export function getSettingsSections(
       label: "Plugins",
       icon: <Blocks className="h-4 w-4" />,
       component: PluginsSettingsSection,
+      experimental: true,
     });
   }
   if (memoryEnabled) {
