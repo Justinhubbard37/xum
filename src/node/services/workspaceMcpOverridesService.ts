@@ -581,17 +581,34 @@ export class WorkspaceMcpOverridesService {
           continue;
         }
 
+        // Duplicate properties make jsonc.parse (last value wins) and
+        // jsonc.modify (first matching path wins) disagree: the edit loop
+        // below could spin forever on an entry it can never remove, or
+        // declare success while a stale plugin key survives in the shadowed
+        // property. Reject up front — the caller keeps its retry tombstone
+        // until the malformed file is repaired.
+        const duplicateName = findDuplicateOverrideProperty(jsonc.parseTree(original));
+        if (duplicateName !== undefined) {
+          throw new Error(
+            `Workspace MCP overrides file has duplicate "${duplicateName}" properties: ${filePath}`
+          );
+        }
+
         // Targeted jsonc edits, NOT JSON.stringify of the parsed object: the
         // .jsonc file is user-maintained and may carry comments/formatting a
         // wholesale rewrite would erase.
         let text = original;
         const removeAt = (jsonPath: jsonc.JSONPath): void => {
-          text = jsonc.applyEdits(
+          const next = jsonc.applyEdits(
             text,
             jsonc.modify(text, jsonPath, undefined, {
               formattingOptions: { insertSpaces: true, tabSize: 2 },
             })
           );
+          // A no-op edit means parse and modify disagreed about the path;
+          // looping on it would never terminate.
+          assert(next !== text, "prunePluginOverrideKeys: targeted edit produced no change");
+          text = next;
         };
 
         for (const field of ["enabledServers", "disabledServers"] as const) {
@@ -627,4 +644,46 @@ export class WorkspaceMcpOverridesService {
       }
     });
   }
+}
+
+/** Property names prunePluginOverrideKeys edits by JSON path. */
+const PRUNED_OVERRIDE_FIELDS = new Set(["enabledServers", "disabledServers", "toolAllowlist"]);
+
+/**
+ * Detect duplicate JSONC properties that would break path-based edits in
+ * prunePluginOverrideKeys: a root-level duplicate of an edited field, or any
+ * duplicate key inside toolAllowlist. jsonc.parse exposes the LAST value for
+ * a duplicated property while jsonc.modify resolves the FIRST matching path,
+ * so editing such a file can loop forever or silently miss the effective
+ * (shadowing) value. Returns the duplicated property name, if any.
+ */
+function findDuplicateOverrideProperty(root: jsonc.Node | undefined): string | undefined {
+  const duplicateIn = (
+    node: jsonc.Node | undefined,
+    names?: ReadonlySet<string>
+  ): string | undefined => {
+    if (node?.type !== "object") {
+      return undefined;
+    }
+    const seen = new Set<string>();
+    for (const property of node.children ?? []) {
+      const name: unknown = property.children?.[0]?.value;
+      if (typeof name !== "string" || (names !== undefined && !names.has(name))) {
+        continue;
+      }
+      if (seen.has(name)) {
+        return name;
+      }
+      seen.add(name);
+    }
+    return undefined;
+  };
+
+  const rootDuplicate = duplicateIn(root, PRUNED_OVERRIDE_FIELDS);
+  if (rootDuplicate !== undefined) {
+    return rootDuplicate;
+  }
+  return duplicateIn(
+    root === undefined ? undefined : jsonc.findNodeAtLocation(root, ["toolAllowlist"])
+  );
 }

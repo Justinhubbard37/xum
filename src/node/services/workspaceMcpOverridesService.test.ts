@@ -408,6 +408,80 @@ describe("WorkspaceMcpOverridesService", () => {
     });
   });
 
+  it("prunePluginOverrideKeys rejects duplicate properties instead of mis-editing", async () => {
+    const projectPath = "/fake/project";
+    const workspaceId = "ws-id";
+    const workspaceName = "branch";
+
+    const workspacePath = getWorkspacePath({
+      srcDir: config.srcDir,
+      projectName: "project",
+      workspaceName,
+    });
+    const filePath = path.join(workspacePath, ".mux", "mcp.local.jsonc");
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+
+    await config.editConfig((cfg) => {
+      cfg.projects.set(projectPath, {
+        workspaces: [
+          {
+            path: workspacePath,
+            id: workspaceId,
+            name: workspaceName,
+            runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+          },
+        ],
+      });
+      return cfg;
+    });
+    const service = new WorkspaceMcpOverridesService(config);
+
+    // Duplicate toolAllowlist properties: jsonc.parse exposes the LAST
+    // object (holding the plugin key) while jsonc.modify edits the FIRST,
+    // so a "successful" prune would leave the stale key in the effective
+    // value. The prune must throw (caller keeps its retry tombstone).
+    const duplicateAllowlist = `{
+  "toolAllowlist": { "other": ["t2"] },
+  "toolAllowlist": { "plugin:abc:echo": ["t1"] }
+}
+`;
+    await fs.writeFile(filePath, duplicateAllowlist);
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(service.prunePluginOverrideKeys(workspaceId, "plugin:abc:")).rejects.toThrow(
+      /duplicate "toolAllowlist"/
+    );
+    expect(await fs.readFile(filePath, "utf-8")).toBe(duplicateAllowlist);
+
+    // Duplicate enabledServers: the same parse/modify disagreement makes the
+    // index-based removal loop spin on the unchanged effective array.
+    await fs.writeFile(
+      filePath,
+      `{
+  "enabledServers": ["other"],
+  "enabledServers": ["plugin:abc:echo"]
+}
+`
+    );
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(service.prunePluginOverrideKeys(workspaceId, "plugin:abc:")).rejects.toThrow(
+      /duplicate "enabledServers"/
+    );
+
+    // Duplicate keys INSIDE toolAllowlist: removal by name hits the first,
+    // parse exposes the last — the stale key would survive.
+    await fs.writeFile(
+      filePath,
+      `{
+  "toolAllowlist": { "plugin:abc:echo": ["t1"], "plugin:abc:echo": ["t2"] }
+}
+`
+    );
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(service.prunePluginOverrideKeys(workspaceId, "plugin:abc:")).rejects.toThrow(
+      /duplicate "plugin:abc:echo"/
+    );
+  });
+
   it("removes workspace-local file when overrides are set to empty", async () => {
     const projectPath = "/fake/project";
     const workspaceId = "ws-id";
