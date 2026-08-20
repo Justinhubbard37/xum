@@ -154,6 +154,38 @@ describe("AgentPluginInstallService", () => {
     expect(granted.hook).toEqual({ path: "hooks.js", toolGrants: ["bash", "file_read"] });
   });
 
+  test("consent preview discloses agents, workflows, and slash commands", async () => {
+    // Every activatable component must be named before install, not just
+    // skills/MCP/hooks: agents become selectable, workflow scripts are
+    // executable, slash commands appear in the composer.
+    const bare = await service.preview({ input: remoteDir });
+    expect(bare.agents).toEqual([]);
+    expect(bare.workflows).toEqual([]);
+    expect(bare.slashCommands).toEqual([]);
+
+    await fsPromises.mkdir(path.join(remoteDir, "agents"), { recursive: true });
+    await fsPromises.writeFile(path.join(remoteDir, "agents", "reviewer.md"), "# reviewer\n");
+    await fsPromises.mkdir(path.join(remoteDir, "workflows"), { recursive: true });
+    await fsPromises.writeFile(path.join(remoteDir, "workflows", "release.js"), "// wf\n");
+    await fsPromises.writeFile(path.join(remoteDir, "workflows", "notes.txt"), "not a script\n");
+    const manifestPath = path.join(remoteDir, "plugin.json");
+    const manifest = JSON.parse(await fsPromises.readFile(manifestPath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    manifest.contributes = {
+      slashCommands: [{ name: "standup", description: "Daily standup", expansion: "Do standup" }],
+    };
+    await fsPromises.writeFile(manifestPath, JSON.stringify(manifest, null, 2));
+    await commitAll(remoteDir, "agents + workflows + slash commands");
+
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.agents).toEqual(["reviewer.md"]);
+    // Only *.js is executable by workflow discovery; notes.txt is not listed.
+    expect(preview.workflows).toEqual(["release.js"]);
+    expect(preview.slashCommands).toEqual([{ name: "standup", description: "Daily standup" }]);
+  });
+
   test("preview stages+validates without writing; install promotes and records the registry", async () => {
     const head = (await git(remoteDir, "rev-parse", "HEAD")).trim();
 

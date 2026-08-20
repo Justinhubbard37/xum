@@ -36,6 +36,12 @@ export const AgentPluginPreviewHookSchema = z.object({
   toolGrants: z.array(z.string()),
 });
 
+/** Composer slash command declared by the manifest (data-driven expansion). */
+export const AgentPluginPreviewSlashCommandSchema = z.object({
+  name: z.string(),
+  description: z.string().optional(),
+});
+
 /** Manifest metadata surfaced in the consent preview (UI-safe projection of plugin.json). */
 export const AgentPluginManifestSummarySchema = z.object({
   name: z.string(),
@@ -60,6 +66,12 @@ export const AgentPluginInstallPreviewSchema = z.object({
   mcpServers: z.array(AgentPluginPreviewMcpServerSchema),
   /** Present when the plugin ships an executable hooks.js (absent = no hooks). */
   hook: AgentPluginPreviewHookSchema.optional(),
+  /** Agent definition files (agents/*.md) that become selectable agents. */
+  agents: z.array(z.string()),
+  /** Executable workflow scripts (workflows/*.js) invokable after install. */
+  workflows: z.array(z.string()),
+  /** Composer slash commands the manifest contributes. */
+  slashCommands: z.array(AgentPluginPreviewSlashCommandSchema),
   /** Manifest warnings + component diagnostics from validating the staged clone. */
   warnings: z.array(z.string()),
   /** Final install directory (~/.mux/plugins/<name>). */
@@ -96,6 +108,7 @@ export const AgentPluginUpdateCheckSchema = z.object({
 export type AgentPluginPreviewSkill = z.infer<typeof AgentPluginPreviewSkillSchema>;
 export type AgentPluginPreviewMcpServer = z.infer<typeof AgentPluginPreviewMcpServerSchema>;
 export type AgentPluginPreviewHook = z.infer<typeof AgentPluginPreviewHookSchema>;
+export type AgentPluginPreviewSlashCommand = z.infer<typeof AgentPluginPreviewSlashCommandSchema>;
 export type AgentPluginManifestSummary = z.infer<typeof AgentPluginManifestSummarySchema>;
 export type AgentPluginInstallPreview = z.infer<typeof AgentPluginInstallPreviewSchema>;
 export type AgentPluginListItem = z.infer<typeof AgentPluginListItemSchema>;

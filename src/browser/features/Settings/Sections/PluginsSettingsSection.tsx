@@ -257,6 +257,56 @@ const AddPluginPanel: React.FC<{
             </p>
           </div>
 
+          {preview.agents.length > 0 && (
+            <div>
+              <h4 className="text-foreground mb-1 text-xs font-medium">
+                Agents ({preview.agents.length})
+              </h4>
+              {/* Activatable components: consent must name everything that
+                  becomes available after install, not just skills/MCP. */}
+              <p className="text-xs">
+                <span className="text-foreground font-mono break-all">
+                  {preview.agents.join(", ")}
+                </span>{" "}
+                <span className="text-muted">— become selectable agent definitions.</span>
+              </p>
+            </div>
+          )}
+
+          {preview.workflows.length > 0 && (
+            <div>
+              <h4 className="text-foreground mb-1 text-xs font-medium">
+                Workflows ({preview.workflows.length})
+              </h4>
+              <p className="text-xs">
+                <span className="text-foreground font-mono break-all">
+                  {preview.workflows.join(", ")}
+                </span>{" "}
+                <span className="text-muted">
+                  — executable workflow scripts, invokable after install.
+                </span>
+              </p>
+            </div>
+          )}
+
+          {preview.slashCommands.length > 0 && (
+            <div>
+              <h4 className="text-foreground mb-1 text-xs font-medium">
+                Slash commands ({preview.slashCommands.length})
+              </h4>
+              <ul className="space-y-1">
+                {preview.slashCommands.map((command) => (
+                  <li key={command.name} className="text-xs">
+                    <span className="text-foreground font-mono">/{command.name}</span>
+                    {command.description && (
+                      <span className="text-muted"> — {command.description}</span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
           {preview.hook && (
             <div>
               <h4 className="text-foreground mb-1 text-xs font-medium">Hooks</h4>

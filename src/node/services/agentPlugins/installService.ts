@@ -602,6 +602,35 @@ export class AgentPluginInstallService {
     };
   }
 
+  /**
+   * Agent definition files (agents/*.md) and executable workflow scripts
+   * (workflows/*.js) for the consent preview, mirroring the runtime listers
+   * (agentDefinitionsService / workflowScriptDiscovery: top-level files and
+   * symlinks with the matching extension, sorted). These activate after
+   * install, so consent must name them.
+   */
+  private async collectComponentFiles(
+    dir: string | undefined,
+    extension: string
+  ): Promise<string[]> {
+    if (dir === undefined) {
+      return [];
+    }
+    try {
+      const entries = await fsPromises.readdir(dir, { withFileTypes: true });
+      return entries
+        .filter(
+          (entry) =>
+            (entry.isFile() || entry.isSymbolicLink()) &&
+            entry.name.toLowerCase().endsWith(extension)
+        )
+        .map((entry) => entry.name)
+        .sort((a, b) => a.localeCompare(b));
+    } catch {
+      return [];
+    }
+  }
+
   private async collectSkills(
     plugin: Pick<AgentPluginInfo, "rootPath" | "skillsDir">,
     warnings: string[]
@@ -760,6 +789,12 @@ export class AgentPluginInstallService {
         warnings
       );
       const hook = this.collectHook(plugin);
+      const agents = await this.collectComponentFiles(plugin.agentsDir, ".md");
+      const workflows = await this.collectComponentFiles(plugin.workflowsDir, ".js");
+      const slashCommands = (plugin.manifest.contributes?.slashCommands ?? []).map((command) => ({
+        name: command.name,
+        ...(command.description !== undefined ? { description: command.description } : {}),
+      }));
 
       if (resolved.refType === "tag" && sha !== resolved.sha) {
         warnings.push(
@@ -780,6 +815,9 @@ export class AgentPluginInstallService {
         skills,
         mcpServers,
         ...(hook !== undefined ? { hook } : {}),
+        agents,
+        workflows,
+        slashCommands,
         warnings,
         targetPath: shortenHome(targetPath),
       };

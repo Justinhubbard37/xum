@@ -279,6 +279,9 @@ export const AddPluginConsentPreview: Story = {
                 summary: "node ~/.mux/plugins/grill/server.js --db ${PLUGIN_DATA}/state.sqlite",
               },
             ],
+            agents: ["grill-master.md"],
+            workflows: ["grill-report.js"],
+            slashCommands: [{ name: "grill", description: "Grill the current plan" }],
             warnings: ["Unknown top-level field 'hooks' ignored"],
             targetPath: "~/.mux/plugins/grill",
           },
@@ -300,6 +303,13 @@ export const AddPluginConsentPreview: Story = {
     await canvas.findByText("grill-lite");
     await canvas.findByText("MCP servers (1)");
     await canvas.findByText(/server\.js --db/);
+    // Every activatable component type is disclosed, not just skills/MCP.
+    await canvas.findByText("Agents (1)");
+    await canvas.findByText(/grill-master\.md/);
+    await canvas.findByText("Workflows (1)");
+    await canvas.findByText(/grill-report\.js/);
+    await canvas.findByText("Slash commands (1)");
+    await canvas.findByText("/grill");
     await canvas.findByText(/Unknown top-level field 'hooks' ignored/);
     await canvas.findByRole("button", { name: /Install/ });
   },
