@@ -314,18 +314,20 @@ describe("toolset composition (PTC × RLM × exclusive)", () => {
     expect(tools.code_execution.description).not.toContain("Kernel-first");
   });
 
-  test("PTC + RLM: supplement set + rollback, kernel notes but no kernel-first preamble", async () => {
+  test("PTC + RLM: exclusive-only — RLM forces the kernel-first narrowed set", async () => {
+    // RLM is exclusive-only: supplement-mode RLM measured ~2x flat tokens/cost
+    // (flat schemas + kernel defs shipped while models took the flat path), so
+    // the rlm flag implies the exclusive posture even without the exclusive
+    // experiment. This pins the removal of supplement-mode RLM.
     using tmp = new DisposableTempDir("compose-ptc-rlm");
     try {
       const tools = await assemble("ws-compose-ptc-rlm", tmp.path, {
         programmaticToolCalling: true,
         rlm: true,
       });
-      expect(Object.keys(tools).sort()).toEqual(
-        [...SUPPLEMENT_NAMES, "refinement_rollback"].sort()
-      );
+      expect(Object.keys(tools).sort()).toEqual([...EXCLUSIVE_NAMES, "refinement_rollback"].sort());
       expect(tools.code_execution.description).toContain("Persistent kernel");
-      expect(tools.code_execution.description).not.toContain("Kernel-first");
+      expect(tools.code_execution.description).toContain("Kernel-first");
     } finally {
       await sandboxHostService.disposeScope("ws-compose-ptc-rlm");
     }

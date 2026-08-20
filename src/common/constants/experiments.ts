@@ -73,7 +73,7 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     id: EXPERIMENT_IDS.RLM,
     name: "RLM Mode",
     description:
-      "Persistent sandbox kernel for code_execution: vars survive across calls and turns (snapshot-backed). Later RLM features build on this kernel.",
+      "Kernel-first exclusive toolset: code_execution becomes the primary tool, backed by a persistent sandbox kernel (vars survive across calls/turns, bulk file loads, result handles, fire-and-forget sub-agents). Implies PTC Exclusive posture; supplement mode is not supported.",
     enabledByDefault: false,
     showInSettings: true,
   },

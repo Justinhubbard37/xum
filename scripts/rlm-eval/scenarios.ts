@@ -178,35 +178,16 @@ export const CONFIGS: EvalConfig[] = [
     id: "ptc-only",
     experiments: { programmaticToolCalling: true, rlm: false },
   },
-  {
-    id: "rlm-base",
-    experiments: { programmaticToolCalling: true, rlm: true },
-  },
-  {
-    id: "rlm-nudge",
-    experiments: { programmaticToolCalling: true, rlm: true },
-    nudge:
-      "When you use code_execution, persist any data you might need in later turns in `vars` " +
-      "(for example `vars.data = ...`) instead of re-reading files, and answer follow-up " +
-      "questions from `vars` when the data is already there.",
-  },
-  // Kernel-first posture (r10): with flat tools removed, does the model adopt
-  // vars organically, and does the nudge still add anything on top?
+  // RLM is exclusive-only (supplement-mode RLM measured ~2x flat tokens/cost
+  // and was removed): the rlm flag alone yields the kernel-first exclusive
+  // toolset. The explicit exclusive flag is redundant but harmless.
   {
     id: "rlm-excl",
-    experiments: {
-      programmaticToolCalling: true,
-      programmaticToolCallingExclusive: true,
-      rlm: true,
-    },
+    experiments: { programmaticToolCalling: true, rlm: true },
   },
   {
     id: "rlm-excl-nudge",
-    experiments: {
-      programmaticToolCalling: true,
-      programmaticToolCallingExclusive: true,
-      rlm: true,
-    },
+    experiments: { programmaticToolCalling: true, rlm: true },
     nudge:
       "When you use code_execution, persist any data you might need in later turns in `vars` " +
       "(for example `vars.data = ...`) instead of re-reading files, and answer follow-up " +

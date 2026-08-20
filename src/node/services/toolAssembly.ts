@@ -202,6 +202,12 @@ export async function applyToolPolicyAndExperiments(
 
   // Handle PTC experiments — add or replace tools with code_execution
   let toolsForModel = policyFilteredTools;
+  // RLM is exclusive-only: supplement-mode RLM measured ~2x flat tokens/cost
+  // (flat schemas + kernel type defs shipped while models still take the flat
+  // path), so enabling RLM forces the kernel-first exclusive toolset. The
+  // standalone exclusive experiment stays usable without RLM (no kernel).
+  const rlmActive = experiments?.rlm === true;
+  const exclusiveActive = experiments?.programmaticToolCallingExclusive === true || rlmActive;
   if (experiments?.programmaticToolCalling || experiments?.programmaticToolCallingExclusive) {
     try {
       // Lazy-load PTC modules only when experiments are enabled
@@ -250,19 +256,17 @@ export async function applyToolPolicyAndExperiments(
         toolBridge,
         emitNestedToolEvent,
         withMount,
-        // Kernel-first description preamble is the RLM + exclusive posture
-        // only: RLM alone keeps supplement-mode descriptions, exclusive alone
-        // (or with the env-var mount override) keeps today's exclusive
-        // descriptions byte-identical. createCodeExecutionTool additionally
-        // requires a live persistent mount before honoring the flag.
+        // Kernel-first description preamble rides RLM (which is exclusive-only
+        // now); exclusive alone (or the env-var mount override) keeps today's
+        // exclusive descriptions byte-identical. createCodeExecutionTool
+        // additionally requires a live persistent mount before honoring it.
         {
-          kernelFirst:
-            experiments?.rlm === true && experiments?.programmaticToolCallingExclusive === true,
+          kernelFirst: rlmActive,
           loadFile: sandbox?.kernelFileLoader,
         }
       );
 
-      if (experiments?.programmaticToolCallingExclusive) {
+      if (exclusiveActive) {
         // Exclusive mode: code_execution is mandatory — it's the only way to use bridged
         // tools. The experiment flag is the opt-in; policy cannot disable it here since
         // that would leave no way to access tools. nonBridgeable is policy-filtered but
