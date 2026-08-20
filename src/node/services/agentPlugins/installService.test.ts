@@ -650,6 +650,48 @@ describe("AgentPluginInstallService", () => {
     expect(doc.pendingOverridePrunes).toContainEqual(foreignPrune);
   });
 
+  test("corrupted tombstone prefixes are never executed and pass through verbatim", async () => {
+    // A corrupted plugins.json could carry an arbitrary prefix (e.g. "g");
+    // handing it to prunePluginOverrideKeys would strip every matching
+    // enabled/disabled/tool-allowlist key from workspace overrides. Such a
+    // tombstone must be treated as unrecognized: preserved, never retried.
+    const pruneCalls: string[] = [];
+    const overridesStub = {
+      prunePluginOverrideKeys: (_workspaceId: string, prefix: string) => {
+        pruneCalls.push(prefix);
+        return Promise.resolve();
+      },
+    };
+    const serviceWithOverrides = new AgentPluginInstallService(config, {
+      isEnabled: () => true,
+      workspaceMcpOverridesService: overridesStub as unknown as WorkspaceMcpOverridesService,
+    });
+    // The named workspace exists, so a recognized tombstone WOULD be retried
+    // (and its prefix executed) on section open.
+    const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
+      Promise.resolve([{ id: "ws-1", runtimeConfig: { type: "local" } }] as unknown as Awaited<
+        ReturnType<Config["getAllWorkspaceMetadata"]>
+      >)
+    );
+    try {
+      const corrupted = { prefix: "g", workspaceIds: ["ws-1"] };
+      await fsPromises.writeFile(
+        registryFile(),
+        JSON.stringify({ plugins: [], pendingOverridePrunes: [corrupted] })
+      );
+
+      await serviceWithOverrides.list();
+
+      expect(pruneCalls).toEqual([]);
+      const doc = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+        pendingOverridePrunes: unknown[];
+      };
+      expect(doc.pendingOverridePrunes).toContainEqual(corrupted);
+    } finally {
+      metadataSpy.mockRestore();
+    }
+  });
+
   test("tombstone retries on list are serialized with registry mutations", async () => {
     const instanceId = computePluginInstanceId(path.join(pluginsDir(), "other-name"));
     // A tombstone whose prune blocks until released, so a mutation can be

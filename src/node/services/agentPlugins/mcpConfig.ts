@@ -61,6 +61,19 @@ export function buildPluginServerKey(instanceId: string, serverName: string): st
   return `${PLUGIN_SERVER_KEY_PREFIX}${instanceId}:${serverName}`;
 }
 
+/**
+ * Canonical uninstall-tombstone prefix shape: `plugin:<instanceId>:` where
+ * the instance ID is the 16-hex-char computePluginInstanceId output. Persisted
+ * tombstones are validated against this before being executed so a corrupted
+ * `plugins.json` prefix (e.g. `"g"`) can never destructively prune arbitrary
+ * workspace override keys.
+ */
+const CANONICAL_PLUGIN_KEY_PREFIX_PATTERN = /^plugin:[0-9a-f]{16}:$/;
+
+export function isCanonicalPluginServerKeyPrefix(prefix: string): boolean {
+  return CANONICAL_PLUGIN_KEY_PREFIX_PATTERN.test(prefix);
+}
+
 function collectPluginOverrideKeys(overrides: WorkspaceMCPOverrides): Set<string> {
   return new Set(
     [

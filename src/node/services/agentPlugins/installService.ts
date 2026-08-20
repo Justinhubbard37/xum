@@ -40,6 +40,7 @@ import {
   buildPluginServerKey,
   computePluginInstanceId,
   getPluginDataPath,
+  isCanonicalPluginServerKeyPrefix,
   loadPluginMcpServers,
 } from "./mcpConfig";
 import { isFullCommitSha, parseAgentPluginSourceInput } from "./sourceInput";
@@ -1267,7 +1268,11 @@ export class AgentPluginInstallService {
     const workspaceIds = (item as { workspaceIds?: unknown }).workspaceIds;
     return (
       typeof prefix === "string" &&
-      prefix.length > 0 &&
+      // Only canonical `plugin:<instanceId>:` prefixes are executable: a
+      // corrupted prefix (e.g. "g") must never reach prunePluginOverrideKeys,
+      // where it would destructively strip arbitrary workspace override keys.
+      // Invalid tombstones pass through verbatim like unknown variants.
+      isCanonicalPluginServerKeyPrefix(prefix) &&
       Array.isArray(workspaceIds) &&
       workspaceIds.every((id): id is string => typeof id === "string")
     );
