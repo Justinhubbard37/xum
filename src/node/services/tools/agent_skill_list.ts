@@ -31,20 +31,15 @@ interface AgentSkillListToolArgs {
   includeUnadvertised?: boolean | null;
 }
 
-interface SkillDirectoryEntry {
-  name: string;
-  isSymbolicLink: boolean;
-}
-
-async function listSkillDirectories(skillsRoot: string): Promise<SkillDirectoryEntry[]> {
+async function listSkillDirectories(skillsRoot: string): Promise<string[]> {
   try {
     const entries = await fsPromises.readdir(skillsRoot, { withFileTypes: true });
+    // Include symlinked entries: skill package managers install skills by
+    // symlinking directories into skills roots. readSkillDescriptor enforces
+    // realpath containment per skill, so escaping symlinks stay rejected.
     return entries
       .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
-      .map((entry) => ({
-        name: entry.name,
-        isSymbolicLink: entry.isSymbolicLink(),
-      }));
+      .map((entry) => entry.name);
   } catch (error) {
     log.warn(
       `Skipping skills root '${skillsRoot}' because directory entries could not be read: ${getErrorMessage(error)}`
@@ -68,12 +63,17 @@ async function readSkillDescriptor(
   }
 
   const directoryName = parsedDirectoryName.data;
-  const skillFilePath = path.join(skillsRoot, directoryName, "SKILL.md");
+  const skillDir = path.join(skillsRoot, directoryName);
+  const skillFilePath = path.join(skillDir, "SKILL.md");
 
-  // Validate SKILL.md canonical path stays within the containment root before any read.
-  // This prevents repo-controlled symlinks from escaping the project boundary.
+  // SECURITY: validate that BOTH the skill directory and SKILL.md canonical
+  // paths stay within the containment root before any read. Checking only the
+  // file would let a skill-dir symlink resolve outside containment while its
+  // SKILL.md symlinks back inside, advertising a skill whose sibling files
+  // agent_skill_read_file would then read from the external location.
   let containedPath: string;
   try {
+    await ensurePathContained(containmentRoot, skillDir);
     containedPath = await ensurePathContained(containmentRoot, skillFilePath);
   } catch (error) {
     if (hasErrorCode(error, "ENOENT")) {
@@ -228,12 +228,6 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
           skillsRoot: string;
           containmentRoot: string;
           scope: "global" | "project";
-          /**
-           * Agent Plugins root: per-skill containment anchors at the plugin
-           * root (§4.1), so contained symlinked skill dirs stay listed —
-           * matching stream discovery and agent_skill_read.
-           */
-          isPlugin?: boolean;
         }> = [
           {
             skillsRoot: path.join(muxScope.muxHome, "skills"),
@@ -315,14 +309,13 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
               skillsRoot: plugin.skillsDir,
               containmentRoot: plugin.rootPath,
               scope: plugin.scope,
-              isPlugin: true,
             });
           }
         }
 
         const skills: AgentSkillDescriptor[] = [];
         const seenByScope = new Set<string>();
-        for (const { skillsRoot, containmentRoot, scope, isPlugin } of roots) {
+        for (const { skillsRoot, containmentRoot, scope } of roots) {
           let skillsRootReal: string;
           try {
             skillsRootReal = await fsPromises.realpath(skillsRoot);
@@ -342,22 +335,15 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
             continue;
           }
 
-          const directoryEntries = await listSkillDirectories(skillsRootReal);
-          for (const entry of directoryEntries) {
-            // Project scope: reject symlinked skill directories to avoid resolving
-            // repo-controlled entries to out-of-project locations. Plugin roots
-            // are exempt: readSkillDescriptor enforces realpath containment at
-            // the plugin root, the same rule stream discovery applies.
-            if (scope === "project" && !isPlugin && entry.isSymbolicLink) {
-              log.warn(
-                `Skipping project skill '${entry.name}': skill directory is a symbolic link`
-              );
-              continue;
-            }
-
+          const directoryNames = await listSkillDirectories(skillsRootReal);
+          for (const directoryName of directoryNames) {
+            // SECURITY: symlinked skill directories are allowed only through
+            // readSkillDescriptor's realpath containment check, which rejects
+            // entries resolving outside the containment root. This matches the
+            // posture of stream discovery and plugin roots.
             const descriptor = await readSkillDescriptor(
               skillsRootReal,
-              entry.name,
+              directoryName,
               scope,
               containmentRoot
             );
