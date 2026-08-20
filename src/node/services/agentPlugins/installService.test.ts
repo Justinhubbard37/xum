@@ -1157,32 +1157,40 @@ describe("AgentPluginInstallService", () => {
     expect(await registry()).toHaveLength(1);
   });
 
-  test("added plugin override keys are rejected for uninstalled instances", async () => {
+  test("added plugin override keys are validated against discovered servers", async () => {
     // The overrides revision is content-derived, so a dialog opened before an
     // uninstall (overrides {}) sees an unchanged revision after it — only a
-    // registry check at save time can reject the ghost row's new key.
-    const preview = await service.preview({ input: remoteDir });
-    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
-    const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
-    const installedKey = `plugin:${instanceId}:echo`;
+    // discovery check at save time can reject the ghost row's new key. The
+    // source is DISCOVERED server keys (managed + project + ~/.agents +
+    // unmanaged containers), not the managed registry, so non-managed plugin
+    // servers stay enableable.
+    const discoveredKey = "plugin:abc123:echo";
+    const validator = buildAddedPluginKeyValidator(() => Promise.resolve(new Set([discoveredKey])));
 
-    const validator = buildAddedPluginKeyValidator(() => service.listInstalledInstanceIds());
+    // Discovered server (managed or not): addition accepted.
+    await validator({}, { enabledServers: [discoveredKey] });
 
-    // Installed instance: addition accepted.
-    await validator({}, { enabledServers: [installedKey] });
-
-    await service.uninstall({ name: "demo-plugin", deletePluginData: false });
-
-    // Uninstalled instance: NEW key rejected (enabled list, allowlist alike)…
-    await expect(validator({}, { enabledServers: [installedKey] })).rejects.toThrow(
-      /no longer installed/
+    // Undiscovered plugin key: NEW key rejected (enabled list, allowlist alike)…
+    await expect(validator({}, { enabledServers: ["plugin:gone:echo"] })).rejects.toThrow(
+      /does not match any available plugin server/
     );
-    await expect(validator({}, { toolAllowlist: { [installedKey]: [] } })).rejects.toThrow(
-      /no longer installed/
+    await expect(validator({}, { toolAllowlist: { "plugin:gone:echo": [] } })).rejects.toThrow(
+      /does not match any available plugin server/
     );
     // …while round-tripping an EXISTING stale key and non-plugin keys stays allowed.
-    await validator({ enabledServers: [installedKey] }, { enabledServers: [installedKey] });
+    await validator(
+      { enabledServers: ["plugin:gone:echo"] },
+      { enabledServers: ["plugin:gone:echo"] }
+    );
     await validator({}, { enabledServers: ["ordinary-server"] });
+
+    // Discovery failure → additions rejected (never accept unverifiable keys).
+    const failingValidator = buildAddedPluginKeyValidator(() =>
+      Promise.reject(new Error("discovery unavailable"))
+    );
+    await expect(failingValidator({}, { enabledServers: [discoveredKey] })).rejects.toThrow(
+      /does not match any available plugin server/
+    );
   });
 
   test("falls back to a branch clone when the remote refuses direct SHA fetches", async () => {

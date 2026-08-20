@@ -5795,10 +5795,31 @@ export const router = (authToken?: string) => {
                   // Content-derived revisions cannot detect an uninstall that
                   // left overrides byte-identical ({} before and after), so a
                   // stale dialog could persist a plugin: key for a plugin
-                  // that is gone — validate additions against the registry.
-                  validateAgainstCurrent: buildAddedPluginKeyValidator(() =>
-                    context.agentPluginInstallService.listInstalledInstanceIds()
-                  ),
+                  // that is gone. Validate additions against the DISCOVERED
+                  // plugin server keys for this workspace (managed installs,
+                  // project containers, ~/.agents/plugins, unmanaged dirs) —
+                  // the same set the modal lists from.
+                  validateAgainstCurrent: buildAddedPluginKeyValidator(async () => {
+                    const metadataResult = await context.aiService.getWorkspaceMetadata(
+                      input.workspaceId
+                    );
+                    if (!metadataResult.success) {
+                      throw new Error(metadataResult.error);
+                    }
+                    const projectPath = metadataResult.data.projectPath;
+                    const servers = await context.mcpConfigService.listServers(
+                      projectPath,
+                      isTrustedProjectPath(context, projectPath),
+                      {
+                        agentPlugins: await resolveWorkspaceAgentPluginsMcpContext(
+                          context,
+                          input.workspaceId,
+                          projectPath
+                        ),
+                      }
+                    );
+                    return new Set(Object.keys(servers).filter((key) => key.startsWith("plugin:")));
+                  }),
                 }
               );
               // Prompt invocation can hit cached servers before the next stream

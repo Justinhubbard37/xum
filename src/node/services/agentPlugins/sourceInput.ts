@@ -1,6 +1,7 @@
 import * as os from "node:os";
 import * as path from "node:path";
 
+import { hasUrlCredentials } from "@/common/config/schemas/settingsBackup";
 import { GITHUB_SHORTHAND_PATTERN, normalizeRepoUrlForClone } from "@/node/utils/gitUrls";
 
 /**
@@ -57,6 +58,17 @@ export function parseAgentPluginSourceInput(rawInput: string): ParsedAgentPlugin
   const input = rawInput.trim();
   if (input.length === 0) {
     throw new Error("Enter a git URL or owner/repo shorthand.");
+  }
+
+  // Plugin sources are persisted verbatim in ~/.mux/plugins.json and rendered
+  // in Settings/consent previews, so a credential-bearing URL (userinfo or
+  // known token query parameters) would land on disk and on screen. Reject it
+  // up front — git credential helpers are the supported path for private
+  // repos. Same policy (and helper) as the persisted backup-repository URL.
+  if (hasUrlCredentials(input)) {
+    throw new Error(
+      "Remove the embedded credentials from the URL. Private repositories authenticate via git credential helpers or SSH."
+    );
   }
 
   if (isUrlLike(input)) {

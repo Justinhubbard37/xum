@@ -874,25 +874,6 @@ export class AgentPluginInstallService {
     });
   }
 
-  /**
-   * Instance IDs owned by current registry entries (including entries this
-   * build cannot parse — raw names still own their identity). Used by the
-   * workspace.mcp.set handler to reject newly added `plugin:` override keys
-   * for uninstalled plugins. No enablement assert: validation must hold even
-   * while the experiment is being toggled.
-   */
-  async listInstalledInstanceIds(): Promise<Set<string>> {
-    const { rawEntries } = await this.readRegistryDocument("lenient");
-    const instanceIds = new Set<string>();
-    for (const rawEntry of rawEntries) {
-      const name = this.rawEntryName(rawEntry);
-      if (name !== undefined) {
-        instanceIds.add(this.instanceIdFor(name));
-      }
-    }
-    return instanceIds;
-  }
-
   /** Managed registry entries merged with unmanaged plugins found by global discovery. */
   async list(): Promise<AgentPluginListItem[]> {
     this.assertEnabled();

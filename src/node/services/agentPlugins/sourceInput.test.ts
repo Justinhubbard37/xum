@@ -70,6 +70,23 @@ describe("parseAgentPluginSourceInput", () => {
     expect(parseAgentPluginSourceInput("coder/mux@main").ref).toBe("main");
   });
 
+  test("rejects credential-bearing URLs (persisted + rendered verbatim)", () => {
+    // Sources land in ~/.mux/plugins.json and Settings; embedded secrets must
+    // never reach either. SSH usernames are routing data and stay allowed.
+    expect(() => parseAgentPluginSourceInput("https://user:token@host/repo.git")).toThrow(
+      /embedded credentials/
+    );
+    expect(() => parseAgentPluginSourceInput("https://token@host/repo.git")).toThrow(
+      /embedded credentials/
+    );
+    expect(parseAgentPluginSourceInput("git@github.com:coder/mux.git").url).toBe(
+      "git@github.com:coder/mux.git"
+    );
+    expect(parseAgentPluginSourceInput("ssh://git@git.corp:2222/x/y.git").url).toBe(
+      "ssh://git@git.corp:2222/x/y.git"
+    );
+  });
+
   test("does not treat @ inside URLs as a ref separator", () => {
     // git@host URLs keep their @ — refs for URL inputs come from the ref field.
     const parsed = parseAgentPluginSourceInput("git@github.com:coder/mux.git");

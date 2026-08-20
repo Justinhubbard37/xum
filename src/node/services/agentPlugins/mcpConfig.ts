@@ -61,15 +61,6 @@ export function buildPluginServerKey(instanceId: string, serverName: string): st
   return `${PLUGIN_SERVER_KEY_PREFIX}${instanceId}:${serverName}`;
 }
 
-/** Instance ID embedded in a `plugin:<instanceId>:<serverName>` override key (undefined for non-plugin keys). */
-export function pluginInstanceIdFromServerKey(serverKey: string): string | undefined {
-  if (!serverKey.startsWith(PLUGIN_SERVER_KEY_PREFIX)) {
-    return undefined;
-  }
-  const instanceId = serverKey.slice(PLUGIN_SERVER_KEY_PREFIX.length).split(":")[0];
-  return instanceId !== undefined && instanceId.length > 0 ? instanceId : undefined;
-}
-
 function collectPluginOverrideKeys(overrides: WorkspaceMCPOverrides): Set<string> {
   return new Set(
     [
@@ -82,7 +73,7 @@ function collectPluginOverrideKeys(overrides: WorkspaceMCPOverrides): Set<string
 
 /**
  * Save-time validator for workspace MCP override writes: rejects NEWLY ADDED
- * `plugin:<instanceId>:` keys whose instance is not currently installed.
+ * `plugin:` keys that do not name a currently-discoverable plugin server.
  *
  * Why additions-only, at write time: the overrides revision is content-derived,
  * so a dialog opened while a default-disabled plugin had no override key sees
@@ -90,10 +81,15 @@ function collectPluginOverrideKeys(overrides: WorkspaceMCPOverrides): Set<string
  * CAS check alone cannot tell the snapshot is stale. Without this, the stale
  * dialog could enable the ghost row, persist its key, and a later reinstall of
  * the same instance ID would silently re-enable the server without consent.
- * Existing keys round-trip untouched so unrelated saves never break.
+ *
+ * Validation source is the workspace's DISCOVERED plugin server keys — the
+ * same set the Workspace MCP modal lists from — so servers contributed by
+ * project containers, ~/.agents/plugins, and unmanaged global dirs stay
+ * enableable; the managed-install registry alone would reject them. Existing
+ * keys round-trip untouched so unrelated saves never break.
  */
 export function buildAddedPluginKeyValidator(
-  listInstalledInstanceIds: () => Promise<Set<string>>
+  listDiscoveredPluginServerKeys: () => Promise<Set<string>>
 ): (current: WorkspaceMCPOverrides, incoming: WorkspaceMCPOverrides) => Promise<void> {
   return async (current, incoming) => {
     const currentKeys = collectPluginOverrideKeys(current);
@@ -103,20 +99,17 @@ export function buildAddedPluginKeyValidator(
     if (addedKeys.length === 0) {
       return;
     }
-    let installedIds: Set<string>;
+    let discoveredKeys: Set<string>;
     try {
-      installedIds = await listInstalledInstanceIds();
+      discoveredKeys = await listDiscoveredPluginServerKeys();
     } catch {
       // Cannot confirm → reject the additions (never accept unverifiable keys).
-      installedIds = new Set();
+      discoveredKeys = new Set();
     }
-    const staleKeys = addedKeys.filter((key) => {
-      const instanceId = pluginInstanceIdFromServerKey(key);
-      return instanceId === undefined || !installedIds.has(instanceId);
-    });
+    const staleKeys = addedKeys.filter((key) => !discoveredKeys.has(key));
     if (staleKeys.length > 0) {
       throw new Error(
-        `Cannot save: ${staleKeys.join(", ")} belongs to a plugin that is no longer installed. ` +
+        `Cannot save: ${staleKeys.join(", ")} does not match any available plugin server. ` +
           "Close and reopen this dialog to load the current server list."
       );
     }
