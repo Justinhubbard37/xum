@@ -26,11 +26,16 @@
  * by our own backend code and always use `undefined` for absent fields.
  */
 
+import {
+  SUBAGENT_REUSABLE_BENCH_EXCLUSIVE_LIMIT,
+  SUBAGENT_REUSABLE_BENCH_TARGET,
+} from "@/common/constants/subagentLifecycle";
 import { isGrokFrontierModel } from "@/common/types/thinking";
 import { z } from "zod";
 import {
   AgentIdSchema,
   AgentSkillPackageSchema,
+  BestOfGroupSchema,
   SkillNameSchema,
   WorkflowRunRecordSchema,
   WorkflowRunStatusSchema,
@@ -316,7 +321,7 @@ export function buildTaskToolDescription(runtimeMode: RuntimeMode | undefined): 
     `${getTaskRuntimeVisibilityGuidance(runtimeMode)} ` +
     "\n\nProvide agentId (preferred) or subagent_type, prompt, title, run_in_background, and optional n. For sub-agents, use title as a short, friendly reusable role name (for example, Reviewer or Simplicity Auditor), not a task summary. For kind=workspace, use a normal work-specific chat title. " +
     "Use n only when you want several agents to try the same prompt independently. Omit it for a single task, and prefer non-interfering sub-agents for grouped runs (for example read-only agents like explore). " +
-    "\n\nA terminal report makes the child inactive but leaves its workspace persistent. Inactive children are low-cost to retain: keep them by default, and before spawning a new standalone child, prefer reawakening a known inactive child when its context or expertise fits. Retitle it if its reusable responsibility changes. Reawakening preserves the child's checkout, so for repository-dependent work, reuse it only when that snapshot is appropriate or instruct the child to verify and synchronize before acting; otherwise spawn a new child. Stop active work with task_stop; use irreversible task_remove only when the user asks or the child is clearly obsolete with no plausible future value. " +
+    `\n\nA terminal report makes the child inactive but leaves its workspace persistent. Keep each parent's direct standalone bench small and role-based: aim for at most ${SUBAGENT_REUSABLE_BENCH_TARGET} and keep it below ${SUBAGENT_REUSABLE_BENCH_EXCLUSIVE_LIMIT}; deliberate grouped n runs are temporary exceptions. Before spawning standalone work, prefer reawakening a known inactive child when its context or expertise fits, and retitle it if its reusable responsibility changes. At the target, add a role only for a genuinely distinct responsibility and prune an inactive overlapping or least-useful role before reaching the limit. Reawakening preserves the child's checkout, so for repository-dependent work, reuse it only when that snapshot is appropriate or instruct the child to verify and synchronize before acting; otherwise spawn a new child. Stop active work with task_stop; use irreversible task_remove for consumed grouped candidates, bench consolidation, explicit user requests, or clearly obsolete context—not routine end-of-turn cleanup. ` +
     "\n\nWhen the user explicitly asks for best-of-n work, the parent should begin with light preliminary analysis to extract shared context, constraints, or evaluation criteria that would otherwise be duplicated across children. " +
     "Keep that pre-work lightweight: frame the task and provide useful starting points, but do not pre-solve the problem or over-constrain how the children reason about it. Then delegate the substantive analysis to the spawned sub-agents. " +
     "Do not also do a full parallel analysis in the parent. Call task_await when you are ready to act on child output; do not await reflexively just because tasks are running. " +
@@ -1366,6 +1371,7 @@ export const TaskListToolTaskSchema = z
     workspaceId: z.string().optional(),
     modelString: z.string().optional(),
     thinkingLevel: TaskThinkingLevelSchema.optional(),
+    bestOf: BestOfGroupSchema.optional(),
     workflowProgress: WorkflowProgressSummarySchema.optional(),
     depth: z.number().int().min(0),
   })
@@ -2279,14 +2285,14 @@ export const TOOL_DEFINITIONS = {
   },
   task_remove: {
     description:
-      "Irreversibly remove inactive child task workspaces owned by the current workspace. Inactive children are low-cost to retain, so do not use this for routine end-of-turn cleanup; remove one only when the user asks or its context is clearly obsolete with no plausible future value. Removed sub-agents cannot be restored or reawakened. Active targets are rejected; descendants must be removed first, so nested batches are processed deepest-first.",
+      "Irreversibly remove inactive child task workspaces owned by the current workspace. Use it to prune completed grouped candidates after their results and artifacts are consumed, consolidate substantially overlapping standalone roles, restore the bounded reusable bench, honor an explicit user request, or discard clearly obsolete context. Do not use it for a blanket end-of-turn cleanup: retain a small bench of distinct useful roles. Removed sub-agents cannot be restored or reawakened. Active targets are rejected; descendants must be removed first, so nested batches are processed deepest-first.",
     schema: TaskRemoveToolArgsSchema,
   },
   task_list: {
     description:
       "List descendant tasks for the current workspace, including status + metadata. " +
       "This includes sub-agent tasks, background bash tasks, and top-level workflow runs, but omits workflow-owned sub-agents/background bash tasks whose reports are consumed through parent workflow runs. " +
-      "Use this after compaction, interruptions, workflow_run errors/aborts, or an app restart to rediscover active tasks, inactive persistent sub-agents, and resumable workflow runs. The default statuses find unfinished work; request `reported` explicitly for completed persistent sub-agents. " +
+      "Use this after compaction, interruptions, workflow_run errors/aborts, or an app restart to rediscover active tasks, inactive persistent sub-agents, and resumable workflow runs. Sub-agent rows from grouped runs include `bestOf` metadata so they can be distinguished from the standalone reusable bench. The default statuses find unfinished work; request `reported` explicitly for completed persistent sub-agents. " +
       "When recovering an uncertain workflow_run, omit statuses first or include pending/running/backgrounded as well as interrupted/failed/completed; terminal-only filters can hide unfinished workflow runs. Pending runs may need workflow_resume because no runner may be active yet. " +
       "Workflow rows may include compact `workflowProgress` so callers can see the latest phase before deciding whether to await, resume, or leave the run alone. " +
       "The legacy includeArchived option only affects archived workspace-turn and bash records; sub-agents remain one inactive/active task identity. " +
