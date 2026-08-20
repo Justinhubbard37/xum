@@ -13,7 +13,6 @@ import {
   type ToolConfiguration,
   type WorkspaceHeartbeatToolService,
 } from "./tools";
-
 const DESKTOP_TOOL_NAMES = [
   "desktop_screenshot",
   "desktop_move_mouse",
@@ -758,5 +757,21 @@ describe("getToolsForModel", () => {
 
     const toolNames = Object.keys(tools);
     expect(toolNames).toEqual([...toolNames].sort((a, b) => a.localeCompare(b)));
+  });
+
+  test("includes web_fetch in the runtime toolset", async () => {
+    const tools = await getToolsForModel(
+      "noop:model",
+      {
+        cwd: process.cwd(),
+        runtime: new LocalRuntime(process.cwd()),
+        runtimeTempDir: "/tmp",
+        workspaceId: "ws-1",
+      },
+      "ws-1",
+      createInitStateManager()
+    );
+
+    expect(tools.web_fetch).toBeDefined();
   });
 });
