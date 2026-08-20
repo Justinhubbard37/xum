@@ -489,16 +489,34 @@ export class WorkspaceMcpOverridesService {
   async setOverridesForWorkspace(
     workspaceId: string,
     overrides: WorkspaceMCPOverrides,
-    options?: { expectedRevision?: string }
+    options?: {
+      expectedRevision?: string;
+      /**
+       * Extra write-time validation run inside the exclusive queue after the
+       * CAS check, with the CURRENT stored overrides and the normalized
+       * incoming ones. Throwing rejects the save. Used by the oRPC handler to
+       * refuse newly added `plugin:` keys for uninstalled plugins, which the
+       * content-derived revision alone cannot catch (see
+       * buildAddedPluginKeyValidator).
+       */
+      validateAgainstCurrent?: (
+        current: WorkspaceMCPOverrides,
+        incoming: WorkspaceMCPOverrides
+      ) => Promise<void>;
+    }
   ): Promise<void> {
     assert(overrides && typeof overrides === "object", "overrides must be an object");
 
     return this.runExclusive(async () => {
-      if (options?.expectedRevision !== undefined) {
+      if (options?.expectedRevision !== undefined || options?.validateAgainstCurrent) {
         const current = await this.loadOverrides(workspaceId);
-        if (computeOverridesRevision(current) !== options.expectedRevision) {
+        if (
+          options.expectedRevision !== undefined &&
+          computeOverridesRevision(current) !== options.expectedRevision
+        ) {
           throw new WorkspaceMcpOverridesConflictError();
         }
+        await options.validateAgainstCurrent?.(current, normalizeWorkspaceMcpOverrides(overrides));
       }
 
       const { metadata, runtime, workspacePath } =
@@ -518,6 +536,75 @@ export class WorkspaceMcpOverridesService {
       await this.ensureOverridesDir(runtime, workspacePath, metadata.runtimeConfig);
       await writeFileString(runtime, jsoncPath, JSON.stringify(normalized, null, 2) + "\n");
       await this.ensureOverridesGitignored(runtime, workspacePath, metadata.runtimeConfig);
+    });
+  }
+
+  /**
+   * Remove every override key starting with `keyPrefix` from this workspace's
+   * override files, PRESERVING all fields this build does not recognize.
+   *
+   * Used by the Agent Plugin uninstaller. It patches the RAW parsed document
+   * (only filtering the three known fields) rather than round-tripping
+   * through get+set: a newer build's extra top-level fields must survive a
+   * downgrade-side prune (AGENTS.md upgrade↔downgrade rule). Runs inside the
+   * exclusive write queue, so it cannot interleave with a dialog save's
+   * read-modify-write. Reads are strict: an unreadable file throws so the
+   * caller keeps its retry tombstone instead of retiring it against content
+   * it never saw. A missing file means nothing to prune — plugin keys are
+   * only ever written to workspace-local files (legacy config.json storage
+   * predates Agent Plugins).
+   */
+  async prunePluginOverrideKeys(workspaceId: string, keyPrefix: string): Promise<void> {
+    assert(keyPrefix.length > 0, "prunePluginOverrideKeys: keyPrefix must be non-empty");
+
+    return this.runExclusive(async () => {
+      const { metadata, runtime, workspacePath } =
+        await this.getRuntimeAndWorkspacePath(workspaceId);
+      const { jsoncPath, jsonPath } = this.getOverridesFilePaths(
+        workspacePath,
+        metadata.runtimeConfig
+      );
+
+      for (const filePath of [jsoncPath, jsonPath]) {
+        if (!(await statIsFile(runtime, filePath, "strict"))) {
+          continue;
+        }
+        const parsed = await this.readOverridesFile(runtime, filePath, "strict");
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+          continue;
+        }
+        const raw = { ...(parsed as Record<string, unknown>) };
+        let changed = false;
+
+        for (const field of ["enabledServers", "disabledServers"] as const) {
+          const value = raw[field];
+          if (!Array.isArray(value)) {
+            continue;
+          }
+          const filtered = value.filter(
+            (key) => !(typeof key === "string" && key.startsWith(keyPrefix))
+          );
+          if (filtered.length !== value.length) {
+            raw[field] = filtered;
+            changed = true;
+          }
+        }
+
+        const allowlist = raw.toolAllowlist;
+        if (allowlist !== null && typeof allowlist === "object" && !Array.isArray(allowlist)) {
+          const entries = Object.entries(allowlist as Record<string, unknown>);
+          const kept = entries.filter(([key]) => !key.startsWith(keyPrefix));
+          if (kept.length !== entries.length) {
+            raw.toolAllowlist = Object.fromEntries(kept);
+            changed = true;
+          }
+        }
+
+        if (!changed) {
+          continue;
+        }
+        await writeFileString(runtime, filePath, JSON.stringify(raw, null, 2) + "\n");
+      }
     });
   }
 }

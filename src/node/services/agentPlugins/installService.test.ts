@@ -6,14 +6,12 @@ import * as path from "node:path";
 
 import { Config } from "@/node/config";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
-import {
-  WorkspaceMcpOverridesConflictError,
-  type WorkspaceMcpOverridesService,
-} from "@/node/services/workspaceMcpOverridesService";
+import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import { AgentPluginInstallService } from "./installService";
 import {
   AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+  buildAddedPluginKeyValidator,
   computePluginInstanceId,
   getPluginDataPath,
 } from "./mcpConfig";
@@ -385,8 +383,7 @@ describe("AgentPluginInstallService", () => {
     // no Settings row left to retry from, and a reinstall (same instance ID)
     // would silently re-enable those servers.
     const overridesStub = {
-      getOverridesForWorkspace: () => Promise.resolve({ overrides: {}, revision: "r0" }),
-      setOverridesForWorkspace: () => Promise.resolve(),
+      prunePluginOverrideKeys: () => Promise.resolve(),
     };
     const serviceWithMcp = new AgentPluginInstallService(config, {
       isEnabled: () => true,
@@ -430,17 +427,15 @@ describe("AgentPluginInstallService", () => {
     let overridesBroken = true;
     let storedOverrides: Record<string, unknown> = { enabledServers: [serverKey] };
     const overridesStub = {
-      getOverridesForWorkspace: () => {
+      prunePluginOverrideKeys: (_id: string, keyPrefix: string) => {
         if (overridesBroken) {
           return Promise.reject(new Error("checkout unavailable"));
         }
-        return Promise.resolve({
-          overrides: storedOverrides,
-          revision: JSON.stringify(storedOverrides),
-        });
-      },
-      setOverridesForWorkspace: (_id: string, overrides: Record<string, unknown>) => {
-        storedOverrides = overrides;
+        storedOverrides = {
+          enabledServers: (storedOverrides.enabledServers as string[]).filter(
+            (key) => !key.startsWith(keyPrefix)
+          ),
+        };
         return Promise.resolve();
       },
     };
@@ -496,61 +491,10 @@ describe("AgentPluginInstallService", () => {
     }
   });
 
-  test("prune retries after a concurrent overrides save conflicts instead of tombstoning", async () => {
-    const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
-    const serverKey = `plugin:${instanceId}:echo`;
-
-    // A Workspace MCP dialog save lands between the prune's read and write
-    // exactly once; the prune must re-read and complete rather than treating
-    // the transient conflict as a failed workspace.
-    let storedOverrides: Record<string, unknown> = { enabledServers: [serverKey, "other"] };
-    let conflictsRemaining = 1;
-    const overridesStub = {
-      getOverridesForWorkspace: () =>
-        Promise.resolve({ overrides: storedOverrides, revision: JSON.stringify(storedOverrides) }),
-      setOverridesForWorkspace: (_id: string, overrides: Record<string, unknown>) => {
-        if (conflictsRemaining > 0) {
-          conflictsRemaining -= 1;
-          return Promise.reject(new WorkspaceMcpOverridesConflictError());
-        }
-        storedOverrides = overrides;
-        return Promise.resolve();
-      },
-    };
-    const serviceWithOverrides = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
-      workspaceMcpOverridesService: overridesStub as unknown as WorkspaceMcpOverridesService,
-    });
-    const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
-      Promise.resolve([{ id: "ws-1", runtimeConfig: { type: "local" } }] as unknown as Awaited<
-        ReturnType<Config["getAllWorkspaceMetadata"]>
-      >)
-    );
-
-    try {
-      const preview = await serviceWithOverrides.preview({ input: remoteDir });
-      await serviceWithOverrides.install({
-        source: preview.source,
-        expectedSha: preview.lockedSha,
-      });
-      await serviceWithOverrides.uninstall({ name: "demo-plugin", deletePluginData: false });
-    } finally {
-      metadataSpy.mockRestore();
-    }
-
-    // Plugin keys pruned, non-plugin keys kept, and no tombstone persisted.
-    expect(storedOverrides).toEqual({ enabledServers: ["other"] });
-    const doc = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
-      pendingOverridePrunes?: unknown;
-    };
-    expect(doc.pendingOverridePrunes).toBeUndefined();
-  });
-
   test("tombstone survives even when both the prune and the shrink write fail", async () => {
     const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
     const overridesStub = {
-      getOverridesForWorkspace: () => Promise.reject(new Error("checkout unavailable")),
-      setOverridesForWorkspace: () => Promise.resolve(),
+      prunePluginOverrideKeys: () => Promise.reject(new Error("checkout unavailable")),
     };
     const serviceWithOverrides = new AgentPluginInstallService(config, {
       isEnabled: () => true,
@@ -613,8 +557,7 @@ describe("AgentPluginInstallService", () => {
     // Overrides service that permanently throws (as it would for a workspace
     // that no longer exists in config).
     const overridesStub = {
-      getOverridesForWorkspace: () => Promise.reject(new Error("Workspace metadata not found")),
-      setOverridesForWorkspace: () => Promise.resolve(),
+      prunePluginOverrideKeys: () => Promise.reject(new Error("Workspace metadata not found")),
     };
     const serviceWithOverrides = new AgentPluginInstallService(config, {
       isEnabled: () => true,
@@ -684,11 +627,9 @@ describe("AgentPluginInstallService", () => {
       releasePrune = resolve;
     });
     const overridesStub = {
-      getOverridesForWorkspace: async () => {
+      prunePluginOverrideKeys: async () => {
         await pruneGate;
-        return { overrides: {}, revision: "r0" };
       },
-      setOverridesForWorkspace: () => Promise.resolve(),
     };
     const serviceWithOverrides = new AgentPluginInstallService(config, {
       isEnabled: () => true,
@@ -1169,9 +1110,24 @@ describe("AgentPluginInstallService", () => {
   });
 
   test("install rolls back the promoted dir when the registry write fails", async () => {
-    const preview = await service.preview({ input: remoteDir });
+    // A getToolsForWorkspace running during the promote↔rollback window can
+    // have discovered the briefly-visible tree; the rollback must invalidate
+    // the plugin prefix (like update/uninstall) so no server survives from
+    // the deleted, unregistered tree.
+    const stoppedPrefixes: string[] = [];
+    const mcpStub = {
+      stopServersWithKeyPrefix: (prefix: string) => {
+        stoppedPrefixes.push(prefix);
+        return Promise.resolve();
+      },
+    };
+    const serviceWithMcp = new AgentPluginInstallService(config, {
+      isEnabled: () => true,
+      mcpServerManager: mcpStub as unknown as MCPServerManager,
+    });
+    const preview = await serviceWithMcp.preview({ input: remoteDir });
 
-    const internals = service as unknown as {
+    const internals = serviceWithMcp as unknown as {
       writeRegistry: (envelope: Record<string, unknown>, entries: unknown[]) => Promise<void>;
     };
     const writeSpy = spyOn(internals, "writeRegistry").mockImplementationOnce(() =>
@@ -1179,20 +1135,54 @@ describe("AgentPluginInstallService", () => {
     );
     try {
       await expect(
-        service.install({ source: preview.source, expectedSha: preview.lockedSha })
+        serviceWithMcp.install({ source: preview.source, expectedSha: preview.lockedSha })
       ).rejects.toThrow(/persist the plugin registry/);
     } finally {
       writeSpy.mockRestore();
     }
 
-    // No partial state: the promoted dir was rolled back.
+    // No partial state: the promoted dir was rolled back and any server
+    // started from the briefly-visible tree was invalidated.
     expect(await pathExists(path.join(pluginsDir(), "demo-plugin"))).toBe(false);
     expect(await stagingLeftovers()).toEqual([]);
+    const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
+    expect(stoppedPrefixes).toEqual([`plugin:${instanceId}:`]);
 
     // The retry of the same consented install succeeds.
-    const entry = await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const entry = await serviceWithMcp.install({
+      source: preview.source,
+      expectedSha: preview.lockedSha,
+    });
     expect(entry.name).toBe("demo-plugin");
     expect(await registry()).toHaveLength(1);
+  });
+
+  test("added plugin override keys are rejected for uninstalled instances", async () => {
+    // The overrides revision is content-derived, so a dialog opened before an
+    // uninstall (overrides {}) sees an unchanged revision after it — only a
+    // registry check at save time can reject the ghost row's new key.
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
+    const installedKey = `plugin:${instanceId}:echo`;
+
+    const validator = buildAddedPluginKeyValidator(() => service.listInstalledInstanceIds());
+
+    // Installed instance: addition accepted.
+    await validator({}, { enabledServers: [installedKey] });
+
+    await service.uninstall({ name: "demo-plugin", deletePluginData: false });
+
+    // Uninstalled instance: NEW key rejected (enabled list, allowlist alike)…
+    await expect(validator({}, { enabledServers: [installedKey] })).rejects.toThrow(
+      /no longer installed/
+    );
+    await expect(validator({}, { toolAllowlist: { [installedKey]: [] } })).rejects.toThrow(
+      /no longer installed/
+    );
+    // …while round-tripping an EXISTING stale key and non-plugin keys stays allowed.
+    await validator({ enabledServers: [installedKey] }, { enabledServers: [installedKey] });
+    await validator({}, { enabledServers: ["ordinary-server"] });
   });
 
   test("falls back to a branch clone when the remote refuses direct SHA fetches", async () => {

@@ -26,10 +26,7 @@ import type { Config } from "@/node/config";
 import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
 import { log } from "@/node/services/log";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
-import {
-  WorkspaceMcpOverridesConflictError,
-  type WorkspaceMcpOverridesService,
-} from "@/node/services/workspaceMcpOverridesService";
+import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import {
@@ -860,6 +857,13 @@ export class AgentPluginInstallService {
           // No partial state: a promote without a registry entry would look
           // like an unmanaged dir and block reinstall.
           await this.removeDir(targetPath);
+          // A getToolsForWorkspace running during the promote↔rollback window
+          // can have discovered the briefly-visible tree and be starting a
+          // server from it; invalidate the prefix (same as update/uninstall)
+          // so it is closed instead of surviving the failed install.
+          await this.deps.mcpServerManager?.stopServersWithKeyPrefix(
+            `plugin:${this.instanceIdFor(name)}:`
+          );
           throw new Error(`Failed to persist the plugin registry: ${getErrorMessage(error)}`);
         }
         log.info(`Installed agent plugin '${name}' at ${args.expectedSha.slice(0, 12)}`);
@@ -868,6 +872,25 @@ export class AgentPluginInstallService {
         await this.removeDir(stagedDir);
       }
     });
+  }
+
+  /**
+   * Instance IDs owned by current registry entries (including entries this
+   * build cannot parse — raw names still own their identity). Used by the
+   * workspace.mcp.set handler to reject newly added `plugin:` override keys
+   * for uninstalled plugins. No enablement assert: validation must hold even
+   * while the experiment is being toggled.
+   */
+  async listInstalledInstanceIds(): Promise<Set<string>> {
+    const { rawEntries } = await this.readRegistryDocument("lenient");
+    const instanceIds = new Set<string>();
+    for (const rawEntry of rawEntries) {
+      const name = this.rawEntryName(rawEntry);
+      if (name !== undefined) {
+        instanceIds.add(this.instanceIdFor(name));
+      }
+    }
+    return instanceIds;
   }
 
   /** Managed registry entries merged with unmanaged plugins found by global discovery. */
@@ -1184,55 +1207,13 @@ export class AgentPluginInstallService {
     if (!overridesService) {
       return [];
     }
-    // A concurrent Workspace MCP dialog save can land between our read and
-    // write; expectedRevision detects that, and we re-read + re-filter.
-    const MAX_CAS_ATTEMPTS = 3;
     const failedWorkspaceIds: string[] = [];
     for (const workspaceId of workspaceIds) {
       try {
-        for (let attempt = 1; ; attempt++) {
-          // Strict read: a temporarily unreadable overrides file must FAIL
-          // this workspace's prune (preserving its tombstone for retry), not
-          // read as "{}" and retire the tombstone against keys never seen.
-          const { overrides, revision } = await overridesService.getOverridesForWorkspace(
-            workspaceId,
-            { mode: "strict" }
-          );
-          const dropKey = (key: string) => key.startsWith(serverKeyPrefix);
-          const enabledServers = overrides.enabledServers?.filter((key) => !dropKey(key));
-          const disabledServers = overrides.disabledServers?.filter((key) => !dropKey(key));
-          const toolAllowlist = overrides.toolAllowlist
-            ? Object.fromEntries(
-                Object.entries(overrides.toolAllowlist).filter(([key]) => !dropKey(key))
-              )
-            : undefined;
-
-          const changed =
-            (overrides.enabledServers?.length ?? 0) !== (enabledServers?.length ?? 0) ||
-            (overrides.disabledServers?.length ?? 0) !== (disabledServers?.length ?? 0) ||
-            Object.keys(overrides.toolAllowlist ?? {}).length !==
-              Object.keys(toolAllowlist ?? {}).length;
-          if (!changed) {
-            break;
-          }
-          try {
-            await overridesService.setOverridesForWorkspace(
-              workspaceId,
-              {
-                ...(enabledServers !== undefined ? { enabledServers } : {}),
-                ...(disabledServers !== undefined ? { disabledServers } : {}),
-                ...(toolAllowlist !== undefined ? { toolAllowlist } : {}),
-              },
-              { expectedRevision: revision }
-            );
-            break;
-          } catch (error) {
-            if (error instanceof WorkspaceMcpOverridesConflictError && attempt < MAX_CAS_ATTEMPTS) {
-              continue;
-            }
-            throw error;
-          }
-        }
+        // Raw in-queue patch: preserves unknown fields written by newer
+        // builds, throws on unreadable files (tombstone retry), and cannot
+        // interleave with a dialog save (shared exclusive write queue).
+        await overridesService.prunePluginOverrideKeys(workspaceId, serverKeyPrefix);
       } catch (error) {
         failedWorkspaceIds.push(workspaceId);
         log.warn("Failed to prune plugin MCP overrides for workspace", {

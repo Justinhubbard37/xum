@@ -3,7 +3,7 @@ import { constants as fsConstants } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
-import type { MCPServerInfo, MCPStdioServerInfo } from "@/common/types/mcp";
+import type { MCPServerInfo, MCPStdioServerInfo, WorkspaceMCPOverrides } from "@/common/types/mcp";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -59,6 +59,68 @@ export function getPluginDataPath(muxHome: string, instanceId: string): string {
 
 export function buildPluginServerKey(instanceId: string, serverName: string): string {
   return `${PLUGIN_SERVER_KEY_PREFIX}${instanceId}:${serverName}`;
+}
+
+/** Instance ID embedded in a `plugin:<instanceId>:<serverName>` override key (undefined for non-plugin keys). */
+export function pluginInstanceIdFromServerKey(serverKey: string): string | undefined {
+  if (!serverKey.startsWith(PLUGIN_SERVER_KEY_PREFIX)) {
+    return undefined;
+  }
+  const instanceId = serverKey.slice(PLUGIN_SERVER_KEY_PREFIX.length).split(":")[0];
+  return instanceId !== undefined && instanceId.length > 0 ? instanceId : undefined;
+}
+
+function collectPluginOverrideKeys(overrides: WorkspaceMCPOverrides): Set<string> {
+  return new Set(
+    [
+      ...(overrides.enabledServers ?? []),
+      ...(overrides.disabledServers ?? []),
+      ...Object.keys(overrides.toolAllowlist ?? {}),
+    ].filter((key) => key.startsWith(PLUGIN_SERVER_KEY_PREFIX))
+  );
+}
+
+/**
+ * Save-time validator for workspace MCP override writes: rejects NEWLY ADDED
+ * `plugin:<instanceId>:` keys whose instance is not currently installed.
+ *
+ * Why additions-only, at write time: the overrides revision is content-derived,
+ * so a dialog opened while a default-disabled plugin had no override key sees
+ * the same revision ({} hash) before and after that plugin's uninstall — the
+ * CAS check alone cannot tell the snapshot is stale. Without this, the stale
+ * dialog could enable the ghost row, persist its key, and a later reinstall of
+ * the same instance ID would silently re-enable the server without consent.
+ * Existing keys round-trip untouched so unrelated saves never break.
+ */
+export function buildAddedPluginKeyValidator(
+  listInstalledInstanceIds: () => Promise<Set<string>>
+): (current: WorkspaceMCPOverrides, incoming: WorkspaceMCPOverrides) => Promise<void> {
+  return async (current, incoming) => {
+    const currentKeys = collectPluginOverrideKeys(current);
+    const addedKeys = [...collectPluginOverrideKeys(incoming)].filter(
+      (key) => !currentKeys.has(key)
+    );
+    if (addedKeys.length === 0) {
+      return;
+    }
+    let installedIds: Set<string>;
+    try {
+      installedIds = await listInstalledInstanceIds();
+    } catch {
+      // Cannot confirm → reject the additions (never accept unverifiable keys).
+      installedIds = new Set();
+    }
+    const staleKeys = addedKeys.filter((key) => {
+      const instanceId = pluginInstanceIdFromServerKey(key);
+      return instanceId === undefined || !installedIds.has(instanceId);
+    });
+    if (staleKeys.length > 0) {
+      throw new Error(
+        `Cannot save: ${staleKeys.join(", ")} belongs to a plugin that is no longer installed. ` +
+          "Close and reopen this dialog to load the current server list."
+      );
+    }
+  };
 }
 
 export interface LoadPluginMcpServersResult {

@@ -284,6 +284,69 @@ describe("WorkspaceMcpOverridesService", () => {
     expect(absent.overrides).toEqual({});
   });
 
+  it("prunePluginOverrideKeys removes only prefix keys and preserves unknown fields", async () => {
+    const projectPath = "/fake/project";
+    const workspaceId = "ws-id";
+    const workspaceName = "branch";
+
+    const workspacePath = getWorkspacePath({
+      srcDir: config.srcDir,
+      projectName: "project",
+      workspaceName,
+    });
+    const filePath = path.join(workspacePath, ".mux", "mcp.local.jsonc");
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    // A newer build's file: extra top-level field + mixed keys. The prune
+    // must drop ONLY the plugin's keys and keep everything else byte-safe
+    // for downgrade round-trips (AGENTS.md upgrade↔downgrade rule).
+    await fs.writeFile(
+      filePath,
+      JSON.stringify({
+        futureField: { keep: "me" },
+        enabledServers: ["plugin:abc:echo", "other-server"],
+        disabledServers: ["plugin:abc:beta"],
+        toolAllowlist: { "plugin:abc:echo": ["t1"], "other-server": ["t2"] },
+      })
+    );
+
+    await config.editConfig((cfg) => {
+      cfg.projects.set(projectPath, {
+        workspaces: [
+          {
+            path: workspacePath,
+            id: workspaceId,
+            name: workspaceName,
+            runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+          },
+        ],
+      });
+      return cfg;
+    });
+
+    const service = new WorkspaceMcpOverridesService(config);
+    await service.prunePluginOverrideKeys(workspaceId, "plugin:abc:");
+
+    const after = JSON.parse(await fs.readFile(filePath, "utf-8")) as Record<string, unknown>;
+    expect(after).toEqual({
+      futureField: { keep: "me" },
+      enabledServers: ["other-server"],
+      disabledServers: [],
+      toolAllowlist: { "other-server": ["t2"] },
+    });
+
+    // Unreadable content must throw (callers keep their retry tombstones).
+    await fs.writeFile(filePath, "{ not json");
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(service.prunePluginOverrideKeys(workspaceId, "plugin:abc:")).rejects.toThrow(
+      /parse errors/
+    );
+
+    // A missing file is nothing to prune (plugin keys only ever live in
+    // workspace-local files).
+    await fs.rm(filePath);
+    await service.prunePluginOverrideKeys(workspaceId, "plugin:abc:");
+  });
+
   it("removes workspace-local file when overrides are set to empty", async () => {
     const projectPath = "/fake/project";
     const workspaceId = "ws-id";

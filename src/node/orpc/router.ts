@@ -50,6 +50,7 @@ import {
   resolveWorkspaceRootPath,
 } from "@/node/runtime/runtimeHelpers";
 import {
+  buildAddedPluginKeyValidator,
   resolveAgentPluginsMcpContext,
   type AgentPluginsMcpContext,
 } from "@/node/services/agentPlugins/mcpConfig";
@@ -5789,7 +5790,16 @@ export const router = (authToken?: string) => {
               await context.workspaceMcpOverridesService.setOverridesForWorkspace(
                 input.workspaceId,
                 input.overrides,
-                { expectedRevision: input.expectedRevision }
+                {
+                  expectedRevision: input.expectedRevision,
+                  // Content-derived revisions cannot detect an uninstall that
+                  // left overrides byte-identical ({} before and after), so a
+                  // stale dialog could persist a plugin: key for a plugin
+                  // that is gone — validate additions against the registry.
+                  validateAgainstCurrent: buildAddedPluginKeyValidator(() =>
+                    context.agentPluginInstallService.listInstalledInstanceIds()
+                  ),
+                }
               );
               // Prompt invocation can hit cached servers before the next stream
               // recomputes enablement, so sync the manager's view immediately.
