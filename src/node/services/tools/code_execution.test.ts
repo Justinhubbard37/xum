@@ -197,7 +197,7 @@ describe("createCodeExecutionTool", () => {
         { kernelFirst: true }
       );
 
-      expect(withTask.description).toContain("mux.task_spawn");
+      expect(withTask.description).toContain("shux.task_spawn");
       expect(withoutTask.description).not.toContain("task_spawn");
     });
   });

@@ -359,26 +359,26 @@ describe("getCachedXumTypes", () => {
   test("kernel mode is part of the cache identity (RLM on/off must not share types)", async () => {
     const tool = createMockTool(z.object({ prompt: z.string() }));
 
-    const kernelOff = await getCachedMuxTypes({ task: tool });
-    const kernelOn = await getCachedMuxTypes({ task: tool }, { kernel: true });
+    const kernelOff = await getCachedShuxTypes({ task: tool });
+    const kernelOn = await getCachedShuxTypes({ task: tool }, { kernel: true });
     expect(kernelOff).not.toContain("task_spawn");
     expect(kernelOn).toContain("function task_spawn(args: TaskArgs): TaskSpawnResult;");
     // Re-fetching kernel-off after kernel-on must not serve stale kernel types.
-    expect(await getCachedMuxTypes({ task: tool })).toBe(kernelOff);
+    expect(await getCachedShuxTypes({ task: tool })).toBe(kernelOff);
   });
 });
 
 describe("kernel declarations (RLM)", () => {
   test("RLM off: no kernel members in the generated namespace", async () => {
     const tool = createMockTool(z.object({ prompt: z.string() }));
-    const types = await generateMuxTypes({ task: tool });
+    const types = await generateShuxTypes({ task: tool });
     expect(types).not.toContain("task_spawn");
     expect(types).not.toContain("function events()");
   });
 
   test("kernel mode declares task_spawn (reusing TaskArgs) and events", async () => {
     const tool = createMockTool(z.object({ prompt: z.string() }));
-    const types = await generateMuxTypes({ task: tool }, { kernel: true });
+    const types = await generateShuxTypes({ task: tool }, { kernel: true });
     expect(types).toContain("function task_spawn(args: TaskArgs): TaskSpawnResult;");
     expect(types).toContain("function events(): HostEvent[];");
     expect(types).toContain('type HostEvent = { type: "task-terminal";');
@@ -386,7 +386,7 @@ describe("kernel declarations (RLM)", () => {
 
   test("kernel mode without a bridged task tool declares events but not task_spawn", async () => {
     const tool = createMockTool(z.object({ filePath: z.string() }));
-    const types = await generateMuxTypes({ file_read: tool }, { kernel: true });
+    const types = await generateShuxTypes({ file_read: tool }, { kernel: true });
     expect(types).not.toContain("task_spawn");
     expect(types).toContain("function events(): HostEvent[];");
   });
