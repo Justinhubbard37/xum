@@ -82,6 +82,79 @@ export const SCENARIOS: EvalScenario[] = [
     },
   },
   {
+    // r12 benchmark gate: bulk data must not transit the model context. The
+    // kernel cell (rlm-excl) must answer correctly with input tokens at or
+    // below the flat-bash cell; pre-r12 the kernel shipped every nested
+    // mux.file_read page inline and cost ~10x more than bash on this task.
+    id: "orders-filter",
+    description:
+      "Filter/aggregate over a ~500KB orders JSONL: total revenue of shipped emea orders + top order id.",
+    setup: (fixtureDir) => {
+      const rng = mulberry32(9042);
+      const regions = ["emea", "amer", "apac", "latam"];
+      const statuses = ["shipped", "pending", "cancelled", "returned"];
+      // Unique revenues (rejection sampling on a seeded PRNG stays
+      // deterministic) so the top shipped-emea order is unambiguous.
+      const used = new Set<number>();
+      const drawRevenue = (): number => {
+        for (;;) {
+          const r = 100 + Math.floor(rng() * 900000);
+          if (!used.has(r)) {
+            used.add(r);
+            return r;
+          }
+        }
+      };
+      const hex = "0123456789abcdef";
+      const lines: string[] = [];
+      let total = 0;
+      let topRevenue = -1;
+      let topId = "";
+      // ~160 bytes/line x 3150 lines ≈ 504KB, matching the measured motivation task.
+      for (let i = 0; i < 3150; i++) {
+        const id = `ORD-${String(i + 1).padStart(6, "0")}`;
+        const region = regions[Math.floor(rng() * regions.length)];
+        const status = statuses[Math.floor(rng() * statuses.length)];
+        const revenue = drawRevenue();
+        let note = "";
+        for (let j = 0; j < 40; j++) note += hex[Math.floor(rng() * 16)];
+        lines.push(
+          JSON.stringify({
+            id,
+            region,
+            status,
+            revenue,
+            customer: `cust-${String(Math.floor(rng() * 100000)).padStart(5, "0")}`,
+            sku: `SKU-${String(Math.floor(rng() * 10000)).padStart(4, "0")}`,
+            note,
+          })
+        );
+        if (region === "emea" && status === "shipped") {
+          total += revenue;
+          if (revenue > topRevenue) {
+            topRevenue = revenue;
+            topId = id;
+          }
+        }
+      }
+      fs.mkdirSync(fixtureDir, { recursive: true });
+      fs.writeFileSync(path.join(fixtureDir, "orders.jsonl"), lines.join("\n") + "\n");
+      return { total: String(total), top: topId };
+    },
+    turns: (_truth, fixtureDir) => [
+      `Read the orders file at ${fixtureDir}/orders.jsonl (one JSON object per line with fields id, region, status, revenue). Compute the total revenue of orders with status "shipped" and region "emea", and the id of the single shipped emea order with the highest revenue. Revenues are integers. End your reply with "TOTAL=<total> TOP=<order id>".`,
+    ],
+    verify: (truth, texts) => {
+      const t = texts[0] ?? "";
+      const totalOk = t.includes(`TOTAL=${truth.total}`);
+      const topOk = t.includes(`TOP=${truth.top}`);
+      return {
+        pass: totalOk && topOk,
+        detail: `total:${totalOk ? "ok" : "FAIL"} top:${topOk ? "ok" : "FAIL"}`,
+      };
+    },
+  },
+  {
     id: "control-quick",
     description:
       "Trivial task where kernel features are unnecessary: detects over-adoption overhead and prompt-cost regressions.",
@@ -95,6 +168,12 @@ export const SCENARIOS: EvalScenario[] = [
 ];
 
 export const CONFIGS: EvalConfig[] = [
+  // Baseline for the r12 benchmark gate: all PTC/RLM experiments off, so the
+  // model works through flat tools (bash etc.) exactly as today.
+  {
+    id: "flat-bash",
+    experiments: { programmaticToolCalling: false, rlm: false },
+  },
   {
     id: "ptc-only",
     experiments: { programmaticToolCalling: true, rlm: false },
