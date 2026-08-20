@@ -35,6 +35,7 @@ interface CliArgs {
   baseUrl: string;
   root: string;
   model: string;
+  thinking: string;
   seeds: number;
   scenarios: string[];
   configs: string[];
@@ -57,6 +58,7 @@ function parseArgs(argv: string[]): CliArgs {
     baseUrl: baseUrl.replace(/\/$/, ""),
     root,
     model: get("--model") ?? "anthropic:claude-haiku-4-5",
+    thinking: get("--thinking") ?? "off",
     seeds: Number(get("--seeds") ?? "2"),
     scenarios: (get("--scenarios") ?? SCENARIOS.map((s) => s.id).join(",")).split(","),
     configs: (get("--configs") ?? CONFIGS.map((c) => c.id).join(",")).split(","),
@@ -100,19 +102,38 @@ async function waitForTurn(
     const lines = fs.readFileSync(chatPath, "utf-8").trim().split("\n");
     let users = 0;
     let lastRole = "";
+    let lastAssistantHasText = false;
     for (const line of lines) {
       try {
         const row: unknown = JSON.parse(line);
         if (isRecord(row) && typeof row.role === "string") {
           if (row.role === "user") users += 1;
           lastRole = row.role;
+          if (row.role === "assistant") {
+            // Mid-turn tool-call steps commit assistant rows without the final
+            // text; treating those as settled races the extractor against the
+            // closing text part (observed with Opus 5 @ medium thinking).
+            const parts = Array.isArray(row.parts) ? row.parts : [];
+            lastAssistantHasText = parts.some(
+              (p: unknown) =>
+                isRecord(p) &&
+                p.type === "text" &&
+                typeof p.text === "string" &&
+                p.text.trim() !== ""
+            );
+          }
         }
       } catch {
         // skip torn line
       }
     }
     const streaming = fs.existsSync(path.join(sessionDir, "partial.json"));
-    if (users >= expectedUserTurns && lastRole === "assistant" && !streaming) {
+    if (
+      users >= expectedUserTurns &&
+      lastRole === "assistant" &&
+      lastAssistantHasText &&
+      !streaming
+    ) {
       // Two consecutive stable polls guard against mid-write reads.
       stableTicks += 1;
       if (stableTicks >= 2) return;
@@ -132,6 +153,7 @@ interface CellResult {
   verifyDetail: string;
   gitSha: string;
   model: string;
+  thinking: string;
   metrics: CellMetrics;
 }
 
@@ -164,7 +186,7 @@ async function runCell(
       message: turns[i],
       options: {
         model: args.model,
-        thinkingLevel: "off",
+        thinkingLevel: args.thinking,
         agentId: "exec",
         experiments: config.experiments,
         ...(config.nudge !== undefined ? { additionalSystemInstructions: config.nudge } : {}),
@@ -184,6 +206,7 @@ async function runCell(
     verifyDetail: verdict.detail,
     gitSha,
     model: args.model,
+    thinking: args.thinking,
     metrics,
   };
 }
