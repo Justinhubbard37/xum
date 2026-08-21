@@ -612,6 +612,13 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
         type: "refine-summary";
       }
     | {
+        // Child-controlled family-message payload (task_message_parent),
+        // stored as an ASSISTANT-role synthetic row so prompt-injected child
+        // output never gains user-priority trust; a separate fixed-content
+        // user trigger row (no child bytes) wakes the parent turn.
+        type: "family-message";
+      }
+    | {
         type: "heartbeat-request";
         /** Synthetic heartbeat follow-ups use an explicit marker so future backend dispatch stays inspectable. */
         source?: "heartbeat";

@@ -49,6 +49,10 @@ export const createBranchSummaryMessageId = (): string =>
 export const createRefineSummaryMessageId = (): string =>
   `refine-summary-${Date.now()}-${randomSuffix(9)}`;
 
+/** Family-message payload row IDs (task_message_parent): family-message-{timestamp}-{random} */
+export const createFamilyMessageId = (): string =>
+  `family-message-${Date.now()}-${randomSuffix(9)}`;
+
 /** Context reset boundary IDs: context-reset-{timestamp}-{random} */
 export const createContextResetBoundaryMessageId = (): string =>
   `context-reset-${Date.now()}-${randomSuffix(9)}`;
