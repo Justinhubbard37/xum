@@ -37,6 +37,7 @@ import { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import { IdleDispatcher } from "@/node/services/idleDispatcher";
 import {
   TASK_FAMILY_MESSAGE_MAX_CHARS,
+  TASK_FAMILY_MESSAGE_MAX_TITLE_CHARS,
   TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS,
   TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES,
   TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES,
@@ -13263,32 +13264,53 @@ describe("TaskService", () => {
     );
 
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const { taskService, historyService } = createTaskServiceHarness(config, {
+      workspaceService,
+    });
 
-    // Exactly the chars budget worth of max-size messages is deliverable...
+    // Budgets charge the COMPLETE rendered payload (attribution framing +
+    // message), so max-size sends are refused strictly BEFORE the rendered
+    // total could cross the ceiling.
     const maxSizeSends = TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS / TASK_FAMILY_MESSAGE_MAX_CHARS;
+    let delivered = 0;
+    let refusal: Awaited<ReturnType<typeof taskService.sendMessageToParentFromAgentTask>> | null =
+      null;
     for (let i = 0; i < maxSizeSends; i++) {
       const sent = await taskService.sendMessageToParentFromAgentTask(
         childTaskId,
         "x".repeat(TASK_FAMILY_MESSAGE_MAX_CHARS),
         "tool-end"
       );
-      expect(sent.success).toBe(true);
+      if (!sent.success) {
+        refusal = sent;
+        break;
+      }
+      delivered += 1;
     }
-    expect(sendMessage).toHaveBeenCalledTimes(maxSizeSends);
+    // Rendered overhead makes fewer than the raw-chars quotient fit; the
+    // refusing send is a budget error that delivered nothing.
+    expect(delivered).toBeLessThan(maxSizeSends);
+    expect(delivered).toBeGreaterThan(0);
+    expect(refusal).not.toBeNull();
+    if (refusal !== null && !refusal.success) {
+      expect(refusal.error.code).toBe("send_failed");
+      expect("message" in refusal.error && refusal.error.message).toContain("budget");
+    }
+    expect(sendMessage).toHaveBeenCalledTimes(delivered);
 
-    // ...then even a tiny message is refused without delivering.
-    const exhausted = await taskService.sendMessageToParentFromAgentTask(
-      childTaskId,
-      "one more",
-      "tool-end"
-    );
-    expect(exhausted.success).toBe(false);
-    if (!exhausted.success) {
-      expect(exhausted.error.code).toBe("send_failed");
-      expect("message" in exhausted.error && exhausted.error.message).toContain("budget");
-    }
-    expect(sendMessage).toHaveBeenCalledTimes(maxSizeSends);
+    // The AIRTIGHT invariant: the rendered bytes persisted into the parent
+    // transcript never exceed the pair ceiling.
+    const history = await historyService.getHistoryFromLatestBoundary(parentWorkspaceId);
+    expect(history.success).toBe(true);
+    if (!history.success) return;
+    const renderedTotal = history.data
+      .filter((m) => m.metadata?.muxMetadata?.type === "family-message")
+      .reduce(
+        (sum, m) =>
+          sum + m.parts.reduce((s, part) => s + (part.type === "text" ? part.text.length : 0), 0),
+        0
+      );
+    expect(renderedTotal).toBeLessThanOrEqual(TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS);
   });
 
   test("wake failures retain the budget charge for persisted payload rows", async () => {
@@ -13334,16 +13356,16 @@ describe("TaskService", () => {
         "x".repeat(TASK_FAMILY_MESSAGE_MAX_CHARS),
         "tool-end"
       );
-      // Each attempt fails (wake down) but persisted a payload row, so it
-      // must consume budget.
+      // Each attempt fails (wake down, or budget once rendered charging
+      // exhausts it) — persisted rows must have consumed budget.
       expect(sent.success).toBe(false);
     }
 
-    // The budget is exhausted: the next retry is refused WITHOUT appending
-    // another payload row.
+    // The budget is exhausted for max-size sends: the next retry is refused
+    // WITHOUT appending another payload row.
     const exhausted = await taskService.sendMessageToParentFromAgentTask(
       childTaskId,
-      "one more",
+      "x".repeat(TASK_FAMILY_MESSAGE_MAX_CHARS),
       "tool-end"
     );
     expect(exhausted.success).toBe(false);
@@ -13356,7 +13378,73 @@ describe("TaskService", () => {
     const payloadRows = history.data.filter(
       (m) => m.metadata?.muxMetadata?.type === "family-message"
     );
-    expect(payloadRows).toHaveLength(maxSizeSends);
+    // Rendered-length charging (round 20) refuses before the raw quotient.
+    expect(payloadRows.length).toBeGreaterThan(0);
+    expect(payloadRows.length).toBeLessThan(maxSizeSends);
+  });
+
+  test("huge sender titles are capped and budgets charge the rendered payload", async () => {
+    // Codex round 20: attribution interpolated the FULL title while quotas
+    // charged only message.trim().length — spawn/retitle impose no title cap,
+    // so an attacker-influenced huge title added unbounded uncharged bytes to
+    // every send, breaking the transcript ceilings.
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-huge-title";
+    const childTaskId = "child-huge-title";
+    const hugeTitle = "T".repeat(64 * 1024);
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId, {
+          aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
+        }),
+        projectWorkspace(projectPath, "child", childTaskId, {
+          parentWorkspaceId,
+          title: hugeTitle,
+          taskStatus: "running",
+          taskExperiments: { rlm: true },
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService } = createWorkspaceServiceMocks({
+      sendMessage: mock(
+        async (
+          _workspaceId: string,
+          _message: string,
+          _options: unknown,
+          internal?: { onAccepted?: () => Promise<void> | void }
+        ): Promise<Result<void>> => {
+          await internal?.onAccepted?.();
+          return Ok(undefined);
+        }
+      ),
+    });
+    const { taskService, historyService } = createTaskServiceHarness(config, {
+      workspaceService,
+    });
+
+    const sent = await taskService.sendMessageToParentFromAgentTask(
+      childTaskId,
+      "small message",
+      "tool-end"
+    );
+    expect(sent.success).toBe(true);
+
+    const history = await historyService.getHistoryFromLatestBoundary(parentWorkspaceId);
+    expect(history.success).toBe(true);
+    if (!history.success) return;
+    const payloadRow = history.data.find((m) => m.metadata?.muxMetadata?.type === "family-message");
+    expect(payloadRow).toBeDefined();
+    const text = payloadRow!.parts.map((part) => (part.type === "text" ? part.text : "")).join("");
+    // The persisted row is provably bounded: the huge title was capped.
+    expect(text.length).toBeLessThan(TASK_FAMILY_MESSAGE_MAX_TITLE_CHARS + 512);
+    expect(text).toContain("T".repeat(TASK_FAMILY_MESSAGE_MAX_TITLE_CHARS));
+    expect(text).not.toContain("T".repeat(TASK_FAMILY_MESSAGE_MAX_TITLE_CHARS + 1));
   });
 
   test("the receiver-side ceiling bounds many senders targeting one parent", async () => {

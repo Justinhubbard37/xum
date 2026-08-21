@@ -35,3 +35,13 @@ export const TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS = 256 * 1024;
  */
 export const TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES = 128;
 export const TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_CHARS = 1024 * 1024;
+
+/**
+ * Cap on the sender title interpolated into a family-message payload row's
+ * attribution. Titles are attacker-influenced (auto-titling derives them from
+ * child content; spawn/retitle impose no cap), and the attribution framing is
+ * rendered on EVERY send — an unbounded title would multiply through the
+ * per-send accounting. Sanity bound only: budgets additionally charge the
+ * complete rendered payload length, so accounting stays exact regardless.
+ */
+export const TASK_FAMILY_MESSAGE_MAX_TITLE_CHARS = 256;
