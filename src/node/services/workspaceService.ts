@@ -4925,6 +4925,83 @@ export class WorkspaceService extends EventEmitter {
             )
           );
 
+        parentWorkspaceId = metadata.parentWorkspaceId ?? null;
+        childTaskModelString = metadata.taskModelString;
+        childTaskThinkingLevel = coerceThinkingLevel(metadata.taskThinkingLevel);
+
+        // Cancel and drain BOTH background producers BEFORE any disk
+        // mutation below. Two invariants depend on this ordering:
+        // (1) an admitted /refine apply runs to completion and can write
+        //     project skills into the CHECKOUT — draining after
+        //     runtime.deleteWorkspace() let that write race checkout
+        //     deletion (recreating .mux/skills in a deleted tree, or failing
+        //     midway with the failure swallowed);
+        // (2) a draining producer records headless usage as it settles, so
+        //     the usage rollup below must read its snapshot only after both
+        //     drains (spend landing later is lost — the child is deleted
+        //     with no second rollup).
+        // Trade-off: a force=false deletion failure below keeps the
+        // workspace but its producers were already drained. That loss is
+        // recoverable (rerun /refine, refork); a checkout write racing
+        // deletion is not. Both calls are idempotent; they run again later
+        // for the phantom-metadata path.
+        await clearPendingBranchSummary(workspaceId);
+        await this.refinePassCanceller?.cancelInFlightRefinePass(workspaceId);
+
+        // If this workspace is a sub-agent/task, roll its accumulated timing into the parent BEFORE
+        // deleting ~/.xum/sessions/<workspaceId>/session-timing.json.
+        if (parentWorkspaceId && this.sessionTimingService) {
+          try {
+            // Flush any last timing write (e.g. from stream-abort) before reading.
+            await this.sessionTimingService.waitForIdle(workspaceId);
+            await this.sessionTimingService.rollUpTimingIntoParent(parentWorkspaceId, workspaceId);
+          } catch (error: unknown) {
+            log.error("Failed to roll up child session timing into parent", {
+              workspaceId,
+              parentWorkspaceId,
+              error: getErrorMessage(error),
+            });
+          }
+        }
+
+        // If this workspace is a sub-agent/task, roll its accumulated usage into the parent BEFORE
+        // deleting ~/.xum/sessions/<workspaceId>/session-usage.json. Runs before runtime deletion
+        // so a crash mid-removal cannot lose already-drained spend; a force=false deletion failure
+        // afterwards is retry-safe (rollUpUsageIntoParent dedupes via rolledUpFrom).
+        if (parentWorkspaceId && this.sessionUsageService) {
+          try {
+            const childUsage = await this.sessionUsageService.getSessionUsage(workspaceId);
+            if (childUsage && Object.keys(childUsage.byModel).length > 0) {
+              const rollup = await this.sessionUsageService.rollUpUsageIntoParent(
+                parentWorkspaceId,
+                workspaceId,
+                childUsage.byModel,
+                {
+                  agentType: metadata.agentType,
+                  model: metadata.taskModelString,
+                }
+              );
+
+              if (rollup.didRollUp) {
+                // Live UI update (best-effort): only emit if the parent session is already active.
+                this.sessions.get(parentWorkspaceId)?.emitChatEvent({
+                  type: "session-usage-delta",
+                  workspaceId: parentWorkspaceId,
+                  sourceWorkspaceId: workspaceId,
+                  byModelDelta: childUsage.byModel,
+                  timestamp: Date.now(),
+                });
+              }
+            }
+          } catch (error: unknown) {
+            log.error("Failed to roll up child session usage into parent", {
+              workspaceId,
+              parentWorkspaceId,
+              error: getErrorMessage(error),
+            });
+          }
+        }
+
         if (isMultiProject(metadata)) {
           const projects = getProjects(metadata);
           const deleteErrors: string[] = [];
@@ -5152,74 +5229,6 @@ export class WorkspaceService extends EventEmitter {
           }
 
           // Note: Coder workspace deletion is handled by CoderSSHRuntime.deleteWorkspace()
-        }
-
-        parentWorkspaceId = metadata.parentWorkspaceId ?? null;
-        childTaskModelString = metadata.taskModelString;
-        childTaskThinkingLevel = coerceThinkingLevel(metadata.taskThinkingLevel);
-
-        // Cancel and drain BOTH background usage producers BEFORE the usage
-        // rollup below reads its snapshot: a draining branch-summary writer
-        // or /refine pass records headless usage as it settles, and spend
-        // landing after getSessionUsage would be permanently lost from parent
-        // accounting (the child is archived/deleted with no second rollup).
-        // Deliberately after the runtime deletion above — its force=false
-        // early return keeps the workspace, and a kept workspace must not
-        // have its producers cancelled. Both calls are idempotent; they run
-        // again later for the phantom-metadata path.
-        await clearPendingBranchSummary(workspaceId);
-        await this.refinePassCanceller?.cancelInFlightRefinePass(workspaceId);
-
-        // If this workspace is a sub-agent/task, roll its accumulated timing into the parent BEFORE
-        // deleting ~/.xum/sessions/<workspaceId>/session-timing.json.
-        if (parentWorkspaceId && this.sessionTimingService) {
-          try {
-            // Flush any last timing write (e.g. from stream-abort) before reading.
-            await this.sessionTimingService.waitForIdle(workspaceId);
-            await this.sessionTimingService.rollUpTimingIntoParent(parentWorkspaceId, workspaceId);
-          } catch (error: unknown) {
-            log.error("Failed to roll up child session timing into parent", {
-              workspaceId,
-              parentWorkspaceId,
-              error: getErrorMessage(error),
-            });
-          }
-        }
-
-        // If this workspace is a sub-agent/task, roll its accumulated usage into the parent BEFORE
-        // deleting ~/.xum/sessions/<workspaceId>/session-usage.json.
-        if (parentWorkspaceId && this.sessionUsageService) {
-          try {
-            const childUsage = await this.sessionUsageService.getSessionUsage(workspaceId);
-            if (childUsage && Object.keys(childUsage.byModel).length > 0) {
-              const rollup = await this.sessionUsageService.rollUpUsageIntoParent(
-                parentWorkspaceId,
-                workspaceId,
-                childUsage.byModel,
-                {
-                  agentType: metadata.agentType,
-                  model: metadata.taskModelString,
-                }
-              );
-
-              if (rollup.didRollUp) {
-                // Live UI update (best-effort): only emit if the parent session is already active.
-                this.sessions.get(parentWorkspaceId)?.emitChatEvent({
-                  type: "session-usage-delta",
-                  workspaceId: parentWorkspaceId,
-                  sourceWorkspaceId: workspaceId,
-                  byModelDelta: childUsage.byModel,
-                  timestamp: Date.now(),
-                });
-              }
-            }
-          } catch (error: unknown) {
-            log.error("Failed to roll up child session usage into parent", {
-              workspaceId,
-              parentWorkspaceId,
-              error: getErrorMessage(error),
-            });
-          }
         }
       } else {
         log.error(`Could not find metadata for workspace ${workspaceId}, creating phantom cleanup`);

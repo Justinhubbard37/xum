@@ -14021,6 +14021,76 @@ describe("WorkspaceService.remove usage-rollup ordering", () => {
   });
 });
 
+describe("WorkspaceService.remove checkout-deletion ordering", () => {
+  test("an admitted apply's checkout write completes before removal deletes the workdir", async () => {
+    // Codex round 15: the refine drain ran AFTER runtime/workdir deletion, so
+    // an admitted /refine apply's agent_skill_write could race checkout
+    // deletion — recreating .mux/skills inside the deleted tree (orphaned
+    // state) or failing midway with the failure swallowed. The drain must
+    // complete before any disk mutation.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const scratchId = "scratch-apply-race";
+    const scratchDir = path.join(config.rootDir, "scratch", scratchId);
+    try {
+      await fsPromises.mkdir(scratchDir, { recursive: true });
+      await config.editConfig((cfg) => {
+        cfg.projects.set(SCRATCH_PROJECT_CONFIG_KEY, {
+          workspaces: [{ path: scratchDir, id: scratchId, name: scratchId, kind: "scratch" }],
+        });
+        return cfg;
+      });
+      const scratchMetadata: WorkspaceMetadata = {
+        id: scratchId,
+        name: scratchId,
+        projectName: "scratch",
+        projectPath: scratchDir,
+        runtimeConfig: { type: "local" },
+        kind: "scratch",
+      };
+      // Models the admitted apply completing during the drain: it writes a
+      // project skill into the CHECKOUT as it settles. Only the FIRST drain
+      // has an in-flight pass (matching the real idempotent canceller — later
+      // calls find nothing to drain and no-op).
+      let drained = false;
+      const cancelInFlightRefinePass = mock(async () => {
+        if (drained) return;
+        drained = true;
+        await fsPromises.mkdir(path.join(scratchDir, ".mux", "skills", "lesson"), {
+          recursive: true,
+        });
+        await fsPromises.writeFile(
+          path.join(scratchDir, ".mux", "skills", "lesson", "SKILL.md"),
+          "distilled\n"
+        );
+      });
+      const service = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        aiService: createMockAIService({
+          getWorkspaceMetadata: (() =>
+            Promise.resolve(Ok(scratchMetadata))) as AIService["getWorkspaceMetadata"],
+        }),
+      });
+      service.setRefinePassCanceller({ cancelInFlightRefinePass });
+
+      const result = await service.remove(scratchId);
+      expect(result.success).toBe(true);
+      expect(cancelInFlightRefinePass).toHaveBeenCalled();
+
+      // The drain's checkout write happened BEFORE workdir deletion, so the
+      // removal deleted everything — no recreated .mux/skills orphan.
+      const workdirExists = await fsPromises.access(scratchDir).then(
+        () => true,
+        () => false
+      );
+      expect(workdirExists).toBe(false);
+    } finally {
+      await fsPromises.rm(scratchDir, { recursive: true, force: true });
+      await cleanup();
+    }
+  });
+});
+
 describe("WorkspaceService.fork branch-summary rollback ordering", () => {
   test("a fork whose setup fails never leaves a summary writer or registration behind", async () => {
     // Codex round-11: the background summary writer used to start BEFORE
