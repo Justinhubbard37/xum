@@ -231,14 +231,14 @@ export class ToolBridge {
    *   (see IJSRuntime.registerObject / QuickJSRuntime asyncify docs).
    */
   private addKernelMethods(
-    shuxObj: Record<string, (...args: unknown[]) => Promise<unknown>>,
+    xumObj: Record<string, (...args: unknown[]) => Promise<unknown>>,
     syncMethods: Record<string, (...args: unknown[]) => unknown>,
     kernel: KernelBridgeOptions,
     runtime: IJSRuntime
   ): void {
     const taskTool = this.bridgeableTools.get("task");
     if (taskTool !== undefined) {
-      shuxObj.task_spawn = async (args: unknown) => {
+      xumObj.task_spawn = async (args: unknown) => {
         // task_spawn is subject to the same grant as task (defense in depth,
         // mirroring the per-call re-check on regular bridged tools).
         if (!isBridgeToolGranted(this.grants, "task")) {
@@ -262,7 +262,7 @@ export class ToolBridge {
         return extractAdmissionHandle(result);
       };
     } else if (this.deniedToolNames.has("task")) {
-      shuxObj.task_spawn = () =>
+      xumObj.task_spawn = () =>
         Promise.reject(
           new Error("Capability denied: mux.task_spawn is not granted for this sandbox")
         );
@@ -275,7 +275,7 @@ export class ToolBridge {
     const loadFile = kernel.loadFile;
     if (loadFile !== undefined) {
       if (this.bridgeableTools.has("file_read")) {
-        shuxObj.load = async (args: unknown) => {
+        xumObj.load = async (args: unknown) => {
           // Defense in depth: same call-time re-checks as regular bridged tools.
           if (!isBridgeToolGranted(this.grants, "file_read")) {
             throw new Error("Capability denied: mux.load is not granted for this sandbox");
@@ -298,7 +298,7 @@ export class ToolBridge {
           return { key, bytes: loaded.bytes, lines: loaded.lines, preview: loaded.preview };
         };
       } else if (this.deniedToolNames.has("file_read")) {
-        shuxObj.load = () =>
+        xumObj.load = () =>
           Promise.reject(new Error("Capability denied: mux.load is not granted for this sandbox"));
       }
     }

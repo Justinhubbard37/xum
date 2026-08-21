@@ -347,7 +347,7 @@ export async function createCodeExecutionTool(
 **Persistent kernel:** the global \`vars\` object persists across code_execution calls and turns (JSON-serializable values only) and survives restarts via snapshots. Nested tool results do NOT enter your context: each mux.* call's visible record is a compact {tool, ok, bytes} summary (plus the error message on failure). Data reaches you only through your \`return\` value (offloaded to a {handle, preview, size} vars handle like \`vars.__h1\` when >${Math.floor(RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES / 1024)}KB serialized — read or slice it in a follow-up call), \`console\` output (capped at ${Math.floor(KERNEL_CONSOLE_CAP_BYTES / 1024)}KB per execution), and \`vars\`. Keep working data in \`vars\` and return only what you need to see. Note \`mux.file_read\` errors beyond its ~16KB/1000-line per-call cap (it does not offload).${
         loadEnabled
           ? `
-**Bulk file ingestion:** \`shux.load({path, key})\` reads a whole file host-side into \`vars[key]\` (string) and shows you only {key, bytes, lines, preview}. Use it instead of paginated \`shux.file_read\` for large files.`
+**Bulk file ingestion:** \`xum.load({path, key})\` reads a whole file host-side into \`vars[key]\` (string) and shows you only {key, bytes, lines, preview}. Use it instead of paginated \`xum.file_read\` for large files.`
           : ""
       }${
         "task" in bridgeableTools
@@ -363,7 +363,7 @@ export async function createCodeExecutionTool(
     kernel && options?.kernelFirst === true
       ? `**Kernel-first workflow:** this is your primary tool — other tools are \`mux.*\` calls inside it. Write complete programs: batch ALL steps of a task — every file load, transformation, and check — into a single call using loops and in-code error handling (try/catch), instead of one tool call per code_execution; split into separate calls only when a later step genuinely depends on your own review of intermediate output. Persist state in \`vars\` across calls and turns; nested results stay in the kernel (you see compact {tool, ok, bytes} summaries), and an oversized return value comes back as {handle, preview, size} — read or slice the full value at its handle in a follow-up call${
           "task" in bridgeableTools
-            ? "; spawn sub-agents with `shux.task_spawn(...)` and collect their reports with `shux.events()`"
+            ? "; spawn sub-agents with `xum.task_spawn(...)` and collect their reports with `xum.events()`"
             : ""
         }.
 
