@@ -132,6 +132,16 @@ async function runGit(args: string[], opts?: { timeoutMs?: number }): Promise<st
 const UPDATE_CHECK_CONCURRENCY = 4;
 
 /**
+ * Aggregate quota for a staged clone's checkout (excluding .git). Remotes are
+ * untrusted: --depth 1 and the subprocess output cap do not bound CHECKOUT
+ * bytes, so a malicious repository could otherwise exhaust disk (and the
+ * full-file manifest reads that follow) before consent ever appears. Far
+ * above any legitimate plugin (skills/agents/workflows are text).
+ */
+const STAGED_TREE_MAX_BYTES = 100 * 1024 * 1024;
+const STAGED_TREE_MAX_FILES = 10_000;
+
+/**
  * Map with a bounded worker pool, preserving input order. Rejections
  * propagate; callers needing per-item error isolation catch inside `fn`
  * (checkUpdates does).
@@ -201,6 +211,8 @@ export class AgentPluginInstallService {
       mcpServerManager?: MCPServerManager;
       /** Used to prune plugin server keys from per-workspace overrides on uninstall. */
       workspaceMcpOverridesService?: WorkspaceMcpOverridesService;
+      /** Test override for the staged-clone checkout quota. */
+      stagingQuota?: { maxBytes: number; maxFiles: number };
     }
   ) {
     assert(path.isAbsolute(config.rootDir), "AgentPluginInstallService: rootDir must be absolute");
@@ -514,6 +526,46 @@ export class AgentPluginInstallService {
     }
   }
 
+  /**
+   * Enforce the staged-checkout quota (bytes + file count, .git excluded,
+   * symlinks not followed). Runs immediately after every staged clone so an
+   * oversized tree is deleted by the caller's error path before any
+   * validation reads it.
+   */
+  private async assertStagedTreeWithinQuota(dir: string): Promise<void> {
+    const quota = this.deps.stagingQuota ?? {
+      maxBytes: STAGED_TREE_MAX_BYTES,
+      maxFiles: STAGED_TREE_MAX_FILES,
+    };
+    let bytes = 0;
+    let files = 0;
+    const pending: string[] = [dir];
+    while (pending.length > 0) {
+      const current = pending.pop();
+      assert(current !== undefined, "assertStagedTreeWithinQuota: queue underflow");
+      for (const entry of await fsPromises.readdir(current, { withFileTypes: true })) {
+        if (entry.name === ".git" && current === dir) {
+          continue;
+        }
+        const entryPath = path.join(current, entry.name);
+        if (entry.isDirectory()) {
+          pending.push(entryPath);
+          continue;
+        }
+        files += 1;
+        if (entry.isFile()) {
+          const stat = await fsPromises.lstat(entryPath);
+          bytes += stat.size;
+        }
+        if (files > quota.maxFiles || bytes > quota.maxBytes) {
+          throw new Error(
+            `The repository is too large to install as a plugin (limit: ${quota.maxFiles} files, ${Math.floor(quota.maxBytes / (1024 * 1024))} MiB).`
+          );
+        }
+      }
+    }
+  }
+
   /** Shallow-clone `resolved` into a fresh staging dir; returns { dir, sha } with sha = HEAD. */
   private async cloneResolved(
     url: string,
@@ -539,6 +591,7 @@ export class AgentPluginInstallService {
       }
       const sha = (await runGit(["-C", dir, "rev-parse", "HEAD"])).trim();
       assert(isFullCommitSha(sha), "cloneResolved: rev-parse HEAD must be a full SHA");
+      await this.assertStagedTreeWithinQuota(dir);
       return { dir, sha };
     } catch (error) {
       await this.removeDir(dir);
@@ -584,6 +637,7 @@ export class AgentPluginInstallService {
           `The remote moved since the preview (expected ${sha.slice(0, 12)}, got ${head.slice(0, 12)}). Run the preview again.`
         );
       }
+      await this.assertStagedTreeWithinQuota(dir);
       return dir;
     } catch (error) {
       await this.removeDir(dir);
@@ -899,13 +953,19 @@ export class AgentPluginInstallService {
           info.args !== undefined
             ? [info.command, ...info.args].map(rewrite).map(shellQuote).join(" ")
             : rewrite(info.command);
-        const envKeys = Object.keys(info.env ?? {}).filter(
-          (key) => key !== "PLUGIN_ROOT" && key !== "PLUGIN_DATA"
-        );
+        // Env VALUES are execution-relevant (e.g. NODE_OPTIONS=--require=…
+        // auto-loads code the argv never shows), so consent must disclose the
+        // full assignment, quoted like the argv so boundaries are unambiguous.
+        const envAssignments = Object.entries(info.env ?? {})
+          .filter(([key]) => key !== "PLUGIN_ROOT" && key !== "PLUGIN_DATA")
+          .map(([key, value]) => `${key}=${shellQuote(rewrite(value))}`);
         result.push({
           serverName: info.plugin.serverName,
           transport: "stdio",
-          summary: envKeys.length > 0 ? `${commandLine} (env: ${envKeys.join(", ")})` : commandLine,
+          summary:
+            envAssignments.length > 0
+              ? `${commandLine} (env: ${envAssignments.join(" ")})`
+              : commandLine,
         });
       } else {
         result.push({
@@ -1346,6 +1406,24 @@ export class AgentPluginInstallService {
       } catch (error) {
         await restoreTree("failed registry write");
         if (stagedData) {
+          // A getToolsForWorkspace startup that began after the pre-stage
+          // invalidation can have recreated dataPath (prepareStdioLaunch
+          // mkdirs it) while the registry write failed. Invalidate again so
+          // no late server publishes against the restored install, then
+          // remove the recreated (fresh, empty) directory — otherwise the
+          // rename below EEXIST-fails and strands the ORIGINAL data in
+          // staging while the still-installed plugin sees an empty data dir.
+          try {
+            await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
+          } catch (stopError) {
+            log.warn("Failed to re-invalidate plugin servers during data rollback", {
+              serverKeyPrefix,
+              error: getErrorMessage(stopError),
+            });
+          }
+          if (await pathExists(dataPath)) {
+            await this.removeDir(dataPath).catch(() => undefined);
+          }
           await fsPromises.rename(dataTrashDir, dataPath).catch((rollbackError: unknown) => {
             log.error("Failed to restore plugin data after failed registry write", {
               dataPath,

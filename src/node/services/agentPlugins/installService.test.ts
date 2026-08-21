@@ -401,6 +401,103 @@ describe("AgentPluginInstallService", () => {
     expect(updated.lockedSha).toBe(newHead);
   });
 
+  test("preview rejects a repository exceeding the staged-checkout quota", async () => {
+    // Remotes are untrusted: --depth 1 bounds history, not checkout bytes.
+    // An oversized tree must be rejected (and its staging dir deleted)
+    // before any validation reads it.
+    const smallQuotaService = new AgentPluginInstallService(config, {
+      isEnabled: () => true,
+      stagingQuota: { maxBytes: 1024, maxFiles: 100 },
+    });
+    await fsPromises.writeFile(path.join(remoteDir, "payload.bin"), "x".repeat(4096));
+    await commitAll(remoteDir, "oversized payload");
+
+    await expect(smallQuotaService.preview({ input: remoteDir })).rejects.toThrow(
+      /too large to install/
+    );
+    expect(await stagingLeftovers()).toEqual([]);
+
+    // File-count quota trips independently of bytes.
+    const fileCountService = new AgentPluginInstallService(config, {
+      isEnabled: () => true,
+      stagingQuota: { maxBytes: 1024 * 1024, maxFiles: 2 },
+    });
+
+    await expect(fileCountService.preview({ input: remoteDir })).rejects.toThrow(
+      /too large to install/
+    );
+  });
+
+  test("consent preview discloses full env assignments, not just key names", async () => {
+    // NODE_OPTIONS=--require=./payload.js changes what executes without
+    // appearing in the argv; the consent card must show the value.
+    await fsPromises.writeFile(
+      path.join(remoteDir, "mcp.json"),
+      JSON.stringify({
+        $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+        mcpServers: {
+          echo: {
+            type: "stdio",
+            command: "node",
+            args: ["${PLUGIN_ROOT}/server.js"],
+            env: { NODE_OPTIONS: "--require=./payload.js" },
+          },
+        },
+      })
+    );
+    await commitAll(remoteDir, "env with execution-relevant value");
+
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.mcpServers[0].summary).toContain("NODE_OPTIONS='--require=./payload.js'");
+  });
+
+  test("failed uninstall registry write restores plugin data over a recreated data dir", async () => {
+    const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
+    const dataPath = getPluginDataPath(muxRoot, instanceId);
+    const stoppedPrefixes: string[] = [];
+    const mcpStub = {
+      stopServersWithKeyPrefix: (prefix: string) => {
+        stoppedPrefixes.push(prefix);
+        return Promise.resolve();
+      },
+    };
+    const serviceWithMcp = new AgentPluginInstallService(config, {
+      isEnabled: () => true,
+      mcpServerManager: mcpStub as unknown as MCPServerManager,
+    });
+    const preview = await serviceWithMcp.preview({ input: remoteDir });
+    await serviceWithMcp.install({ source: preview.source, expectedSha: preview.lockedSha });
+    await fsPromises.mkdir(dataPath, { recursive: true });
+    await fsPromises.writeFile(path.join(dataPath, "state.txt"), "original");
+
+    // The registry write fails AND a late server launch recreated dataPath in
+    // the meantime (prepareStdioLaunch mkdirs it): the rollback must
+    // re-invalidate, clear the recreated dir, and restore the ORIGINAL data —
+    // an EEXIST rename failure would strand it in staging.
+    const internals = serviceWithMcp as unknown as {
+      writeRegistry: (envelope: Record<string, unknown>, entries: unknown[]) => Promise<void>;
+    };
+    const writeSpy = spyOn(internals, "writeRegistry").mockImplementationOnce(async () => {
+      await fsPromises.mkdir(dataPath, { recursive: true });
+      throw new Error("ENOSPC: no space left on device");
+    });
+    try {
+      await expect(
+        serviceWithMcp.uninstall({ name: "demo-plugin", deletePluginData: true })
+      ).rejects.toThrow(/persist the plugin registry/);
+    } finally {
+      writeSpy.mockRestore();
+    }
+
+    // Original data restored; rollback re-invalidated (pre-stage stop + rollback stop).
+    expect(await fsPromises.readFile(path.join(dataPath, "state.txt"), "utf8")).toBe("original");
+    expect(stoppedPrefixes.filter((p) => p === `plugin:${instanceId}:`).length).toBeGreaterThan(1);
+    expect((await registry()).map((entry) => (entry as { name: string }).name)).toEqual([
+      "demo-plugin",
+    ]);
+    expect((await stagingLeftovers()).filter((name) => name.startsWith("trash-data-"))).toEqual([]);
+  });
+
   test("checkUpdates surfaces a corrupted registry instead of a false all-clear", async () => {
     await fsPromises.writeFile(registryFile(), "{ not json");
 
