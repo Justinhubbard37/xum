@@ -34,6 +34,7 @@ import {
   type MemoryConsolidationOp,
 } from "@/node/services/memoryConsolidation";
 import type { StagedRefineEdit } from "@/node/services/refinement/refineStaging";
+import { validateSkillWriteProposal } from "@/node/services/tools/agent_skill_write";
 import type { MemoryMetaService } from "@/node/services/memoryMeta";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
 
@@ -82,6 +83,17 @@ function wrapSkillWriteWithStaging(
           success: false,
           error: `Mutation budget exhausted (${budget.limit} per run); stop and summarize.`,
         };
+      }
+      // Validate BEFORE staging with the real tool's extracted non-mutating
+      // checks (name, filePath shape, SKILL.md frontmatter + size cap): an
+      // invalid proposal must fail staging with the real error, not be
+      // staged, rendered approvable, and only rejected at /refine apply —
+      // which would consume the approved set as a silent no-op.
+      const invalid = validateSkillWriteProposal(
+        input as { name: string; filePath?: string | null; content: string }
+      );
+      if (!invalid.ok) {
+        return { success: false, error: invalid.error };
       }
       onStaged(input, options.toolCallId);
       return {

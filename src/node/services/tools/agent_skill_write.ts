@@ -18,6 +18,7 @@ import { readFileString, writeFileString } from "@/node/utils/runtime/helpers";
 import { generateDiff } from "@/node/services/tools/fileCommon";
 import {
   hasErrorCode,
+  isAbsolutePathAny,
   isSkillMarkdownRootFile,
   resolveContainedSkillFilePath,
   SKILL_FILENAME,
@@ -102,6 +103,56 @@ function injectSkillNameIntoFrontmatter(content: string, skillName: string): str
   }
 
   return lines.join("\n");
+}
+
+/**
+ * Non-mutating validation for a proposed skill write, extracted from the
+ * execute path so refine staging can reject proposals the real tool would
+ * reject (invalid name, traversal-shaped filePath, invalid SKILL.md
+ * frontmatter, the parser's size cap) BEFORE they are staged, rendered, and
+ * approved. Built from the same primitives execute uses (SkillNameSchema,
+ * injectSkillNameIntoFrontmatter, parseSkillMarkdown, isSkillMarkdownRootFile)
+ * so it cannot drift. Deliberately excludes state/filesystem checks
+ * (symlink/realpath containment, workspace bounds): staging validation is
+ * advisory — the real tool re-validates authoritatively at apply time.
+ */
+export function validateSkillWriteProposal(args: {
+  name: string;
+  filePath?: string | null;
+  content: string;
+}): { ok: true } | { ok: false; error: string } {
+  const parsedName = SkillNameSchema.safeParse(args.name);
+  if (!parsedName.success) {
+    return { ok: false, error: parsedName.error.message };
+  }
+  const relativeFilePath = args.filePath ?? SKILL_FILENAME;
+  // Same string-level shape checks both execute branches run inside their
+  // path resolvers (before any filesystem access).
+  if (!relativeFilePath) {
+    return { ok: false, error: "filePath is required" };
+  }
+  if (isAbsolutePathAny(relativeFilePath) || relativeFilePath.startsWith("~")) {
+    return {
+      ok: false,
+      error: `Invalid filePath (must be relative to the skill directory): ${relativeFilePath}`,
+    };
+  }
+  if (relativeFilePath.startsWith("..")) {
+    return { ok: false, error: `Invalid filePath (path traversal): ${relativeFilePath}` };
+  }
+  if (isSkillMarkdownRootFile(relativeFilePath.replace(/\\/g, "/"))) {
+    const contentToWrite = injectSkillNameIntoFrontmatter(args.content, parsedName.data);
+    try {
+      parseSkillMarkdown({
+        content: contentToWrite,
+        byteSize: Buffer.byteLength(contentToWrite, "utf-8"),
+        directoryName: parsedName.data,
+      });
+    } catch (error) {
+      return { ok: false, error: getErrorMessage(error) };
+    }
+  }
+  return { ok: true };
 }
 
 /**

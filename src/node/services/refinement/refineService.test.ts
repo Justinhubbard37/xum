@@ -1144,12 +1144,13 @@ describe("RefineService", () => {
     });
     await fixture.seedTrajectory();
 
-    // Both writes (including the escape attempt) are STAGED — the standard
-    // tool's containment runs at apply time and refuses the escape there.
+    // The valid write is STAGED; the traversal-shaped escape attempt is
+    // refused at STAGING by the extracted real-tool validation (round 19) —
+    // deeper filesystem containment still re-runs at apply time.
     const stagedResult = await fixture.service.run(WORKSPACE_ID);
     expect(stagedResult.success).toBe(true);
     if (!stagedResult.success) return;
-    expect(stagedResult.data.staged).toHaveLength(2);
+    expect(stagedResult.data.staged).toHaveLength(1);
     expect(await listRefinements(fixture.sessionDir)).toHaveLength(0);
 
     const result = await fixture.service.apply(WORKSPACE_ID);
@@ -1179,6 +1180,43 @@ describe("RefineService", () => {
     });
     expect(rollback.success).toBe(true);
     expect(await pathExists(skillFile)).toBe(false);
+  });
+
+  it("refuses to stage a skill write the real tool would reject", async () => {
+    // Codex round 19: the staging wrapper recorded agent_skill_write
+    // proposals without the real tool's validation — an invalid-frontmatter
+    // SKILL.md staged, rendered approvable, then apply rejected it through
+    // the real handler, consuming the approved set as a silent no-op.
+    using fixture = await createFixture({
+      withSkillTool: true,
+      modelFactory: () =>
+        toolCallModel(
+          [
+            {
+              toolCallId: "refine-bad-skill-1",
+              toolName: "agent_skill_write",
+              input: {
+                name: "broken-skill",
+                // No frontmatter at all: parseSkillMarkdown requires a
+                // frontmatter block with name + description.
+                content: "just a body with no frontmatter\n",
+              },
+            },
+          ],
+          "attempted an invalid skill"
+        ),
+    });
+    await fixture.seedTrajectory();
+
+    const result = await fixture.service.run(WORKSPACE_ID);
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    // Nothing staged: the proposal failed validation with the real error.
+    expect(result.data.noOp).toBe(true);
+    expect(result.data.staged).toBeUndefined();
+    const applyAfter = await fixture.service.apply(WORKSPACE_ID);
+    expect(applyAfter.success).toBe(false);
+    if (!applyAfter.success) expect(applyAfter.error).toContain("no staged refine edits");
   });
 
   it("includes timeline events in the prompt only when the Timeline experiment is on", async () => {
