@@ -476,6 +476,47 @@ describe("refinementRollback", () => {
     expect(await fsPromises.readFile(`${lockPath}.reclaim-guard`, "utf-8")).toBe(liveGuardToken);
   });
 
+  it("commit-point ownership loss aborts, compensates mutations, and appends no row", async () => {
+    using fixture = await createFixture();
+    await fixture.service.create(fixture.ctx, "/memories/global/entry.md", "v1\n", "agent");
+    await fixture.service.strReplace(fixture.ctx, "/memories/global/entry.md", "v1", "v2", "agent");
+    const editRow = await lastRow(fixture.sessionDir);
+    const physicalPath = path.join(fixture.muxHome, "memory", "global", "entry.md");
+    const lockPath = path.join(fixture.sessionDir, "refinement-rollback.lock");
+
+    // Simulate the theoretical double-entry: another process wrongly judged
+    // us dead and reclaimed the canonical lock AFTER our mutation but before
+    // our journal append. The commit-point re-check must catch it.
+    const result = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: editRow.id,
+      evidence: EVIDENCE,
+      testOnlyBeforeCommit: async () => {
+        // Mutation already applied at this point (v1 back on disk).
+        expect(await fsPromises.readFile(physicalPath, "utf-8")).toBe("v1\n");
+        await fsPromises.writeFile(lockPath, `${process.pid}:foreign-uuid`, "utf-8");
+      },
+    });
+    expect(result.success).toBe(false);
+    if (result.success) throw new Error("unreachable");
+    expect(result.error).toContain("lost ownership");
+    // The losing entrant compensated: the file is back to its post-edit state...
+    expect(await fsPromises.readFile(physicalPath, "utf-8")).toBe("v2\n");
+    // ...and no rollbackOf row was committed.
+    const rows = await listRefinements(fixture.sessionDir);
+    expect(rows.some((row) => row.data.rollbackOf === editRow.id)).toBe(false);
+
+    // With the foreign lock removed, a clean retry sees no divergence.
+    await fsPromises.unlink(lockPath);
+    const retry = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: editRow.id,
+      evidence: EVIDENCE,
+    });
+    expect(retry.success).toBe(true);
+    expect(await fsPromises.readFile(physicalPath, "utf-8")).toBe("v1\n");
+  });
+
   it("serializes concurrent rollbacks of the same row: one succeeds, one rollbackOf row", async () => {
     using fixture = await createFixture();
     await fixture.service.create(fixture.ctx, "/memories/global/race.md", "v1\n", "agent");

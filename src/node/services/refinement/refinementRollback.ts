@@ -69,6 +69,13 @@ export interface RollbackRefinementOptions {
   evidence: { toolName: string; toolCallId?: string; actor?: string };
   /** Caller-supplied justification, recorded in the rollback row's action. */
   reason?: string;
+  /**
+   * Test seam: runs after filesystem mutation, immediately before the
+   * commit-point ownership re-check — the only way to deterministically
+   * exercise the double-entry interleaving (a real competitor cannot be
+   * paused between our mutation and our journal append).
+   */
+  testOnlyBeforeCommit?: () => Promise<void>;
 }
 
 export interface RollbackApplied {
@@ -177,17 +184,46 @@ function isPidProvablyDead(pid: number): boolean {
  *   simply wins the lock; the reclaimer's own create then fails with EEXIST
  *   and surfaces as held-by-live-owner. Exclusion holds in every interleaving.
  *
+ * Defense in depth: plain POSIX files cannot make delete-if-content-matches
+ * atomic, so guard reclamation itself has a theoretical double-remove window
+ * (two reclaimers of the same dead-guard remnant). Guards + reclamation make
+ * double-entry improbable; the commit-point ownership re-verification in
+ * rollbackRefinement (assertStillOwned before mutation and before the journal
+ * append) makes it harmless — at most one entrant still owns the canonical
+ * lock at the commit point, the loser aborts and self-compensates.
+ *
  * Exported for tests (concurrency scenarios need the raw lock, not a full
  * rollback); production callers go through rollbackRefinement.
  */
-export async function acquireRollbackFileLock(sessionDir: string): Promise<AsyncDisposable> {
+export interface RollbackFileLock extends AsyncDisposable {
+  /** Re-read the canonical lockfile and require this acquisition's token. */
+  assertStillOwned(): Promise<void>;
+}
+
+export async function acquireRollbackFileLock(sessionDir: string): Promise<RollbackFileLock> {
   const lockPath = path.join(path.resolve(sessionDir), ROLLBACK_LOCKFILE);
   // A session dir may not exist yet (e.g. unknown-id refusals before any row
   // was journaled); the claim must still succeed so the ordinary "No
   // refinement row" refusal is reached instead of a lockfile ENOENT.
   await fsPromises.mkdir(path.resolve(sessionDir), { recursive: true });
   const myToken = `${process.pid}:${randomUUID()}`;
-  const lockHandle: AsyncDisposable = {
+  const lockHandle: RollbackFileLock = {
+    async assertStillOwned() {
+      let current: string | null = null;
+      try {
+        current = await fsPromises.readFile(lockPath, "utf-8");
+      } catch (error) {
+        if (errnoCode(error) !== "ENOENT") {
+          throw error;
+        }
+        // ENOENT = the lock vanished: someone judged us dead and reclaimed.
+      }
+      if (current !== myToken) {
+        throw new RollbackError(
+          `Aborting rollback: lost ownership of '${lockPath}' mid-operation (another process reclaimed it). No changes were committed by this call.`
+        );
+      }
+    },
     async [Symbol.asyncDispose]() {
       try {
         // Ownership-verified release: a mismatched token means this lock was
@@ -783,7 +819,7 @@ export async function rollbackRefinement(
     // cheaply; the lockfile serializes the debug CLI (a separate Bun process)
     // against the backend.
     await using _lock = await sessionLock(opts.sessionDir).acquire();
-    await using _fileLock = await acquireRollbackFileLock(opts.sessionDir);
+    await using fileLock = await acquireRollbackFileLock(opts.sessionDir);
     const journal = sharedDurableEventJournal(opts.sessionDir);
     const rows = await listRefinements(opts.sessionDir);
 
@@ -847,6 +883,12 @@ export async function rollbackRefinement(
     // Capture the pre-rollback state (the new row's inverse) BEFORE mutating.
     const newInverse = await capturePreRollbackInverse(inverse);
 
+    // Ownership re-verification before any filesystem mutation: guards +
+    // reclamation make cross-process double-entry improbable; this check (and
+    // the commit-point one below) makes it harmless. Losing ownership here
+    // aborts with nothing mutated.
+    await fileLock.assertStillOwned();
+
     // Apply the target's inverse to disk. Multi-file ops are two-phase: a
     // failure after the first mutation would otherwise leave an unjournaled
     // partial rollback behind (no rollbackOf row, and a retry refuses on the
@@ -896,6 +938,21 @@ export async function rollbackRefinement(
         break;
     }
 
+    // Commit point: even if two processes double-entered the critical section
+    // (theoretically possible — plain POSIX files cannot make the guard's
+    // delete-if-content-matches atomic), only the entrant still owning the
+    // canonical lock may journal. The loser undoes its mutations, so no
+    // duplicate rollbackOf rows and no unjournaled divergence can result.
+    try {
+      if (opts.testOnlyBeforeCommit !== undefined) {
+        await opts.testOnlyBeforeCommit();
+      }
+      await fileLock.assertStillOwned();
+    } catch (error) {
+      await compensateApplied(applied, newInverse);
+      throw error;
+    }
+
     // Journal the rollback row. The filesystem is already restored at this
     // point, so a journaling failure must not fail the operation (self-healing
     // doctrine) — but it is reported via rollbackRowId: null.
@@ -937,6 +994,34 @@ export async function rollbackRefinement(
       return { success: false, error: error.message };
     }
     return { success: false, error: `Rollback failed: ${getErrorMessage(error)}` };
+  }
+}
+
+/**
+ * Undo a fully applied inverse after the commit-point ownership check fails:
+ * every mutated path returns to its captured pre-rollback state, so the
+ * losing entrant of a (theoretical) double-entry leaves no trace.
+ */
+async function compensateApplied(
+  applied: RollbackApplied,
+  preState: RefinementInverseDraft
+): Promise<void> {
+  if (applied.renamed !== undefined) {
+    // The rename's own pre-state IS the mirrored rename.
+    assert(preState.op === "rename", "rename apply must capture a rename pre-state");
+    try {
+      await fsPromises.rename(applied.renamed.to, applied.renamed.from);
+    } catch (error) {
+      log.error("[refinement] failed to compensate an applied rollback rename", {
+        renamed: applied.renamed,
+        error,
+      });
+    }
+    return;
+  }
+  const mutated = [...applied.deleted, ...applied.restored];
+  if (mutated.length > 0) {
+    await compensatePartialApply(mutated, preState);
   }
 }
 
