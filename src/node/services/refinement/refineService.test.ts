@@ -657,6 +657,11 @@ describe("RefineService", () => {
     expect(await pathExists(lessonFile)).toBe(false);
     expect(await listRefinements(fixture.sessionDir)).toHaveLength(0);
     expect(fixture.emittedMessages).toHaveLength(1);
+    // SECURITY: the summary embeds verbatim model output over an
+    // attacker-influenceable trajectory; it must reach later provider
+    // requests as ASSISTANT context, never user-priority instructions
+    // (MuxMessage role maps 1:1 into the provider request).
+    expect(fixture.emittedMessages[0].role).toBe("assistant");
     const stagedText = fixture.emittedMessages[0].parts
       .map((part) => (part.type === "text" ? part.text : ""))
       .join("");
@@ -684,6 +689,8 @@ describe("RefineService", () => {
     const chat = await fixture.readChat();
     const summaryRow = chat[chat.length - 1];
     expect(summaryRow.metadata?.muxMetadata?.type).toBe("refine-summary");
+    // Same trust boundary on the applied audit row (generated provenance).
+    expect(summaryRow.role).toBe("assistant");
     const summaryText = summaryRow.parts
       .map((part) => (part.type === "text" ? part.text : ""))
       .join("");

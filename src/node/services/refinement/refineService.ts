@@ -169,7 +169,15 @@ export function createRefineSummaryMessage(
       "Rollback with: bun run debug refinements <workspace-id> --rollback <id>, or the refinement_rollback tool."
     );
   }
-  return createMuxMessage(createRefineSummaryMessageId(), "user", lines.join("\n"), {
+  // SECURITY: assistant role, never user. The summary embeds the refine
+  // model's verbatim closing output over an attacker-influenceable
+  // trajectory; a user row would grant prompt-injected text user-priority
+  // trust in every later tool-capable request (and startup auto-retry can
+  // resume it after a restart). As an assistant row the provider reads it as
+  // prior generated context — same posture as branch summaries and
+  // compaction summary rows; transformModelMessages merges consecutive
+  // text-only assistant rows for Anthropic's alternation constraint.
+  return createMuxMessage(createRefineSummaryMessageId(), "assistant", lines.join("\n"), {
     timestamp: Date.now(),
     // Synthetic system-style row: provider-visible durable history (never
     // request-time injection), uiVisible so users see what was self-applied.
