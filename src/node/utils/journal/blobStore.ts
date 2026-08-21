@@ -101,6 +101,24 @@ export class BlobStore {
     }
   }
 
+  /**
+   * Byte size of a stored blob via stat; null when missing. No content
+   * verification (unlike get) — intended for quota accounting, where a
+   * corrupt payload still occupies the bytes being accounted.
+   */
+  async size(ref: BlobRef): Promise<number | null> {
+    this.assertValidRef(ref);
+    try {
+      const stats = await fs.stat(this.pathFor(ref));
+      return stats.size;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return null;
+      }
+      throw error;
+    }
+  }
+
   async has(ref: BlobRef): Promise<boolean> {
     this.assertValidRef(ref);
     try {

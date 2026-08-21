@@ -27,9 +27,13 @@ import type { IJSRuntime, IJSRuntimeFactory } from "@/node/services/ptc/runtime"
 import { resolveCapabilityGrants, type CapabilityGrants } from "@/common/types/capabilityGrants";
 import {
   sharedDurableEventJournal,
-  type BlobMentions,
   type DurableEventJournal,
 } from "@/node/utils/journal/durableEventJournal";
+import {
+  blobOnlyMentionedBy,
+  walkBlobQuota,
+  type BlobQuotaEntry,
+} from "@/node/utils/journal/blobReclamation";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import { log } from "@/node/services/log";
 import { TASK_TERMINAL_EVENT_TYPE } from "@/constants/sandboxEvents";
@@ -57,13 +61,6 @@ export class VarsSnapshotBudgetError extends Error {
   }
 }
 
-/** One result-handle blob payload as the quota accounting sees it. */
-interface HandleBlobEntry {
-  ref: BlobRef;
-  /** Recorded event size (bytes of the serialized value). */
-  size: number;
-}
-
 /**
  * Per-journal incremental reclamation state (Codex round 6: both passes ran
  * after EVERY kernel call and re-derived their candidates from the full
@@ -82,7 +79,7 @@ interface JournalReclamationState {
   latestSnapshotRef: Map<string, BlobRef>;
   /** Handle payloads currently retained under the quota, newest first
    * (bounded by quota/offload-threshold); null until the recovery sweep. */
-  retainedHandles: HandleBlobEntry[] | null;
+  retainedHandles: BlobQuotaEntry[] | null;
 }
 
 const reclamationStates = new WeakMap<DurableEventJournal, JournalReclamationState>();
@@ -94,33 +91,6 @@ function reclamationStateFor(journal: DurableEventJournal): JournalReclamationSt
     reclamationStates.set(journal, state);
   }
   return state;
-}
-
-/**
- * Reference safety: a blob may be deleted only when every event mentioning
- * its hash belongs to the reclaiming pass's own kind (and, for snapshots, its
- * own scope) — content addressing means identical content shares one blob,
- * and deleting a payload referenced by any other event would corrupt that
- * event. Backed by the journal's blob-mention index (O(1) per candidate)
- * instead of a per-persist journal scan.
- */
-function onlyMentionedBy(
-  mentions: BlobMentions | undefined,
-  kind: "sandbox-vars-snapshot" | "result-handle",
-  scopeKey?: string
-): boolean {
-  // Candidates come from journal events, so an unindexed ref means the index
-  // and the journal disagree — retain, never guess.
-  if (mentions === undefined) return false;
-  for (const mentionKind of mentions.kinds) {
-    if (mentionKind !== kind) return false;
-  }
-  if (scopeKey !== undefined) {
-    for (const scope of mentions.snapshotScopes) {
-      if (scope !== scopeKey) return false;
-    }
-  }
-  return true;
 }
 
 /**
@@ -159,7 +129,7 @@ export async function reclaimSupersededSnapshotBlobs(
             .filter(([ref, mentions]) => mentions.snapshotScopes.has(scopeKey) && ref !== latestRef)
             .map(([ref]) => ref);
     for (const ref of candidates) {
-      if (!onlyMentionedBy(index.get(ref), "sandbox-vars-snapshot", scopeKey)) continue;
+      if (!blobOnlyMentionedBy(index.get(ref), "sandbox-vars-snapshot", scopeKey)) continue;
       await journal.blobs.delete(ref);
     }
   });
@@ -174,18 +144,18 @@ export async function reclaimSupersededSnapshotBlobs(
  * list instead of the journal, so payloads evicted by earlier passes are
  * never revisited. The first pass per process (or a call without
  * `published`) runs a full recovery sweep. Reference safety and locking:
- * see onlyMentionedBy / reclaimSupersededSnapshotBlobs.
+ * see blobOnlyMentionedBy / reclaimSupersededSnapshotBlobs.
  *
  * Exported for tests (quota interleavings need synthetic event sizes).
  */
 export async function reclaimExcessResultHandleBlobs(
   journal: DurableEventJournal,
-  published?: HandleBlobEntry
+  published?: BlobQuotaEntry
 ): Promise<void> {
   await journal.withBlobLock(async () => {
     const state = reclamationStateFor(journal);
     const index = await journal.blobMentionIndex();
-    let entries: HandleBlobEntry[];
+    let entries: BlobQuotaEntry[];
     if (state.retainedHandles !== null && published !== undefined) {
       entries = [published, ...state.retainedHandles];
     } else {
@@ -200,43 +170,13 @@ export async function reclaimExcessResultHandleBlobs(
         entries.push({ ref: event.data.blobHash, size: event.data.size });
       }
     }
-    const { retained, evictable } = walkHandleQuota(entries);
+    const { retained, evictable } = walkBlobQuota(entries, RESULT_HANDLE_BLOB_QUOTA_BYTES);
     state.retainedHandles = retained;
     for (const ref of evictable) {
-      if (!onlyMentionedBy(index.get(ref), "result-handle")) continue;
+      if (!blobOnlyMentionedBy(index.get(ref), "result-handle")) continue;
       await journal.blobs.delete(ref);
     }
   });
-}
-
-/**
- * The newest-first quota walk shared by the recovery sweep (all journal
- * rows) and the incremental path (previous retained list + the new handle).
- * Content addressing can repeat a ref; its NEWEST occurrence decides
- * retention (duplicates are one blob, counted once). Note the walk keeps
- * accumulating after an entry fails to fit, so an older-but-smaller payload
- * can stay retained past a newer oversized one — retention is per-entry
- * "fits the remaining quota", not a suffix cut.
- */
-function walkHandleQuota(entries: HandleBlobEntry[]): {
-  retained: HandleBlobEntry[];
-  evictable: Set<BlobRef>;
-} {
-  const seen = new Set<BlobRef>();
-  const retained: HandleBlobEntry[] = [];
-  const evictable = new Set<BlobRef>();
-  let retainedBytes = 0;
-  for (const entry of entries) {
-    if (seen.has(entry.ref)) continue;
-    seen.add(entry.ref);
-    if (retainedBytes + entry.size <= RESULT_HANDLE_BLOB_QUOTA_BYTES) {
-      retainedBytes += entry.size;
-      retained.push(entry);
-    } else {
-      evictable.add(entry.ref);
-    }
-  }
-  return { retained, evictable };
 }
 
 export type SandboxMountLifetime = "ephemeral" | "persistent";
