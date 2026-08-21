@@ -1101,6 +1101,9 @@ describe("refinement journal", () => {
 
     const events = await readRefinementEvents(sessionsDir);
     expect(events).toHaveLength(1);
+    // Runtime-namespace paths are not host-addressable: the row must be
+    // stamped remote so rollback refuses it instead of touching local paths.
+    expect(events[0].data.runtime).toBe("remote");
     const inverse = RefinementInverseSchema.parse(events[0].data.inverse);
     expect(inverse.op).toBe("restore-files");
     if (inverse.op === "restore-files") {

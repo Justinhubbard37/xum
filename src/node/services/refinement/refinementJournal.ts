@@ -56,6 +56,12 @@ export interface RefinementEmitArgs {
    * `postState` so rollback can detect out-of-band edits content-exactly.
    */
   postFiles?: RefinementFileCapture[];
+  /**
+   * "remote" when the mutation ran through a non-local runtime (SSH/Docker).
+   * Such rows carry runtime-namespace paths and are refused by rollback,
+   * which only applies inverses to the host filesystem.
+   */
+  runtime?: "remote";
 }
 
 /** Shared by the rollback engine to compare current files against `postState`. */
@@ -123,6 +129,7 @@ export async function appendRefinementEvent(args: RefinementEmitArgs): Promise<v
         inverse,
         evidence,
         ...(postState !== undefined ? { postState } : {}),
+        ...(args.runtime !== undefined ? { runtime: args.runtime } : {}),
       },
     });
   } catch (error) {

@@ -241,6 +241,9 @@ export const createAgentSkillWriteTool: ToolFactory = (config: ToolConfiguration
                 : { op: "delete-files", paths: [resolvedTarget.resolvedPath] },
               evidence: { toolName: "agent_skill_write", toolCallId },
               postFiles: [{ path: resolvedTarget.resolvedPath, content: contentToWrite }],
+              // project-runtime = SSH/Docker: inverse paths are
+              // runtime-namespace, not applicable to the host filesystem.
+              runtime: "remote",
             });
           }
 

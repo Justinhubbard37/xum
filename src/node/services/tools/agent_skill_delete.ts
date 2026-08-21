@@ -335,6 +335,9 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
                 action: { op: "delete-skill", skillName: parsedName.data },
                 inverse: { op: "restore-files", files: skillCaptures },
                 evidence: { toolName: "agent_skill_delete", toolCallId },
+                // project-runtime = SSH/Docker: inverse paths are
+                // runtime-namespace, not applicable to the host filesystem.
+                runtime: "remote",
               });
             }
 
@@ -443,6 +446,9 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
               action: { op: "delete-file", skillName: parsedName.data, filePath },
               inverse: { op: "restore-files", files: [fileCapture] },
               evidence: { toolName: "agent_skill_delete", toolCallId },
+              // project-runtime = SSH/Docker: inverse paths are
+              // runtime-namespace, not applicable to the host filesystem.
+              runtime: "remote",
             });
           }
 

@@ -89,6 +89,12 @@ export const RefinementDataSchema = z.object({
   rollbackOf: z.string().optional(),
   /** Expected post-action file hashes (RefinementPostStateSchema in refinement.ts). */
   postState: JsonValueSchema.optional(),
+  /**
+   * "remote" when the mutation ran through a non-local runtime (SSH/Docker):
+   * its inverse paths are runtime-namespace and must not be applied to the
+   * host filesystem. Absent (older rows / local runtimes) = host-local.
+   */
+  runtime: z.string().optional(),
 });
 
 /**

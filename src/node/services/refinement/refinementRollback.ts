@@ -851,6 +851,18 @@ export async function rollbackRefinement(
         `Refinement kind '${kind}' is not rollbackable (only memory and skill rows are)`
       );
     }
+    // Remote (SSH/Docker) rows carry runtime-namespace paths; this engine
+    // applies inverses through host fsPromises, which would at best refuse on
+    // divergence and at worst create/overwrite a similarly named LOCAL path
+    // while the remote edit stays untouched. Not overridable with force:
+    // force overrides divergence, not the addressing mode — a forced apply
+    // would still write to the wrong filesystem. Rows without the field
+    // (older binaries, local runtimes) are host-local by construction.
+    if (target.data.runtime === "remote") {
+      throw new RollbackError(
+        `Row '${opts.id}' was produced by a remote (SSH/Docker) workspace runtime; its paths are not addressable on this host. Remote skill rollbacks are not supported.`
+      );
+    }
     const existingRollback = rows.find((row) => row.data.rollbackOf === opts.id);
     if (existingRollback !== undefined) {
       throw new RollbackError(

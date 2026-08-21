@@ -668,6 +668,47 @@ describe("refinementRollback", () => {
     expect(await fsPromises.readFile(skillFile, "utf-8")).toBe(content);
   });
 
+  it("refuses remote-runtime skill rows even with force", async () => {
+    using fixture = await createFixture();
+    // A remote (SSH/Docker) workspace journaled this row: its path is
+    // runtime-namespace, resembling a host path but on another filesystem.
+    const remotePath = path.join(fixture.checkout, ".mux", "skills", "my-skill", "SKILL.md");
+    await appendRefinementEvent({
+      sessionDir: fixture.sessionDir,
+      workspaceId: WORKSPACE_ID,
+      kind: "skill",
+      action: { op: "write", skillName: "my-skill", filePath: "SKILL.md" },
+      inverse: { op: "delete-files", paths: [remotePath] },
+      evidence: { toolName: "agent_skill_write" },
+      runtime: "remote",
+    });
+    // A same-named LOCAL file must never be touched by a remote row.
+    await fsPromises.mkdir(path.dirname(remotePath), { recursive: true });
+    await fsPromises.writeFile(remotePath, "local content\n", "utf-8");
+    const row = await lastRow(fixture.sessionDir);
+
+    const refused = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: row.id,
+      evidence: EVIDENCE,
+    });
+    expect(refused.success).toBe(false);
+    if (refused.success) throw new Error("unreachable");
+    expect(refused.error).toContain("remote");
+
+    // force overrides divergence, NOT the addressing mode.
+    const forced = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: row.id,
+      force: true,
+      evidence: EVIDENCE,
+    });
+    expect(forced.success).toBe(false);
+    if (forced.success) throw new Error("unreachable");
+    expect(forced.error).toContain("remote");
+    expect(await fsPromises.readFile(remotePath, "utf-8")).toBe("local content\n");
+  });
+
   it("rolls back a GLOBAL skill write (path under <muxHome>/skills)", async () => {
     using fixture = await createFixture();
     // Global-scope skills live at <muxHome>/skills (agent_skill_write/delete
