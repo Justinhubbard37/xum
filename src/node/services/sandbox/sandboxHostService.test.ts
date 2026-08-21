@@ -777,6 +777,108 @@ describe("SandboxHostService", () => {
     await host.disposeScope("ws-reset");
   });
 
+  test("context reset never resurrects pre-reset vars when the tombstone publish fails once", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const host = new SandboxHostService();
+    const journal = sharedDurableEventJournal(tmp.path);
+    const mount = await host.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-reset-fail",
+      sessionDir: tmp.path,
+    });
+    await mount.runtime.eval('vars.secret = "cleared-by-user"; return true;');
+    await mount.persistVars();
+
+    // The reset's empty-snapshot (tombstone) publish fails, e.g. disk full.
+    // (mockImplementationOnce, not mockRejectedValueOnce: the latter creates
+    // the rejected promise eagerly, tripping unhandled-rejection detection.)
+    const publishSpy = spyOn(journal, "publishWithBlob").mockImplementationOnce(() =>
+      Promise.reject(new Error("disk full"))
+    );
+    let discardError: unknown = null;
+    try {
+      await host.discardScope("ws-reset-fail", tmp.path);
+    } catch (error) {
+      discardError = error;
+    }
+    // The failed durable invalidation must be surfaced, not swallowed.
+    expect(discardError).not.toBeNull();
+    expect(mount.isDisposed).toBe(true);
+
+    // Reacquisition retries the tombstone (spy is once-only → succeeds now)
+    // and must NOT restore the value the user explicitly cleared.
+    const fresh = await host.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-reset-fail",
+      sessionDir: tmp.path,
+    });
+    const probe = await fresh.runtime.eval("return Object.keys(vars).length;");
+    expect(probe.success).toBe(true);
+    expect(probe.result).toBe(0);
+    // The tombstone landed durably: the LATEST snapshot row is empty vars
+    // (replay reconstruction agrees the scope was reset).
+    const snapshots = (await journal.read()).filter((e) => e.kind === "sandbox-vars-snapshot");
+    const latest = snapshots[snapshots.length - 1];
+    if (latest.kind !== "sandbox-vars-snapshot") throw new Error("unreachable");
+    expect(await journal.blobs.getText(latest.data.blobHash)).toBe("{}");
+    expect(publishSpy).toHaveBeenCalledTimes(2); // failed discard + retry
+    publishSpy.mockRestore();
+    await host.dropScope("ws-reset-fail");
+  });
+
+  test("reacquisition stays blocked while the reset tombstone cannot be made durable", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const host = new SandboxHostService();
+    const journal = sharedDurableEventJournal(tmp.path);
+    const mount = await host.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-reset-block",
+      sessionDir: tmp.path,
+    });
+    await mount.runtime.eval('vars.secret = "cleared"; return true;');
+    await mount.persistVars();
+
+    // Persistent journal failure: the discard AND the acquire-time retry fail.
+    const publishSpy = spyOn(journal, "publishWithBlob").mockImplementation(() =>
+      Promise.reject(new Error("disk full"))
+    );
+    try {
+      await host.discardScope("ws-reset-block", tmp.path);
+    } catch {
+      // expected — asserted in the previous test
+    }
+    let acquireError: unknown = null;
+    try {
+      await host.acquireMount({
+        lifetime: "persistent",
+        runtimeFactory,
+        scopeKey: "ws-reset-block",
+        sessionDir: tmp.path,
+      });
+    } catch (error) {
+      acquireError = error;
+    }
+    // Mounting would restore (resurrect) the cleared snapshot: refuse until
+    // the invalidation is durable.
+    expect(String(acquireError)).toContain("reset");
+
+    // Journal heals (spy restored): acquisition retries the tombstone,
+    // succeeds, and starts empty.
+    publishSpy.mockRestore();
+    const fresh = await host.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-reset-block",
+      sessionDir: tmp.path,
+    });
+    const probe = await fresh.runtime.eval("return Object.keys(vars).length;");
+    expect(probe.result).toBe(0);
+    await host.dropScope("ws-reset-block");
+  });
+
   test("reacquiring with changed grants rebuilds the mount under the new grants", async () => {
     using tmp = new DisposableTempDir("sandbox-host-test");
     const host = new SandboxHostService();

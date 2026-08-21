@@ -580,6 +580,17 @@ export class SandboxHostService {
   /** Per-scope mutex serializing acquisition, exclusive runs, and disposal.
    * Kept for the process lifetime (bounded by workspace count). */
   private readonly scopeLocks = new Map<string, AsyncMutex>();
+  /**
+   * Scopes whose context reset has NOT been made durable yet: the mount was
+   * disposed but the empty-snapshot tombstone failed to publish. While a
+   * scope is pending, acquisition retries the tombstone and REFUSES to mount
+   * until it lands — restoring the latest snapshot would resurrect values
+   * the user explicitly cleared (potentially sensitive). In-memory only: a
+   * crash before the retry lands loses the flag, so the next process can
+   * still restore pre-reset state (unavoidable when durable storage is the
+   * failing component; the reset caller is told loudly).
+   */
+  private readonly pendingDiscards = new Set<string>();
 
   private lockFor(scopeKey: string): AsyncMutex {
     let lock = this.scopeLocks.get(scopeKey);
@@ -665,6 +676,21 @@ export class SandboxHostService {
     }
 
     const journal = this.journalFor(sessionDir);
+    if (this.pendingDiscards.has(scopeKey)) {
+      // A context reset disposed this scope but its durable invalidation
+      // never landed: retry it now and refuse the mount while it keeps
+      // failing (initializeVars below would otherwise restore — resurrect —
+      // the snapshot the user explicitly cleared).
+      try {
+        await this.publishDiscardTombstone(journal, scopeKey);
+      } catch (error) {
+        throw new Error(
+          `sandbox scope '${scopeKey}' is reset-pending: the context reset's durable ` +
+            `invalidation failed and retrying it failed again (mounting would resurrect ` +
+            `cleared vars): ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    }
     const runtime = await options.runtimeFactory.create();
     const mount = new SandboxMount(
       runtime,
@@ -874,6 +900,9 @@ export class SandboxHostService {
     await using _guard = await this.lockFor(scopeKey).acquire();
     const mount = this.persistentMounts.get(scopeKey);
     this.persistentMounts.delete(scopeKey);
+    // The caller is deleting the session dir: there is no snapshot left to
+    // invalidate, so a pending reset tombstone becomes moot.
+    this.pendingDiscards.delete(scopeKey);
     // The scope lock stays in the map (see scopeLocks doc): deleting it while
     // waiters hold references could let two locks govern the same scope.
     if (mount && !mount.isDisposed) {
@@ -886,6 +915,12 @@ export class SandboxHostService {
    * WITHOUT snapshotting current vars, and supersede any earlier snapshot
    * with an empty one so the next mount starts fresh instead of restoring
    * pre-reset state. Rotation-by-append keeps the journal append-only.
+   *
+   * Throws when the tombstone cannot be made durable — the reset is only
+   * durably invalidated once the empty snapshot lands (a swallowed failure
+   * would let the next acquisition resurrect cleared, potentially sensitive
+   * values). The scope stays reset-pending (see pendingDiscards) and refuses
+   * to mount until an acquisition-time retry succeeds.
    */
   async discardScope(scopeKey: string, sessionDir: string): Promise<void> {
     await using _guard = await this.lockFor(scopeKey).acquire();
@@ -895,26 +930,48 @@ export class SandboxHostService {
     if (mount && !mount.isDisposed) {
       mount.dispose();
     }
+    // Pending until the tombstone provably lands; cleared inside the helper.
+    this.pendingDiscards.add(scopeKey);
+    await this.publishDiscardTombstone(journal, scopeKey);
+  }
+
+  /**
+   * Publish the reset tombstone: an EMPTY vars snapshot superseding any
+   * earlier one, so restoration and replay reconstruction agree the scope
+   * was cleared. Clears the scope's reset-pending flag only after the row is
+   * durable. Caller must hold the scope lock.
+   */
+  private async publishDiscardTombstone(
+    journal: DurableEventJournal,
+    scopeKey: string
+  ): Promise<void> {
+    // Only write the empty snapshot when there is prior state to supersede;
+    // otherwise a reset in a sandbox-less workspace would create journal
+    // files for nothing.
+    const events = await journal.read();
+    const hasSnapshot = events.some(
+      (event) => event.kind === "sandbox-vars-snapshot" && event.data.scopeKey === scopeKey
+    );
+    if (!hasSnapshot) {
+      this.pendingDiscards.delete(scopeKey);
+      return;
+    }
+    const { ref } = await journal.publishWithBlob("{}", (blobHash, size) => ({
+      workspaceId: scopeKey,
+      kind: "sandbox-vars-snapshot",
+      data: { scopeKey, blobHash, size },
+    }));
+    this.pendingDiscards.delete(scopeKey);
     try {
-      // Only write the empty snapshot when there is prior state to supersede;
-      // otherwise a reset in a sandbox-less workspace would create journal
-      // files for nothing.
-      const events = await journal.read();
-      const hasSnapshot = events.some(
-        (event) => event.kind === "sandbox-vars-snapshot" && event.data.scopeKey === scopeKey
-      );
-      if (!hasSnapshot) return;
-      const { ref } = await journal.publishWithBlob("{}", (blobHash, size) => ({
-        workspaceId: scopeKey,
-        kind: "sandbox-vars-snapshot",
-        data: { scopeKey, blobHash, size },
-      }));
       // The pre-reset snapshot is superseded like any other: reclaim it now
       // so the per-journal latest-ref state stays true to the journal.
+      // Best-effort — a reclamation failure only delays disk cleanup and
+      // must not fail a reset whose invalidation IS durable.
       await reclaimSupersededSnapshotBlobs(journal, scopeKey, ref);
     } catch (error) {
-      // Never let discard bookkeeping block a context reset.
-      log.warn(`SandboxHostService: vars discard failed for scope ${scopeKey}`, { error });
+      log.debug(`SandboxHostService: post-reset snapshot reclamation failed for ${scopeKey}`, {
+        error,
+      });
     }
   }
 

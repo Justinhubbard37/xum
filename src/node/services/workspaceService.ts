@@ -9899,7 +9899,19 @@ export class WorkspaceService extends EventEmitter {
       // context reset ends that session, so sandbox state is DISCARDED (not
       // snapshotted) — vars must not survive a reset the way they survive
       // archive/un-archive.
-      await sandboxHostService.discardScope(workspaceId, this.config.getSessionDir(workspaceId));
+      try {
+        await sandboxHostService.discardScope(workspaceId, this.config.getSessionDir(workspaceId));
+      } catch (error) {
+        // The chat reset already applied; only the sandbox invalidation
+        // failed. The scope is reset-pending: it refuses to mount (no
+        // resurrection of cleared vars) until an acquisition-time tombstone
+        // retry lands, so surface loudly instead of failing the reset.
+        log.error(
+          `Failed to durably invalidate sandbox state for ${workspaceId} after context reset; ` +
+            `the sandbox kernel stays unavailable until invalidation succeeds`,
+          error
+        );
+      }
 
       return Ok("reset");
     } finally {
