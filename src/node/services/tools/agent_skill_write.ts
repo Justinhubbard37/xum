@@ -3,6 +3,7 @@ import * as path from "path";
 import { tool } from "ai";
 
 import { SkillNameSchema } from "@/common/orpc/schemas";
+import { REFINEMENT_CAPTURE_MAX_FILE_BYTES } from "@/common/types/refinement";
 import type { AgentSkillWriteToolResult } from "@/common/types/tools";
 import { FILE_EDIT_DIFF_OMITTED_MESSAGE } from "@/common/types/tools";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -11,6 +12,7 @@ import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools"
 import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { appendRefinementEventFromTool } from "@/node/services/refinement/refinementJournal";
+import { log } from "@/node/services/log";
 import { readFileString, writeFileString } from "@/node/utils/runtime/helpers";
 import { generateDiff } from "@/node/services/tools/fileCommon";
 import {
@@ -30,6 +32,30 @@ interface AgentSkillWriteToolArgs {
   name: string;
   filePath?: string | null;
   content: string;
+}
+
+/**
+ * Whether an overwrite's prior content may be journaled as a restore inverse.
+ * Same capture discipline as agent_skill_delete: an over-budget prior file
+ * must not be duplicated into the session journal/blob store (repeated
+ * overwrites of repo-controlled skill content could exhaust disk), and a
+ * lossy utf-8 decode (invalid bytes become U+FFFD) would corrupt a binary
+ * prior file on rollback. Skipping journaling never skips the write itself;
+ * files legitimately containing U+FFFD are a rare false positive whose only
+ * cost is an unjournaled overwrite.
+ */
+function isJournalablePriorContent(filePath: string, content: string): boolean {
+  if (Buffer.byteLength(content, "utf-8") > REFINEMENT_CAPTURE_MAX_FILE_BYTES) {
+    log.debug("[agent_skill_write] skipping refinement inverse: capture budget exceeded", {
+      filePath,
+    });
+    return false;
+  }
+  if (content.includes("\uFFFD")) {
+    log.debug("[agent_skill_write] skipping refinement inverse: binary content", { filePath });
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -193,23 +219,30 @@ export const createAgentSkillWriteTool: ToolFactory = (config: ToolConfiguration
           await writeFileString(config.runtime, resolvedTarget.resolvedPath, contentToWrite);
 
           // Refinement journal (RLM r2): row is appended before the write is
-          // acknowledged; failures never fail the tool (self-healing).
-          await appendRefinementEventFromTool(config, {
-            kind: "skill",
-            action: {
-              op: "write",
-              skillName: parsedName.data,
-              filePath: resolvedTarget.normalizedRelativePath,
-            },
-            inverse: fileExisted
-              ? {
-                  op: "restore-files",
-                  files: [{ path: resolvedTarget.resolvedPath, content: originalContent }],
-                }
-              : { op: "delete-files", paths: [resolvedTarget.resolvedPath] },
-            evidence: { toolName: "agent_skill_write", toolCallId },
-            postFiles: [{ path: resolvedTarget.resolvedPath, content: contentToWrite }],
-          });
+          // acknowledged; failures never fail the tool (self-healing). An
+          // unjournalable prior capture skips the row entirely — a delete
+          // inverse in its place would destroy the prior file on rollback.
+          if (
+            !fileExisted ||
+            isJournalablePriorContent(resolvedTarget.resolvedPath, originalContent)
+          ) {
+            await appendRefinementEventFromTool(config, {
+              kind: "skill",
+              action: {
+                op: "write",
+                skillName: parsedName.data,
+                filePath: resolvedTarget.normalizedRelativePath,
+              },
+              inverse: fileExisted
+                ? {
+                    op: "restore-files",
+                    files: [{ path: resolvedTarget.resolvedPath, content: originalContent }],
+                  }
+                : { op: "delete-files", paths: [resolvedTarget.resolvedPath] },
+              evidence: { toolName: "agent_skill_write", toolCallId },
+              postFiles: [{ path: resolvedTarget.resolvedPath, content: contentToWrite }],
+            });
+          }
 
           const diff = generateDiff(resolvedTarget.resolvedPath, originalContent, contentToWrite);
 
@@ -326,23 +359,30 @@ export const createAgentSkillWriteTool: ToolFactory = (config: ToolConfiguration
         await fsPromises.writeFile(resolvedTarget.resolvedPath, contentToWrite, "utf-8");
 
         // Refinement journal (RLM r2): row is appended before the write is
-        // acknowledged; failures never fail the tool (self-healing).
-        await appendRefinementEventFromTool(config, {
-          kind: "skill",
-          action: {
-            op: "write",
-            skillName: parsedName.data,
-            filePath: resolvedTarget.normalizedRelativePath,
-          },
-          inverse: fileExisted
-            ? {
-                op: "restore-files",
-                files: [{ path: resolvedTarget.resolvedPath, content: originalContent }],
-              }
-            : { op: "delete-files", paths: [resolvedTarget.resolvedPath] },
-          evidence: { toolName: "agent_skill_write", toolCallId },
-          postFiles: [{ path: resolvedTarget.resolvedPath, content: contentToWrite }],
-        });
+        // acknowledged; failures never fail the tool (self-healing). An
+        // unjournalable prior capture skips the row entirely — a delete
+        // inverse in its place would destroy the prior file on rollback.
+        if (
+          !fileExisted ||
+          isJournalablePriorContent(resolvedTarget.resolvedPath, originalContent)
+        ) {
+          await appendRefinementEventFromTool(config, {
+            kind: "skill",
+            action: {
+              op: "write",
+              skillName: parsedName.data,
+              filePath: resolvedTarget.normalizedRelativePath,
+            },
+            inverse: fileExisted
+              ? {
+                  op: "restore-files",
+                  files: [{ path: resolvedTarget.resolvedPath, content: originalContent }],
+                }
+              : { op: "delete-files", paths: [resolvedTarget.resolvedPath] },
+            evidence: { toolName: "agent_skill_write", toolCallId },
+            postFiles: [{ path: resolvedTarget.resolvedPath, content: contentToWrite }],
+          });
+        }
 
         const diff = generateDiff(resolvedTarget.resolvedPath, originalContent, contentToWrite);
 

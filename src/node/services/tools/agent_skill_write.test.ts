@@ -6,6 +6,7 @@ import type { MuxToolScope } from "@/common/types/toolScope";
 import { FILE_EDIT_DIFF_OMITTED_MESSAGE } from "@/common/types/tools";
 import type { AgentSkillReadToolResult, AgentSkillWriteToolResult } from "@/common/types/tools";
 import {
+  REFINEMENT_CAPTURE_MAX_FILE_BYTES,
   RefinementEvidenceSchema,
   RefinementInverseSchema,
   SkillRefinementActionSchema,
@@ -26,6 +27,8 @@ import {
   skillMarkdown,
   TEST_GLOBAL_WORKSPACE_ID as GLOBAL_WORKSPACE_ID,
   TestTempDir,
+  writeGlobalSkill,
+  writeProjectSkill,
 } from "./testHelpers";
 
 async function createWriteTool(
@@ -859,6 +862,86 @@ describe("refinement journal", () => {
     expect(await fs.readFile(skillPath, "utf-8")).toBe(updated);
     await applyRefinementInverse(sessionDirOf(tempDir.path), events[1].data.inverse);
     expect(await fs.readFile(skillPath, "utf-8")).toBe(original);
+  });
+
+  it("skips journaling when the prior file exceeds the capture budget", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-write-refinement-budget");
+
+    // Prior file created out-of-band (repo-controlled skill content): its
+    // capture would duplicate over-budget bytes into the journal/blob store
+    // on every overwrite.
+    await writeGlobalSkill(tempDir.path, "demo-skill", {
+      description: "fixture",
+      files: { "references/big.txt": "x".repeat(REFINEMENT_CAPTURE_MAX_FILE_BYTES + 1) },
+    });
+
+    const tool = await createWriteTool(tempDir.path);
+    const result = (await tool.execute!(
+      { name: "demo-skill", filePath: "references/big.txt", content: "trimmed\n" },
+      mockToolCallOptions
+    )) as AgentSkillWriteToolResult;
+
+    // The write itself must still succeed; only journaling is skipped.
+    expect(result.success).toBe(true);
+    const written = path.join(tempDir.path, "skills", "demo-skill", "references", "big.txt");
+    expect(await fs.readFile(written, "utf-8")).toBe("trimmed\n");
+    expect(await readRefinementEvents(sessionDirOf(tempDir.path))).toHaveLength(0);
+  });
+
+  it("skips journaling when the prior file is not valid UTF-8 (binary)", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-write-refinement-binary");
+
+    await writeGlobalSkill(tempDir.path, "demo-skill", { description: "fixture" });
+    const binPath = path.join(tempDir.path, "skills", "demo-skill", "references", "asset.bin");
+    await fs.mkdir(path.dirname(binPath), { recursive: true });
+    // 0xff/0xfe can never round-trip through utf-8; a captured inverse would
+    // restore U+FFFD-corrupted bytes on rollback.
+    await fs.writeFile(binPath, Buffer.from([0xff, 0xfe, 0x00, 0x01]));
+
+    const tool = await createWriteTool(tempDir.path);
+    const result = (await tool.execute!(
+      { name: "demo-skill", filePath: "references/asset.bin", content: "now text\n" },
+      mockToolCallOptions
+    )) as AgentSkillWriteToolResult;
+
+    expect(result.success).toBe(true);
+    expect(await readRefinementEvents(sessionDirOf(tempDir.path))).toHaveLength(0);
+  });
+
+  it("skips journaling oversized prior files on the runtime-backed path", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-write-refinement-budget-runtime");
+    const skillName = "my-skill";
+    const remoteWorkspaceRoot = "/remote/workspace";
+
+    await writeProjectSkill(tempDir.path, skillName, {
+      description: "fixture",
+      files: { "references/big.txt": "x".repeat(REFINEMENT_CAPTURE_MAX_FILE_BYTES + 1) },
+    });
+
+    const remoteRuntime = new RemotePathMappedRuntime(tempDir.path, remoteWorkspaceRoot);
+    const sessionsDir = path.join(tempDir.path, "session-dir");
+    await fs.mkdir(sessionsDir, { recursive: true });
+    const baseConfig = createTestToolConfig(tempDir.path, {
+      workspaceId: "regular-workspace",
+      sessionsDir,
+      runtime: remoteRuntime,
+      muxScope: {
+        type: "project",
+        muxHome: tempDir.path,
+        projectRoot: "/host/project",
+        projectStorageAuthority: "runtime",
+      },
+    });
+    const config = { ...baseConfig, cwd: remoteWorkspaceRoot };
+
+    const tool = createAgentSkillWriteTool(config);
+    const result = (await tool.execute!(
+      { name: skillName, filePath: "references/big.txt", content: "trimmed\n" },
+      mockToolCallOptions
+    )) as AgentSkillWriteToolResult;
+
+    expect(result.success).toBe(true);
+    expect(await readRefinementEvents(sessionsDir)).toHaveLength(0);
   });
 
   it("does not fail the write when the journal is unavailable", async () => {
