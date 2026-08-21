@@ -39,6 +39,7 @@ import {
   TASK_FAMILY_MESSAGE_MAX_CHARS,
   TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS,
   TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES,
+  TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES,
 } from "@/constants/taskMessages";
 import {
   TerminalAttentionStore,
@@ -13261,6 +13262,64 @@ describe("TaskService", () => {
       expect("message" in exhausted.error && exhausted.error.message).toContain("budget");
     }
     expect(sendMessage).toHaveBeenCalledTimes(maxSizeSends);
+  });
+
+  test("the receiver-side ceiling bounds many senders targeting one parent", async () => {
+    // Pair budgets alone let every child spend a full allowance on the same
+    // busy parent; the target ceiling bounds the aggregate across senders.
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-target-budget";
+    const senderCount =
+      TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES / TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES;
+
+    const children = Array.from({ length: senderCount + 1 }, (_, i) =>
+      projectWorkspace(projectPath, `child-${i}`, `child-target-budget-${i}`, {
+        parentWorkspaceId,
+        taskStatus: "running" as const,
+        taskExperiments: { rlm: true },
+      })
+    );
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId, {
+          aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
+        }),
+        ...children,
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    // Each of the first N senders exhausts its own per-pair message count.
+    for (let s = 0; s < senderCount; s++) {
+      for (let i = 0; i < TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES; i++) {
+        const sent = await taskService.sendMessageToParentFromAgentTask(
+          `child-target-budget-${s}`,
+          `update ${s}/${i}`,
+          "tool-end"
+        );
+        expect(sent.success).toBe(true);
+      }
+    }
+    expect(sendMessage).toHaveBeenCalledTimes(TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES);
+
+    // A FRESH sender with an untouched pair budget is still refused: the
+    // receiver's aggregate ceiling is exhausted.
+    const refused = await taskService.sendMessageToParentFromAgentTask(
+      `child-target-budget-${senderCount}`,
+      "fresh sender",
+      "tool-end"
+    );
+    expect(refused.success).toBe(false);
+    if (!refused.success) {
+      expect(refused.error.code).toBe("send_failed");
+    }
+    expect(sendMessage).toHaveBeenCalledTimes(TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES);
   });
 
   test("sibling family messages enforce the aggregate message-count budget", async () => {

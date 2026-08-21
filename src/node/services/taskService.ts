@@ -31,6 +31,8 @@ import {
   TASK_FAMILY_MESSAGE_MAX_CHARS,
   TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS,
   TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES,
+  TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_CHARS,
+  TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES,
 } from "@/constants/taskMessages";
 import { log } from "@/node/services/log";
 import { eventSpine } from "@/node/services/events/eventSpine";
@@ -1341,11 +1343,13 @@ export class TaskService {
   // Bounded by max entries; disk persistence is the source of truth for restart-safety.
   private readonly completedReportsByTaskId = new Map<string, CompletedAgentReportCacheEntry>();
 
-  // Aggregate RLM family-message totals per sender→target pair (see
-  // src/constants/taskMessages.ts for the rationale and limits). In-memory
-  // and process-lifetime by design: the bound protects the live queue and
-  // provider input, and a restart naturally re-arms it.
+  // Aggregate RLM family-message totals per sender→target pair AND per
+  // target across all senders (see src/constants/taskMessages.ts for the
+  // rationale and limits). In-memory and process-lifetime by design: the
+  // bound protects the live queue and provider input, and a restart
+  // naturally re-arms it.
   private readonly familyMessageTotals = new Map<string, { count: number; chars: number }>();
+  private readonly familyMessageTargetTotals = new Map<string, { count: number; chars: number }>();
 
   // Task workspace removals that outlived their termination timeout. Retries must
   // await the ORIGINAL removal outcome: WorkspaceService.remove() short-circuits Ok
@@ -7374,10 +7378,14 @@ export class TaskService {
 
   /**
    * Reserve aggregate family-message budget for one send (per-message caps are
-   * enforced separately by the callers). The check + increment are synchronous
-   * so concurrent sends cannot interleave past the limit; delivery failures
+   * enforced separately by the callers). Two independent ceilings must both
+   * admit the send: the sender→target pair budget (sender fairness) and the
+   * per-target budget across ALL senders (receiver protection — N children
+   * each spending a full pair allowance on one busy parent would otherwise
+   * still grow its queue unboundedly). The check + increment are synchronous
+   * so concurrent sends cannot interleave past a limit; delivery failures
    * refund via the returned function so a flaky target does not burn budget.
-   * Returns null when the sender→target budget is exhausted.
+   * Returns null when either budget is exhausted.
    */
   private reserveFamilyMessageBudget(
     senderWorkspaceId: string,
@@ -7385,23 +7393,34 @@ export class TaskService {
     chars: number
   ): (() => void) | null {
     assert(chars > 0, "reserveFamilyMessageBudget: chars must be positive");
-    const key = `${senderWorkspaceId}\u0000${targetWorkspaceId}`;
-    const totals = this.familyMessageTotals.get(key) ?? { count: 0, chars: 0 };
+    const pairKey = `${senderWorkspaceId}\u0000${targetWorkspaceId}`;
+    const pairTotals = this.familyMessageTotals.get(pairKey) ?? { count: 0, chars: 0 };
+    const targetTotals = this.familyMessageTargetTotals.get(targetWorkspaceId) ?? {
+      count: 0,
+      chars: 0,
+    };
     if (
-      totals.count + 1 > TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES ||
-      totals.chars + chars > TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS
+      pairTotals.count + 1 > TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES ||
+      pairTotals.chars + chars > TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS ||
+      targetTotals.count + 1 > TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES ||
+      targetTotals.chars + chars > TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_CHARS
     ) {
       return null;
     }
-    totals.count += 1;
-    totals.chars += chars;
-    this.familyMessageTotals.set(key, totals);
+    pairTotals.count += 1;
+    pairTotals.chars += chars;
+    this.familyMessageTotals.set(pairKey, pairTotals);
+    targetTotals.count += 1;
+    targetTotals.chars += chars;
+    this.familyMessageTargetTotals.set(targetWorkspaceId, targetTotals);
     let refunded = false;
     return () => {
       if (refunded) return;
       refunded = true;
-      totals.count -= 1;
-      totals.chars -= chars;
+      pairTotals.count -= 1;
+      pairTotals.chars -= chars;
+      targetTotals.count -= 1;
+      targetTotals.chars -= chars;
     };
   }
 

@@ -23,3 +23,15 @@ export const TASK_FAMILY_MESSAGE_MAX_CHARS = 16 * 1024;
  */
 export const TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES = 32;
 export const TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS = 256 * 1024;
+
+/**
+ * Receiver-side aggregate ceilings, independent of sender. The per-pair
+ * budget alone still lets N children each spend a full allowance on the
+ * same busy parent, reproducing the unbounded receiver-queue growth the
+ * quota exists to prevent. One target workspace accepts at most this many
+ * family messages / bytes per process session across ALL senders: 4x the
+ * per-pair budget, sized for a full bench of concurrently chatty children
+ * while keeping the worst-case queue join bounded (~1MB).
+ */
+export const TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES = 128;
+export const TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_CHARS = 1024 * 1024;
