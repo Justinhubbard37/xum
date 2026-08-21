@@ -45,6 +45,7 @@ import type { Config } from "@/node/config";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { buildAbandonedBranchTranscript, isRlmModeEnabled } from "@/node/services/branchSummary";
 import type { HistoryService } from "@/node/services/historyService";
+import { runLanguageModelCleanup } from "@/node/services/languageModelCleanup";
 import { log } from "@/node/services/log";
 import {
   resolveConsolidationProjectPath,
@@ -213,82 +214,91 @@ export class RefineService {
     if (!modelResult.success) {
       return Err(`could not create model ${modelString}: ${modelResult.error.type}`);
     }
+    // From here on the model is live: every exit (success, stream failure,
+    // throw) must release it in the finally below.
+    try {
+      const projectPath = resolveConsolidationProjectPath(workspace);
+      const ctx: MemoryScopeContext = {
+        runtime: null,
+        checkoutCwd: "",
+        workspaceId,
+        projectPath,
+      };
 
-    const projectPath = resolveConsolidationProjectPath(workspace);
-    const ctx: MemoryScopeContext = {
-      runtime: null,
-      checkoutCwd: "",
-      workspaceId,
-      projectPath,
-    };
+      const sessionDir = this.config.getSessionDir(workspaceId);
+      // Baseline BEFORE the pass: rows appended by this run have seq > baseline.
+      // Correlation additionally requires the row's evidence.toolCallId to be
+      // one of this pass's tool calls, so concurrent main-agent self-edits in
+      // the same journal can never be misattributed to the refine pass.
+      const baselineSeq = await this.readMaxJournalSeq(sessionDir);
 
-    const sessionDir = this.config.getSessionDir(workspaceId);
-    // Baseline BEFORE the pass: rows appended by this run have seq > baseline.
-    // Correlation additionally requires the row's evidence.toolCallId to be
-    // one of this pass's tool calls, so concurrent main-agent self-edits in
-    // the same journal can never be misattributed to the refine pass.
-    const baselineSeq = await this.readMaxJournalSeq(sessionDir);
+      const skillWriteTool = await this.buildSkillWriteTool(workspaceId, sessionDir);
 
-    const skillWriteTool = await this.buildSkillWriteTool(workspaceId, sessionDir);
-
-    const result = await runRefinePass({
-      model: modelResult.data.model,
-      memoryService: this.memoryService,
-      metaService: this.metaService,
-      ctx,
-      transcript,
-      timelineText,
-      skillWriteTool,
-      // Hard timeout: a wedged provider stream must not hold the run lock forever.
-      abortSignal: AbortSignal.timeout(this.options.timeoutMs ?? REFINE_TIMEOUT_MS),
-      recordUsage: async (usage, providerMetadata) => {
-        await this.options.sessionUsageService?.recordHeadlessUsage(
-          workspaceId,
-          modelString,
-          usage,
-          providerMetadata,
-          {
-            costsIncluded: modelCostsIncluded(modelResult.data.model),
-            analyticsSource: "refine",
-            metadataModel: modelResult.data.metadataModel,
-          }
+      const result = await runRefinePass({
+        model: modelResult.data.model,
+        memoryService: this.memoryService,
+        metaService: this.metaService,
+        ctx,
+        transcript,
+        timelineText,
+        skillWriteTool,
+        // Hard timeout: a wedged provider stream must not hold the run lock forever.
+        abortSignal: AbortSignal.timeout(this.options.timeoutMs ?? REFINE_TIMEOUT_MS),
+        recordUsage: async (usage, providerMetadata) => {
+          await this.options.sessionUsageService?.recordHeadlessUsage(
+            workspaceId,
+            modelString,
+            usage,
+            providerMetadata,
+            {
+              costsIncluded: modelCostsIncluded(modelResult.data.model),
+              analyticsSource: "refine",
+              metadataModel: modelResult.data.metadataModel,
+            }
+          );
+        },
+      });
+      if (result.streamError !== undefined) {
+        // Edits applied before the failure remain journaled + rollbackable;
+        // point the user at the audit trail instead of hiding them.
+        return Err(
+          `refine stream failed: ${result.streamError} (any applied edits are listed by 'bun run debug refinements ${workspaceId}')`
         );
-      },
-    });
-    if (result.streamError !== undefined) {
-      // Edits applied before the failure remain journaled + rollbackable;
-      // point the user at the audit trail instead of hiding them.
-      return Err(
-        `refine stream failed: ${result.streamError} (any applied edits are listed by 'bun run debug refinements ${workspaceId}')`
+      }
+
+      const applied = await this.collectAppliedEdits(
+        sessionDir,
+        workspaceId,
+        baselineSeq,
+        result.toolCallIds
       );
+      const record: RefineRecord = {
+        applied,
+        summary: result.summary.length > 0 ? result.summary : "Nothing worth distilling.",
+        noOp: applied.length === 0,
+        usage: result.usage,
+      };
+
+      log.debug("[Refine] pass complete", {
+        workspaceId,
+        applied: applied.length,
+        budgetExhausted: result.budgetExhausted,
+        usage: result.usage,
+      });
+
+      // Completion UX: post the labeled summary row ONLY when edits were
+      // applied — a no-op stays out of chat (the invoking toast reports it).
+      if (!record.noOp) {
+        await this.appendSummaryMessage(workspaceId, record);
+      }
+      return Ok(record);
+    } finally {
+      // Providers can attach cleanup hooks (e.g. an OpenAI Responses
+      // WebSocket transport); without this, repeated /refine runs accumulate
+      // live transports. Same posture as the other headless model consumers
+      // (branchSummary, workspaceTitleGenerator).
+      runLanguageModelCleanup(modelResult.data.model);
     }
-
-    const applied = await this.collectAppliedEdits(
-      sessionDir,
-      workspaceId,
-      baselineSeq,
-      result.toolCallIds
-    );
-    const record: RefineRecord = {
-      applied,
-      summary: result.summary.length > 0 ? result.summary : "Nothing worth distilling.",
-      noOp: applied.length === 0,
-      usage: result.usage,
-    };
-
-    log.debug("[Refine] pass complete", {
-      workspaceId,
-      applied: applied.length,
-      budgetExhausted: result.budgetExhausted,
-      usage: result.usage,
-    });
-
-    // Completion UX: post the labeled summary row ONLY when edits were
-    // applied — a no-op stays out of chat (the invoking toast reports it).
-    if (!record.noOp) {
-      await this.appendSummaryMessage(workspaceId, record);
-    }
-    return Ok(record);
   }
 
   /** Newest journal seq, or -1 for a fresh/absent journal. */

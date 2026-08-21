@@ -14,6 +14,7 @@ import { Config } from "@/node/config";
 import { HistoryService } from "@/node/services/historyService";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import { MemoryService } from "@/node/services/memoryService";
+import { attachLanguageModelCleanup } from "@/node/services/languageModelCleanup";
 import { listRefinements, rollbackRefinement } from "./refinementRollback";
 import { RefineService } from "./refineService";
 import { TestTempDir } from "../tools/testHelpers";
@@ -314,6 +315,40 @@ describe("RefineService", () => {
     expect(second.success).toBe(false);
     if (!second.success) expect(second.error).not.toContain("already running");
     expect(fixture.modelCalls).toHaveLength(2);
+  });
+
+  it("releases model resources after successful and failed passes", async () => {
+    // Providers attach cleanup hooks (e.g. WebSocket transports) via
+    // attachLanguageModelCleanup; every pass must release its model or
+    // repeated /refine runs accumulate live transports.
+    let cleanups = 0;
+    const withCleanup = (model: MockLanguageModelV3): MockLanguageModelV3 => {
+      attachLanguageModelCleanup(model, () => {
+        cleanups += 1;
+      });
+      return model;
+    };
+
+    {
+      using fixture = await createFixture({ modelFactory: () => withCleanup(noOpModel()) });
+      await fixture.seedTrajectory();
+      expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
+      expect(cleanups).toBe(1);
+    }
+
+    {
+      // Failure path: the stream errors immediately, and the finally must
+      // still release the model.
+      const failingModel = () =>
+        withCleanup(
+          new MockLanguageModelV3({ doStream: () => Promise.reject(new Error("provider boom")) })
+        );
+      using fixture = await createFixture({ modelFactory: failingModel });
+      await fixture.seedTrajectory();
+      const result = await fixture.service.run(WORKSPACE_ID);
+      expect(result.success).toBe(false);
+      expect(cleanups).toBe(2);
+    }
   });
 
   it("returns a no-op without a model call for an empty trajectory", async () => {
