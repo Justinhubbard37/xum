@@ -474,6 +474,32 @@ describe("AgentPluginInstallService", () => {
     expect(preview.mcpServers[0].summary).toContain("NODE_OPTIONS='--require=./payload.js'");
   });
 
+  test("consent preview discloses the stdio working directory", async () => {
+    // cwd changes relative script/config resolution (prepareStdioLaunch
+    // passes it to the runtime): `node server.js` under cwd=${PLUGIN_DATA}
+    // executes from WRITABLE persistent data, not the reviewed tree — the
+    // consent card must say so.
+    await fsPromises.writeFile(
+      path.join(remoteDir, "mcp.json"),
+      JSON.stringify({
+        $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+        mcpServers: {
+          echo: {
+            type: "stdio",
+            command: "node",
+            args: ["server.js"],
+            cwd: "${PLUGIN_DATA}",
+          },
+        },
+      })
+    );
+    await commitAll(remoteDir, "cwd pointing at plugin data");
+
+    const preview = await service.preview({ input: remoteDir });
+    const dataPath = getPluginDataPath(muxRoot, computePluginInstanceId(preview.targetPath));
+    expect(preview.mcpServers[0].summary).toContain(`cwd: '${dataPath}'`);
+  });
+
   test("failed uninstall registry write restores plugin data over a recreated data dir", async () => {
     const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
     const dataPath = getPluginDataPath(muxRoot, instanceId);

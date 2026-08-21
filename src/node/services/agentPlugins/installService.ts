@@ -1271,13 +1271,24 @@ export class AgentPluginInstallService {
         const envAssignments = Object.entries(info.env ?? {})
           .filter(([key]) => key !== "PLUGIN_ROOT" && key !== "PLUGIN_DATA")
           .map(([key, value]) => `${key}=${shellQuote(rewrite(value))}`);
+        const details: string[] = [];
+        // cwd is execution-relevant too: prepareStdioLaunch passes it to the
+        // runtime, so `node server.js` resolves scripts/configs relative to
+        // it — including from WRITABLE persistent plugin data — and the argv
+        // alone would imply a different resolution (capabilitySurface treats
+        // cwd as consent-relevant for the same reason). The loader defaults
+        // cwd to the plugin root; only a DEVIATION from the reviewed tree
+        // root needs calling out.
+        if (info.cwd !== undefined && rewrite(info.cwd) !== finalTargetPath) {
+          details.push(`cwd: ${shellQuote(rewrite(info.cwd))}`);
+        }
+        if (envAssignments.length > 0) {
+          details.push(`env: ${envAssignments.join(" ")}`);
+        }
         result.push({
           serverName: info.plugin.serverName,
           transport: "stdio",
-          summary:
-            envAssignments.length > 0
-              ? `${commandLine} (env: ${envAssignments.join(" ")})`
-              : commandLine,
+          summary: details.length > 0 ? `${commandLine} (${details.join("; ")})` : commandLine,
         });
       } else {
         result.push({
