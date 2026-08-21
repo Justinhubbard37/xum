@@ -32,16 +32,19 @@ import type { DurableEvent } from "@/common/types/durableEvent";
 import {
   MemoryRefinementActionSchema,
   RefinementInverseSchema,
+  RefinementPostStateSchema,
   RollbackRefinementActionSchema,
   SkillRefinementActionSchema,
   type RefinementInverse,
   type RollbackRefinementAction,
 } from "@/common/types/refinement";
 import { getErrorMessage } from "@/common/utils/errors";
+import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import { sharedDurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { log } from "@/node/services/log";
 import {
   resolveRefinementInverse,
+  sha256Hex,
   type RefinementFileCapture,
   type RefinementInverseDraft,
 } from "./refinementJournal";
@@ -84,6 +87,26 @@ export type RollbackRefinementResult =
 
 /** Expected, recoverable rollback refusals; converted to { success: false }. */
 class RollbackError extends Error {}
+
+/**
+ * Per-session-dir locks serializing the whole read → validate → mutate →
+ * append sequence. Without this, two concurrent rollback calls for the same
+ * row (model tool + debug CLI, or two tool invocations) can both read the
+ * journal before either appends, pass the already-rolled-back check, apply
+ * the same inverse twice, and append duplicate `rollbackOf` rows. Both entry
+ * points go through this module in-process, so a process-wide map suffices.
+ */
+const sessionLocks = new Map<string, AsyncMutex>();
+
+function sessionLock(sessionDir: string): AsyncMutex {
+  const key = path.resolve(sessionDir);
+  let mutex = sessionLocks.get(key);
+  if (mutex === undefined) {
+    mutex = new AsyncMutex();
+    sessionLocks.set(key, mutex);
+  }
+  return mutex;
+}
 
 // ---------------------------------------------------------------------------
 // Confinement: legal self-modification roots
@@ -353,6 +376,41 @@ async function collectDivergence(
       break;
     }
   }
+
+  // Content-exact check via the row's recorded post-action hashes: a manual
+  // or cross-workspace edit after the target row never appears in this
+  // session's journal, so the seq-based scan above cannot see it.
+  complaints.push(...(await collectPostStateDivergence(target)));
+
+  return complaints;
+}
+
+/**
+ * Compare the current contents of every file the target row recorded a
+ * post-action hash for. Rows without a parseable `postState` (written before
+ * the field existed, or rollback rows, which never record it) contribute no
+ * complaints — their expected post-edit contents cannot be reconstructed from
+ * the journal, so the presence-only checks above are the best we can do.
+ */
+async function collectPostStateDivergence(target: RefinementEvent): Promise<string[]> {
+  const postState = RefinementPostStateSchema.safeParse(target.data.postState);
+  if (!postState.success) {
+    return [];
+  }
+  const complaints: string[] = [];
+  for (const file of postState.data.files) {
+    let current: string;
+    try {
+      current = await fsPromises.readFile(file.path, "utf-8");
+    } catch {
+      continue; // Missing files are already reported by the presence checks.
+    }
+    if (sha256Hex(current) !== file.sha256) {
+      complaints.push(
+        `'${file.path}' was modified after the target refinement (current content no longer matches the state it left behind)`
+      );
+    }
+  }
   return complaints;
 }
 
@@ -470,6 +528,9 @@ export async function rollbackRefinement(
   try {
     assert(opts.sessionDir.length > 0, "rollbackRefinement requires a session dir");
     assert(opts.id.length > 0, "rollbackRefinement requires a target row id");
+    // Held across read → validate → mutate → append so concurrent calls for
+    // the same row cannot both pass validation and double-apply the inverse.
+    await using _lock = await sessionLock(opts.sessionDir).acquire();
     const journal = sharedDurableEventJournal(opts.sessionDir);
     const rows = await listRefinements(opts.sessionDir);
 

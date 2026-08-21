@@ -208,6 +208,7 @@ export const createAgentSkillWriteTool: ToolFactory = (config: ToolConfiguration
                 }
               : { op: "delete-files", paths: [resolvedTarget.resolvedPath] },
             evidence: { toolName: "agent_skill_write", toolCallId },
+            postFiles: [{ path: resolvedTarget.resolvedPath, content: contentToWrite }],
           });
 
           const diff = generateDiff(resolvedTarget.resolvedPath, originalContent, contentToWrite);
@@ -340,6 +341,7 @@ export const createAgentSkillWriteTool: ToolFactory = (config: ToolConfiguration
               }
             : { op: "delete-files", paths: [resolvedTarget.resolvedPath] },
           evidence: { toolName: "agent_skill_write", toolCallId },
+          postFiles: [{ path: resolvedTarget.resolvedPath, content: contentToWrite }],
         });
 
         const diff = generateDiff(resolvedTarget.resolvedPath, originalContent, contentToWrite);

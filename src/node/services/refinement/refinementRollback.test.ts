@@ -177,6 +177,63 @@ describe("refinementRollback", () => {
     expect(await fsPromises.readFile(physicalPath, "utf-8")).toBe("v1\n");
   });
 
+  it("refuses when the file was manually edited after the refinement, applies with force", async () => {
+    using fixture = await createFixture();
+    await fixture.service.create(fixture.ctx, "/memories/global/hand.md", "v1\n", "agent");
+    await fixture.service.strReplace(fixture.ctx, "/memories/global/hand.md", "v1", "v2", "agent");
+    const editRow = await lastRow(fixture.sessionDir);
+    const physicalPath = path.join(fixture.muxHome, "memory", "global", "hand.md");
+    // Out-of-band edit (user editor, other workspace): the file still exists,
+    // so presence checks pass — only the recorded postState hash detects it.
+    await fsPromises.writeFile(physicalPath, "manually edited\n", "utf-8");
+
+    const refused = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: editRow.id,
+      evidence: EVIDENCE,
+    });
+    expect(refused.success).toBe(false);
+    if (refused.success) throw new Error("unreachable");
+    expect(refused.error).toContain("modified after the target refinement");
+    // The manual edit is untouched by a refused rollback.
+    expect(await fsPromises.readFile(physicalPath, "utf-8")).toBe("manually edited\n");
+
+    const forced = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: editRow.id,
+      force: true,
+      evidence: EVIDENCE,
+    });
+    expect(forced.success).toBe(true);
+    expect(await fsPromises.readFile(physicalPath, "utf-8")).toBe("v1\n");
+  });
+
+  it("serializes concurrent rollbacks of the same row: one succeeds, one rollbackOf row", async () => {
+    using fixture = await createFixture();
+    await fixture.service.create(fixture.ctx, "/memories/global/race.md", "v1\n", "agent");
+    await fixture.service.strReplace(fixture.ctx, "/memories/global/race.md", "v1", "v2", "agent");
+    const editRow = await lastRow(fixture.sessionDir);
+
+    // Model tool + debug CLI (or two tool invocations) racing on the same row:
+    // without the per-session lock both pass the already-rolled-back check.
+    const opts = { sessionDir: fixture.sessionDir, id: editRow.id, evidence: EVIDENCE };
+    const results = await Promise.all([rollbackRefinement(opts), rollbackRefinement(opts)]);
+
+    const successes = results.filter((result) => result.success);
+    const failures = results.filter((result) => !result.success);
+    expect(successes).toHaveLength(1);
+    expect(failures).toHaveLength(1);
+    if (failures[0].success) throw new Error("unreachable");
+    expect(failures[0].error).toContain("already rolled back");
+
+    const rollbackRows = (await listRefinements(fixture.sessionDir)).filter(
+      (row) => row.data.rollbackOf === editRow.id
+    );
+    expect(rollbackRows).toHaveLength(1);
+    const physicalPath = path.join(fixture.muxHome, "memory", "global", "race.md");
+    expect(await fsPromises.readFile(physicalPath, "utf-8")).toBe("v1\n");
+  });
+
   it("refuses when a later refinement row touched the same path (roll back newest first)", async () => {
     using fixture = await createFixture();
     await fixture.service.create(fixture.ctx, "/memories/global/stack.md", "v1\n", "agent");

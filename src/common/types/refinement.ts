@@ -60,6 +60,20 @@ export const RefinementInverseSchema = z.discriminatedUnion("op", [
 ]);
 export type RefinementInverse = z.infer<typeof RefinementInverseSchema>;
 
+/**
+ * Expected post-action file state, recorded at write time: sha256 of each
+ * file's contents exactly as the action left them. Rollback compares these
+ * hashes against the current files before restoring, so manual or
+ * cross-workspace edits — which never appear in this session's journal — are
+ * detected as divergence. Optional: rows written before this field existed
+ * (and rollback rows, which never record it) fall back to presence-only
+ * divergence checks because their post-edit contents cannot be reconstructed.
+ */
+export const RefinementPostStateSchema = z.object({
+  files: z.array(z.object({ path: z.string().min(1), sha256: z.string().length(64) })),
+});
+export type RefinementPostState = z.infer<typeof RefinementPostStateSchema>;
+
 /** Action payload for `data.kind === "memory"` rows (memory tool commands). */
 export const MemoryRefinementActionSchema = z.object({
   op: z.enum(["create", "str_replace", "insert", "delete", "rename"]),

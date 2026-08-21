@@ -87,6 +87,8 @@ export const RefinementDataSchema = z.object({
   evidence: JsonValueSchema.optional(),
   /** Envelope `id` of the entry this one rolls back. */
   rollbackOf: z.string().optional(),
+  /** Expected post-action file hashes (RefinementPostStateSchema in refinement.ts). */
+  postState: JsonValueSchema.optional(),
 });
 
 /**

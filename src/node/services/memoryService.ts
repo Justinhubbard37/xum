@@ -650,7 +650,8 @@ export class MemoryService extends EventEmitter {
     action: MemoryRefinementAction,
     inverse: RefinementInverseDraft,
     actor: MemoryActor,
-    toolCallId?: string
+    toolCallId?: string,
+    postFiles?: RefinementFileCapture[]
   ): Promise<void> {
     if (!ctx.workspaceId) {
       log.debug("[MemoryService] skipping refinement journal: no workspace session", {
@@ -669,6 +670,7 @@ export class MemoryService extends EventEmitter {
         actor,
         ...(toolCallId !== undefined ? { toolCallId } : {}),
       },
+      ...(postFiles !== undefined ? { postFiles } : {}),
     });
   }
 
@@ -816,7 +818,8 @@ export class MemoryService extends EventEmitter {
           { op: "create", path: toVirtualPath(scope, parsed.relPath) },
           { op: "delete-files", paths: [store.physicalPath(parsed.relPath)] },
           actor,
-          toolCallId
+          toolCallId,
+          [{ path: store.physicalPath(parsed.relPath), content: fileText }]
         );
         await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
         this.emitChange(ctx, scope, parsed.relPath, actor);
@@ -869,7 +872,8 @@ export class MemoryService extends EventEmitter {
             files: [{ path: store.physicalPath(parsed.relPath), content }],
           },
           actor,
-          toolCallId
+          toolCallId,
+          [{ path: store.physicalPath(parsed.relPath), content: updated }]
         );
         await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
         this.emitChange(ctx, scope, parsed.relPath, actor);
@@ -914,7 +918,8 @@ export class MemoryService extends EventEmitter {
             files: [{ path: store.physicalPath(parsed.relPath), content }],
           },
           actor,
-          toolCallId
+          toolCallId,
+          [{ path: store.physicalPath(parsed.relPath), content: updated }]
         );
         await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
         this.emitChange(ctx, scope, parsed.relPath, actor);

@@ -15,12 +15,15 @@
  * (and invertible from) their own acting workspace's log.
  */
 
+import { createHash } from "node:crypto";
+
 import assert from "@/common/utils/assert";
 import {
   REFINEMENT_INLINE_MAX_CHARS,
   type MemoryRefinementAction,
   type RefinementEvidence,
   type RefinementInverse,
+  type RefinementPostState,
   type SkillRefinementAction,
 } from "@/common/types/refinement";
 import type { BlobStore } from "@/node/utils/journal/blobStore";
@@ -47,6 +50,17 @@ export interface RefinementEmitArgs {
   action: MemoryRefinementAction | SkillRefinementAction;
   inverse: RefinementInverseDraft;
   evidence: { toolName: string; toolCallId?: string; actor?: string };
+  /**
+   * Contents the action left on disk (edit-type actions only: create,
+   * str_replace, insert, skill write). Hashed at append into the row's
+   * `postState` so rollback can detect out-of-band edits content-exactly.
+   */
+  postFiles?: RefinementFileCapture[];
+}
+
+/** Shared by the rollback engine to compare current files against `postState`. */
+export function sha256Hex(text: string): string {
+  return createHash("sha256").update(text, "utf-8").digest("hex");
 }
 
 /**
@@ -91,10 +105,25 @@ export async function appendRefinementEvent(args: RefinementEmitArgs): Promise<v
       ...(args.evidence.toolCallId !== undefined ? { toolCallId: args.evidence.toolCallId } : {}),
       ...(args.evidence.actor !== undefined ? { actor: args.evidence.actor } : {}),
     };
+    const postState: RefinementPostState | undefined =
+      args.postFiles !== undefined
+        ? {
+            files: args.postFiles.map((file) => ({
+              path: file.path,
+              sha256: sha256Hex(file.content),
+            })),
+          }
+        : undefined;
     await journal.append({
       workspaceId: args.workspaceId,
       kind: "refinement",
-      data: { kind: args.kind, action: args.action, inverse, evidence },
+      data: {
+        kind: args.kind,
+        action: args.action,
+        inverse,
+        evidence,
+        ...(postState !== undefined ? { postState } : {}),
+      },
     });
   } catch (error) {
     log.debug("[refinement] failed to journal refinement event; continuing", {
