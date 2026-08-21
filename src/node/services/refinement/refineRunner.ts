@@ -102,6 +102,31 @@ function trackToolExecutions(inner: Tool, pending: Set<Promise<unknown>>): Tool 
   };
 }
 
+/**
+ * Sum per-step usage. On an errored stream the SDK's all-steps total resolves
+ * with undefined token counts even though completed steps carry real per-step
+ * usage — this fallback keeps that spend recordable. Undefined-preserving:
+ * a field stays undefined only when no step reported it.
+ */
+function sumStepUsages(steps: Array<{ usage: LanguageModelV2Usage }>): LanguageModelV2Usage {
+  const add = (a: number | undefined, b: number | undefined): number | undefined =>
+    a === undefined && b === undefined ? undefined : (a ?? 0) + (b ?? 0);
+  return steps.reduce<LanguageModelV2Usage>(
+    (total, step) => ({
+      inputTokens: add(total.inputTokens, step.usage.inputTokens),
+      outputTokens: add(total.outputTokens, step.usage.outputTokens),
+      totalTokens: add(total.totalTokens, step.usage.totalTokens),
+      reasoningTokens: add(total.reasoningTokens, step.usage.reasoningTokens),
+      cachedInputTokens: add(total.cachedInputTokens, step.usage.cachedInputTokens),
+    }),
+    {
+      inputTokens: undefined,
+      outputTokens: undefined,
+      totalTokens: undefined,
+    }
+  );
+}
+
 function buildRefineSystemPrompt(hasSkillTool: boolean): string {
   return [
     "You are Mux's refine agent. You are given a recent trajectory (chat transcript, possibly timeline events) of ONE workspace.",
@@ -202,13 +227,27 @@ export async function runRefinePass(args: {
   // True only when the provider stream closed on its own: distinguishes a
   // clean finish (late abort must not fail the pass) from a deadline cutoff.
   let streamDrained = false;
+  // True when the stream SETTLED on its own — drained cleanly OR errored.
+  // Result promises (steps/usage) are safe to await only then: a
+  // deadline-cancelled wedged stream or an abort-ignoring runaway we broke
+  // away from must never be awaited (resuming the SDK's internal drain is
+  // exactly what the deadline machinery prevents).
+  let streamSettled = false;
+  // Set BEFORE the deadline path cancels the reader: cancellation resolves
+  // the pinned read as done, which must not count as the stream settling on
+  // its own (the result block would then wait out its defensive timeout on a
+  // stream that will never deliver).
+  let externallyCancelled = false;
   const reader = stream.fullStream.getReader();
   const consume = (async () => {
     try {
       while (true) {
         const { done, value } = await reader.read();
         if (done) {
-          streamDrained = true;
+          if (!externallyCancelled) {
+            streamDrained = true;
+            streamSettled = true;
+          }
           break;
         }
         // Deadline already fired: stop consuming and tear the stream down.
@@ -220,6 +259,8 @@ export async function runRefinePass(args: {
         }
       }
     } catch (error) {
+      // A thrown read() means the stream errored — settled, not cut off.
+      streamSettled = true;
       streamErrors.push(getErrorMessage(error));
     } finally {
       // Cancel (not just release) on ANY exit so an early break stops the
@@ -254,6 +295,7 @@ export async function runRefinePass(args: {
     // settling. Safe to await: cancel settles promptly even on wedged
     // streams (a pending pull does not block it), and it resolves the pinned
     // read so the consumer exits.
+    externallyCancelled = true;
     await reader.cancel().catch(() => undefined);
     await consume;
     if (streamErrors.length === 0) {
@@ -266,16 +308,40 @@ export async function runRefinePass(args: {
   let usage: RefinePassResult["usage"];
   if (streamErrors.length === 0) {
     summary = (await stream.text).trim();
+  }
+  // Steps/usage are read whenever the stream settled on its own — INCLUDING
+  // error endings: steps completed before a later-step failure billed real
+  // tokens, and skipping the read made that spend vanish from accounting.
+  // An errored stream settles the SDK result promises, so the awaits below
+  // resolve or reject promptly; the timeout race is a defensive bound and
+  // the catch absorbs rejections on streams that errored before any step.
+  if (streamSettled) {
     try {
-      const steps = await stream.steps;
-      toolCallIds = steps.flatMap((step) => step.toolCalls.map((call) => call.toolCallId));
-      // AI SDK 7: top-level `usage` is the all-steps total.
-      const totalUsage = await stream.usage;
-      usage = {
-        inputTokens: totalUsage.inputTokens ?? 0,
-        outputTokens: totalUsage.outputTokens ?? 0,
-      };
-      await args.recordUsage?.(totalUsage, accumulateStepsProviderMetadata(steps));
+      const settled = await Promise.race([
+        // AI SDK 7: top-level `usage` is the all-steps total.
+        Promise.all([stream.steps, stream.usage]),
+        new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 2000)),
+      ]);
+      if (settled !== undefined) {
+        const [steps, totalUsage] = settled;
+        toolCallIds = steps.flatMap((step) => step.toolCalls.map((call) => call.toolCallId));
+        // Errored streams resolve the all-steps total with undefined counts;
+        // completed steps still carry real per-step usage, so fall back to
+        // their sum rather than dropping the spend.
+        const effectiveUsage =
+          totalUsage.inputTokens !== undefined || totalUsage.outputTokens !== undefined
+            ? totalUsage
+            : sumStepUsages(steps);
+        usage = {
+          inputTokens: effectiveUsage.inputTokens ?? 0,
+          outputTokens: effectiveUsage.outputTokens ?? 0,
+        };
+        // Skip recording when nothing was measured (e.g. an error before any
+        // step completed) so zero rows do not pollute the ledger.
+        if (effectiveUsage.inputTokens !== undefined || effectiveUsage.outputTokens !== undefined) {
+          await args.recordUsage?.(effectiveUsage, accumulateStepsProviderMetadata(steps));
+        }
+      }
     } catch {
       usage = undefined;
     }

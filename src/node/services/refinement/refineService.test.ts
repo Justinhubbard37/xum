@@ -134,6 +134,8 @@ async function createFixture(options?: {
   timelineEvents?: Array<{ kind: string; description: string }>;
   /** Shortens the pass deadline (wedged-provider tests). */
   timeoutMs?: number;
+  /** Captures recordHeadlessUsage calls (usage accounting tests). */
+  onHeadlessUsage?: (usage: { inputTokens?: number; outputTokens?: number }) => void;
 }): Promise<Fixture> {
   const tempDir = new TestTempDir("test-refine-service");
   const muxHome = path.join(tempDir.path, "mux-home");
@@ -191,6 +193,20 @@ async function createFixture(options?: {
         emittedMessages.push(message);
       },
       ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+      ...(options?.onHeadlessUsage !== undefined
+        ? {
+            sessionUsageService: {
+              recordHeadlessUsage: (
+                _workspaceId: string,
+                _modelString: string,
+                usage: { inputTokens?: number; outputTokens?: number } | undefined
+              ) => {
+                if (usage) options.onHeadlessUsage!(usage);
+                return Promise.resolve(undefined);
+              },
+            },
+          }
+        : {}),
       timelineService:
         options?.timelineEvents !== undefined
           ? {
@@ -286,6 +302,55 @@ describe("RefineService", () => {
     const third = await fixture.service.run(WORKSPACE_ID);
     expect(third.success).toBe(true);
     expect(fixture.modelCalls).toHaveLength(2);
+  });
+
+  it("records completed-step usage when a later step errors", async () => {
+    // Step 1 completes (tool call + finish with real usage); step 2 errors.
+    // The completed step billed real tokens — the error must not make that
+    // spend vanish from accounting.
+    let streamCount = 0;
+    const errorOnStepTwoModel = () =>
+      new MockLanguageModelV3({
+        doStream: () => {
+          streamCount++;
+          if (streamCount === 1) {
+            return Promise.resolve({
+              stream: simulateReadableStream({
+                chunks: [
+                  {
+                    type: "tool-call",
+                    toolCallId: "usage-step-1",
+                    toolName: "memory",
+                    input: JSON.stringify({
+                      command: "create",
+                      path: LESSON_PATH,
+                      file_text: "Lesson recorded before the provider failure.\n",
+                    }),
+                  },
+                  finishChunk("tool-calls"),
+                ] satisfies LanguageModelV3StreamPart[],
+              }),
+            });
+          }
+          return Promise.reject(new Error("provider exploded on step 2"));
+        },
+      });
+    const usages: Array<{ inputTokens?: number; outputTokens?: number }> = [];
+    using fixture = await createFixture({
+      modelFactory: errorOnStepTwoModel,
+      onHeadlessUsage: (usage) => usages.push(usage),
+    });
+    await fixture.seedTrajectory();
+
+    const result = await fixture.service.run(WORKSPACE_ID);
+    // The pass still fails (edits stay journaled + rollbackable)...
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toContain("refine stream failed");
+    // ...but the completed step's tokens were recorded (finishChunk reports
+    // 10 in / 5 out per step).
+    expect(usages).toHaveLength(1);
+    expect(usages[0].inputTokens).toBeGreaterThan(0);
+    expect(usages[0].outputTokens).toBeGreaterThan(0);
   });
 
   it("does not resolve a cancelled pass while a tool write is still settling", async () => {

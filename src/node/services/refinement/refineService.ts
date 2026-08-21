@@ -88,7 +88,8 @@ export interface RefineAiService {
 
 interface RefineServiceOptions {
   timelineService?: Pick<TimelineService, "list">;
-  sessionUsageService?: SessionUsageService;
+  /** Narrowed to the one member used so tests can pass lightweight fakes. */
+  sessionUsageService?: Pick<SessionUsageService, "recordHeadlessUsage">;
   /** Live-session emission hook so the appended summary row renders immediately. */
   emitChatMessage?: (workspaceId: string, message: MuxMessage) => void;
   /** Test seam: overrides REFINE_TIMEOUT_MS as the pass deadline. */
