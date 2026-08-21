@@ -3,6 +3,7 @@ import * as os from "os";
 import * as path from "path";
 import * as fs from "fs/promises";
 import * as nodeFs from "fs";
+import { Readable } from "stream";
 import { LocalRuntime } from "./LocalRuntime";
 import type { InitLogger, RuntimeStatusEvent } from "./Runtime";
 
@@ -425,6 +426,46 @@ describe("LocalRuntime", () => {
       } finally {
         spy.mockRestore();
         await fs.rm(testFile, { force: true });
+      }
+    });
+
+    it("a caller abort unblocks a stalled readFile and errors the stream", async () => {
+      // r19: a FIFO or blocked network mount stalls before yielding enough
+      // bytes for consumer-side ceilings to cancel; only the caller's abort
+      // (kernel deadline / workspace removal) can unblock the pinned read.
+      const runtime = new LocalRuntime(testDir);
+      let destroyed = false;
+      const stalled = new Readable({
+        read() {
+          // Never pushes: models a FIFO with no writer.
+        },
+        destroy(err, cb) {
+          destroyed = true;
+          cb(err);
+        },
+      });
+      const spy = spyOn(nodeFs, "createReadStream").mockReturnValue(stalled as nodeFs.ReadStream);
+      try {
+        const abort = new AbortController();
+        const reader = runtime.readFile("stalled.fifo", abort.signal).getReader();
+        const pending = reader.read();
+        // Bounded check that the read is actually pinned before aborting.
+        const raced = await Promise.race([
+          pending.then(() => "settled"),
+          Bun.sleep(50).then(() => "pinned"),
+        ]);
+        expect(raced).toBe("pinned");
+
+        abort.abort();
+        try {
+          await pending;
+          expect.unreachable("Aborted read should error, not settle cleanly");
+        } catch (e) {
+          expect(String(e)).toContain("aborted");
+        }
+        expect(destroyed).toBe(true);
+      } finally {
+        spy.mockRestore();
       }
     });
 
