@@ -1006,6 +1006,8 @@ export class MemoryService extends EventEmitter {
       | { command: "create"; path: string; file_text: string }
       | { command: "str_replace"; path: string; old_str: string; new_str: string }
       | { command: "insert"; path: string; insert_line: number; insert_text: string }
+      | { command: "delete"; path: string }
+      | { command: "rename"; path: string; new_path: string }
   ): Promise<{ ok: true } | { ok: false; error: string }> {
     const result = await this.runCommand(async () => {
       const parsed = parseMemoryPath(command.path);
@@ -1041,6 +1043,36 @@ export class MemoryService extends EventEmitter {
           assertWithinFileSizeCap(
             computeInsertUpdate(content, command.insert_line, command.insert_text).updated
           );
+          break;
+        }
+        case "delete": {
+          // Mirrors deletePath: the target must exist (file or directory).
+          const store = await this.resolveStore(ctx, scope, parsed.relPath);
+          const kind = await store.kind(parsed.relPath);
+          if (kind === null) {
+            throw new MemoryCommandError(`No memory file or directory at ${command.path}`);
+          }
+          break;
+        }
+        case "rename": {
+          // Mirrors rename: same-scope only, existing source, free destination.
+          const newParsed = parseMemoryPath(command.new_path);
+          this.requireFilePath(newParsed, command.new_path);
+          if (newParsed.scope !== scope) {
+            throw new MemoryCommandError(
+              `Cannot rename across memory scopes (${scope} -> ${String(newParsed.scope)}); create the file in the target scope instead`
+            );
+          }
+          const store = await this.resolveStore(ctx, scope, parsed.relPath);
+          await store.assertContained(newParsed.relPath);
+          const oldKind = await store.kind(parsed.relPath);
+          if (oldKind === null) {
+            throw new MemoryCommandError(`No memory file or directory at ${command.path}`);
+          }
+          const newKind = await store.kind(newParsed.relPath);
+          if (newKind !== null) {
+            throw new MemoryCommandError(`Destination ${command.new_path} already exists`);
+          }
           break;
         }
       }

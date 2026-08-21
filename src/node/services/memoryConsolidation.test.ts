@@ -414,6 +414,58 @@ describe("consolidation memory tool rails", () => {
     expect(onDisk).toBe(nearCap);
   });
 
+  it("dry-run rejects delete/rename proposals the real handlers would reject", async () => {
+    // Codex round 20: delete/rename skipped staging validation entirely —
+    // deleting a nonexistent path, renaming a missing source, or renaming
+    // onto an existing destination staged and presented for approval, then
+    // failed at apply and consumed the set.
+    using fixture = await createFixture({ dryRun: true });
+    await fsPromises.writeFile(path.join(fixture.globalMemoryDir, "exists-a.md"), "a\n");
+    await fsPromises.writeFile(path.join(fixture.globalMemoryDir, "exists-b.md"), "b\n");
+
+    // Rename onto an existing destination: refused with the real error.
+    const ontoExisting = await execute(fixture.tool, {
+      command: "rename",
+      old_path: "/memories/global/exists-a.md",
+      new_path: "/memories/global/exists-b.md",
+    });
+    expect(ontoExisting.success).toBe(false);
+    if (!ontoExisting.success) expect(ontoExisting.error).toContain("already exists");
+
+    // Rename of a missing source: refused.
+    const missingSource = await execute(fixture.tool, {
+      command: "rename",
+      old_path: "/memories/global/missing.md",
+      new_path: "/memories/global/fresh.md",
+    });
+    expect(missingSource.success).toBe(false);
+
+    // Delete of a nonexistent path: refused.
+    const missingDelete = await execute(fixture.tool, {
+      command: "delete",
+      path: "/memories/global/never-existed.md",
+    });
+    expect(missingDelete.success).toBe(false);
+    if (!missingDelete.success) {
+      expect(missingDelete.error).toContain("No memory file or directory");
+    }
+
+    // Valid delete/rename still stage — and touch nothing on disk.
+    const validRename = await execute(fixture.tool, {
+      command: "rename",
+      old_path: "/memories/global/exists-a.md",
+      new_path: "/memories/global/renamed-a.md",
+    });
+    expect(validRename.success).toBe(true);
+    const validDelete = await execute(fixture.tool, {
+      command: "delete",
+      path: "/memories/global/exists-b.md",
+    });
+    expect(validDelete.success).toBe(true);
+    expect(await pathExists(path.join(fixture.globalMemoryDir, "exists-a.md"))).toBe(true);
+    expect(await pathExists(path.join(fixture.globalMemoryDir, "exists-b.md"))).toBe(true);
+  });
+
   it("journals failed dispatches as unapplied with the error note", async () => {
     using fixture = await createFixture();
     const result = await execute(fixture.tool, {

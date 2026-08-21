@@ -162,8 +162,28 @@ async function validateMutationForStaging(
       });
       return result.ok ? null : result.error;
     }
+    case "delete": {
+      if (input.path == null) return "delete requires 'path'";
+      const result = await memoryService.validateMutation(ctx, {
+        command: "delete",
+        path: input.path,
+      });
+      return result.ok ? null : result.error;
+    }
+    case "rename": {
+      // classifyMutation already required these (same old_path ?? path rule).
+      const oldPath = input.old_path ?? input.path;
+      if (oldPath == null || input.new_path == null) {
+        return "rename requires 'old_path' (or 'path') and 'new_path'";
+      }
+      const result = await memoryService.validateMutation(ctx, {
+        command: "rename",
+        path: oldPath,
+        new_path: input.new_path,
+      });
+      return result.ok ? null : result.error;
+    }
     default:
-      // delete/rename argument shapes are fully validated by classifyMutation.
       return null;
   }
 }
