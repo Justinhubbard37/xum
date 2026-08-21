@@ -196,7 +196,7 @@ export async function reclaimExcessRefinementInverseBlobs(
         resolveLatestSnapshot,
       });
       if (!deletable) continue;
-      await journal.blobs.delete(ref);
+      await journal.deleteBlobUnderLock(ref);
     }
   });
 }

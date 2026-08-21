@@ -141,7 +141,7 @@ export async function reclaimSupersededSnapshotBlobs(
         resolveLatestSnapshot,
       });
       if (!deletable) continue;
-      await journal.blobs.delete(ref);
+      await journal.deleteBlobUnderLock(ref);
     }
   });
 }
@@ -195,7 +195,7 @@ export async function reclaimExcessResultHandleBlobs(
         resolveLatestSnapshot,
       });
       if (!deletable) continue;
-      await journal.blobs.delete(ref);
+      await journal.deleteBlobUnderLock(ref);
     }
   });
 }

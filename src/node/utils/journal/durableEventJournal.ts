@@ -24,7 +24,7 @@ import {
   type DurableEventDraft,
 } from "@/common/types/durableEvent";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
-import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { acquireProcessFileLock, type ProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import { Journal } from "./journal";
 import { BlobStore } from "./blobStore";
 
@@ -111,6 +111,10 @@ export class DurableEventJournal {
   /** In-process leg of the blob lock (fairness + reentrancy assertions);
    * the cross-process leg is the blobs.lock file (see withBlobLock). */
   private readonly blobLock = new AsyncMutex();
+  /** The live blobs.lock handle while withBlobLock runs (one holder at a
+   * time — the mutex serializes in-process callers). Lets critical blob
+   * mutations re-verify cross-process ownership without signature changes. */
+  private activeBlobFileLock: ProcessFileLock | null = null;
   /**
    * Lazily built blob-mention index (see indexBlobMentions), maintained
    * incrementally on append so reclamation passes do O(1) reference lookups
@@ -197,12 +201,44 @@ export class DurableEventJournal {
    */
   async withBlobLock<T>(fn: () => Promise<T>): Promise<T> {
     await using _mutex = await this.blobLock.acquire();
-    await using _fileLock = await acquireProcessFileLock({
+    await using fileLock = await acquireProcessFileLock({
       lockPath: this.blobLockPath,
       timeoutMs: BLOB_LOCK_TIMEOUT_MS,
       label: "blob lock",
     });
-    return await fn();
+    this.activeBlobFileLock = fileLock;
+    try {
+      return await fn();
+    } finally {
+      this.activeBlobFileLock = null;
+    }
+  }
+
+  /**
+   * Re-verify cross-process blob-lock ownership from inside a withBlobLock
+   * section. Defense in depth (round 11): the lock protocol makes wrongful
+   * displacement practically impossible but not provably impossible on
+   * birth-less platforms; critical blob mutations verify immediately before
+   * acting so a displaced holder aborts instead of racing the new owner.
+   */
+  async assertBlobLockOwned(): Promise<void> {
+    assert(
+      this.blobLock.isLocked && this.activeBlobFileLock !== null,
+      "assertBlobLockOwned requires holding withBlobLock"
+    );
+    await this.activeBlobFileLock.assertStillOwned();
+  }
+
+  /**
+   * Delete a blob payload from inside a withBlobLock section, re-verifying
+   * ownership immediately before the irreversible unlink. All reclamation
+   * delete loops MUST use this instead of blobs.delete: a wrongfully
+   * displaced reclaimer could otherwise delete a blob the new lock owner is
+   * concurrently publishing.
+   */
+  async deleteBlobUnderLock(ref: BlobRef): Promise<void> {
+    await this.assertBlobLockOwned();
+    await this.blobs.delete(ref);
   }
 
   /**
@@ -215,6 +251,12 @@ export class DurableEventJournal {
   ): Promise<{ event: DurableEvent; ref: BlobRef; size: number }> {
     return await this.withBlobLock(async () => {
       const { ref, size } = await this.blobs.put(content);
+      // Ownership re-check between put and append (round 11 defense in
+      // depth): if this holder was wrongfully displaced, a reclaimer may
+      // have deleted the just-put blob — appending would then create a row
+      // permanently referencing a missing payload. Abort instead (an
+      // unreferenced orphan blob is harmless).
+      await this.assertBlobLockOwned();
       const event = await this.append(buildDraft(ref, size));
       return { event, ref, size };
     });

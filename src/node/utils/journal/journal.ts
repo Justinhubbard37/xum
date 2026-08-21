@@ -54,6 +54,13 @@ export interface JournalOptions<T> {
    * to keep its blob-mention index verifiably fresh.
    */
   onAppended?: (row: T, sizes: { preAppendFileSize: number; postAppendFileSize: number }) => void;
+  /**
+   * Test seam: awaited between sequence derivation and the pre-write
+   * ownership assertion — the only way to deterministically interleave a
+   * competing writer into an in-flight append (see the displaced-appender
+   * test).
+   */
+  testOnlyBeforeAppendWrite?: () => Promise<void>;
 }
 
 export class Journal<T> {
@@ -64,6 +71,7 @@ export class Journal<T> {
   private readonly getId: (row: T) => string;
   private readonly appendLockTimeoutMs: number;
   private readonly onAppended?: JournalOptions<T>["onAppended"];
+  private readonly testOnlyBeforeAppendWrite?: () => Promise<void>;
   /** Next sequence to assign; null until the file has been scanned once. */
   private nextSeq: number | null = null;
   /**
@@ -86,6 +94,7 @@ export class Journal<T> {
     this.appendLockTimeoutMs = options.appendLockTimeoutMs ?? APPEND_LOCK_TIMEOUT_MS;
     assert(this.appendLockTimeoutMs > 0, "Journal appendLockTimeoutMs must be positive");
     this.onAppended = options.onAppended;
+    this.testOnlyBeforeAppendWrite = options.testOnlyBeforeAppendWrite;
   }
 
   /**
@@ -99,7 +108,7 @@ export class Journal<T> {
       // Cross-process serialization: seq derivation and the write must be one
       // exclusive unit, or a concurrent writer in another process (debug CLI
       // vs live backend) could assign the same sequence number.
-      await using _lock = await acquireProcessFileLock({
+      await using lock = await acquireProcessFileLock({
         lockPath: this.lockPath,
         timeoutMs: this.appendLockTimeoutMs,
         label: "append lock",
@@ -122,6 +131,16 @@ export class Journal<T> {
       const line = JSON.stringify(row);
       assert(!line.includes("\n"), "Journal rows must serialize to a single line");
       const payload = `${separator}${line}\n`;
+      if (this.testOnlyBeforeAppendWrite !== undefined) {
+        await this.testOnlyBeforeAppendWrite();
+      }
+      // Defense in depth (round 11): the lock protocol makes wrongful
+      // displacement of a live holder practically impossible but not provably
+      // impossible on birth-less platforms; verifying ownership immediately
+      // before the write guarantees a displaced holder can never append a
+      // duplicate sequence. Failure throws — callers already tolerate append
+      // failures per the self-healing doctrine.
+      await lock.assertStillOwned();
       await fs.appendFile(this.filePath, payload, "utf-8");
       this.nextSeq = seq + 1;
       const postAppendFileSize = fileSize + Buffer.byteLength(payload, "utf-8");

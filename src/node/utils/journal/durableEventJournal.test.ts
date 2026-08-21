@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import * as fs from "fs/promises";
 import * as path from "path";
@@ -214,6 +214,51 @@ describe("DurableEventJournal", () => {
       data: { handle: "vars.__h1", preview: "p", blobHash, size },
     }));
     expect(await journal.blobs.has(ref)).toBe(true);
+  });
+
+  test("publishWithBlob aborts before appending when blob-lock ownership is lost mid-publish", async () => {
+    using tmp = new DisposableTempDir("durable-journal-test");
+    const journal = new DurableEventJournal(tmp.path);
+    const blobsLockPath = path.join(tmp.path, "blobs.lock");
+    // Hijack the blobs.lock inside the put (i.e. mid-publish, while the lock
+    // is held): models a wrongful displacement, after which a reclaimer may
+    // already have deleted the just-put payload.
+    const originalPut = journal.blobs.put.bind(journal.blobs);
+    const putSpy = spyOn(journal.blobs, "put").mockImplementation(async (content) => {
+      const result = await originalPut(content);
+      await fs.writeFile(blobsLockPath, "424242:hijack", "utf-8");
+      return result;
+    });
+    try {
+      await journal.publishWithBlob("payload", (blobHash, size) => ({
+        workspaceId: "ws-1",
+        kind: "result-handle",
+        data: { handle: "vars.__h1", preview: "p", blobHash, size },
+      }));
+      expect.unreachable("a displaced publisher must abort before appending");
+    } catch (error) {
+      expect(String(error)).toContain("no longer owned");
+    }
+    // No row references the (possibly reclaimed) payload.
+    expect(await journal.read()).toHaveLength(0);
+    putSpy.mockRestore();
+  });
+
+  test("deleteBlobUnderLock refuses to delete after blob-lock ownership is lost", async () => {
+    using tmp = new DisposableTempDir("durable-journal-test");
+    const journal = new DurableEventJournal(tmp.path);
+    const blobsLockPath = path.join(tmp.path, "blobs.lock");
+    await journal.withBlobLock(async () => {
+      const { ref } = await journal.blobs.put("keep-me");
+      await fs.writeFile(blobsLockPath, "424242:hijack", "utf-8");
+      try {
+        await journal.deleteBlobUnderLock(ref);
+        expect.unreachable("a displaced reclaimer must not delete blobs");
+      } catch (error) {
+        expect(String(error)).toContain("no longer owned");
+      }
+      expect(await journal.blobs.has(ref)).toBe(true);
+    });
   });
 
   test("interleaved writers through the shared registry keep seq strictly increasing", async () => {

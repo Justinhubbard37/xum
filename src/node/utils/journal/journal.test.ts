@@ -13,13 +13,18 @@ const RowSchema = z.object({
 });
 type Row = z.infer<typeof RowSchema>;
 
-function makeJournal(dir: string, appendLockTimeoutMs?: number): Journal<Row> {
+function makeJournal(
+  dir: string,
+  appendLockTimeoutMs?: number,
+  testOnlyBeforeAppendWrite?: () => Promise<void>
+): Journal<Row> {
   return new Journal<Row>({
     filePath: path.join(dir, "test.jsonl"),
     schema: RowSchema,
     getSeq: (row) => row.seq,
     getId: (row) => row.id,
     ...(appendLockTimeoutMs !== undefined ? { appendLockTimeoutMs } : {}),
+    ...(testOnlyBeforeAppendWrite !== undefined ? { testOnlyBeforeAppendWrite } : {}),
   });
 }
 
@@ -142,6 +147,36 @@ describe("Journal", () => {
     // Recovery after release: the failed attempt must not poison the counter.
     const row = await journal.append((seq) => ({ seq, id: "c", value: "after" }));
     expect(row.seq).toBe(1);
+  });
+
+  test("a displaced appender aborts before writing a duplicate sequence", async () => {
+    using tmp = new DisposableTempDir("journal-test");
+    const lockPath = path.join(tmp.path, "test.jsonl.lock");
+    const journalB = makeJournal(tmp.path);
+    // The seam models a wrongful displacement of A's held append lock (the
+    // round-11 residual): A's lock vanishes mid-append and B appends with
+    // the SAME derived sequence. A must detect the loss and abort instead
+    // of writing a duplicate-seq row.
+    let hijack = false;
+    const journalA = makeJournal(tmp.path, undefined, async () => {
+      if (!hijack) return;
+      hijack = false;
+      await fs.unlink(lockPath);
+      await journalB.append((seq) => ({ seq, id: "b", value: "b-row" }));
+    });
+    await journalA.append((seq) => ({ seq, id: "a0", value: "a-first" }));
+    hijack = true;
+
+    // Only A has the seam; its second append gets hijacked.
+    try {
+      await journalA.append((seq) => ({ seq, id: "a1", value: "a-second" }));
+      expect.unreachable("a displaced appender must abort before writing");
+    } catch (error) {
+      expect(String(error)).toContain("no longer owned");
+    }
+    const rows = await makeJournal(tmp.path).read();
+    expect(rows.map((r) => r.id)).toEqual(["a0", "b"]);
+    expect(new Set(rows.map((r) => r.seq)).size).toBe(rows.length); // unique seqs
   });
 
   test("append rejects rows that fail schema validation", async () => {
