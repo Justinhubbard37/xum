@@ -16,6 +16,7 @@
  */
 
 import { streamText } from "ai";
+import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { NAME_GEN_PREFERRED_MODELS } from "@/common/constants/nameGeneration";
@@ -37,13 +38,24 @@ import type { AIService } from "./aiService";
 import type { HistoryService } from "./historyService";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { log } from "./log";
+import { modelCostsIncluded } from "./providerModelFactory";
+import type { SessionUsageService } from "./sessionUsageService";
 import { createBranchSummaryMessageId } from "./utils/messageIds";
 
 /** Human-readable marker prefixed to the durable summary row's text. */
 export const BRANCH_SUMMARY_LABEL = "Summary of the abandoned branch:";
 
-/** Structural subset of AIService so tests can pass lightweight fakes. */
-export type BranchSummaryAiService = Pick<AIService, "createModel" | "getWorkspaceMetadata">;
+/**
+ * Structural subset of AIService so tests can pass lightweight fakes.
+ * Pinned-metadata creation (not plain createModel): usage recorded below must
+ * carry the creation-time pricing identity, or a Coder catalog refresh
+ * mid-generation could re-attribute the spend (same rationale as the status
+ * generator and /refine).
+ */
+export type BranchSummaryAiService = Pick<
+  AIService,
+  "createModelWithPinnedMetadata" | "getWorkspaceMetadata"
+>;
 
 /** Send-option experiment flags relevant to RLM gating (subset of ExperimentsSchema). */
 export interface RlmExperimentFlags {
@@ -221,6 +233,20 @@ async function generateAbandonedBranchSummaryText(input: {
   prompt: string;
   timeoutMs: number;
   cancellationSignal?: AbortSignal;
+  /**
+   * Cost telemetry for the side-channel call (mirrors the status generator's
+   * hook): invoked after a cleanly finished stream so this spend reaches
+   * session usage instead of staying invisible.
+   */
+  recordUsage?: (
+    modelString: string,
+    usage: LanguageModelV2Usage,
+    options: {
+      costsIncluded: boolean;
+      providerMetadata?: Record<string, unknown>;
+      metadataModel: string;
+    }
+  ) => Promise<void>;
 }): Promise<string | null> {
   // One shared deadline across all candidates: callers may block on this, so
   // the total wait must stay bounded regardless of how many models fail over.
@@ -245,7 +271,7 @@ async function generateAbandonedBranchSummaryText(input: {
   for (let i = 0; i < maxAttempts; i++) {
     if (abortSignal.aborted) break;
     const modelString = input.candidates[i];
-    const modelResult = await input.aiService.createModel(modelString, undefined, {
+    const modelResult = await input.aiService.createModelWithPinnedMetadata(modelString, {
       agentInitiated: true,
     });
     if (!modelResult.success) {
@@ -261,7 +287,7 @@ async function generateAbandonedBranchSummaryText(input: {
       // No thinking provider options are passed, so the call itself stays
       // thinking-free on top of the thinking-stripped transcript.
       const stream = streamText({
-        model: modelResult.data,
+        model: modelResult.data.model,
         prompt: input.prompt,
         maxOutputTokens: BRANCH_SUMMARY_MAX_OUTPUT_TOKENS,
         abortSignal,
@@ -342,6 +368,33 @@ async function generateAbandonedBranchSummaryText(input: {
         const finishReason = cappedAtLimit
           ? null
           : await Promise.race([stream.finishReason, deadline]);
+        // Usage is recorded ONLY when a real finish part arrived (non-null
+        // finishReason): the stream fully drained, so the SDK's settled usage
+        // promise is safe to read. Capped or deadline-hit paths (including
+        // salvaged partial summaries) must NOT touch stream.usage — like
+        // finishReason above, awaiting it resumes the SDK's internal drain of
+        // a runaway/wedged stream, so that spend stays unrecorded by design.
+        // Recorded even when the text ends up unusable: the tokens were spent.
+        if (finishReason !== null && input.recordUsage) {
+          try {
+            // Timeout guard mirrors the status generator: a slow-settling SDK
+            // promise must not block the fork/edit path behind the deadline.
+            const settled = await Promise.race([
+              Promise.all([stream.usage, stream.providerMetadata]),
+              new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 2000)),
+            ]);
+            if (settled !== undefined) {
+              const [usage, providerMetadata] = settled;
+              await input.recordUsage(modelString, usage, {
+                costsIncluded: modelCostsIncluded(modelResult.data.model),
+                ...(providerMetadata !== undefined ? { providerMetadata } : {}),
+                metadataModel: modelResult.data.metadataModel,
+              });
+            }
+          } catch {
+            // Usage promise rejection must not fail an otherwise good summary.
+          }
+        }
         const text =
           finishReason === "length" || finishReason === null
             ? trimSummaryToBoundary(accumulated)
@@ -358,7 +411,7 @@ async function generateAbandonedBranchSummaryText(input: {
         error: getErrorMessage(error),
       });
     } finally {
-      runLanguageModelCleanup(modelResult.data);
+      runLanguageModelCleanup(modelResult.data.model);
     }
   }
   return null;
@@ -395,6 +448,13 @@ export interface AbandonedBranchSummaryInput {
   experiments?: RlmExperimentFlags;
   /** Machine-override fallback (ExperimentsService/AIService.isExperimentEnabled). */
   isExperimentEnabled?: (experimentId: ExperimentId) => boolean;
+  /**
+   * Cost telemetry sink: the side-channel call bills real tokens, and without
+   * this the spend never reaches session usage or the cost UI. Recorded
+   * against the workspace receiving the summary row (fork target / edited
+   * workspace), same attribution recordHeadlessUsage gives /refine.
+   */
+  sessionUsageService?: Pick<SessionUsageService, "recordHeadlessUsage">;
   /**
    * When set, the summary row is appended only if this message is still the
    * branch's tail at append time (compare-and-append under the history lock).
@@ -459,12 +519,42 @@ export async function maybeAppendAbandonedBranchSummary(
       return null;
     }
 
+    const sessionUsageService = input.sessionUsageService;
     const summaryText = await generateAbandonedBranchSummaryText({
       aiService: input.aiService,
       candidates,
       prompt: buildAbandonedBranchSummaryPrompt(transcript),
       timeoutMs: input.timeoutMs ?? BRANCH_SUMMARY_TIMEOUT_MS,
       cancellationSignal: input.cancellationSignal,
+      ...(sessionUsageService
+        ? {
+            recordUsage: async (
+              modelString: string,
+              usage: LanguageModelV2Usage,
+              options: {
+                costsIncluded: boolean;
+                providerMetadata?: Record<string, unknown>;
+                metadataModel: string;
+              }
+            ) => {
+              // recordHeadlessUsage never throws (cost telemetry must not
+              // fail the feature that spent the tokens). The analytics
+              // sidecar entry matters because this spend produces no
+              // assistant chat row the ETL could otherwise ingest.
+              await sessionUsageService.recordHeadlessUsage(
+                input.workspaceId,
+                modelString,
+                usage,
+                options.providerMetadata,
+                {
+                  costsIncluded: options.costsIncluded,
+                  analyticsSource: "branch_summary",
+                  metadataModel: options.metadataModel,
+                }
+              );
+            },
+          }
+        : {}),
     });
     if (summaryText === null) {
       return null;

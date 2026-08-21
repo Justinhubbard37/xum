@@ -76,13 +76,13 @@ function fakeAiService(
   opts?: { onCreateModel?: () => void }
 ): BranchSummaryAiService {
   return {
-    createModel: (() => {
+    createModelWithPinnedMetadata: ((modelString: string) => {
       opts?.onCreateModel?.();
       if (!model) {
         return Promise.resolve(Err({ type: "api_key_not_found" as const, provider: "anthropic" }));
       }
-      return Promise.resolve(Ok(model));
-    }) as BranchSummaryAiService["createModel"],
+      return Promise.resolve(Ok({ model, metadataModel: modelString }));
+    }) as BranchSummaryAiService["createModelWithPinnedMetadata"],
     getWorkspaceMetadata: (() =>
       Promise.resolve(
         Err("workspace not found")
@@ -313,6 +313,93 @@ describe("maybeAppendAbandonedBranchSummary", () => {
       expect(row.metadata?.uiVisible).toBe(true);
       expect(row.metadata?.muxMetadata?.type).toBe("branch-summary");
       expect(row.metadata?.historySequence).toBeGreaterThanOrEqual(0);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("a completed summary records headless usage against the target workspace", async () => {
+    const { historyService, cleanup } = await createTestHistoryService();
+    try {
+      const usageCalls: Array<{
+        workspaceId: string;
+        modelString: string;
+        usage: { inputTokens?: number; outputTokens?: number };
+        options?: { analyticsSource?: string; metadataModel?: string };
+      }> = [];
+      const appended = await maybeAppendAbandonedBranchSummary({
+        historyService,
+        aiService: fakeAiService(summaryModel("Explored the race; found the fix.")),
+        workspaceId: "ws-usage",
+        abandonedMessages: meatyExchange("usage"),
+        experiments: RLM_ON,
+        sessionUsageService: {
+          recordHeadlessUsage: async (workspaceId, modelString, usage, _metadata, options) => {
+            usageCalls.push({
+              workspaceId,
+              modelString,
+              usage: usage as { inputTokens?: number; outputTokens?: number },
+              options: options as { analyticsSource?: string; metadataModel?: string },
+            });
+            return undefined;
+          },
+        },
+      });
+      expect(appended).not.toBeNull();
+
+      // The side-channel spend was recorded once, against the workspace that
+      // received the summary row, with plausible token counts.
+      expect(usageCalls).toHaveLength(1);
+      expect(usageCalls[0].workspaceId).toBe("ws-usage");
+      expect(usageCalls[0].modelString.length).toBeGreaterThan(0);
+      expect(usageCalls[0].usage.inputTokens).toBeGreaterThan(0);
+      expect(usageCalls[0].usage.outputTokens).toBeGreaterThan(0);
+      expect(usageCalls[0].options?.metadataModel).toBe(usageCalls[0].modelString);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("a deadline-salvaged summary skips usage recording without crashing", async () => {
+    const { historyService, cleanup } = await createTestHistoryService();
+    try {
+      // Streams one complete sentence then stalls forever: the deadline
+      // salvages the text, but the stream never produced a finish part, so
+      // reading the SDK's usage promise would resume draining a wedged
+      // stream. The recorder must simply not be called.
+      const stallingModel = new MockLanguageModelV3({
+        doStream: () =>
+          Promise.resolve({
+            stream: new ReadableStream<LanguageModelV3StreamPart>({
+              start: (controller) => {
+                controller.enqueue({ type: "text-start", id: "t1" });
+                controller.enqueue({
+                  type: "text-delta",
+                  id: "t1",
+                  delta: "Salvageable sentence before the stall.",
+                });
+              },
+            }),
+          }),
+      });
+      let usageRecorded = 0;
+      const appended = await maybeAppendAbandonedBranchSummary({
+        historyService,
+        aiService: fakeAiService(stallingModel),
+        workspaceId: "ws-usage-salvage",
+        abandonedMessages: meatyExchange("usage-salvage"),
+        experiments: RLM_ON,
+        timeoutMs: 150,
+        sessionUsageService: {
+          recordHeadlessUsage: async () => {
+            usageRecorded += 1;
+            return undefined;
+          },
+        },
+      });
+      // The salvage still produced a row; only the usage read is skipped.
+      expect(appended).not.toBeNull();
+      expect(usageRecorded).toBe(0);
     } finally {
       await cleanup();
     }
@@ -762,10 +849,10 @@ describe("branch summary placement on fork/truncate flows", () => {
       });
       const model = summaryModel("A summary that must never land after removal.");
       const gatedAiService: BranchSummaryAiService = {
-        createModel: (async (...createArgs) => {
+        createModelWithPinnedMetadata: (async (...createArgs) => {
           await modelGate;
-          return fakeAiService(model).createModel(...createArgs);
-        }) as BranchSummaryAiService["createModel"],
+          return fakeAiService(model).createModelWithPinnedMetadata(...createArgs);
+        }) as BranchSummaryAiService["createModelWithPinnedMetadata"],
         getWorkspaceMetadata: fakeAiService(model).getWorkspaceMetadata,
       };
 

@@ -188,7 +188,7 @@ describe("AgentSession disposal race conditions", () => {
       appendToHistoryIfTailMatches: writerGuardedAppend,
     } as unknown as HistoryService;
     const gatedAiService = {
-      createModel: async () => {
+      createModelWithPinnedMetadata: async () => {
         await modelGate;
         return Err({ type: "api_key_not_found" as const, provider: "anthropic" });
       },

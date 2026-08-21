@@ -3518,6 +3518,8 @@ export class WorkspaceService extends EventEmitter {
       initStateManager: this.initStateManager,
       workspaceGoalService: this.workspaceGoalService,
       backgroundProcessManager: this.backgroundProcessManager,
+      // Branch-summary side-channel spend recording (edit-resend path).
+      sessionUsageService: this.sessionUsageService,
       onCompactionComplete: (metadata) => {
         this.schedulePostCompactionMetadataRefresh(workspaceId);
         // Compaction marks a long session with accumulated learnings: harvest
@@ -8181,6 +8183,8 @@ export class WorkspaceService extends EventEmitter {
             abandonedMessages: truncateResult.data.removedMessages,
             isExperimentEnabled: (experimentId) => this.isExperimentEnabled(experimentId),
             guardTailMessageId: sourceMessageId,
+            // Side-channel spend must reach session usage / the cost UI.
+            ...(this.sessionUsageService ? { sessionUsageService: this.sessionUsageService } : {}),
           });
         }
 

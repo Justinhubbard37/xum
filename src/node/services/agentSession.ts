@@ -9,6 +9,7 @@ import { eventSpine } from "@/node/services/events/eventSpine";
 import type { Config } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
 import type { HistoryService } from "@/node/services/historyService";
+import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 
@@ -424,6 +425,8 @@ interface AgentSessionOptions {
   telemetryService?: TelemetryService;
   backgroundProcessManager: BackgroundProcessManager;
   workspaceGoalService?: WorkspaceGoalService;
+  /** Cost telemetry sink for headless side-channel calls (branch summaries). */
+  sessionUsageService?: Pick<SessionUsageService, "recordHeadlessUsage">;
   /** When true, skip terminating background processes on dispose/compaction (for bench/CI) */
   keepBackgroundProcesses?: boolean;
   /** Called when compaction completes (e.g., to clear idle compaction pending state) */
@@ -467,6 +470,7 @@ export class AgentSession {
   private readonly initStateManager: InitStateManager;
   private readonly backgroundProcessManager: BackgroundProcessManager;
   private readonly workspaceGoalService?: WorkspaceGoalService;
+  private readonly sessionUsageService?: Pick<SessionUsageService, "recordHeadlessUsage">;
   private readonly keepBackgroundProcesses: boolean;
   private readonly onPostCompactionStateChange?: () => void;
   private readonly emitter = new EventEmitter();
@@ -702,6 +706,7 @@ export class AgentSession {
       telemetryService,
       backgroundProcessManager,
       workspaceGoalService,
+      sessionUsageService,
       keepBackgroundProcesses,
       onCompactionComplete,
       onIdleCompactionOutcome,
@@ -720,6 +725,7 @@ export class AgentSession {
     this.initStateManager = initStateManager;
     this.backgroundProcessManager = backgroundProcessManager;
     this.workspaceGoalService = workspaceGoalService;
+    this.sessionUsageService = sessionUsageService;
     this.keepBackgroundProcesses = keepBackgroundProcesses ?? false;
     this.onPostCompactionStateChange = onPostCompactionStateChange;
 
@@ -2938,6 +2944,8 @@ export class AgentSession {
             typeof this.aiService.isExperimentEnabled === "function"
               ? (experimentId) => this.aiService.isExperimentEnabled(experimentId)
               : undefined,
+          // Side-channel spend must reach session usage / the cost UI.
+          ...(this.sessionUsageService ? { sessionUsageService: this.sessionUsageService } : {}),
         });
         if (branchSummaryMessage) {
           // The renderer just truncated its visible chat; surface the durable
