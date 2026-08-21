@@ -84,6 +84,23 @@ export class BlobStore {
     return buffer === null ? null : buffer.toString("utf-8");
   }
 
+  /**
+   * Delete a blob (idempotent — missing blobs are a no-op). Callers own the
+   * safety argument: content addressing means a hash can be shared by every
+   * event that stored identical content, so delete only refs proven
+   * unreferenced (e.g. superseded vars snapshots after a journal scan).
+   */
+  async delete(ref: BlobRef): Promise<void> {
+    this.assertValidRef(ref);
+    try {
+      await fs.unlink(this.pathFor(ref));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw error;
+      }
+    }
+  }
+
   async has(ref: BlobRef): Promise<boolean> {
     this.assertValidRef(ref);
     try {

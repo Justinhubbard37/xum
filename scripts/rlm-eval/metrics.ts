@@ -109,11 +109,25 @@ export function extractMetrics(sessionDir: string): CellMetrics {
     }
   }
 
-  // chat.jsonl: tool-call counts + assistant text grouped by user turn
+  // Chat history: tool-call counts + assistant text grouped by user turn.
+  // Compaction rotates pre-boundary turns into chat-archive.jsonl (full
+  // history = archive ++ active), so read both in order — scanning only
+  // chat.jsonl would drop earlier answers/tool calls from compacted cells.
+  const chatRows = [
+    ...readJsonl(path.join(sessionDir, "chat-archive.jsonl")),
+    ...readJsonl(path.join(sessionDir, "chat.jsonl")),
+  ];
   let currentTurnText: string[] | null = null;
-  for (const row of readJsonl(path.join(sessionDir, "chat.jsonl"))) {
+  for (const row of chatRows) {
     if (!isRecord(row)) continue;
     const msg = row as ChatMessage;
+    // RLM keep-recent floor re-appends sanitized COPIES of preserved-tail
+    // messages after the boundary; the originals are already counted, so
+    // counting the copies would double tool calls and text.
+    {
+      const meta = (row as Record<string, unknown>).metadata;
+      if (isRecord(meta) && meta.rlmPreservedTailCopy === true) continue;
+    }
     if (msg.role === "user") {
       currentTurnText = [];
       metrics.assistantTextPerTurn.push("");

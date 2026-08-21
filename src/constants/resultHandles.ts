@@ -36,3 +36,13 @@ export function buildHandlePreview(serialized: string, size: number): string {
  * value, so eviction only trades guest-local convenience for bounded state.
  */
 export const RESULT_HANDLE_VARS_CAP_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Hard budget for one serialized vars snapshot (counts ALL vars, not just
+ * managed handles/loads — guest-authored keys are guest-writable and
+ * otherwise unbounded). Exceeding it fails the persist: the mount is
+ * disposed and the next call restores the last durable snapshot, so an
+ * over-budget namespace can never reach disk. 2x the handle retention cap
+ * leaves ample room for legitimate working state.
+ */
+export const VARS_SNAPSHOT_MAX_BYTES = 8 * 1024 * 1024;

@@ -13,6 +13,7 @@ import type { ToolBridge } from "@/node/services/ptc/toolBridge";
 import type { IJSRuntime, IJSRuntimeFactory } from "@/node/services/ptc/runtime";
 import type { PTCConsoleRecord, PTCEvent, PTCExecutionResult } from "@/node/services/ptc/types";
 import type { SandboxMount } from "@/node/services/sandbox/sandboxHostService";
+import { VarsSnapshotBudgetError } from "@/node/services/sandbox/sandboxHostService";
 import type { KernelFileLoader } from "@/node/services/tools/kernelFileLoad";
 
 import { analyzeCode } from "@/node/services/ptc/staticAnalysis";
@@ -218,7 +219,14 @@ function collectNewLoadKeys(result: PTCExecutionResult, loadActive: boolean): st
  */
 function compactKernelToolCallRecords(result: PTCExecutionResult, loadActive: boolean): void {
   result.toolCalls = result.toolCalls.map((record) => {
-    if (loadActive && record.toolName === "load") return record;
+    // Load records keep their result ({key, bytes, lines, preview} — bounded
+    // by construction: parseLoadArgs caps the key, the preview is capped
+    // host-side), but their ARGS are still guest-supplied: a rejected call's
+    // record can carry an unbounded key/path, so bound them like every other
+    // record.
+    if (loadActive && record.toolName === "load") {
+      return { ...record, args: boundCompactRecordArgs(record.args) };
+    }
     let bytes = 0;
     if (record.result !== undefined) {
       try {
@@ -568,15 +576,24 @@ ${xumTypes}
             try {
               await mount.persistVars();
             } catch (persistError) {
-              // Vars became unsnapshottable (e.g. guest created a cycle then
-              // threw). Leaving the live mount would make memory and disk
+              // Vars became unsnapshottable (cycle) or exceeded the snapshot
+              // budget. Leaving the live mount would make memory and disk
               // permanently disagree; dispose it so the next acquire rebuilds
               // from the last durable snapshot. Never mask the eval result
-              // with a snapshot error.
+              // with a snapshot error — but DO tell the model via a console
+              // record when its own state was the cause, so it can trim vars
+              // instead of silently losing this call's mutations.
               log.warn(
                 "code_execution: vars snapshot failed; disposing mount so the next call restores the last durable snapshot",
                 { persistError }
               );
+              if (persistError instanceof VarsSnapshotBudgetError) {
+                result.consoleOutput.push({
+                  level: "warn",
+                  args: [`[kernel] ${persistError.message}`],
+                  timestamp: Date.now(),
+                });
+              }
               mount.dispose();
             }
           }

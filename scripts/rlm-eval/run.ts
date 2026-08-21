@@ -54,12 +54,19 @@ function parseArgs(argv: string[]): CliArgs {
     console.error("Required: --base-url <sandbox backend url> --root <sandbox MUX_ROOT>");
     process.exit(1);
   }
+  // A malformed --seeds (0, negative, NaN) would run zero cells and exit 0,
+  // making a typo look like a valid empty experiment.
+  const seeds = Number(get("--seeds") ?? "2");
+  if (!Number.isInteger(seeds) || seeds <= 0) {
+    console.error(`--seeds must be a positive integer, got '${get("--seeds")}'`);
+    process.exit(1);
+  }
   return {
     baseUrl: baseUrl.replace(/\/$/, ""),
     root,
     model: get("--model") ?? "anthropic:claude-haiku-4-5",
     thinking: get("--thinking") ?? "off",
-    seeds: Number(get("--seeds") ?? "2"),
+    seeds,
     scenarios: (get("--scenarios") ?? SCENARIOS.map((s) => s.id).join(",")).split(","),
     configs: (get("--configs") ?? CONFIGS.map((c) => c.id).join(",")).split(","),
     out: get("--out") ?? "/tmp/rlm-eval-results.jsonl",

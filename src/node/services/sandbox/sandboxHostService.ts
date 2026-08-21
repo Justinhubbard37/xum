@@ -22,6 +22,7 @@
  */
 
 import assert from "node:assert";
+import type { BlobRef } from "@/common/types/durableEvent";
 import type { IJSRuntime, IJSRuntimeFactory } from "@/node/services/ptc/runtime";
 import { resolveCapabilityGrants, type CapabilityGrants } from "@/common/types/capabilityGrants";
 import {
@@ -35,7 +36,68 @@ import {
   buildHandlePreview,
   RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES,
   RESULT_HANDLE_VARS_CAP_BYTES,
+  VARS_SNAPSHOT_MAX_BYTES,
 } from "@/constants/resultHandles";
+
+/**
+ * Thrown when a vars snapshot exceeds VARS_SNAPSHOT_MAX_BYTES. A distinct
+ * class so code_execution can surface a targeted "trim your vars" notice to
+ * the model instead of a generic snapshot failure.
+ */
+export class VarsSnapshotBudgetError extends Error {
+  constructor(sizeBytes: number) {
+    super(
+      `vars snapshot is ${sizeBytes} bytes, exceeding the ${VARS_SNAPSHOT_MAX_BYTES}-byte budget; ` +
+        `state was NOT persisted — remove or shrink large vars entries`
+    );
+    this.name = "VarsSnapshotBudgetError";
+  }
+}
+
+/**
+ * Delete blob payloads of superseded vars snapshots for one scope. A blob is
+ * reclaimable only when (a) it is not the latest snapshot and (b) no OTHER
+ * journal event references its hash — content addressing means identical
+ * content shares one blob (e.g. a result-handle that stored the same bytes),
+ * and deleting a shared payload would corrupt that other event. The reference
+ * check is a generic serialized-containment scan so every current and future
+ * event kind that embeds a blob hash is honored without maintaining a
+ * per-kind field list; 64-hex-char hashes make false positives a
+ * non-concern (a false positive merely retains a blob).
+ */
+async function reclaimSupersededSnapshotBlobs(
+  journal: DurableEventJournal,
+  scopeKey: string,
+  latestRef: BlobRef
+): Promise<void> {
+  const events = await journal.read();
+  const superseded = new Set<BlobRef>();
+  for (const event of events) {
+    if (
+      event.kind === "sandbox-vars-snapshot" &&
+      event.data.scopeKey === scopeKey &&
+      event.data.blobHash !== latestRef
+    ) {
+      superseded.add(event.data.blobHash);
+    }
+  }
+  if (superseded.size === 0) return;
+
+  for (const event of events) {
+    if (superseded.size === 0) break;
+    // Superseded snapshot rows of THIS scope are exactly what we are
+    // reclaiming; every other event keeps its references alive.
+    if (event.kind === "sandbox-vars-snapshot" && event.data.scopeKey === scopeKey) continue;
+    const serialized = JSON.stringify(event);
+    for (const hash of superseded) {
+      if (serialized.includes(hash)) superseded.delete(hash);
+    }
+  }
+
+  for (const hash of superseded) {
+    await journal.blobs.delete(hash);
+  }
+}
 
 export type SandboxMountLifetime = "ephemeral" | "persistent";
 
@@ -203,6 +265,15 @@ export class SandboxMount {
       "persistVars is only available on persistent mounts with a session dir"
     );
     const varsJson = await this.snapshotVars();
+    // Hard per-snapshot budget over ALL vars: retention only manages handle
+    // and load keys, but every key is guest-writable — without this bound a
+    // guest storing large changing values would grow the blob store without
+    // limit. Callers dispose the mount on failure, so the next acquire
+    // restores the last durable (in-budget) snapshot.
+    const sizeBytes = Buffer.byteLength(varsJson, "utf8");
+    if (sizeBytes > VARS_SNAPSHOT_MAX_BYTES) {
+      throw new VarsSnapshotBudgetError(sizeBytes);
+    }
     await this.persistSnapshot(varsJson);
   }
 
@@ -506,6 +577,16 @@ export class SandboxHostService {
           kind: "sandbox-vars-snapshot",
           data: { scopeKey, blobHash: ref, size },
         });
+        // Reclaim superseded snapshot blobs: only the LATEST snapshot per
+        // scope is ever restored, so older versions are pure disk growth
+        // (per-call persistence would otherwise retain every unique vars
+        // version for the life of the session). Failure must never fail the
+        // persist — reclamation is best-effort bookkeeping.
+        try {
+          await reclaimSupersededSnapshotBlobs(journal, scopeKey, ref);
+        } catch (error) {
+          log.debug("SandboxHostService: snapshot blob reclamation failed; continuing", { error });
+        }
       },
       lock,
       options.bridgeKey,

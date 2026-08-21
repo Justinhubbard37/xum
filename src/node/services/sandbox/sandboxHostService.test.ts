@@ -12,7 +12,8 @@ import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { ToolBridge } from "@/node/services/ptc/toolBridge";
 import { FULL_GRANTS, LEAST_PRIVILEGE_GRANTS } from "@/common/types/capabilityGrants";
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
-import { SandboxHostService } from "./sandboxHostService";
+import { SandboxHostService, VarsSnapshotBudgetError } from "./sandboxHostService";
+import { VARS_SNAPSHOT_MAX_BYTES } from "@/constants/resultHandles";
 
 const runtimeFactory = new QuickJSRuntimeFactory();
 
@@ -100,6 +101,84 @@ describe("SandboxHostService", () => {
     expect(read.success).toBe(true);
     expect(read.result).toEqual({ hits: [1, 2, 3], query: "foo" });
     await host2.disposeScope("ws-restart");
+  });
+
+  test("persistVars rejects an over-budget vars namespace (nothing reaches disk)", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const host = new SandboxHostService();
+    const mount = await host.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-budget",
+      sessionDir: tmp.path,
+    });
+
+    // All vars count against the budget — not just managed handle/load keys.
+    const oversize = VARS_SNAPSHOT_MAX_BYTES + 16;
+    const write = await mount.runtime.eval(`vars.big = "x".repeat(${oversize}); return true;`);
+    expect(write.success).toBe(true);
+
+    let thrown: unknown;
+    try {
+      await mount.persistVars();
+      expect.unreachable("persistVars must reject an over-budget snapshot");
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(VarsSnapshotBudgetError);
+
+    // The rejected snapshot must not have been journaled or blobbed.
+    const journal = new DurableEventJournal(tmp.path);
+    const events = await journal.read();
+    expect(events.filter((e) => e.kind === "sandbox-vars-snapshot")).toHaveLength(0);
+    await host.dropScope("ws-budget");
+  });
+
+  test("superseded snapshot blobs are reclaimed; referenced blobs survive", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const host = new SandboxHostService();
+    const mount = await host.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-reclaim",
+      sessionDir: tmp.path,
+    });
+    const journal = new DurableEventJournal(tmp.path);
+    const snapshotRefs = async () => {
+      const events = await journal.read();
+      return events
+        .filter((e) => e.kind === "sandbox-vars-snapshot")
+        .map((e) => (e.data as { blobHash: string }).blobHash);
+    };
+
+    await mount.runtime.eval('vars.state = "one"; return true;');
+    await mount.persistVars();
+    const [firstRef] = await snapshotRefs();
+    expect(await journal.blobs.has(firstRef as never)).toBe(true);
+
+    // A second, different snapshot supersedes the first: per-call
+    // persistence must not retain every historical vars version on disk.
+    await mount.runtime.eval('vars.state = "two"; return true;');
+    await mount.persistVars();
+    const refs = await snapshotRefs();
+    expect(refs).toHaveLength(2);
+    expect(await journal.blobs.has(firstRef as never)).toBe(false);
+    expect(await journal.blobs.has(refs[1] as never)).toBe(true);
+
+    // A superseded hash referenced by ANOTHER event kind must survive
+    // (content addressing can share payloads across events): reference the
+    // CURRENT latest snapshot, then supersede it — reclamation must skip it.
+    const secondRef = refs[1];
+    await journal.append({
+      workspaceId: "ws-reclaim",
+      kind: "result-handle",
+      data: { handle: "vars.__h1", preview: "shared", blobHash: secondRef, size: 1 },
+    });
+    await mount.runtime.eval('vars.state = "three"; return true;');
+    await mount.persistVars();
+    expect(await journal.blobs.has(secondRef as never)).toBe(true);
+
+    await host.disposeScope("ws-reclaim");
   });
 
   test("host→guest events: queue + drain via drainHostEvents()", async () => {

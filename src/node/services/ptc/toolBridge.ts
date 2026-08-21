@@ -67,6 +67,15 @@ function extractAdmissionHandle(result: unknown): TaskSpawnAdmissionHandle {
 }
 
 /**
+ * Hard cap on a xum.load vars key. Keys are variable names; load records are
+ * exempt from kernel record compaction (their summaries are bounded by
+ * construction), so an unbounded key (e.g. `key: vars.large`) would ride the
+ * exemption straight into model context. 128 bytes is generous for any real
+ * identifier.
+ */
+export const LOAD_KEY_MAX_BYTES = 128;
+
+/**
  * Validate mux.load arguments. Manual (no Zod): load is a hand-authored
  * kernel member with no backing tool schema, mirroring task_spawn's style.
  */
@@ -79,6 +88,11 @@ function parseLoadArgs(args: unknown): { path: string; key: string } {
   }
   if (typeof key !== "string" || key.length === 0) {
     throw new Error("Invalid arguments for load: key must be a non-empty string");
+  }
+  if (Buffer.byteLength(key, "utf8") > LOAD_KEY_MAX_BYTES) {
+    throw new Error(
+      `Invalid arguments for load: key exceeds ${LOAD_KEY_MAX_BYTES} bytes (use a short variable name)`
+    );
   }
   // __-prefixed vars keys are reserved kernel bookkeeping (__hN handles,
   // __handleSeq) — a load must not clobber them.
