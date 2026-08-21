@@ -696,8 +696,12 @@ export class AgentPluginInstallService {
             ? JSON.stringify({
                 transport: "stdio",
                 argv: [info.command, ...(info.args ?? [])].map(normalize),
+                // Sorted: env is an unordered map, so a mere property
+                // reordering upstream must not read as a capability change.
                 env: Object.fromEntries(
-                  Object.entries(info.env ?? {}).map(([key, value]) => [key, normalize(value)])
+                  Object.entries(info.env ?? {})
+                    .map(([key, value]): [string, string] => [key, normalize(value)])
+                    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
                 ),
                 // cwd changes relative module/config resolution (e.g. plugin
                 // root → writable PLUGIN_DATA), so it is consent-relevant.

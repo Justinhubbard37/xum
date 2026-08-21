@@ -267,6 +267,46 @@ describe("MCPServerManager", () => {
     expect(Object.keys(second.tools)).toHaveLength(1);
   });
 
+  test("workspace removal landing during the invalidation scan never publishes the started servers", async () => {
+    const workspaceId = "ws-removal-race";
+    const pluginKey = "plugin:abc123:echo";
+    configService.listServers.mockImplementation(() =>
+      Promise.resolve({ [pluginKey]: stdioConfig("node server.js") })
+    );
+
+    // Same one-shot iterator hook as the invalidation race above, but the
+    // queued call is a removal-style stopServers(workspaceId): it bumps the
+    // stop epoch AFTER the pre-publication epoch check ran and finds no cache
+    // entry to close (publication hasn't happened) — publishing anyway would
+    // resurrect MCP processes for a removed workspace until idle cleanup.
+    const close = mock(() => Promise.resolve(undefined));
+    let stopPromise: Promise<void> | undefined;
+    const instances = new Map<string, unknown>([[pluginKey, testInstance(pluginKey, { close })]]);
+    let armed = true;
+    const originalIterator = instances[Symbol.iterator].bind(instances);
+    instances[Symbol.iterator] = () => {
+      if (armed) {
+        armed = false;
+        queueMicrotask(() => {
+          stopPromise = manager.stopServers(workspaceId);
+        });
+      }
+      return originalIterator();
+    };
+
+    access.startServers = () =>
+      Promise.resolve({ instances, failedServerNames: [], timedOutServerNames: [] });
+
+    const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(stopPromise).toBeDefined();
+    await stopPromise;
+
+    // Publication was skipped and the late clients were closed.
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(Object.keys(result.tools)).toEqual([]);
+    expect(access.workspaceServers.has(workspaceId)).toBe(false);
+  });
+
   test("stopServersWithKeyPrefix closes only matching instances and retries them on next use", async () => {
     const workspaceId = "ws-selective-stop";
     const pluginKey = "plugin:abc123:echo";

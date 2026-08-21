@@ -97,18 +97,17 @@ const MAX_LENGTH_ITEM: AgentPluginListItem = {
   mcpServerCount: 0,
 };
 
-const PluginsSectionStoryShell: FC<{ options: MockORPCClientOptions; children: ReactNode }> = ({
-  options,
-  children,
-}) => {
+const PluginsSectionStoryShell: FC<{ options: MockORPCClientOptions; children: ReactNode }> = (
+  props
+) => {
   const clientRef = useRef<APIClient | null>(null);
-  clientRef.current ??= createMockORPCClient(options);
+  clientRef.current ??= createMockORPCClient(props.options);
 
   return (
     <ThemeProvider>
       <TooltipProvider>
         <APIProvider client={clientRef.current}>
-          <ExperimentsProvider>{children}</ExperimentsProvider>
+          <ExperimentsProvider>{props.children}</ExperimentsProvider>
         </APIProvider>
       </TooltipProvider>
     </ThemeProvider>

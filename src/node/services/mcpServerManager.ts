@@ -1984,12 +1984,20 @@ export class MCPServerManager {
       // happens inside the stable-clock callback so no invalidation can land
       // between the final scan and workspaceServers.set (see
       // closeInvalidatedInstancesThenPublish).
-      let entry!: WorkspaceServers;
+      let entry: WorkspaceServers | undefined;
       await this.closeInvalidatedInstancesThenPublish(
         instances,
         startupEpoch,
         workspaceId,
         (invalidatedKeys) => {
+          // Recheck the removal-stop epoch INSIDE the synchronous publication
+          // callback: a stopServers(workspaceId) landing while the awaited
+          // invalidation scan yielded found no cache entry to close, so
+          // publishing now would resurrect processes for a removed workspace
+          // until idle cleanup. Skip publication; the late close runs below.
+          if ((this.workspaceStopEpochs.get(workspaceId) ?? 0) !== stopEpochBefore) {
+            return;
+          }
           entry = {
             configSignature: signature,
             instances,
@@ -2002,6 +2010,19 @@ export class MCPServerManager {
           this.workspaceServers.set(workspaceId, entry);
         }
       );
+      if (entry === undefined) {
+        for (const instance of instances.values()) {
+          try {
+            await instance.close();
+          } catch (error) {
+            log.warn("Failed to stop late MCP server for removed workspace", {
+              error,
+              name: instance.name,
+            });
+          }
+        }
+        return { tools: {}, toolServerNames: {}, stats, promptDescriptors: [] };
+      }
 
       // Repair first so the awaited refresh never queries a server revoked
       // during startup, then again after it so mutations landing during the

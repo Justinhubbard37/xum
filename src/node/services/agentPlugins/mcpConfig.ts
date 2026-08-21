@@ -74,14 +74,22 @@ export function isCanonicalPluginServerKeyPrefix(prefix: string): boolean {
   return CANONICAL_PLUGIN_KEY_PREFIX_PATTERN.test(prefix);
 }
 
-function collectPluginOverrideKeys(overrides: WorkspaceMCPOverrides): Set<string> {
-  return new Set(
-    [
-      ...(overrides.enabledServers ?? []),
-      ...(overrides.disabledServers ?? []),
-      ...Object.keys(overrides.toolAllowlist ?? {}),
-    ].filter((key) => key.startsWith(PLUGIN_SERVER_KEY_PREFIX))
-  );
+/**
+ * Plugin keys PER FIELD, not collapsed into one set: a stale key that only
+ * survives in toolAllowlist (e.g. a removed unmanaged dir's old tool
+ * selection) must not make that key's NEW appearance in enabledServers look
+ * like a no-op — enabling is the consent-relevant action.
+ */
+function collectPluginOverrideKeysByField(
+  overrides: WorkspaceMCPOverrides
+): Record<"enabledServers" | "disabledServers" | "toolAllowlist", Set<string>> {
+  const pluginKeys = (keys: readonly string[]): Set<string> =>
+    new Set(keys.filter((key) => key.startsWith(PLUGIN_SERVER_KEY_PREFIX)));
+  return {
+    enabledServers: pluginKeys(overrides.enabledServers ?? []),
+    disabledServers: pluginKeys(overrides.disabledServers ?? []),
+    toolAllowlist: pluginKeys(Object.keys(overrides.toolAllowlist ?? {})),
+  };
 }
 
 /**
@@ -105,10 +113,18 @@ export function buildAddedPluginKeyValidator(
   listDiscoveredPluginServerKeys: () => Promise<Set<string>>
 ): (current: WorkspaceMCPOverrides, incoming: WorkspaceMCPOverrides) => Promise<void> {
   return async (current, incoming) => {
-    const currentKeys = collectPluginOverrideKeys(current);
-    const addedKeys = [...collectPluginOverrideKeys(incoming)].filter(
-      (key) => !currentKeys.has(key)
-    );
+    // Additions are computed PER FIELD so a key already present in one field
+    // (say a stale toolAllowlist entry) still validates when it newly enters
+    // another (enabledServers — the consent-relevant one).
+    const currentByField = collectPluginOverrideKeysByField(current);
+    const incomingByField = collectPluginOverrideKeysByField(incoming);
+    const addedKeys = [
+      ...new Set(
+        (Object.keys(incomingByField) as Array<keyof typeof incomingByField>).flatMap((field) =>
+          [...incomingByField[field]].filter((key) => !currentByField[field].has(key))
+        )
+      ),
+    ];
     if (addedKeys.length === 0) {
       return;
     }

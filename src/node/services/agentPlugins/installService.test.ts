@@ -371,6 +371,36 @@ describe("AgentPluginInstallService", () => {
     expect(updated.lockedSha).toBe(cleanHead);
   });
 
+  test("update accepts an env property reordering as capability-neutral", async () => {
+    // env is an unordered map: a mere property reordering upstream spawns an
+    // identical environment and must not be rejected as a capability change
+    // (which would force a needless uninstall/reinstall).
+    const mcpWithEnv = (env: Record<string, string>) =>
+      JSON.stringify({
+        $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+        mcpServers: {
+          echo: { type: "stdio", command: "node", args: ["${PLUGIN_ROOT}/server.js"], env },
+        },
+      });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "mcp.json"),
+      mcpWithEnv({ ALPHA: "1", BETA: "2" })
+    );
+    await commitAll(remoteDir, "env in ALPHA,BETA order");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    await writePluginFixture(remoteDir, { version: "1.0.1" });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "mcp.json"),
+      mcpWithEnv({ BETA: "2", ALPHA: "1" })
+    );
+    const newHead = await commitAll(remoteDir, "env reordered to BETA,ALPHA");
+
+    const updated = await service.update({ name: "demo-plugin" });
+    expect(updated.lockedSha).toBe(newHead);
+  });
+
   test("checkUpdates surfaces a corrupted registry instead of a false all-clear", async () => {
     await fsPromises.writeFile(registryFile(), "{ not json");
 
@@ -1684,6 +1714,17 @@ describe("AgentPluginInstallService", () => {
       { enabledServers: ["plugin:gone:echo"] }
     );
     await validator({}, { enabledServers: ["ordinary-server"] });
+
+    // Additions are PER FIELD: a stale key surviving only in toolAllowlist
+    // (e.g. a removed unmanaged dir's old tool selection) must not smuggle
+    // that key into enabledServers without discovery validation — enabling
+    // is the consent-relevant action.
+    await expect(
+      validator(
+        { toolAllowlist: { "plugin:gone:echo": [] } },
+        { toolAllowlist: { "plugin:gone:echo": [] }, enabledServers: ["plugin:gone:echo"] }
+      )
+    ).rejects.toThrow(/does not match any available plugin server/);
 
     // Discovery failure → additions rejected (never accept unverifiable keys).
     const failingValidator = buildAddedPluginKeyValidator(() =>
