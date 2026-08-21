@@ -1,7 +1,8 @@
-import { describe, expect, it, beforeAll, afterAll } from "bun:test";
+import { describe, expect, it, beforeAll, afterAll, spyOn } from "bun:test";
 import * as os from "os";
 import * as path from "path";
 import * as fs from "fs/promises";
+import * as nodeFs from "fs";
 import { LocalRuntime } from "./LocalRuntime";
 import type { InitLogger, RuntimeStatusEvent } from "./Runtime";
 
@@ -394,6 +395,36 @@ describe("LocalRuntime", () => {
         expect(result).toBe(content);
       } finally {
         await fs.rm(muxDir, { recursive: true, force: true });
+      }
+    });
+
+    it("cancelling readFile destroys the underlying node stream (no fd leak)", async () => {
+      // r18: the old eager start loop had no cancel callback, so a cancelled
+      // wrapper (e.g. mux.load's byte ceiling on an oversized file) abandoned
+      // the inner reader and left the file handle open until GC.
+      const runtime = new LocalRuntime(testDir);
+      const testFile = path.join(testDir, "cancel-read-test.txt");
+      await fs.writeFile(testFile, "x".repeat(256 * 1024));
+
+      const realCreate = nodeFs.createReadStream;
+      let captured: nodeFs.ReadStream | undefined;
+      const spy = spyOn(nodeFs, "createReadStream").mockImplementation(((
+        ...args: Parameters<typeof nodeFs.createReadStream>
+      ) => {
+        const stream = realCreate(...args);
+        captured = stream;
+        return stream;
+      }) as typeof nodeFs.createReadStream);
+      try {
+        const reader = runtime.readFile(testFile).getReader();
+        await reader.read();
+        await reader.cancel();
+        expect(captured).toBeDefined();
+        // Reader cancellation must destroy the node stream (closing the fd).
+        expect(captured?.destroyed).toBe(true);
+      } finally {
+        spy.mockRestore();
+        await fs.rm(testFile, { force: true });
       }
     });
 

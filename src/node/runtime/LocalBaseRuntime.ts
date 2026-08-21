@@ -213,7 +213,8 @@ export abstract class LocalBaseRuntime implements Runtime {
   }
 
   readFile(filePath: string, _abortSignal?: AbortSignal): ReadableStream<Uint8Array> {
-    // Note: _abortSignal ignored for local operations (fast, no need for cancellation)
+    // Note: _abortSignal ignored for local operations; cancelling the
+    // returned stream is the cancellation path (see cancel below).
     // Expand tildes before reading (Node.js fs doesn't expand ~)
     const expandedPath = expandTilde(filePath);
     const nodeStream = fs.createReadStream(expandedPath);
@@ -221,17 +222,22 @@ export abstract class LocalBaseRuntime implements Runtime {
     // Handle errors by wrapping in a transform
     // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
     const webStream = Readable.toWeb(nodeStream) as unknown as ReadableStream<Uint8Array>;
+    const reader = webStream.getReader();
 
+    // Pull-based (not an eager start loop): consumers control the read rate
+    // (backpressure), and cancellation can reach the source — the old eager
+    // loop had no cancel callback, so a cancelled wrapper (e.g. mux.load's
+    // byte ceiling on /dev/zero) abandoned the reader and leaked the open
+    // file handle (r18).
     return new ReadableStream<Uint8Array>({
-      async start(controller: ReadableStreamDefaultController<Uint8Array>) {
+      pull: async (controller: ReadableStreamDefaultController<Uint8Array>) => {
         try {
-          const reader = webStream.getReader();
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            controller.enqueue(value);
+          const { done, value } = await reader.read();
+          if (done) {
+            controller.close();
+            return;
           }
-          controller.close();
+          controller.enqueue(value);
         } catch (err) {
           controller.error(
             new RuntimeErrorClass(
@@ -241,6 +247,10 @@ export abstract class LocalBaseRuntime implements Runtime {
             )
           );
         }
+      },
+      cancel: async (reason: unknown) => {
+        // Destroys the underlying node stream and closes the fd.
+        await reader.cancel(reason);
       },
     });
   }
