@@ -12,7 +12,7 @@ import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools"
 import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { appendRefinementEventFromTool } from "@/node/services/refinement/refinementJournal";
-import { targetMutationLocks } from "@/node/services/refinement/targetMutationLocks";
+import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 import { log } from "@/node/services/log";
 import { readFileString, writeFileString } from "@/node/utils/runtime/helpers";
 import { generateDiff } from "@/node/services/tools/fileCommon";
@@ -361,7 +361,8 @@ export const createAgentSkillWriteTool: ToolFactory = (config: ToolConfiguration
         // Prior read → write → journal run under the per-root mutation lock
         // shared with the rollback engine (targetMutationLocks.ts), so a
         // rollback's verify+apply window can never interleave with this write.
-        const outcome = await targetMutationLocks.withLock(
+        const outcome = await withTargetMutationLock(
+          muxScope.muxHome,
           path.resolve(skillsRoot),
           async (): Promise<AgentSkillWriteToolResult | { ok: true; originalContent: string }> => {
             let originalContent = "";

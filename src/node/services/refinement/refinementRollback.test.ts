@@ -9,8 +9,10 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import { MemoryService, type MemoryScopeContext } from "@/node/services/memoryService";
 import { TestTempDir } from "@/node/services/tools/testHelpers";
+import { getProcessBirth } from "@/node/utils/concurrency/fileLock";
 import { sharedDurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { appendRefinementEvent, reclaimExcessRefinementInverseBlobs } from "./refinementJournal";
+import { memoryMutationLockKey, targetMutationLockFilePath } from "./targetMutationLocks";
 import {
   acquireRollbackFileLock,
   listRefinements,
@@ -888,6 +890,114 @@ describe("refinementRollback", () => {
     const oldPath = path.join(fixture.muxHome, "memory", "global", "old.md");
     expect(await fsPromises.readFile(oldPath, "utf-8")).toBe("v1\n");
     expect(await pathExists(path.join(fixture.muxHome, "memory", "global", "new.md"))).toBe(false);
+  });
+
+  describe("cross-process target mutation lock", () => {
+    /** A verified-live foreign-owner token (this process, real birth). */
+    const foreignLiveToken = (): string => {
+      const birth = getProcessBirth(process.pid);
+      return birth === null
+        ? `${process.pid}:foreign`
+        : `${process.pid}:foreign:${Buffer.from(birth).toString("hex")}`;
+    };
+
+    /** The global-memory-root target lockfile for a fixture's mux home. */
+    const memoryTargetLockPath = (muxHome: string): string =>
+      targetMutationLockFilePath(
+        muxHome,
+        memoryMutationLockKey(muxHome, path.join(muxHome, "memory"))
+      );
+
+    it("a foreign-held target lock blocks an ordinary memory write (fail-fast)", async () => {
+      using fixture = await createFixture();
+      // Deterministic two-process interleaving: occupy the lockfile with a
+      // valid live foreign token, as another process's in-flight rollback
+      // would (verified-live → never reclaimed, so the writer must fail).
+      const lockPath = memoryTargetLockPath(fixture.muxHome);
+      await fsPromises.mkdir(path.dirname(lockPath), { recursive: true });
+      await fsPromises.writeFile(lockPath, foreignLiveToken(), { encoding: "utf-8", flag: "wx" });
+
+      const result = await fixture.service.create(
+        fixture.ctx,
+        "/memories/global/blocked.md",
+        "should not land\n",
+        "agent"
+      );
+      expect(result.success).toBe(false);
+      if (result.success) throw new Error("unreachable");
+      expect(result.error).toContain("Another process is mutating");
+      // The write did NOT land while the other side held the target.
+      const physicalPath = path.join(fixture.muxHome, "memory", "global", "blocked.md");
+      expect(await pathExists(physicalPath)).toBe(false);
+
+      // Lock released → the same write succeeds.
+      await fsPromises.unlink(lockPath);
+      const retried = await fixture.service.create(
+        fixture.ctx,
+        "/memories/global/blocked.md",
+        "lands now\n",
+        "agent"
+      );
+      expect(retried.success).toBe(true);
+    });
+
+    it("a foreign-held target lock blocks a rollback before any mutation", async () => {
+      using fixture = await createFixture();
+      await fixture.service.create(fixture.ctx, "/memories/global/held.md", "v1\n", "agent");
+      await fixture.service.strReplace(
+        fixture.ctx,
+        "/memories/global/held.md",
+        "v1",
+        "v2",
+        "agent"
+      );
+      const editRow = await lastRow(fixture.sessionDir);
+
+      const lockPath = memoryTargetLockPath(fixture.muxHome);
+      await fsPromises.mkdir(path.dirname(lockPath), { recursive: true });
+      await fsPromises.writeFile(lockPath, foreignLiveToken(), { encoding: "utf-8", flag: "wx" });
+
+      const refused = await rollbackRefinement({
+        sessionDir: fixture.sessionDir,
+        id: editRow.id,
+        evidence: EVIDENCE,
+      });
+      expect(refused.success).toBe(false);
+      if (refused.success) throw new Error("unreachable");
+      expect(refused.error).toContain("Another process is mutating");
+      // Nothing was applied while the writer-side process held the target.
+      const physicalPath = path.join(fixture.muxHome, "memory", "global", "held.md");
+      expect(await fsPromises.readFile(physicalPath, "utf-8")).toBe("v2\n");
+
+      await fsPromises.unlink(lockPath);
+      const retried = await rollbackRefinement({
+        sessionDir: fixture.sessionDir,
+        id: editRow.id,
+        evidence: EVIDENCE,
+      });
+      expect(retried.success).toBe(true);
+      expect(await fsPromises.readFile(physicalPath, "utf-8")).toBe("v1\n");
+    });
+
+    it("a dead-process target lock remnant is reclaimed instead of blocking writes", async () => {
+      using fixture = await createFixture();
+      const child = spawnSync(process.execPath, ["--version"]);
+      expect(child.pid).toBeGreaterThan(0);
+      const lockPath = memoryTargetLockPath(fixture.muxHome);
+      await fsPromises.mkdir(path.dirname(lockPath), { recursive: true });
+      await fsPromises.writeFile(lockPath, `${child.pid}:crashed`, {
+        encoding: "utf-8",
+        flag: "wx",
+      });
+
+      const result = await fixture.service.create(
+        fixture.ctx,
+        "/memories/global/reclaimed.md",
+        "lands\n",
+        "agent"
+      );
+      expect(result.success).toBe(true);
+    });
   });
 
   describe("confinement guard rails", () => {

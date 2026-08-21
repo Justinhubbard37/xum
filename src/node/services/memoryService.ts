@@ -43,7 +43,7 @@ import type { Config } from "@/node/config";
 import type { Runtime } from "@/node/runtime/Runtime";
 import {
   memoryMutationLockKey,
-  targetMutationLocks,
+  withTargetMutationLock,
 } from "@/node/services/refinement/targetMutationLocks";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
 import {
@@ -879,7 +879,7 @@ export class MemoryService extends EventEmitter {
       assertWithinFileSizeCap(fileText);
       // create is a write: materialize the scope root on first use.
       const store = await this.resolveStore(ctx, scope, parsed.relPath, { createRoot: true });
-      return targetMutationLocks.withLock(this.storeLockKey(store), async () => {
+      return withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), async () => {
         const existing = await store.kind(parsed.relPath);
         if (existing !== null) {
           throw new MemoryCommandError(
@@ -927,7 +927,7 @@ export class MemoryService extends EventEmitter {
         throw new MemoryCommandError("old_str must not be empty");
       }
       const store = await this.resolveStore(ctx, scope, parsed.relPath);
-      return targetMutationLocks.withLock(this.storeLockKey(store), async () => {
+      return withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), async () => {
         const content = await this.readTextFileForEdit(store, parsed.relPath, virtualPath);
         const occurrences = countOccurrences(content, oldStr);
         if (occurrences === 0) {
@@ -975,7 +975,7 @@ export class MemoryService extends EventEmitter {
       const parsed = parseMemoryPath(virtualPath);
       const scope = this.requireFilePath(parsed, virtualPath);
       const store = await this.resolveStore(ctx, scope, parsed.relPath);
-      return targetMutationLocks.withLock(this.storeLockKey(store), async () => {
+      return withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), async () => {
         const content = await this.readTextFileForEdit(store, parsed.relPath, virtualPath);
         const lines = content === "" ? [] : content.split("\n");
         if (insertLine < 0 || insertLine > lines.length) {
@@ -1022,7 +1022,7 @@ export class MemoryService extends EventEmitter {
       const parsed = parseMemoryPath(virtualPath);
       const scope = this.requireFilePath(parsed, virtualPath);
       const store = await this.resolveStore(ctx, scope, parsed.relPath);
-      return targetMutationLocks.withLock(this.storeLockKey(store), async () => {
+      return withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), async () => {
         const kind = await store.kind(parsed.relPath);
         if (kind === null) {
           throw new MemoryCommandError(`No memory file or directory at ${virtualPath}`);
@@ -1070,7 +1070,7 @@ export class MemoryService extends EventEmitter {
       }
       const store = await this.resolveStore(ctx, scope, oldParsed.relPath);
       await store.assertContained(newParsed.relPath);
-      return targetMutationLocks.withLock(this.storeLockKey(store), async () => {
+      return withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), async () => {
         const oldKind = await store.kind(oldParsed.relPath);
         if (oldKind === null) {
           throw new MemoryCommandError(`No memory file or directory at ${oldVirtualPath}`);
@@ -1196,37 +1196,41 @@ export class MemoryService extends EventEmitter {
       assertWithinFileSizeCap(content);
       // UI save can create new files: materialize the scope root on first use.
       const store = await this.resolveStore(ctx, scope, parsed.relPath, { createRoot: true });
-      return await targetMutationLocks.withLock(this.storeLockKey(store), async () => {
-        const kind = await store.kind(parsed.relPath);
-        if (kind === "dir") {
-          throw new MemoryCommandError(`${virtualPath} is a directory, not a file`);
+      return await withTargetMutationLock(
+        this.config.rootDir,
+        this.storeLockKey(store),
+        async () => {
+          const kind = await store.kind(parsed.relPath);
+          if (kind === "dir") {
+            throw new MemoryCommandError(`${virtualPath} is a directory, not a file`);
+          }
+          if (expectedSha256 === null) {
+            if (kind !== null) {
+              return conflict(`A file already exists at ${virtualPath}; reload before saving`);
+            }
+            const files = await store.listFiles();
+            if (files.length >= MEMORY_MAX_FILES_PER_SCOPE) {
+              throw new MemoryCommandError(
+                `The ${scope} memory scope is full (${MEMORY_MAX_FILES_PER_SCOPE} files); delete unused files first`
+              );
+            }
+          } else {
+            if (kind === null) {
+              return conflict(`${virtualPath} no longer exists; it may have been deleted`);
+            }
+            const current = await this.readBoundedTextFile(store, parsed.relPath, virtualPath);
+            if (sha256Hex(current) !== expectedSha256) {
+              return conflict(
+                `${virtualPath} changed since it was loaded; reload and re-apply your edits`
+              );
+            }
+          }
+          await store.writeFile(parsed.relPath, content);
+          await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
+          this.emitChange(ctx, scope, parsed.relPath, actor);
+          return { success: true as const, data: { sha256: sha256Hex(content) } };
         }
-        if (expectedSha256 === null) {
-          if (kind !== null) {
-            return conflict(`A file already exists at ${virtualPath}; reload before saving`);
-          }
-          const files = await store.listFiles();
-          if (files.length >= MEMORY_MAX_FILES_PER_SCOPE) {
-            throw new MemoryCommandError(
-              `The ${scope} memory scope is full (${MEMORY_MAX_FILES_PER_SCOPE} files); delete unused files first`
-            );
-          }
-        } else {
-          if (kind === null) {
-            return conflict(`${virtualPath} no longer exists; it may have been deleted`);
-          }
-          const current = await this.readBoundedTextFile(store, parsed.relPath, virtualPath);
-          if (sha256Hex(current) !== expectedSha256) {
-            return conflict(
-              `${virtualPath} changed since it was loaded; reload and re-apply your edits`
-            );
-          }
-        }
-        await store.writeFile(parsed.relPath, content);
-        await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
-        this.emitChange(ctx, scope, parsed.relPath, actor);
-        return { success: true as const, data: { sha256: sha256Hex(content) } };
-      });
+      );
     } catch (error) {
       const message =
         error instanceof MemoryCommandError
