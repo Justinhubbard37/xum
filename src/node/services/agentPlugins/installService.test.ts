@@ -96,7 +96,11 @@ describe("AgentPluginInstallService", () => {
       () => false
     );
   const stagingLeftovers = async () =>
-    (await pathExists(stagingDir())) ? fsPromises.readdir(stagingDir()) : [];
+    (await pathExists(stagingDir()))
+      ? // The mutation-epoch handshake file is durable staging-root state (it
+        // must survive so scan brackets can compare tokens), not a leftover.
+        (await fsPromises.readdir(stagingDir())).filter((entry) => entry !== "mutation-epoch")
+      : [];
 
   beforeEach(async () => {
     muxRoot = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-plugin-test-"));
@@ -1225,6 +1229,47 @@ describe("AgentPluginInstallService", () => {
     expect(await pathExists(path.join(targetPath, ".mux-promotion-marker"))).toBe(false);
     expect(await pathExists(trashDir)).toBe(false);
     expect(await pathExists(journalPath)).toBe(false);
+  });
+
+  test("a stale promotion journal never strips a marker owned by a later update", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const targetPath = path.join(pluginsDir(), "demo-plugin");
+    const markerPath = path.join(targetPath, ".mux-promotion-marker");
+
+    // Two coexisting journals for one name: the install committed but its
+    // promotion journal survived a failed deletion, and a later update
+    // crashed after promoting its replacement (update journal + its nonce
+    // marker in the live tree). The promotion journal's committed-install
+    // sweep must verify nonce OWNERSHIP before touching the marker —
+    // stripping the update's marker would make update recovery misread the
+    // live tree as an unrecognized user replacement (staged old tree +
+    // markerless target) and suppress the container forever.
+    const trashDir = path.join(stagingDir(), `trash-${Date.now()}-demo-plugin`);
+    await fsPromises.mkdir(trashDir, { recursive: true });
+    await fsPromises.writeFile(markerPath, "update-nonce");
+    await fsPromises.writeFile(
+      path.join(stagingDir(), "update-demo-plugin.json"),
+      JSON.stringify({
+        name: "demo-plugin",
+        trashDir,
+        nonce: "update-nonce",
+        stagedAt: Date.now(),
+      })
+    );
+    await fsPromises.writeFile(
+      path.join(stagingDir(), "promotion-demo-plugin.json"),
+      JSON.stringify({ name: "demo-plugin", nonce: "install-nonce", stagedAt: Date.now() })
+    );
+
+    // Reconciliation must consume BOTH journals (regardless of visit order)
+    // and leave the plugin available, not suppressed.
+    const items = await service.list();
+    expect(items.find((item) => item.name === "demo-plugin")?.managed).toBe(true);
+    expect(await pathExists(path.join(stagingDir(), "promotion-demo-plugin.json"))).toBe(false);
+    expect(await pathExists(path.join(stagingDir(), "update-demo-plugin.json"))).toBe(false);
+    expect(await pathExists(markerPath)).toBe(false);
+    expect(await pathExists(targetPath)).toBe(true);
   });
 
   test("repositories shipping the reserved recovery marker name are rejected", async () => {

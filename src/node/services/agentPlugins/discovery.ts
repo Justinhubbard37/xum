@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
-import { containerHasUnreconciledJournals } from "./journals";
+import { readContainerMutationState } from "./journals";
 import {
   isValidAgentPluginName,
   validatePluginManifest,
@@ -362,13 +362,27 @@ export async function discoverAgentPluginAt(args: {
 }
 
 /**
+ * One gated scan: `suppressed` containers must not be scanned at all, and
+ * `confirm()` — called AFTER the scan — returns containers whose scan results
+ * must be DISCARDED because a mutation may have overlapped the scan.
+ */
+export interface AgentPluginDiscoveryGateSession {
+  suppressed: readonly string[];
+  confirm(): Promise<readonly string[]>;
+}
+
+export type AgentPluginDiscoveryGate = (
+  containerPaths: readonly string[]
+) => Promise<AgentPluginDiscoveryGateSession>;
+
+/**
  * Crash-recovery gate for container scans, so no discovery path (MCP config,
  * hooks, skills, workflows, agents — they all funnel through
  * discoverAgentPlugins) can scan the managed container while install-mutation
  * journal recovery is pending or failed: an agent request arriving right
  * after a crash would otherwise load an orphaned promotion — hook included —
- * before cleanup ran. The gate receives the container paths being scanned and
- * resolves to those that must be SUPPRESSED; it must never reject.
+ * before cleanup ran. The gate receives the container paths being scanned,
+ * resolves the session up front, and must never reject.
  *
  * The DEFAULT gate derives suppression directly from surviving journal files
  * in each container's sibling staging root: processes that never construct
@@ -376,27 +390,49 @@ export async function discoverAgentPluginAt(args: {
  * scripts) must not execute an unreconciled managed tree either. They never
  * RUN recovery, so a journal keeps the managed container suppressed until a
  * desktop/server session reconciles it. AgentPluginInstallService replaces
- * this with its health-tracked gate at construction: when recovery FAILED
- * (unreadable registry, failed restore/quarantine), merely waiting would
- * release discovery over the unreconciled tree, so the managed container
- * stays omitted until a later recovery attempt succeeds.
+ * this with a gate that ADDS health-tracked suppression at construction:
+ * when recovery FAILED (unreadable registry, failed restore/quarantine),
+ * merely waiting would release discovery over the unreconciled tree, so the
+ * managed container stays omitted until a later recovery attempt succeeds.
+ *
+ * A single pre-scan journal check is not enough across processes: a desktop
+ * install/update in ANOTHER process can write its journal and promote a tree
+ * after the check but before (or during) the scan, and can even complete its
+ * whole journal lifetime inside that window. The session therefore re-reads
+ * each container's mutation state in `confirm()` and discards containers
+ * whose journals appeared or whose mutation EPOCH changed (the install
+ * service bumps the epoch before every journal deletion, so a fully
+ * completed transaction cannot hide).
  */
-export function journalDerivedDiscoveryGate(
+export async function journalDerivedDiscoveryGate(
   containerPaths: readonly string[]
-): Promise<readonly string[]> {
-  return Promise.all(
-    containerPaths.map(async (containerPath) =>
-      (await containerHasUnreconciledJournals(containerPath)) ? [containerPath] : []
+): Promise<AgentPluginDiscoveryGateSession> {
+  const pre = new Map(
+    await Promise.all(
+      containerPaths.map(
+        async (containerPath) =>
+          [containerPath, await readContainerMutationState(containerPath)] as const
+      )
     )
-  ).then((nested) => nested.flat());
+  );
+  return {
+    suppressed: containerPaths.filter((containerPath) => pre.get(containerPath)?.hasJournals),
+    confirm: async () => {
+      const flagged = await Promise.all(
+        containerPaths.map(async (containerPath) => {
+          const post = await readContainerMutationState(containerPath);
+          const changed = post.hasJournals || post.epoch !== pre.get(containerPath)?.epoch;
+          return changed ? [containerPath] : [];
+        })
+      );
+      return flagged.flat();
+    },
+  };
 }
 
-let discoveryGate: (containerPaths: readonly string[]) => Promise<readonly string[]> =
-  journalDerivedDiscoveryGate;
+let discoveryGate: AgentPluginDiscoveryGate = journalDerivedDiscoveryGate;
 
-export function setAgentPluginDiscoveryGate(
-  gate: (containerPaths: readonly string[]) => Promise<readonly string[]>
-): void {
+export function setAgentPluginDiscoveryGate(gate: AgentPluginDiscoveryGate): void {
   discoveryGate = gate;
 }
 
@@ -411,11 +447,10 @@ export function setAgentPluginDiscoveryGate(
 export async function discoverAgentPlugins(
   containers: AgentPluginContainer[]
 ): Promise<DiscoverAgentPluginsResult> {
-  const suppressedContainers = new Set(
-    await discoveryGate(containers.map((container) => container.path))
-  );
-  const plugins: AgentPluginInfo[] = [];
-  const diagnostics: AgentPluginDiagnostic[] = [];
+  const gateSession = await discoveryGate(containers.map((container) => container.path));
+  const suppressedContainers = new Set(gateSession.suppressed);
+  let plugins: AgentPluginInfo[] = [];
+  let diagnostics: AgentPluginDiagnostic[] = [];
 
   const seenContainers = new Set<string>();
   for (const container of containers) {
@@ -449,6 +484,32 @@ export async function discoverAgentPlugins(
         plugins.push(plugin);
       }
     }
+  }
+
+  // Post-scan confirmation: a mutation in ANOTHER process (or a concurrent
+  // in-process one) may have started or finished while the scan read the
+  // container, so the trees just read can be transient (an orphaned promotion
+  // that recovery will quarantine, or a mixed old/new update read). Discard
+  // those containers' results rather than hand callers plugin content that
+  // may already be rolled back.
+  const overlapped = new Set(await gateSession.confirm());
+  for (const container of containers) {
+    if (!overlapped.has(container.path) || suppressedContainers.has(container.path)) {
+      continue;
+    }
+    plugins = plugins.filter((plugin) => plugin.containerPath !== container.path);
+    diagnostics = diagnostics.filter(
+      (diagnostic) =>
+        diagnostic.path !== container.path && !diagnostic.path.startsWith(container.path + path.sep)
+    );
+    diagnostics.push({
+      path: container.path,
+      scope: container.scope,
+      severity: "warning",
+      message:
+        "Managed plugin container skipped: a plugin install/update/uninstall overlapped this scan; its plugins are unavailable until the next scan.",
+    });
+    suppressedContainers.add(container.path);
   }
 
   return { plugins, diagnostics };

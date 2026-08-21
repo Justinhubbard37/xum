@@ -740,7 +740,14 @@ export const PluginsSettingsSection: React.FC = () => {
                     )}
                   </div>
 
-                  {uninstallTarget === item.name && (
+                  {/* Managed rows only: an unmanaged plugin in another
+                      container can share the manifest name, and rendering the
+                      confirmation under its row would visually attach a
+                      backend uninstall of the MANAGED install to a read-only
+                      unmanaged plugin. The backend uninstall is keyed by
+                      managed-registry name, so the managed row is the one
+                      identity-correct anchor. */}
+                  {item.managed && uninstallTarget === item.name && (
                     <UninstallConfirm
                       item={item}
                       busy={isBusy}

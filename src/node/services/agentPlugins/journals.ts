@@ -13,11 +13,23 @@
  * service (headless `mux workflow` resolving plugin:// scripts) without an
  * import cycle: installService imports discovery for container scans.
  */
+import { randomUUID } from "node:crypto";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
 /** Staging dir name under the mux home dir — NOT under ~/.mux/plugins, which discovery scans. */
 export const STAGING_DIR_NAME = "plugin-staging";
+
+/**
+ * Mutation-epoch handshake file in the staging root. The install service
+ * rewrites it with a fresh random token immediately BEFORE deleting any
+ * journal, so a mutation whose entire journal lifetime (create → consume)
+ * fits between a scanner's two journal checks still leaves a visible trace:
+ * the journal file alone cannot betray a transaction that finished before
+ * the post-scan check. Bump-before-delete makes "journal gone" imply "epoch
+ * already changed" for any mutation that ran during the scan window.
+ */
+export const MUTATION_EPOCH_FILE = "mutation-epoch";
 
 export const PROMOTION_JOURNAL_PREFIX = "promotion-";
 export const UPDATE_JOURNAL_PREFIX = "update-";
@@ -47,5 +59,58 @@ export async function containerHasUnreconciledJournals(containerPath: string): P
     );
   } catch (error) {
     return !(error instanceof Error && "code" in error && error.code === "ENOENT");
+  }
+}
+
+/**
+ * Snapshot of a container's mutation-visibility state, read twice by the
+ * discovery gate (before and after a container scan) to detect mutations
+ * that overlap the scan.
+ */
+export interface ContainerMutationState {
+  /** Fail-closed: an unreadable staging root reports true. */
+  hasJournals: boolean;
+  /**
+   * Epoch token; `undefined` when the epoch file has never been written (a
+   * stable state). An unreadable epoch file yields a UNIQUE token so it can
+   * never compare equal across two reads (fail toward suppression).
+   */
+  epoch: string | undefined;
+}
+
+export async function readContainerMutationState(
+  containerPath: string
+): Promise<ContainerMutationState> {
+  const stagingRoot = path.join(path.dirname(containerPath), STAGING_DIR_NAME);
+  const hasJournals = await containerHasUnreconciledJournals(containerPath);
+  let epoch: string | undefined;
+  try {
+    epoch = await fsPromises.readFile(path.join(stagingRoot, MUTATION_EPOCH_FILE), "utf-8");
+  } catch (error) {
+    epoch =
+      error instanceof Error && "code" in error && error.code === "ENOENT"
+        ? undefined
+        : `unreadable-${randomUUID()}`;
+  }
+  return { hasJournals, epoch };
+}
+
+/**
+ * Rewrite the epoch file with a fresh random token. MUST be awaited before
+ * deleting a journal (see MUTATION_EPOCH_FILE); a failure must be treated as
+ * a failed journal consumption (keep the journal) or the finished-inside-the-
+ * scan-window race reopens. Written atomically via temp + rename so a
+ * concurrent scanner can never observe a torn token that happens to match
+ * its earlier read.
+ */
+export async function bumpContainerMutationEpoch(stagingRoot: string): Promise<void> {
+  const token = randomUUID();
+  const tempPath = path.join(stagingRoot, `.${MUTATION_EPOCH_FILE}-${token}.tmp`);
+  await fsPromises.writeFile(tempPath, token, "utf-8");
+  try {
+    await fsPromises.rename(tempPath, path.join(stagingRoot, MUTATION_EPOCH_FILE));
+  } catch (error) {
+    await fsPromises.rm(tempPath, { force: true }).catch(() => undefined);
+    throw error;
   }
 }

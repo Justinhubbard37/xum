@@ -35,11 +35,13 @@ import { execFileAsync } from "@/node/utils/disposableExec";
 import {
   discoverAgentPluginAt,
   discoverAgentPlugins,
+  journalDerivedDiscoveryGate,
   setAgentPluginDiscoveryGate,
   type AgentPluginContainer,
   type AgentPluginInfo,
 } from "./discovery";
 import {
+  bumpContainerMutationEpoch,
   isJournalName,
   JOURNAL_PREFIXES,
   PROMOTION_JOURNAL_PREFIX,
@@ -391,10 +393,24 @@ export class AgentPluginInstallService {
     // LATEST reconciliation attempt so an agent request cannot load an
     // orphaned tree while recovery is running — and cannot scan the managed
     // container at all while the latest attempt has FAILED (the journaled
-    // tree may still be sitting in it).
-    setAgentPluginDiscoveryGate(async () =>
-      (await this.reconciliationState) ? [] : [this.containerDir]
-    );
+    // tree may still be sitting in it). Health alone is not enough: a live
+    // mutation (in this process or a sibling desktop/server process sharing
+    // the same mux home) can overlap a scan, so keep the journal+epoch
+    // bracket of the default gate and UNION health suppression onto it.
+    setAgentPluginDiscoveryGate(async (containerPaths) => {
+      // Serialize behind the latest recovery attempt BEFORE snapshotting the
+      // journal bracket: recovery consumes journals, and reading them first
+      // would suppress the very scan whose recovery just succeeded.
+      const unhealthySuppression = (await this.reconciliationState) ? [] : [this.containerDir];
+      const bracket = await journalDerivedDiscoveryGate(containerPaths);
+      return {
+        suppressed: [...new Set([...bracket.suppressed, ...unhealthySuppression])],
+        confirm: async () => {
+          const stillUnhealthy = (await this.reconciliationState) ? [] : [this.containerDir];
+          return [...new Set([...(await bracket.confirm()), ...stillUnhealthy])];
+        },
+      };
+    });
   }
 
   /**
@@ -1589,7 +1605,7 @@ export class AgentPluginInstallService {
           } else {
             // Rollback handled the tree: the journal's crash-recovery job is
             // done.
-            await fsPromises.rm(journalPath, { force: true }).catch(() => undefined);
+            await this.consumeJournalFile(journalPath).catch(() => undefined);
           }
           const notes = cleanupNotes.length > 0 ? ` Additionally, ${cleanupNotes.join("; ")}.` : "";
           throw new Error(
@@ -1598,7 +1614,7 @@ export class AgentPluginInstallService {
         }
         // Registry write committed (entry recorded): the journal's
         // crash-recovery job is done.
-        await fsPromises.rm(journalPath, { force: true }).catch(() => undefined);
+        await this.consumeJournalFile(journalPath).catch(() => undefined);
         // Committed: the marker did its crash-recovery job (a failed removal
         // leaves a stray dotfile the next update swap discards — harmless).
         await fsPromises
@@ -1615,6 +1631,20 @@ export class AgentPluginInstallService {
   private journalPath(prefix: string, name: string): string {
     // Names are grammar-validated (no separators/traversal), so this join is safe.
     return path.join(this.stagingRoot, `${prefix}${name}.json`);
+  }
+
+  /**
+   * Consume a journal whose transaction/recovery job finished: bump the
+   * container mutation epoch FIRST, then delete the file. The epoch bump is
+   * what lets a discovery-gate bracket (pre/post scan reads, in this or any
+   * sibling process) detect a mutation whose whole journal lifetime fit
+   * inside its scan window. A bump failure keeps the journal — callers treat
+   * that as a failed consumption — rather than deleting the last visible
+   * trace of the mutation.
+   */
+  private async consumeJournalFile(journalPath: string): Promise<void> {
+    await bumpContainerMutationEpoch(this.stagingRoot);
+    await fsPromises.rm(journalPath, { force: true });
   }
 
   /** A string field from a journal, or undefined when absent/unreadable. */
@@ -1705,7 +1735,7 @@ export class AgentPluginInstallService {
         assert(prefix !== undefined, "reconcileJournals: filtered journal lost its prefix");
         const name = journalName.slice(prefix.length, -".json".length);
         if (!isValidAgentPluginName(name)) {
-          await fsPromises.rm(journalPath, { force: true }).catch(() => undefined);
+          await this.consumeJournalFile(journalPath).catch(() => undefined);
           continue;
         }
         const consumed =
@@ -1719,7 +1749,7 @@ export class AgentPluginInstallService {
           continue;
         }
         try {
-          await fsPromises.rm(journalPath, { force: true });
+          await this.consumeJournalFile(journalPath);
         } catch (error) {
           allConsumed = false;
           log.warn("Failed to delete a consumed plugin journal; will retry", {
@@ -1746,10 +1776,22 @@ export class AgentPluginInstallService {
     const targetPath = this.targetPathFor(name);
     if (registryNames.has(name)) {
       // The install committed and only the journal deletion was lost; sweep
-      // the marker the commit path would have removed.
-      await fsPromises
-        .rm(path.join(targetPath, PROMOTION_MARKER_FILE), { force: true })
+      // the marker the commit path would have removed — but only when the
+      // marker is OURS (nonce match). A LATER mutation may own the live tree
+      // by now: if an update crashed after promoting its replacement, the
+      // marker at the target carries the UPDATE journal's nonce, and blindly
+      // deleting it would make update recovery misread the live tree as an
+      // unrecognized user replacement (staged old tree + markerless target)
+      // and suppress the container forever.
+      const journalNonce = await this.readJournalField(journalPath, "nonce");
+      const treeNonce = await fsPromises
+        .readFile(path.join(targetPath, PROMOTION_MARKER_FILE), "utf-8")
         .catch(() => undefined);
+      if (journalNonce !== undefined && treeNonce === journalNonce) {
+        await fsPromises
+          .rm(path.join(targetPath, PROMOTION_MARKER_FILE), { force: true })
+          .catch(() => undefined);
+      }
       return true;
     }
     // Only an ORPHAN (tree without registry entry) needs cleanup.
@@ -1824,7 +1866,7 @@ export class AgentPluginInstallService {
         // replacement, deadlocking updates — so a failed journal deletion
         // must abort cleanup and keep the marker as the tree's identity.
         try {
-          await fsPromises.rm(journalPath, { force: true });
+          await this.consumeJournalFile(journalPath);
         } catch (error) {
           log.warn("Failed to delete the update journal; keeping the tree marker for retry", {
             name,
@@ -2162,7 +2204,7 @@ export class AgentPluginInstallService {
         JSON.stringify({ name: entry.name, trashDir, dataTrashDir, stagedAt: Date.now() })
       );
       const consumeJournal = async (): Promise<void> => {
-        await fsPromises.rm(uninstallJournalPath, { force: true }).catch(() => undefined);
+        await this.consumeJournalFile(uninstallJournalPath).catch(() => undefined);
       };
 
       let stagedTree = false;
@@ -2876,7 +2918,7 @@ export class AgentPluginInstallService {
             await this.renameIntoStaging(targetPath, trashDir);
           } catch (error) {
             // Nothing moved: no recovery needed.
-            await fsPromises.rm(updateJournalPath, { force: true }).catch(() => undefined);
+            await this.consumeJournalFile(updateJournalPath).catch(() => undefined);
             throw error;
           }
         }
@@ -2889,7 +2931,7 @@ export class AgentPluginInstallService {
             try {
               await fsPromises.rename(trashDir, targetPath);
               this.activeStagingPaths.delete(trashDir);
-              await fsPromises.rm(updateJournalPath, { force: true }).catch(() => undefined);
+              await this.consumeJournalFile(updateJournalPath).catch(() => undefined);
             } catch (rollbackError) {
               // Keep the journal: reconcileJournals restores the tree on the
               // next startup/section open.
@@ -2913,7 +2955,7 @@ export class AgentPluginInstallService {
         let journalConsumed = true;
         if (hadOldTree) {
           try {
-            await fsPromises.rm(updateJournalPath, { force: true });
+            await this.consumeJournalFile(updateJournalPath);
           } catch (error) {
             journalConsumed = false;
             log.warn(

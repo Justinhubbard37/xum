@@ -66,11 +66,7 @@ export abstract class LocalBaseRuntime implements Runtime {
     try {
       await fsPromises.access(cwd);
     } catch (err) {
-      throw new RuntimeErrorClass(
-        `Working directory does not exist: ${cwd}`,
-        "exec",
-        err instanceof Error ? err : undefined
-      );
+      throw new RuntimeErrorClass(`Working directory does not exist: ${cwd}`, "exec", err);
     }
 
     const bashPath = getBashPath();
@@ -237,7 +233,7 @@ export abstract class LocalBaseRuntime implements Runtime {
             new RuntimeErrorClass(
               `Failed to read file ${filePath}: ${getErrorMessage(err)}`,
               "file_io",
-              err instanceof Error ? err : undefined
+              err
             )
           );
         }
@@ -295,7 +291,7 @@ export abstract class LocalBaseRuntime implements Runtime {
           throw new RuntimeErrorClass(
             `Failed to write file ${filePath}: ${getErrorMessage(err)}`,
             "file_io",
-            err instanceof Error ? err : undefined
+            err
           );
         }
       },
@@ -330,7 +326,7 @@ export abstract class LocalBaseRuntime implements Runtime {
       throw new RuntimeErrorClass(
         `Failed to stat ${filePath}: ${getErrorMessage(err)}`,
         "file_io",
-        err instanceof Error ? err : undefined
+        err
       );
     }
   }
@@ -346,7 +342,7 @@ export abstract class LocalBaseRuntime implements Runtime {
       throw new RuntimeErrorClass(
         `Failed to create directory ${dirPath}: ${getErrorMessage(err)}`,
         "file_io",
-        err instanceof Error ? err : undefined
+        err
       );
     }
   }

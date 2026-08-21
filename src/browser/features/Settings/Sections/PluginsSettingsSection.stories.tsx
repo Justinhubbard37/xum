@@ -225,9 +225,27 @@ export const InstalledPhoneViewport: Story = {
   },
 };
 
+/** An unmanaged plugin sharing the MANAGED_ITEM's manifest name (a supported
+ * container state: `~/.agents/plugins` is user-populated). The uninstall
+ * confirmation is keyed by name, so it must additionally anchor on the
+ * managed row — never under this read-only doppelganger. */
+const UNMANAGED_SAME_NAME_ITEM: AgentPluginListItem = {
+  name: "grill",
+  managed: false,
+  present: true,
+  location: "~/.agents/plugins/grill",
+  description: "Same manifest name in another container; Mux lists it read-only.",
+  skillCount: 1,
+  mcpServerCount: 0,
+};
+
 export const UninstallConfirmation: Story = {
   render: () => (
-    <PluginsSectionStoryShell options={{ agentPlugins: { items: [MANAGED_ITEM] } }}>
+    // Unmanaged doppelganger FIRST: a purely name-keyed confirmation would
+    // render under it too (and before the managed row).
+    <PluginsSectionStoryShell
+      options={{ agentPlugins: { items: [UNMANAGED_SAME_NAME_ITEM, MANAGED_ITEM] } }}
+    >
       <PluginsSettingsSection />
     </PluginsSectionStoryShell>
   ),
@@ -239,6 +257,24 @@ export const UninstallConfirmation: Story = {
 
     // Preserve-by-default: the plugin-data checkbox starts unchecked.
     await canvas.findByText(/Also delete stored plugin data/);
+    const confirms = canvas.getAllByText(/Also delete stored plugin data/);
+    if (confirms.length !== 1) {
+      throw new Error(
+        `Uninstall confirmation must render exactly once (managed row), found ${confirms.length}`
+      );
+    }
+    // ...and under the MANAGED row: confirming a card that visually belongs
+    // to the read-only unmanaged plugin would still uninstall the managed one.
+    // closest() from the label lands on the confirm panel's own rounded div,
+    // so hop to its parent (the row card) before checking the row identity.
+    const panel = confirms[0].closest("div[class*='rounded-md']");
+    const rowCard = panel?.parentElement?.closest("div[class*='rounded-md']");
+    if (
+      !(rowCard instanceof HTMLElement) ||
+      !rowCard.textContent?.includes("~/.mux/plugins/grill")
+    ) {
+      throw new Error("Uninstall confirmation must anchor on the managed row");
+    }
     const checkbox = await canvas.findByRole("checkbox");
     if (checkbox.getAttribute("data-state") !== "unchecked") {
       throw new Error("Plugin-data checkbox must start unchecked (preserve by default)");
