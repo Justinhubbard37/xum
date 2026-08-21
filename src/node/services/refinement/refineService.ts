@@ -122,13 +122,23 @@ export function createRefineSummaryMessage(record: RefineRecord): MuxMessage {
     "",
     ...record.applied.map((edit) => `- ${edit.description} (refinement ${edit.refinementId})`),
   ];
+  if (record.untrackedApplied !== undefined && record.untrackedApplied > 0) {
+    // Real edits with no journal row: the user must learn about them even
+    // though the r6 rollback path cannot address them.
+    lines.push(
+      `- ${record.untrackedApplied} applied edit(s) could not be journaled; rollback is unavailable for them.`
+    );
+  }
   if (record.summary.length > 0) {
     lines.push("", record.summary);
   }
-  lines.push(
-    "",
-    "Rollback with: /debug refinements (bun run debug refinements <workspace-id> --rollback <id>) or the refinement_rollback tool."
-  );
+  // The rollback pointer only applies to journaled rows.
+  if (record.applied.length > 0) {
+    lines.push(
+      "",
+      "Rollback with: /debug refinements (bun run debug refinements <workspace-id> --rollback <id>) or the refinement_rollback tool."
+    );
+  }
   return createMuxMessage(createRefineSummaryMessageId(), "user", lines.join("\n"), {
     timestamp: Date.now(),
     // Synthetic system-style row: provider-visible durable history (never
@@ -313,10 +323,18 @@ export class RefineService {
         baselineSeq,
         result.toolCallIds
       );
+      // Journal acknowledgement can fail while the mutation itself succeeded
+      // (appendRefinementEvent swallows journal/blob failures by design so
+      // user-facing writes stay self-healing). Those edits are real — files
+      // changed with no rollback id — so they must be reported, never
+      // classified as a no-op. The tools' own applied counts are the ground
+      // truth; anything they applied beyond the journaled rows is untracked.
+      const untrackedApplied = Math.max(0, result.appliedMutations - applied.length);
       const record: RefineRecord = {
         applied,
         summary: result.summary.length > 0 ? result.summary : "Nothing worth distilling.",
-        noOp: applied.length === 0,
+        noOp: applied.length === 0 && untrackedApplied === 0,
+        ...(untrackedApplied > 0 ? { untrackedApplied } : {}),
         usage: result.usage,
       };
 

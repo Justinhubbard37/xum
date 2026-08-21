@@ -837,7 +837,9 @@ export async function processSlashCommand(
                     type: "success",
                     message: result.data.noOp
                       ? "Refine: nothing worth distilling"
-                      : `Refine: ${result.data.applied.length} edit(s) applied (see chat summary)`,
+                      : // untrackedApplied: edits that succeeded but could not be
+                        // journaled (no rollback id) — still real, so counted.
+                        `Refine: ${result.data.applied.length + (result.data.untrackedApplied ?? 0)} edit(s) applied (see chat summary)`,
                   }
                 : {
                     id: Date.now().toString(),

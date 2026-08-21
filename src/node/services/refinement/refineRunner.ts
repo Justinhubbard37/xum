@@ -47,6 +47,13 @@ export interface RefinePassResult {
   toolCallIds: string[];
   /** The model's closing text (per-edit rationales, or a no-op statement). */
   summary: string;
+  /**
+   * Mutations the tools THEMSELVES reported as applied (memory ops with
+   * applied=true plus successful skill writes). Journal-independent ground
+   * truth: appendRefinementEvent swallows journal failures by design, so the
+   * caller must not infer "nothing changed" from an empty journal alone.
+   */
+  appliedMutations: number;
   budgetExhausted: boolean;
   usage?: { inputTokens: number; outputTokens: number };
   /** Fatal stream error (provider failure or abort/timeout). */
@@ -60,7 +67,9 @@ export interface RefinePassResult {
  */
 function wrapSkillWriteWithBudget(
   inner: Tool,
-  budget: { limit: number; tryConsume(): boolean }
+  budget: { limit: number; tryConsume(): boolean },
+  /** Reports each write the inner tool acknowledged as successful. */
+  onApplied: () => void
 ): Tool {
   return tool({
     description: TOOL_DEFINITIONS.agent_skill_write.description,
@@ -74,6 +83,13 @@ function wrapSkillWriteWithBudget(
       }
       assert(typeof inner.execute === "function", "agent_skill_write tool must have execute");
       const result: unknown = await inner.execute(input, options);
+      if (
+        typeof result === "object" &&
+        result !== null &&
+        (result as { success?: unknown }).success === true
+      ) {
+        onApplied();
+      }
       return result;
     },
   });
@@ -187,12 +203,15 @@ export async function runRefinePass(args: {
   });
 
   const pendingToolRuns = new Set<Promise<unknown>>();
+  let appliedSkillWrites = 0;
   const tools: Record<string, Tool> = {
     memory: trackToolExecutions(memoryTool, pendingToolRuns),
   };
   if (args.skillWriteTool !== undefined) {
     tools.agent_skill_write = trackToolExecutions(
-      wrapSkillWriteWithBudget(args.skillWriteTool, budget),
+      wrapSkillWriteWithBudget(args.skillWriteTool, budget, () => {
+        appliedSkillWrites += 1;
+      }),
       pendingToolRuns
     );
   }
@@ -362,6 +381,7 @@ export async function runRefinePass(args: {
     ops: journal,
     toolCallIds,
     summary,
+    appliedMutations: journal.filter((op) => op.applied).length + appliedSkillWrites,
     budgetExhausted: getMutationCount() >= REFINE_OP_BUDGET,
     usage,
     streamError: streamErrors[0],

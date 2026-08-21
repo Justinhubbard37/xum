@@ -1134,6 +1134,13 @@ export const RefineRecordSchema = z.object({
   summary: z.string(),
   /** True when the pass finished cleanly without applying any edit. */
   noOp: z.boolean(),
+  /**
+   * Edits the tools reported as applied but whose r2 journal row never landed
+   * (journal/blob failures are swallowed by design so user writes stay
+   * self-healing). Files changed with no rollback id — surfaced instead of
+   * silently classifying the pass as a no-op.
+   */
+  untrackedApplied: z.number().optional(),
   usage: z.object({ inputTokens: z.number(), outputTokens: z.number() }).optional(),
 });
 

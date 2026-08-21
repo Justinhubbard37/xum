@@ -15,6 +15,7 @@ import { HistoryService } from "@/node/services/historyService";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import { MemoryService } from "@/node/services/memoryService";
 import { attachLanguageModelCleanup } from "@/node/services/languageModelCleanup";
+import { sharedDurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { listRefinements, rollbackRefinement } from "./refinementRollback";
 import { RefineService } from "./refineService";
 import { TestTempDir } from "../tools/testHelpers";
@@ -302,6 +303,58 @@ describe("RefineService", () => {
     const third = await fixture.service.run(WORKSPACE_ID);
     expect(third.success).toBe(true);
     expect(fixture.modelCalls).toHaveLength(2);
+  });
+
+  it("reports applied-but-unjournaled edits instead of classifying them as a no-op", async () => {
+    // The memory write succeeds but its r2 journal append fails (swallowed by
+    // design so user writes stay self-healing). The file changed with no
+    // rollback id: the pass must say so — not report "nothing worth
+    // distilling" while leaving a silent, untracked edit behind.
+    using fixture = await createFixture({
+      modelFactory: () =>
+        toolCallModel(
+          [
+            {
+              toolCallId: "refine-unjournaled-1",
+              toolName: "memory",
+              input: {
+                command: "create",
+                path: LESSON_PATH,
+                file_text: "An edit whose journal row never lands.\n",
+              },
+            },
+          ],
+          `${LESSON_PATH}: applied without a journal row.`
+        ),
+    });
+    await fixture.seedTrajectory();
+    // Same process-wide journal instance the service and MemoryService use.
+    const journal = sharedDurableEventJournal(fixture.sessionDir);
+    // Lazy rejection (not mockRejectedValue): bun creates that rejected
+    // promise eagerly, which trips unhandled-rejection detection before any
+    // caller can catch it.
+    const appendSpy = spyOn(journal, "append").mockImplementation(() =>
+      Promise.reject(new Error("journal unavailable"))
+    );
+    try {
+      const result = await fixture.service.run(WORKSPACE_ID);
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      // No journal row landed...
+      expect(await listRefinements(fixture.sessionDir)).toHaveLength(0);
+      expect(result.data.applied).toHaveLength(0);
+      // ...but the edit is real, so the pass is NOT a no-op and the untracked
+      // count is surfaced.
+      expect(result.data.noOp).toBe(false);
+      expect(result.data.untrackedApplied).toBe(1);
+      // The chat summary warns that rollback is unavailable for these edits.
+      expect(fixture.emittedMessages).toHaveLength(1);
+      const text = fixture.emittedMessages[0].parts.find((part) => part.type === "text");
+      expect(text?.type === "text" && text.text).toContain("could not be journaled");
+      expect(text?.type === "text" && text.text).not.toContain("Rollback with:");
+    } finally {
+      appendSpy.mockRestore();
+    }
   });
 
   it("records completed-step usage when a later step errors", async () => {
