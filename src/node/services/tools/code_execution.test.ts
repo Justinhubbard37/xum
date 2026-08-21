@@ -1571,6 +1571,65 @@ describe("createCodeExecutionTool", () => {
       await host.disposeScope("ws-load");
     });
 
+    it("rewrites load records as failures when the post-load snapshot exceeds the budget", async () => {
+      // r14: a successful mux.load can push vars past the snapshot budget
+      // (new load keys are protected from retention eviction). persistVars
+      // throws, the mount is disposed, and the NEXT call restores a snapshot
+      // WITHOUT the loaded key — so the load record must not keep telling
+      // the model the key exists.
+      using tmp = new DisposableTempDir("code-exec-load");
+      // Loads cap at MAX_FILE_SIZE (1MB), so cross the 8MB snapshot budget
+      // with pre-existing unmanaged vars plus one near-cap load.
+      const bigBytes = VARS_SNAPSHOT_MAX_BYTES - 512 * 1024;
+      const fileBytes = 900 * 1024;
+      await fs.writeFile(nodePath.join(tmp.path, "big.jsonl"), "y".repeat(fileBytes), "utf8");
+
+      const host = new SandboxHostService();
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(fileReadTools()),
+        undefined,
+        kernelRunner(host, "ws-load-budget", tmp.path),
+        {
+          loadFile: createKernelFileLoader({ cwd: tmp.path, runtime: new LocalRuntime(tmp.path) }),
+        }
+      );
+
+      // Call 1: fill unmanaged vars close to the budget (durable snapshot).
+      const first = (await tool.execute!(
+        { code: `vars.big = "x".repeat(${bigBytes}); return true;` },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(first.success).toBe(true);
+
+      // Call 2: the load succeeds in-kernel but the post-call snapshot
+      // cannot fit — the loaded key will NOT survive to the next call.
+      const second = (await tool.execute!(
+        { code: 'const s = mux.load({ path: "big.jsonl", key: "orders" }); return s.bytes;' },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(second.success).toBe(true);
+      const loadRecord = second.toolCalls.find((record) => record.toolName === "load");
+      expect(loadRecord).toBeDefined();
+      // The record must reflect reality: no surviving key may be promised.
+      expect(loadRecord!.error).toBeDefined();
+      expect(loadRecord!.result).toBeUndefined();
+      // The model is told why via the kernel console notice.
+      const notice = second.consoleOutput.find(
+        (entry) => typeof entry.args[0] === "string" && entry.args[0].startsWith("[kernel]")
+      );
+      expect(notice).toBeDefined();
+
+      // The next call's restored snapshot indeed lacks the key (and keeps
+      // the last durable state).
+      const third = (await tool.execute!(
+        { code: "return { orders: typeof vars.orders, big: vars.big.length };" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(third.result).toEqual({ orders: "undefined", big: bigBytes });
+      await host.disposeScope("ws-load-budget");
+    });
+
     it("rejects reserved __ keys and surfaces loader errors as catchable guest errors", async () => {
       using tmp = new DisposableTempDir("code-exec-load");
       const host = new SandboxHostService();

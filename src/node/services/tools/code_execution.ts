@@ -710,6 +710,22 @@ ${xumTypes}
               ) {
                 result.result = buildTruncatedRecord(advertised.preview, advertised.size);
               }
+              // r14: loads advertised THIS call do not survive either — the
+              // restored snapshot lacks their keys (a successful load can
+              // itself be what pushed vars over the budget, since new load
+              // keys are protected from retention eviction). Rewrite each
+              // successful load record as a failure so the model is never
+              // told a key exists that the durable snapshot lacks.
+              if (loadActive) {
+                for (const record of result.toolCalls) {
+                  if (record.toolName !== "load" || record.error !== undefined) continue;
+                  record.result = undefined;
+                  record.error =
+                    "load succeeded in-kernel, but its vars entry did NOT survive: the " +
+                    "post-call vars snapshot failed and the kernel was reset to the last " +
+                    "durable state. Free vars space (or load less), then re-issue the load.";
+                }
+              }
               mount.dispose();
             }
           }
