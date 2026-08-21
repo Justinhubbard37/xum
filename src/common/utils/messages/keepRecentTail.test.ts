@@ -103,6 +103,47 @@ describe("selectKeepRecentTailStartIndex", () => {
     expect(selectKeepRecentTailStartIndex(messages, 20_000)).toBe(-1);
   });
 
+  it("extends the boundary backward over the turn's snapshot cluster", () => {
+    // @file / skill / MCP snapshots are synthetic user rows persisted
+    // immediately before the real user row they expand; stranding them in the
+    // summarized head would give the provider the request without its content.
+    const snapshot = createMuxMessage("snap-1", "user", "snapshot: file contents", {
+      historySequence: 2,
+      synthetic: true,
+      fileAtMentionSnapshot: ["src/foo.ts"],
+    });
+    const messages = [
+      userMessage("u0", "x".repeat(40_000), 0),
+      assistantMessage("a0", "big reply", 1),
+      snapshot,
+      userMessage("u1", "@src/foo.ts what does this do?", 3),
+      assistantMessage("a1", "it does things", 4),
+    ];
+
+    // The safe boundary is u1 (index 3), but the tail must start at the
+    // snapshot row (index 2) so the kept turn retains its content.
+    expect(selectKeepRecentTailStartIndex(messages, 1_000)).toBe(2);
+  });
+
+  it("counts the snapshot cluster against the floor", () => {
+    const bigSnapshot = createMuxMessage("snap-1", "user", "x".repeat(40_000), {
+      historySequence: 2,
+      synthetic: true,
+      fileAtMentionSnapshot: ["src/big.ts"],
+    });
+    const messages = [
+      userMessage("u0", "start", 0),
+      assistantMessage("a0", "reply", 1),
+      bigSnapshot,
+      userMessage("u1", "@src/big.ts summarize", 3),
+      assistantMessage("a1", "summary", 4),
+    ];
+
+    // The user turn alone fits under the floor, but WITH its ~10k-token
+    // snapshot it does not: a tail that would strand the snapshot is refused.
+    expect(selectKeepRecentTailStartIndex(messages, 1_000)).toBe(-1);
+  });
+
   it("requires a provider-eligible head so the summarizer has content", () => {
     const boundary = createMuxMessage("summary-1", "assistant", "prior summary", {
       compacted: "user",

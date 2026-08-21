@@ -10,6 +10,7 @@
  */
 
 import type { MuxMessage, MuxMessageMetadata } from "@/common/types/message";
+import { isSyntheticSnapshotUserMessage } from "@/common/types/message";
 import assert from "@/common/utils/assert";
 import { isNonNegativeInteger } from "@/common/utils/numbers";
 import { safeStringifyForCounting } from "@/common/utils/tokens/safeStringifyForCounting";
@@ -34,6 +35,14 @@ export function estimateMuxMessageTokens(message: MuxMessage): number {
  * parts of a single row, so any row boundary is pairing-safe at the provider
  * level; starting on a real user turn additionally keeps a turn's assistant
  * steps and synthetic continuations attached to the prompt that produced them.
+ *
+ * Snapshot clusters: send-time @file / agent-skill / MCP prompt snapshots are
+ * persisted as synthetic user rows immediately BEFORE the real user row they
+ * expand. A boundary that starts at the real user row would strand those
+ * snapshots in the summarized head — the provider would then see the request
+ * without the durable content that accompanied it. The selected boundary is
+ * therefore extended backward over the contiguous snapshot cluster, with the
+ * cluster's size counted against the floor.
  *
  * Clamp-down: when even the newest safe suffix exceeds the floor (or no safe
  * boundary exists), returns -1 — the tail is dropped entirely rather than
@@ -75,12 +84,35 @@ export function selectKeepRecentTailStartIndex(
       continue;
     }
 
-    if (!hasProviderEligibleMessages(messages.slice(0, i))) {
+    // Pull the turn's snapshot cluster (contiguous synthetic snapshot user
+    // rows directly above the real user row) into the candidate tail. Their
+    // tokens count against the floor: a tail that only fits without its
+    // snapshots does not fit. Stop extending at a snapshot row without a
+    // valid historySequence — the boundary stamp needs one, so degrade to
+    // the nearest stampable row (self-healing on corrupt history).
+    let clusterStart = i;
+    let clusterTokens = 0;
+    for (let j = i - 1; j >= 1; j--) {
+      const candidate = messages[j];
+      if (
+        !isSyntheticSnapshotUserMessage(candidate) ||
+        !isNonNegativeInteger(candidate.metadata?.historySequence)
+      ) {
+        break;
+      }
+      clusterTokens += estimateMuxMessageTokens(candidate);
+      clusterStart = j;
+    }
+    if (suffixTokens + clusterTokens > floorTokens) {
+      break;
+    }
+
+    if (!hasProviderEligibleMessages(messages.slice(0, clusterStart))) {
       // An empty head would leave the summarizer with nothing to summarize.
       break;
     }
 
-    bestStartIndex = i;
+    bestStartIndex = clusterStart;
   }
 
   return bestStartIndex;

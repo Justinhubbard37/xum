@@ -130,6 +130,20 @@ async function offloadValue(
   const size = Buffer.byteLength(serialized, "utf8");
   if (size <= RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES) return null;
 
+  // Values beyond the retention cap must never be advertised as handles: the
+  // retention pass would protect the fresh handle while it single-handedly
+  // exceeds the vars snapshot budget, the snapshot would be rejected, and the
+  // mount disposed — the next call would restore a snapshot WITHOUT the
+  // handle the record promised. Keep the value inline instead (bounded by the
+  // provider's own context limits) so the model never chases a missing handle.
+  if (size > RESULT_HANDLE_VARS_CAP_BYTES) {
+    log.warn(
+      "code_execution: return value exceeds the vars retention cap; keeping it inline instead of advertising a handle",
+      { size }
+    );
+    return null;
+  }
+
   // Store in vars FIRST: if the guest assignment fails, the model record must
   // keep the full inline value — never point the model at a missing handle.
   let handleKey: string;
@@ -229,12 +243,19 @@ function compactKernelToolCallRecords(result: PTCExecutionResult, loadActive: bo
     }
     let bytes = 0;
     if (record.result !== undefined) {
-      try {
-        bytes = Buffer.byteLength(JSON.stringify(record.result) ?? "", "utf8");
-      } catch {
-        // Bridged results are JSON round-tripped, so this is unreachable in
-        // practice; size 0 is an honest fallback (nothing model-visible).
-        bytes = 0;
+      // Creation-time bounding (kernel mode) may have replaced the result
+      // with a marker carrying the TRUE size; report that, not marker size.
+      const bounded = record.result as { __kernelBounded?: boolean; bytes?: number };
+      if (bounded.__kernelBounded === true && typeof bounded.bytes === "number") {
+        bytes = bounded.bytes;
+      } else {
+        try {
+          bytes = Buffer.byteLength(JSON.stringify(record.result) ?? "", "utf8");
+        } catch {
+          // Bridged results are JSON round-tripped, so this is unreachable in
+          // practice; size 0 is an honest fallback (nothing model-visible).
+          bytes = 0;
+        }
       }
     }
     return {
@@ -256,6 +277,15 @@ function compactKernelToolCallRecords(result: PTCExecutionResult, loadActive: bo
  * head preview plus the true size.
  */
 function boundCompactRecordArgs(args: unknown): unknown {
+  // Already bounded at creation time (kernel record bounds in the runtime):
+  // pass the marker through instead of double-wrapping it.
+  if (
+    typeof args === "object" &&
+    args !== null &&
+    (args as { __kernelBounded?: boolean }).__kernelBounded === true
+  ) {
+    return args;
+  }
   let serialized: string;
   try {
     serialized = JSON.stringify(args) ?? "";

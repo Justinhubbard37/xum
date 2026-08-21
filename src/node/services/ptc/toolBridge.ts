@@ -10,6 +10,8 @@ import type { Tool } from "ai";
 import type { z } from "zod";
 import type { IJSRuntime } from "./runtime";
 import type { KernelFileLoader } from "@/node/services/tools/kernelFileLoad";
+import { KERNEL_COMPACT_ARGS_CAP_BYTES } from "@/constants/kernelOutput";
+import { RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES } from "@/constants/resultHandles";
 import {
   FULL_GRANTS,
   isBridgeToolGranted,
@@ -178,6 +180,18 @@ export class ToolBridge {
    * not just when the parent stream is cancelled.
    */
   register(runtime: IJSRuntime, kernel?: KernelBridgeOptions): void {
+    // Kernel mode bounds record/event capture at creation (host memory and
+    // streamed-to-history events); ephemeral registrations keep full records
+    // (the byte-identical supplement contract). Post-eval compaction still
+    // bounds the model-visible set.
+    runtime.setKernelRecordBounds(
+      kernel !== undefined
+        ? {
+            argsCapBytes: KERNEL_COMPACT_ARGS_CAP_BYTES,
+            resultCapBytes: RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES,
+          }
+        : undefined
+    );
     const xumObj: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
 
     // Grant-denied tools get an explicit stub: the guest sees a clear

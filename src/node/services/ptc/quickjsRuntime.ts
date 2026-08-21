@@ -12,7 +12,7 @@ import {
 } from "quickjs-emscripten-core";
 import { QuickJSAsyncFFI } from "@jitl/quickjs-wasmfile-release-asyncify/ffi";
 import crypto from "crypto";
-import type { IJSRuntime, IJSRuntimeFactory, RuntimeLimits } from "./runtime";
+import type { IJSRuntime, IJSRuntimeFactory, KernelRecordBounds, RuntimeLimits } from "./runtime";
 import type { PTCEvent, PTCExecutionResult, PTCToolCallRecord, PTCConsoleRecord } from "./types";
 import { UNAVAILABLE_IDENTIFIERS } from "./staticAnalysis";
 
@@ -169,6 +169,8 @@ export class QuickJSRuntime implements IJSRuntime {
   private consoleSetup = false;
   /** Serializes late-settlement guest continuations; see setPendingJobGate. */
   private pendingJobGate?: (run: () => void) => void;
+  /** Kernel-mode caps on record/event capture; see IJSRuntime.setKernelRecordBounds. */
+  private kernelRecordBounds?: KernelRecordBounds;
   /** Monotonic eval counter + the generation currently inside eval() (null
    * between evals). Distinguishes settlements arriving mid-eval (queued for
    * the eval's own drain points) from truly-late ones between evals (gated).
@@ -278,12 +280,17 @@ export class QuickJSRuntime implements IJSRuntime {
       // executed in our sandbox, not requested by the model.
       const callId = generateCallId();
 
+      // Kernel mode bounds captured args/results at creation: records and
+      // streamed events must never retain full guest payloads (host memory +
+      // session history growth); the guest still receives full values.
+      const recordArgs = this.boundCaptureArgs(args[0]);
+
       // Emit start event
       this.eventHandler?.({
         type: "tool-call-start",
         callId,
         toolName: name,
-        args: args[0],
+        args: recordArgs,
         startTime,
       });
 
@@ -291,17 +298,23 @@ export class QuickJSRuntime implements IJSRuntime {
         const result = await fn(...args);
         const endTime = Date.now();
         const duration_ms = endTime - startTime;
+        const recordResult = this.boundCaptureResult(result);
 
         // Record tool call
-        this.toolCalls.push({ toolName: name, args: args[0], result, duration_ms });
+        this.toolCalls.push({
+          toolName: name,
+          args: recordArgs,
+          result: recordResult,
+          duration_ms,
+        });
 
         // Emit end event
         this.eventHandler?.({
           type: "tool-call-end",
           callId,
           toolName: name,
-          args: args[0],
-          result,
+          args: recordArgs,
+          result: recordResult,
           startTime,
           endTime,
         });
@@ -316,7 +329,7 @@ export class QuickJSRuntime implements IJSRuntime {
         // Record failed tool call
         this.toolCalls.push({
           toolName: name,
-          args: args[0],
+          args: recordArgs,
           error: errorStr,
           duration_ms,
         });
@@ -326,7 +339,7 @@ export class QuickJSRuntime implements IJSRuntime {
           type: "tool-call-end",
           callId,
           toolName: name,
-          args: args[0],
+          args: recordArgs,
           error: errorStr,
           startTime,
           endTime,
@@ -448,18 +461,21 @@ export class QuickJSRuntime implements IJSRuntime {
         try {
           const result = await fn(...args);
           const endTime = Date.now();
+          // Same creation-time bounding as synchronous bridges (kernel mode).
+          const recordArgs = this.boundCaptureArgs(args[0]);
+          const recordResult = this.boundCaptureResult(result);
           toolCalls.push({
             toolName: name,
-            args: args[0],
-            result,
+            args: recordArgs,
+            result: recordResult,
             duration_ms: endTime - startTime,
           });
           eventHandler?.({
             type: "tool-call-end",
             callId,
             toolName: name,
-            args: args[0],
-            result,
+            args: recordArgs,
+            result: recordResult,
             startTime,
             endTime,
           });
@@ -471,9 +487,10 @@ export class QuickJSRuntime implements IJSRuntime {
         } catch (error) {
           const endTime = Date.now();
           const errorStr = error instanceof Error ? error.message : String(error);
+          const recordArgs = this.boundCaptureArgs(args[0]);
           toolCalls.push({
             toolName: name,
-            args: args[0],
+            args: recordArgs,
             error: errorStr,
             duration_ms: endTime - startTime,
           });
@@ -481,7 +498,7 @@ export class QuickJSRuntime implements IJSRuntime {
             type: "tool-call-end",
             callId,
             toolName: name,
-            args: args[0],
+            args: recordArgs,
             error: errorStr,
             startTime,
             endTime,
@@ -526,6 +543,49 @@ export class QuickJSRuntime implements IJSRuntime {
 
     this.ctx.setProp(this.ctx.global, name, fnHandle);
     fnHandle.dispose();
+  }
+
+  setKernelRecordBounds(bounds: KernelRecordBounds | undefined): void {
+    this.kernelRecordBounds = bounds;
+  }
+
+  /**
+   * Bound a guest-supplied value at record/event CREATION time (kernel mode
+   * only). Records live in host memory for the whole eval and events land in
+   * partial/final session history via the stream manager, so post-eval
+   * compaction cannot protect either — a guest looping large nested args
+   * would otherwise grow both without bound. The marker keeps the true size
+   * so downstream compaction reports honest byte counts.
+   */
+  private boundCapture(value: unknown, capBytes: number): unknown {
+    if (this.kernelRecordBounds === undefined) return value;
+    let serialized: string;
+    try {
+      serialized = JSON.stringify(value) ?? "";
+    } catch {
+      // Bridged values are JSON round-tripped, so this is unreachable in
+      // practice; suppress rather than risk leaking via toString.
+      return { __kernelBounded: true, bytes: 0, preview: "[unserializable]" };
+    }
+    const bytes = Buffer.byteLength(serialized, "utf8");
+    if (bytes <= capBytes) return value;
+    return {
+      __kernelBounded: true,
+      bytes,
+      preview: `${serialized.slice(0, capBytes)}…[${bytes} bytes total; truncated]`,
+    };
+  }
+
+  private boundCaptureArgs(value: unknown): unknown {
+    return this.kernelRecordBounds === undefined
+      ? value
+      : this.boundCapture(value, this.kernelRecordBounds.argsCapBytes);
+  }
+
+  private boundCaptureResult(value: unknown): unknown {
+    return this.kernelRecordBounds === undefined
+      ? value
+      : this.boundCapture(value, this.kernelRecordBounds.resultCapBytes);
   }
 
   setPendingJobGate(gate: (run: () => void) => void): void {
@@ -607,12 +667,15 @@ export class QuickJSRuntime implements IJSRuntime {
         const startTime = Date.now();
         const callId = generateCallId();
 
+        // Same creation-time bounding as registerFunction (kernel mode).
+        const recordArgs = this.boundCaptureArgs(args[0]);
+
         // Emit start event
         this.eventHandler?.({
           type: "tool-call-start",
           callId,
           toolName: methodName,
-          args: args[0],
+          args: recordArgs,
           startTime,
         });
 
@@ -620,17 +683,23 @@ export class QuickJSRuntime implements IJSRuntime {
           const result = await fn(...args);
           const endTime = Date.now();
           const duration_ms = endTime - startTime;
+          const recordResult = this.boundCaptureResult(result);
 
           // Record tool call
-          this.toolCalls.push({ toolName: methodName, args: args[0], result, duration_ms });
+          this.toolCalls.push({
+            toolName: methodName,
+            args: recordArgs,
+            result: recordResult,
+            duration_ms,
+          });
 
           // Emit end event
           this.eventHandler?.({
             type: "tool-call-end",
             callId,
             toolName: methodName,
-            args: args[0],
-            result,
+            args: recordArgs,
+            result: recordResult,
             startTime,
             endTime,
           });
@@ -643,7 +712,7 @@ export class QuickJSRuntime implements IJSRuntime {
 
           this.toolCalls.push({
             toolName: methodName,
-            args: args[0],
+            args: recordArgs,
             error: errorStr,
             duration_ms,
           });
@@ -652,7 +721,7 @@ export class QuickJSRuntime implements IJSRuntime {
             type: "tool-call-end",
             callId,
             toolName: methodName,
-            args: args[0],
+            args: recordArgs,
             error: errorStr,
             startTime,
             endTime,

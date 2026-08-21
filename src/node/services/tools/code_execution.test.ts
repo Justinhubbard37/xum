@@ -932,6 +932,56 @@ describe("createCodeExecutionTool", () => {
       await host.disposeScope("ws-offload");
     });
 
+    it("bounds nested-call args/results at creation: emitted events never carry full payloads", async () => {
+      // Post-eval compaction cannot protect the stream path: nested events
+      // land in partial/final session history via the stream manager, so a
+      // guest looping `xum.sink({content: vars.large})` would grow history
+      // without bound unless capture is bounded at CREATION time.
+      using tmp = new DisposableTempDir("code-exec-offload");
+      const host = new SandboxHostService();
+      const sinkTools: Record<string, Tool> = {
+        big_fetch: createMockTool("big_fetch", z.object({}), () => bigPayload),
+        sink: createMockTool("sink", z.object({ content: z.string() }), () => "ok"),
+      };
+      const emitted: Array<{ toolName?: string; args?: unknown; result?: unknown }> = [];
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(sinkTools),
+        (event) => {
+          emitted.push(event as { toolName?: string; args?: unknown; result?: unknown });
+        },
+        persistentRunner(host, "ws-event-bound", tmp.path)
+      );
+
+      const result = (await tool.execute!(
+        {
+          code: "const r = mux.big_fetch({}); for (let i = 0; i < 3; i++) { mux.sink({content: r.data}); } return true;",
+        },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+
+      // Every emitted event for the large-arg sink calls is bounded: no
+      // event carries the 20KB payload.
+      const sinkEvents = emitted.filter((e) => e.toolName === "sink");
+      expect(sinkEvents.length).toBeGreaterThan(0);
+      for (const event of sinkEvents) {
+        const serialized = JSON.stringify(event.args) ?? "";
+        expect(serialized.length).toBeLessThan(4 * 1024);
+        const marker = event.args as { __kernelBounded?: boolean; bytes?: number };
+        expect(marker.__kernelBounded).toBe(true);
+        expect(marker.bytes).toBeGreaterThan(10_000);
+      }
+      // big_fetch's oversized RESULT is bounded in its event too.
+      const fetchEnd = emitted.find(
+        (e) => e.toolName === "big_fetch" && (e as { type?: string }).type === "tool-call-end"
+      );
+      expect(fetchEnd).toBeDefined();
+      const fetchResult = fetchEnd!.result as { __kernelBounded?: boolean; bytes?: number };
+      expect(fetchResult.__kernelBounded).toBe(true);
+      await host.disposeScope("ws-event-bound");
+    });
+
     it("bounds oversized nested-call args in compact records (no echo of kernel data)", async () => {
       using tmp = new DisposableTempDir("code-exec-offload");
       const host = new SandboxHostService();
@@ -959,10 +1009,17 @@ describe("createCodeExecutionTool", () => {
 
       const sinkRecord = result.toolCalls.find((r) => r.toolName === "sink");
       expect(sinkRecord).toBeDefined();
-      const args = sinkRecord!.args as { argsPreview?: string; argsBytes?: number };
-      expect(typeof args.argsPreview).toBe("string");
-      expect(args.argsPreview!.length).toBeLessThan(3 * 1024);
-      expect(args.argsBytes).toBeGreaterThan(10_000);
+      // Bounded at creation time (runtime kernel record bounds); the compact
+      // pass passes the marker through without double-wrapping.
+      const args = sinkRecord!.args as {
+        __kernelBounded?: boolean;
+        preview?: string;
+        bytes?: number;
+      };
+      expect(args.__kernelBounded).toBe(true);
+      expect(typeof args.preview).toBe("string");
+      expect(args.preview!.length).toBeLessThan(3 * 1024);
+      expect(args.bytes).toBeGreaterThan(10_000);
       // Small args pass through untouched.
       const fetchRecord = result.toolCalls.find((r) => r.toolName === "big_fetch");
       expect(fetchRecord!.args).toEqual({});

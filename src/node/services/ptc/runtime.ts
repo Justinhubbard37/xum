@@ -81,6 +81,16 @@ export interface IJSRuntime extends Disposable {
   setVarsProperty(key: string, value: string): void;
 
   /**
+   * Bound guest-supplied args/results captured into tool-call records and
+   * streamed events at CREATION time (kernel mode). Post-eval compaction
+   * cannot protect host memory or the session history that streamed events
+   * land in: a guest looping `xum.tool({big: vars.large})` would otherwise
+   * retain and emit every full payload. Pass undefined to disable (ephemeral
+   * mode keeps full records — the byte-identical supplement contract).
+   */
+  setKernelRecordBounds(bounds: KernelRecordBounds | undefined): void;
+
+  /**
    * Route late guest-continuation execution through a host-provided gate.
    * When a fire-and-forget capability (registerPromiseFunction) settles after
    * its originating eval() returned, the runtime must run pending guest jobs —
@@ -119,6 +129,14 @@ export interface IJSRuntime extends Disposable {
    * Clean up resources. Called automatically with `using` declarations.
    */
   dispose(): void;
+}
+
+/** Caps applied to record/event capture when kernel record bounding is on. */
+export interface KernelRecordBounds {
+  /** Max serialized bytes of `args` kept in a record/event. */
+  argsCapBytes: number;
+  /** Max serialized bytes of `result` kept in a record/event. */
+  resultCapBytes: number;
 }
 
 /**

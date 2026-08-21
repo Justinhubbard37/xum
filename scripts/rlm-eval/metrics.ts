@@ -128,24 +128,48 @@ export function extractMetrics(sessionDir: string): CellMetrics {
       const meta = (row as Record<string, unknown>).metadata;
       if (isRecord(meta) && meta.rlmPreservedTailCopy === true) continue;
     }
+    // Internal rows carry a distinguishing muxMetadata type (e.g.
+    // "compaction-request" user rows and their "compaction-summary"
+    // assistant rows). Only REAL scenario user rows may open a turn, and
+    // internal assistant output must not be appended to the preceding
+    // scenario turn — otherwise a compacted two-turn cell yields
+    // [answer1, summary, answer2] and positional verifiers check the
+    // summary as turn 2.
+    const rowMuxType = (() => {
+      const meta = (row as Record<string, unknown>).metadata;
+      if (!isRecord(meta) || !isRecord(meta.muxMetadata)) return undefined;
+      return typeof meta.muxMetadata.type === "string" ? meta.muxMetadata.type : undefined;
+    })();
     if (msg.role === "user") {
+      if (rowMuxType !== undefined && rowMuxType !== "normal") continue;
       currentTurnText = [];
       metrics.assistantTextPerTurn.push("");
       continue;
     }
     if (msg.role !== "assistant") continue;
     // Compaction boundaries: summary rows the compaction handler writes carry
-    // a muxMetadata type marking them; count them as compaction events.
+    // a muxMetadata type marking them; count them as compaction events, but
+    // never as scenario output.
     const meta = (row as Record<string, unknown>).metadata;
-    if (isRecord(meta)) {
-      const muxMeta = meta.muxMetadata;
-      if (
-        isRecord(muxMeta) &&
-        typeof muxMeta.type === "string" &&
-        muxMeta.type.includes("compact")
-      ) {
-        metrics.compactions += 1;
+    if (rowMuxType !== undefined && rowMuxType.includes("compact")) {
+      metrics.compactions += 1;
+    }
+    if (rowMuxType !== undefined && rowMuxType !== "normal") {
+      // Internal assistant rows (compaction summaries etc.) are real provider
+      // requests, so their usage still counts toward peak context pressure —
+      // only their text/tool parts are excluded from scenario turns.
+      if (isRecord(meta) && isRecord(meta.usage)) {
+        const num = (v: unknown): number => (typeof v === "number" ? v : 0);
+        const usage = meta.usage;
+        const ctx =
+          num(usage.inputTokens) +
+          num(usage.cachedInputTokens) +
+          num(usage.cacheCreationInputTokens);
+        metrics.peakContextTokens = Math.max(metrics.peakContextTokens, ctx);
       }
+      continue;
+    }
+    if (isRecord(meta)) {
       // Peak per-request context pressure from the per-row usage snapshot.
       const usage = meta.usage;
       if (isRecord(usage)) {

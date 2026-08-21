@@ -48,7 +48,8 @@ export class VarsSnapshotBudgetError extends Error {
   constructor(sizeBytes: number) {
     super(
       `vars snapshot is ${sizeBytes} bytes, exceeding the ${VARS_SNAPSHOT_MAX_BYTES}-byte budget; ` +
-        `state was NOT persisted — remove or shrink large vars entries`
+        `state was NOT persisted and this call's vars mutations (including any new handles or ` +
+        `loads) will NOT survive — remove or shrink large vars entries`
     );
     this.name = "VarsSnapshotBudgetError";
   }
