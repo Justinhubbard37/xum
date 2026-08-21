@@ -1937,6 +1937,43 @@ describe("CompactionHandler", () => {
       expect(metadata?.preservedTailMessageCount).toBe(0);
     });
 
+    it("commits the boundary and tail all-or-nothing: a failed commit leaves no boundary", async () => {
+      // The boundary write seals the previous epoch and the summarizer already
+      // excluded the stamped tail rows — a boundary that became durable without
+      // its full tail would permanently drop the suffix from provider context.
+      // The commit is one atomic history operation: on failure NOTHING lands.
+      const onCompactionComplete = mock((_metadata: CompactionCompletionMetadata) => undefined);
+      handler = new CompactionHandler({
+        workspaceId,
+        historyService,
+        sessionDir,
+        telemetryService,
+        emitter: mockEmitter,
+        onCompactionComplete,
+      });
+      await seedHistory(
+        createMuxMessage("u0", "user", "old head question"),
+        createMuxMessage("a0", "assistant", "old head answer"),
+        createMuxMessage("u1", "user", "tail question"),
+        createMuxMessage("a1", "assistant", "tail answer"),
+        createStampedCompactionRequest("compact-req", 2)
+      );
+
+      spyOn(historyService, "persistBoundaryWithTailCopies").mockResolvedValueOnce(
+        Err("injected commit failure")
+      );
+
+      await handler.handleCompletion(createStreamEndEvent("Summary"));
+
+      // No boundary and no partial tail copies: the original epoch is intact
+      // and the compaction never reported completion.
+      const epochResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!epochResult.success) throw new Error(epochResult.error);
+      expect(epochResult.data.some((m) => m.metadata?.compactionBoundary === true)).toBe(false);
+      expect(epochResult.data.some((m) => m.metadata?.rlmPreservedTailCopy === true)).toBe(false);
+      expect(onCompactionComplete).not.toHaveBeenCalled();
+    });
+
     it("never preserves older compaction-request rows inside the tail", async () => {
       await seedHistory(
         createMuxMessage("u0", "user", "head question"),

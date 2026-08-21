@@ -158,6 +158,29 @@ test("check misses after staging a change", async () => {
   expect((await gate(repo, "check", "static-check")).exitCode).toBe(1);
 });
 
+test("check misses when an untracked file's executable bit or symlink target changes", async () => {
+  const { chmod, symlink, unlink } = await import("node:fs/promises");
+
+  // Executable bit: builds/tests can execute the file differently, so a
+  // chmod alone must invalidate the recorded gate.
+  const scriptPath = path.join(repo, "run.sh");
+  await writeFile(scriptPath, "#!/bin/sh\necho hi\n");
+  await record(repo, "static-check", "pass");
+  expect((await gate(repo, "check", "static-check")).exitCode).toBe(0);
+  await chmod(scriptPath, 0o755);
+  expect((await gate(repo, "check", "static-check")).exitCode).toBe(1);
+
+  // Symlink identity: retargeting a link without touching contents must
+  // invalidate too (the manifest hashes the target string, not the referent).
+  const linkPath = path.join(repo, "link");
+  await symlink("tracked.txt", linkPath);
+  await record(repo, "static-check", "pass");
+  expect((await gate(repo, "check", "static-check")).exitCode).toBe(0);
+  await unlink(linkPath);
+  await symlink("run.sh", linkPath);
+  expect((await gate(repo, "check", "static-check")).exitCode).toBe(1);
+});
+
 test("record is refused when the worktree changed after the fingerprint was captured", async () => {
   // Simulates a mid-gate worktree change: fingerprint captured, then another
   // process edits a file before record runs. The stale outcome must not be

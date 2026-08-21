@@ -1208,14 +1208,41 @@ export class CompactionHandler {
       "Compaction summary must not persist stale contextProviderMetadata"
     );
 
-    const persistenceResult = persistedStreamSummary
-      ? await this.historyService.updateHistory(this.workspaceId, summaryMessage)
-      : await this.historyService.appendToHistory(this.workspaceId, summaryMessage);
+    // RLM keep-recent floor: sanitized tail copies re-appear verbatim AFTER
+    // the boundary so post-compaction requests see [summary, ...tail]. The
+    // boundary and every copy must land in ONE atomic history commit: the
+    // boundary write seals the previous epoch and the summarizer already
+    // excluded the stamped tail rows, so a boundary that became durable
+    // without the full tail (crash or failure mid-append) would leave the
+    // suffix permanently absent from provider context with no recovery
+    // marker. Empty when unstamped (RLM off) — that path stays untouched.
+    const preservedTailCopies = this.buildPreservedTailCopies(
+      messages,
+      compactionRequestMessageId,
+      summaryMessage.id
+    );
+
+    const persistenceResult =
+      preservedTailCopies.length > 0
+        ? await this.historyService.persistBoundaryWithTailCopies(
+            this.workspaceId,
+            summaryMessage,
+            preservedTailCopies,
+            persistedStreamSummary !== null
+          )
+        : persistedStreamSummary
+          ? await this.historyService.updateHistory(this.workspaceId, summaryMessage)
+          : await this.historyService.appendToHistory(this.workspaceId, summaryMessage);
     if (!persistenceResult.success) {
       this.cachedFileDiffs = [];
       this.cachedLoadedSkills = [];
       await this.deletePersistedPendingStateBestEffort();
-      const operation = persistedStreamSummary ? "update streamed summary" : "append summary";
+      const operation =
+        preservedTailCopies.length > 0
+          ? "commit boundary with preserved tail"
+          : persistedStreamSummary
+            ? "update streamed summary"
+            : "append summary";
       return Err(`Failed to ${operation}: ${persistenceResult.error}`);
     }
 
@@ -1243,16 +1270,11 @@ export class CompactionHandler {
     // Emit summary message to frontend (add type: "message" for discriminated union)
     this.emitChatEvent({ ...summaryMessage, type: "message" });
 
-    // RLM keep-recent floor: re-append the stamped tail verbatim AFTER the
-    // boundary so post-compaction requests see [summary, ...tail]. Must run
-    // after the boundary write (append-only history + eager sealed rotation
-    // archive everything before the boundary). Self-healing: copy failures
-    // shorten the tail but never fail the compaction itself.
-    const preservedTailMessageCount = await this.appendPreservedTailCopies(
-      messages,
-      compactionRequestMessageId,
-      summaryMessage.id
-    );
+    // The tail copies were committed atomically with the boundary above;
+    // sequences were assigned in place, so the emitted events carry them.
+    for (const copy of preservedTailCopies) {
+      this.emitChatEvent({ ...copy, type: "message" });
+    }
 
     return Ok({
       workspaceId: this.workspaceId,
@@ -1261,32 +1283,34 @@ export class CompactionHandler {
       compactionEpoch: nextCompactionEpoch,
       previousBoundaryHistorySequence,
       compactionRequestMessageId,
-      preservedTailMessageCount,
+      preservedTailMessageCount: preservedTailCopies.length,
     });
   }
 
   /**
-   * Append sanitized copies of the keep-recent tail after the compaction
-   * boundary (RLM mode). The tail is derived purely from the durable stamp on
-   * the compaction-request row, so completion agrees byte-for-byte with what
-   * the summarization request excluded. Returns the number of appended copies
-   * (0 when unstamped — i.e. RLM off — keeping default behavior untouched).
+   * Build sanitized copies of the keep-recent tail for re-appearance after
+   * the compaction boundary (RLM mode). The tail is derived purely from the
+   * durable stamp on the compaction-request row, so completion agrees
+   * byte-for-byte with what the summarization request excluded. Returns []
+   * when unstamped — i.e. RLM off — keeping default behavior untouched.
+   * Pure build, no I/O: the caller commits the copies atomically WITH the
+   * boundary via persistBoundaryWithTailCopies.
    */
-  private async appendPreservedTailCopies(
+  private buildPreservedTailCopies(
     messages: MuxMessage[],
     compactionRequestMessageId: string,
     summaryMessageId: string
-  ): Promise<number> {
+  ): MuxMessage[] {
     const requestIndex = messages.findIndex((message) => message.id === compactionRequestMessageId);
     if (requestIndex === -1) {
-      return 0;
+      return [];
     }
 
     const startHistorySequence = getKeepRecentTailStartHistorySequence(
       messages[requestIndex].metadata?.muxMetadata
     );
     if (startHistorySequence === undefined) {
-      return 0;
+      return [];
     }
 
     // Tail = rows between the stamped start and the compaction request.
@@ -1303,10 +1327,9 @@ export class CompactionHandler {
       return message.metadata?.muxMetadata?.type !== "compaction-request";
     });
     if (tailRows.length === 0) {
-      return 0;
+      return [];
     }
 
-    let appended = 0;
     // Preassign copy IDs for ALL tail rows before building any copy: MCP
     // snapshot rows precede the user row they expand, so a build-time map
     // would not yet contain the invoking row's copy ID when the snapshot row
@@ -1316,22 +1339,7 @@ export class CompactionHandler {
     for (const row of tailRows) {
       idMap.set(row.id, createPreservedTailCopyMessageId());
     }
-    for (const row of tailRows) {
-      const copy = this.buildPreservedTailCopy(row, idMap);
-      const appendResult = await this.historyService.appendToHistory(this.workspaceId, copy);
-      if (!appendResult.success) {
-        log.warn("Failed to append preserved tail copy; keeping shorter tail", {
-          workspaceId: this.workspaceId,
-          sourceMessageId: row.id,
-          error: appendResult.error,
-        });
-        break;
-      }
-      appended += 1;
-      this.emitChatEvent({ ...copy, type: "message" });
-    }
-
-    return appended;
+    return tailRows.map((row) => this.buildPreservedTailCopy(row, idMap));
   }
 
   /**

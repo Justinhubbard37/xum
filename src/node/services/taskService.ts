@@ -27,7 +27,11 @@ import {
 } from "@/common/utils/subagentReportEnvelope";
 import { BACKGROUND_WORK_WAKE_OPENINGS } from "@/common/utils/machineTurnPrompts";
 import { WORKSPACE_TURN_TASK_TAGS } from "@/constants/workspaceTags";
-import { TASK_FAMILY_MESSAGE_MAX_CHARS } from "@/constants/taskMessages";
+import {
+  TASK_FAMILY_MESSAGE_MAX_CHARS,
+  TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS,
+  TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES,
+} from "@/constants/taskMessages";
 import { log } from "@/node/services/log";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
@@ -1336,6 +1340,12 @@ export class TaskService {
   // Cache completed reports so callers can retrieve them without re-reading disk.
   // Bounded by max entries; disk persistence is the source of truth for restart-safety.
   private readonly completedReportsByTaskId = new Map<string, CompletedAgentReportCacheEntry>();
+
+  // Aggregate RLM family-message totals per sender→target pair (see
+  // src/constants/taskMessages.ts for the rationale and limits). In-memory
+  // and process-lifetime by design: the bound protects the live queue and
+  // provider input, and a restart naturally re-arms it.
+  private readonly familyMessageTotals = new Map<string, { count: number; chars: number }>();
 
   // Task workspace removals that outlived their termination timeout. Retries must
   // await the ORIGINAL removal outcome: WorkspaceService.remove() short-circuits Ok
@@ -7363,6 +7373,51 @@ export class TaskService {
   }
 
   /**
+   * Reserve aggregate family-message budget for one send (per-message caps are
+   * enforced separately by the callers). The check + increment are synchronous
+   * so concurrent sends cannot interleave past the limit; delivery failures
+   * refund via the returned function so a flaky target does not burn budget.
+   * Returns null when the sender→target budget is exhausted.
+   */
+  private reserveFamilyMessageBudget(
+    senderWorkspaceId: string,
+    targetWorkspaceId: string,
+    chars: number
+  ): (() => void) | null {
+    assert(chars > 0, "reserveFamilyMessageBudget: chars must be positive");
+    const key = `${senderWorkspaceId}\u0000${targetWorkspaceId}`;
+    const totals = this.familyMessageTotals.get(key) ?? { count: 0, chars: 0 };
+    if (
+      totals.count + 1 > TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES ||
+      totals.chars + chars > TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS
+    ) {
+      return null;
+    }
+    totals.count += 1;
+    totals.chars += chars;
+    this.familyMessageTotals.set(key, totals);
+    let refunded = false;
+    return () => {
+      if (refunded) return;
+      refunded = true;
+      totals.count -= 1;
+      totals.chars -= chars;
+    };
+  }
+
+  /** Shared exhausted-budget error for both family-message directions. */
+  private familyMessageBudgetExhaustedError(): { code: "send_failed"; message: string } {
+    return {
+      code: "send_failed" as const,
+      message:
+        `Family-message budget to this target is exhausted for this session ` +
+        `(max ${TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES} messages / ` +
+        `${TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS} chars). Consolidate updates and ` +
+        `use agent_report for the final result.`,
+    };
+  }
+
+  /**
    * Child -> parent family message (RLM family messaging, task_message_parent).
    *
    * Appends a clearly-labeled child message into the PARENT workspace's queue using
@@ -7422,6 +7477,19 @@ export class TaskService {
       });
     }
 
+    // Aggregate budget behind the per-message cap: a code_execution loop can
+    // repeat valid max-size sends, and a busy parent's queue would append
+    // every one into a single unbounded entry before joining it for
+    // history/provider input.
+    const refundBudget = this.reserveFamilyMessageBudget(
+      childWorkspaceId,
+      parentWorkspaceId,
+      trimmedMessage.length
+    );
+    if (refundBudget === null) {
+      return Err(this.familyMessageBudgetExhaustedError());
+    }
+
     const childTitle =
       coerceNonEmptyString(childEntry.workspace.title) ??
       coerceNonEmptyString(childEntry.workspace.name) ??
@@ -7438,6 +7506,7 @@ export class TaskService {
       queueDispatchMode,
     });
     if (!wakeResult.success) {
+      refundBudget();
       return Err({ code: "send_failed" as const, message: wakeResult.error });
     }
     return Ok({ parentWorkspaceId });
@@ -7500,6 +7569,17 @@ export class TaskService {
       return Err({ code: "invalid_scope" as const });
     }
 
+    // Same aggregate budget as the child->parent direction: bound what one
+    // sender can push into one sibling across its session.
+    const refundBudget = this.reserveFamilyMessageBudget(
+      senderWorkspaceId,
+      targetTaskId,
+      message.trim().length
+    );
+    if (refundBudget === null) {
+      return Err(this.familyMessageBudgetExhaustedError());
+    }
+
     const senderTitle =
       coerceNonEmptyString(senderEntry.workspace.title) ??
       coerceNonEmptyString(senderEntry.workspace.name) ??
@@ -7507,13 +7587,17 @@ export class TaskService {
     // Reuse the parent->child delivery machinery (queueing, dispatch boundaries,
     // reactivation) with the shared parent as the authorizing ancestor; only the
     // transcript label differs so the sibling can attribute the sender.
-    return this.sendMessageToDescendantAgentTask(
+    const sendResult = await this.sendMessageToDescendantAgentTask(
       sharedParentId,
       targetTaskId,
       message,
       queueDispatchMode,
       { messageLabel: `Message from sibling task ${senderWorkspaceId} (${senderTitle})` }
     );
+    if (!sendResult.success) {
+      refundBudget();
+    }
+    return sendResult;
   }
 
   async requestAgentFinalReportForTimeout(

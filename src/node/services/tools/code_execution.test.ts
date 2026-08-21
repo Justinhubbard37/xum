@@ -1103,6 +1103,33 @@ describe("createCodeExecutionTool", () => {
       await host.disposeScope("ws-budget-rewrite");
     });
 
+    it("rewrites an advertised handle when vars become unsnapshottable (non-budget persist failure)", async () => {
+      // A cycle created in the same call makes snapshotVars throw a plain
+      // error (not the budget error); the mount is disposed and the handle
+      // does not survive, so the rewrite must apply to EVERY persist failure.
+      using tmp = new DisposableTempDir("code-exec-offload");
+      const host = new SandboxHostService();
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge({}),
+        undefined,
+        persistentRunner(host, "ws-cycle-rewrite", tmp.path)
+      );
+
+      const result = (await tool.execute!(
+        {
+          code: `vars.cycle = {}; vars.cycle.self = vars.cycle; return "y".repeat(${64 * 1024});`,
+        },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+
+      const record = result.result as { truncated?: boolean; handle?: string };
+      expect(record.truncated).toBe(true);
+      expect(record.handle).toBeUndefined();
+      await host.disposeScope("ws-cycle-rewrite");
+    });
+
     it("handle vars survive a simulated restart: a later eval after remount can slice vars.__hN", async () => {
       using tmp = new DisposableTempDir("code-exec-offload");
       const host = new SandboxHostService();

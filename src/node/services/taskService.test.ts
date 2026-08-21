@@ -35,7 +35,11 @@ import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataServi
 import { SessionUsageService } from "@/node/services/sessionUsageService";
 import { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import { IdleDispatcher } from "@/node/services/idleDispatcher";
-import { TASK_FAMILY_MESSAGE_MAX_CHARS } from "@/constants/taskMessages";
+import {
+  TASK_FAMILY_MESSAGE_MAX_CHARS,
+  TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS,
+  TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES,
+} from "@/constants/taskMessages";
 import {
   TerminalAttentionStore,
   type TerminalAttentionOutcome,
@@ -13202,6 +13206,128 @@ describe("TaskService", () => {
       "tool-end"
     );
     expect(atLimit.success).toBe(true);
+  });
+
+  test("family messages are bounded by an aggregate per-sender session budget", async () => {
+    // The per-message cap alone is not enough: a code_execution loop can
+    // repeat valid max-size sends, and a busy parent's queue would append
+    // every one into one unbounded entry before joining it for provider
+    // input. The aggregate budget absolutely bounds one sender's total.
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-msg-budget";
+    const childTaskId = "child-msg-budget";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId, {
+          aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
+        }),
+        projectWorkspace(projectPath, "child", childTaskId, {
+          parentWorkspaceId,
+          taskStatus: "running",
+          taskExperiments: { rlm: true },
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    // Exactly the chars budget worth of max-size messages is deliverable...
+    const maxSizeSends = TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS / TASK_FAMILY_MESSAGE_MAX_CHARS;
+    for (let i = 0; i < maxSizeSends; i++) {
+      const sent = await taskService.sendMessageToParentFromAgentTask(
+        childTaskId,
+        "x".repeat(TASK_FAMILY_MESSAGE_MAX_CHARS),
+        "tool-end"
+      );
+      expect(sent.success).toBe(true);
+    }
+    expect(sendMessage).toHaveBeenCalledTimes(maxSizeSends);
+
+    // ...then even a tiny message is refused without delivering.
+    const exhausted = await taskService.sendMessageToParentFromAgentTask(
+      childTaskId,
+      "one more",
+      "tool-end"
+    );
+    expect(exhausted.success).toBe(false);
+    if (!exhausted.success) {
+      expect(exhausted.error.code).toBe("send_failed");
+      expect("message" in exhausted.error && exhausted.error.message).toContain("budget");
+    }
+    expect(sendMessage).toHaveBeenCalledTimes(maxSizeSends);
+  });
+
+  test("sibling family messages enforce the aggregate message-count budget", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-sibling-budget";
+    const senderTaskId = "sender-sibling-budget";
+    const targetTaskId = "target-sibling-budget";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId),
+        projectWorkspace(projectPath, "sender", senderTaskId, {
+          parentWorkspaceId,
+          title: "Researcher A",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "target", targetTaskId, {
+          parentWorkspaceId,
+          agentId: "explore",
+          agentType: "explore",
+          taskStatus: "running",
+          taskModelString: "openai:gpt-5.2",
+          aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+      sendMessage: mock(
+        async (
+          _workspaceId: string,
+          _message: string,
+          _options: unknown,
+          internal?: { onAccepted?: () => Promise<void> | void }
+        ): Promise<Result<void>> => {
+          await internal?.onAccepted?.();
+          return Ok(undefined);
+        }
+      ),
+    });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    // Small messages exhaust the COUNT budget long before the chars budget.
+    for (let i = 0; i < TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES; i++) {
+      const sent = await taskService.sendMessageToSiblingAgentTask(
+        senderTaskId,
+        targetTaskId,
+        `update ${i}`,
+        "tool-end"
+      );
+      expect(sent.success).toBe(true);
+    }
+    const exhausted = await taskService.sendMessageToSiblingAgentTask(
+      senderTaskId,
+      targetTaskId,
+      "one too many",
+      "tool-end"
+    );
+    expect(exhausted.success).toBe(false);
+    if (!exhausted.success) {
+      expect(exhausted.error.code).toBe("send_failed");
+    }
+    expect(sendMessage).toHaveBeenCalledTimes(TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES);
   });
 
   test("sendMessageToParentFromAgentTask refuses non-child and workflow-owned callers", async () => {

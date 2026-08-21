@@ -1997,6 +1997,115 @@ export class HistoryService {
   }
 
   /**
+   * Atomically persist a compaction boundary together with its preserved
+   * keep-recent tail copies (RLM keep-recent floor) in ONE file commit.
+   *
+   * Why one commit: the boundary write seals the previous epoch — request
+   * assembly starts at the new boundary and the summarizer already excluded
+   * the stamped tail rows from the summary. If the boundary became durable
+   * while the copies were appended row-by-row, a crash or failure between
+   * the two would leave the tail suffix permanently absent from provider
+   * context with no recovery marker. A single writeFileAtomic (temp+rename,
+   * the same primitive updateHistory relies on) commits the boundary and
+   * every copy together: either all of them land or none do.
+   *
+   * `updateExisting` selects update semantics for the summary row (streamed
+   * summaries already occupy their historySequence in the active epoch) vs
+   * append semantics; tail copies are always appended after the boundary so
+   * sealed-epoch rotation keeps them in the active file.
+   */
+  async persistBoundaryWithTailCopies(
+    workspaceId: string,
+    summaryMessage: MuxMessage,
+    tailCopies: readonly MuxMessage[],
+    updateExisting: boolean
+  ): Promise<Result<void>> {
+    assert(tailCopies.length > 0, "persistBoundaryWithTailCopies requires at least one tail copy");
+    return this.withRecoveredHistoryResultLock(
+      workspaceId,
+      "Failed to persist compaction boundary with tail copies",
+      async () => {
+        try {
+          await ensurePrivateDir(this.config.getSessionDir(workspaceId));
+          const historyPath = this.getChatHistoryPath(workspaceId);
+          const messages = await this.readChatHistory(workspaceId);
+
+          let persistedSummary: MuxMessage | undefined;
+          if (updateExisting) {
+            // Same replace semantics as updateHistory: match by sequence and
+            // preserve boundary metadata already persisted on the row.
+            const targetSequence = summaryMessage.metadata?.historySequence;
+            if (targetSequence === undefined) {
+              return Err("Cannot update message without historySequence");
+            }
+            assert(
+              isNonNegativeInteger(targetSequence),
+              "persistBoundaryWithTailCopies requires a non-negative historySequence"
+            );
+            for (let i = 0; i < messages.length; i++) {
+              if (messages[i].metadata?.historySequence !== targetSequence) {
+                continue;
+              }
+              const preservedCompactionMetadata = getCompactionMetadataToPreserve(
+                workspaceId,
+                messages[i],
+                summaryMessage
+              );
+              messages[i] = {
+                ...summaryMessage,
+                metadata: {
+                  ...summaryMessage.metadata,
+                  ...(preservedCompactionMetadata ?? {}),
+                  historySequence: targetSequence,
+                },
+              };
+              persistedSummary = messages[i];
+              break;
+            }
+            if (persistedSummary === undefined) {
+              return Err(`No message found with historySequence ${targetSequence}`);
+            }
+          } else {
+            // Append semantics: assign the next sequence in place so callers
+            // observe it, exactly like appendToHistory does.
+            assert(
+              summaryMessage.metadata?.historySequence === undefined,
+              "persistBoundaryWithTailCopies append expects an unsequenced summary"
+            );
+            const nextSeqNum = await this.getNextHistorySequence(workspaceId);
+            summaryMessage.metadata = {
+              ...summaryMessage.metadata,
+              historySequence: nextSeqNum,
+            };
+            this.sequenceCounters.set(workspaceId, nextSeqNum + 1);
+            persistedSummary = summaryMessage;
+            messages.push(summaryMessage);
+          }
+
+          for (const copy of tailCopies) {
+            assert(
+              copy.metadata?.historySequence === undefined,
+              "persistBoundaryWithTailCopies expects unsequenced tail copies"
+            );
+            const seq = await this.getNextHistorySequence(workspaceId);
+            copy.metadata = { ...copy.metadata, historySequence: seq };
+            this.sequenceCounters.set(workspaceId, seq + 1);
+            messages.push(copy);
+          }
+
+          await writeFileAtomic(historyPath, this.serializeHistoryEntries(messages, workspaceId));
+
+          // Seal the previous epoch only after boundary + tail are durable.
+          await this.rotateAfterBoundaryWriteUnlocked(workspaceId, persistedSummary);
+          return Ok(undefined);
+        } catch (error) {
+          return Err(`Failed to persist boundary with tail copies: ${getErrorMessage(error)}`);
+        }
+      }
+    );
+  }
+
+  /**
    * Atomically delete a set of recent active-history messages by ID while preserving later rows.
    * Used to roll back a not-yet-accepted turn without truncating concurrent non-session writers.
    */

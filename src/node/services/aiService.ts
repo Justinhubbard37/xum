@@ -53,6 +53,7 @@ import {
 } from "@/node/runtime/runtimeHelpers";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { getWorkspacePathHintForProject } from "@/node/services/workspaceProjectRepos";
+import { isRlmModeEnabled } from "@/node/services/branchSummary";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
 import { getXumEnv, getRuntimeType } from "@/node/runtime/initHook";
 import { getSrcBaseDir, isSSHRuntime } from "@/common/types/runtime";
@@ -2671,15 +2672,21 @@ export class AIService extends EventEmitter {
         enableGoalTools: goalToolAvailability,
         // Only child workspaces (tasks) can report to a parent.
         enableAgentReport: Boolean(metadata.parentWorkspaceId),
-        // RLM family messaging: gate on the rlm flag persisted on the task record at
+        // RLM family messaging: gate on the flags persisted on the task record at
         // spawn — NOT the live send-options experiments — so a child spawned under RLM
         // keeps task_message_parent/task_message_sibling across app restarts and
-        // frontend experiment toggles. Workflow-owned workers are excluded: they hand
-        // results to WorkflowRunner through the journal path.
+        // frontend experiment toggles. Uses the full RLM predicate (rlm AND a PTC
+        // parent) rather than the bare rlm bit: the hidden sub-flag can stay true
+        // after its parent is disabled, and such children run outside RLM. Workflow-
+        // owned workers are excluded: they hand results to WorkflowRunner through the
+        // journal path.
         enableFamilyMessaging:
           Boolean(metadata.parentWorkspaceId) &&
           metadata.workflowTask == null &&
-          findWorkspaceEntry(cfg, workspaceId)?.workspace.taskExperiments?.rlm === true,
+          isRlmModeEnabled(
+            findWorkspaceEntry(cfg, workspaceId)?.workspace.taskExperiments,
+            undefined
+          ),
         workflowAgentOutputSchema: metadata.workflowTask?.outputSchema,
         allowLegacyInvalidWorkflowAgentOutputSchema,
         // External edit detection callback

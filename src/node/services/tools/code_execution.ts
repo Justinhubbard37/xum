@@ -660,21 +660,22 @@ ${xumTypes}
                   args: [`[kernel] ${persistError.message}`],
                   timestamp: Date.now(),
                 });
-                // A handle advertised THIS call did not survive (the mount is
-                // being disposed and the next call restores the previous
-                // durable snapshot — e.g. pre-existing unmanaged vars alone
-                // exceed the budget, which retention cannot evict). Rewrite
-                // the result so the model is never promised missing state.
-                const advertised = result.result as Partial<OffloadedValueRecord> | undefined;
-                if (
-                  returnHandleKey !== null &&
-                  advertised !== undefined &&
-                  typeof advertised.handle === "string" &&
-                  typeof advertised.preview === "string" &&
-                  typeof advertised.size === "number"
-                ) {
-                  result.result = buildTruncatedRecord(advertised.preview, advertised.size);
-                }
+              }
+              // A handle advertised THIS call did not survive (the mount is
+              // being disposed and the next call restores the previous
+              // durable snapshot). Applies to EVERY persist failure — over-
+              // budget namespaces AND unsnapshottable state (e.g. the guest
+              // created a cycle after the handle was stored). Rewrite the
+              // result so the model is never promised missing state.
+              const advertised = result.result as Partial<OffloadedValueRecord> | undefined;
+              if (
+                returnHandleKey !== null &&
+                advertised !== undefined &&
+                typeof advertised.handle === "string" &&
+                typeof advertised.preview === "string" &&
+                typeof advertised.size === "number"
+              ) {
+                result.result = buildTruncatedRecord(advertised.preview, advertised.size);
               }
               mount.dispose();
             }
