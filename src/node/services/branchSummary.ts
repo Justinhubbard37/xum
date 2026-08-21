@@ -546,6 +546,14 @@ interface PendingBranchSummary {
   promise: Promise<MuxMessage | null>;
   /** Invalidates the background writer (see clearPendingBranchSummary). */
   controller: AbortController;
+  /**
+   * Exactly-once consumption marker. The entry must STAY in the map while the
+   * first send awaits an unsettled promise — deleting it up front left a
+   * concurrent workspace removal with nothing to abort/drain, so the writer
+   * (or the resumed send) could append after removal deleted the session
+   * directory. Set synchronously, so two concurrent sends cannot both consume.
+   */
+  consumed: boolean;
 }
 const pendingBranchSummaries = new Map<string, PendingBranchSummary>();
 
@@ -567,7 +575,7 @@ export function startAbandonedBranchSummaryInBackground(
     ...input,
     cancellationSignal: controller.signal,
   });
-  const entry: PendingBranchSummary = { promise, controller };
+  const entry: PendingBranchSummary = { promise, controller, consumed: false };
   pendingBranchSummaries.set(input.workspaceId, entry);
   void promise.then((appended) => {
     // A null result has nothing left for the first send to consume, so drop
@@ -592,13 +600,25 @@ export function startAbandonedBranchSummaryInBackground(
  */
 export async function awaitPendingBranchSummary(workspaceId: string): Promise<MuxMessage | null> {
   const entry = pendingBranchSummaries.get(workspaceId);
-  if (!entry) {
+  if (!entry || entry.consumed) {
     return null;
   }
-  // Consume up front so exactly one send observes (and emits) the row;
-  // subsequent sends resolve null immediately.
-  pendingBranchSummaries.delete(workspaceId);
-  return entry.promise;
+  // Check-and-set is synchronous, so exactly one send observes (and emits)
+  // the row; concurrent sends resolve null immediately. The entry itself is
+  // NOT removed until the promise settles: workspace removal racing this
+  // await must still find the cancellation handle to abort/drain the writer
+  // (a cancelled writer resolves null here, so nothing is emitted after
+  // removal).
+  entry.consumed = true;
+  try {
+    return await entry.promise;
+  } finally {
+    // Identity-guarded: clearPendingBranchSummary may have already deleted
+    // (and a re-registration under the same id must not be swept).
+    if (pendingBranchSummaries.get(workspaceId) === entry) {
+      pendingBranchSummaries.delete(workspaceId);
+    }
+  }
 }
 
 /**

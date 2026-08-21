@@ -746,6 +746,64 @@ describe("branch summary placement on fork/truncate flows", () => {
     }
   });
 
+  test("removal during a first-send await still cancels the writer", async () => {
+    const { historyService, cleanup } = await createTestHistoryService();
+    const appendSpy = spyOn(historyService, "appendToHistoryIfTailMatches");
+    try {
+      const ws = "ws-await-race";
+      const branchPoint = createMuxMessage("ar-1", "assistant", "branch point", { timestamp: 1 });
+      expect((await historyService.appendToHistory(ws, branchPoint)).success).toBe(true);
+
+      // Gate generation at model creation so the race window (first send
+      // awaiting an unsettled promise) is held open deterministically.
+      let releaseModel: () => void = () => undefined;
+      const modelGate = new Promise<void>((resolve) => {
+        releaseModel = resolve;
+      });
+      const model = summaryModel("A summary that must never land after removal.");
+      const gatedAiService: BranchSummaryAiService = {
+        createModel: (async (...createArgs) => {
+          await modelGate;
+          return fakeAiService(model).createModel(...createArgs);
+        }) as BranchSummaryAiService["createModel"],
+        getWorkspaceMetadata: fakeAiService(model).getWorkspaceMetadata,
+      };
+
+      startAbandonedBranchSummaryInBackground({
+        historyService,
+        aiService: gatedAiService,
+        workspaceId: ws,
+        abandonedMessages: meatyExchange("await-race"),
+        experiments: RLM_ON,
+        guardTailMessageId: "ar-1",
+      });
+
+      // The fork's first send starts waiting BEFORE generation settles...
+      const firstSend = awaitPendingBranchSummary(ws);
+      // ...and exactly-once holds even mid-await: a concurrent second send
+      // resolves null immediately.
+      expect(await awaitPendingBranchSummary(ws)).toBeNull();
+
+      // Removal races in during the await window. Consumption must not have
+      // removed the cancellation handle, or this finds nothing to abort and
+      // the writer can append after the session directory is deleted.
+      const clearPromise = clearPendingBranchSummary(ws);
+      releaseModel();
+      await clearPromise;
+
+      // The cancelled writer never appended, the waiting send observed the
+      // cancellation (null, so it emits nothing), and the entry is gone.
+      expect(await firstSend).toBeNull();
+      expect(appendSpy).not.toHaveBeenCalled();
+      const history = await historyService.getHistoryFromLatestBoundary(ws);
+      expect(history.success && history.data.map((m) => m.id)).toEqual(["ar-1"]);
+      expect(await awaitPendingBranchSummary(ws)).toBeNull();
+    } finally {
+      appendSpy.mockRestore();
+      await cleanup();
+    }
+  });
+
   test("clearPendingBranchSummary waits for an in-flight append before resolving", async () => {
     const { historyService, cleanup } = await createTestHistoryService();
     // Gate the guarded append so the writer is mid-append when removal starts.
