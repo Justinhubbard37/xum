@@ -125,12 +125,14 @@ const JOURNAL_PREFIXES = [
 ] as const;
 
 /**
- * Marker file written into a staged tree just before its promote rename,
- * holding the random nonce also recorded in the promotion journal. Orphan
- * recovery deletes a tree only when the nonces match: this proves the tree is
- * the one WE promoted. Filesystem identities (dev/ino) are NOT sufficient —
- * deleting the orphan and recreating a directory at the same path can reuse
- * the inode immediately. The marker is removed once the install commits.
+ * Marker file written into a staged tree just before a promote/swap rename,
+ * holding the random nonce also recorded in the promotion or update journal.
+ * Recovery touches a tree at the target path only when the nonces match: this
+ * proves the tree is the one WE moved there. Filesystem identities (dev/ino)
+ * are NOT sufficient — deleting the orphan and recreating a directory at the
+ * same path can reuse the inode immediately. The marker is removed once the
+ * mutation commits, and validateStagedClone rejects repositories shipping the
+ * reserved name so the write can never clobber plugin-owned content.
  */
 const PROMOTION_MARKER_FILE = ".mux-promotion-marker";
 
@@ -1000,6 +1002,17 @@ export class AgentPluginInstallService {
       );
     }
 
+    // The crash-recovery marker name is RESERVED: install/update write a
+    // nonce file at this path just before their promote rename, which would
+    // silently replace repository-shipped content (and the commit path then
+    // deletes it), leaving the installed tree different from the consented
+    // commit. Reject up front instead of corrupting the plugin.
+    if (await pathExists(path.join(stagedDir, PROMOTION_MARKER_FILE))) {
+      throw new Error(
+        `The repository contains a reserved file name (${PROMOTION_MARKER_FILE}) used by the installer's crash recovery. Remove or rename it upstream to install this plugin.`
+      );
+    }
+
     const { plugin, diagnostics } = await discoverAgentPluginAt({
       pluginDir: stagedDir,
       scope: "global",
@@ -1737,12 +1750,41 @@ export class AgentPluginInstallService {
     journalPath: string,
     registryNames: Set<string>
   ): Promise<boolean> {
-    if (await pathExists(this.targetPathFor(name))) {
-      // A live tree (old or new) means the swap never started or completed;
-      // a still-staged old tree is plain trash for reclamation.
-      return true;
-    }
+    const targetPath = this.targetPathFor(name);
     const trashDir = await this.readJournalStagedPath(journalPath, "trashDir");
+    if (await pathExists(targetPath)) {
+      const journalNonce = await this.readJournalField(journalPath, "nonce");
+      const treeNonce = await fsPromises
+        .readFile(path.join(targetPath, PROMOTION_MARKER_FILE), "utf-8")
+        .catch(() => undefined);
+      if (journalNonce !== undefined && treeNonce === journalNonce) {
+        // OUR promoted replacement landed and only the cleanup was lost:
+        // finish it (marker off the live tree, staged old tree is trash).
+        await fsPromises
+          .rm(path.join(targetPath, PROMOTION_MARKER_FILE), { force: true })
+          .catch(() => undefined);
+        if (trashDir !== undefined) {
+          await this.removeDir(trashDir).catch(() => undefined);
+        }
+        return true;
+      }
+      if (trashDir === undefined || !(await pathExists(trashDir))) {
+        // Nothing recoverable is staged: the swap never moved the old tree
+        // (or it was already restored), so the live tree is the install.
+        return true;
+      }
+      // The target holds a tree WITHOUT our nonce while the old tree is
+      // still staged: a user created an unmanaged plugin at the then-empty
+      // target while the app was stopped. The registry would wrongly claim
+      // it (a later Update/Uninstall could overwrite or delete it) — keep
+      // the journal, which also pins the staged original against
+      // reclamation and blocks further updates until resolved.
+      log.warn(
+        "Update recovery found an unrecognized tree at the plugin path; keeping the staged original",
+        { name }
+      );
+      return false;
+    }
     if (trashDir === undefined || !(await pathExists(trashDir))) {
       log.warn("Update swap journal has no recoverable tree", { name });
       return true;
@@ -1756,7 +1798,7 @@ export class AgentPluginInstallService {
     log.warn("Restoring plugin tree after an update swap interrupted by a crash", { name });
     try {
       await fsPromises.mkdir(this.containerDir, { recursive: true });
-      await fsPromises.rename(trashDir, this.targetPathFor(name));
+      await fsPromises.rename(trashDir, targetPath);
     } catch (error) {
       log.warn("Failed to restore plugin tree from an interrupted update swap", {
         name,
@@ -2284,6 +2326,19 @@ export class AgentPluginInstallService {
         // builds, throws on unreadable files (tombstone retry), and cannot
         // interleave with a dialog save (shared exclusive write queue).
         await overridesService.prunePluginOverrideKeys(workspaceId, serverKeyPrefix);
+        // Propagate the pruned state into MCPServerManager's in-memory
+        // override cache, in the same disk-then-memory order as dialog
+        // saves: latestWorkspaceOverrides wins over freshly read files, so a
+        // workspace that once enabled this plugin's server would otherwise
+        // keep serving the stale enable — and a same-name reinstall's
+        // default-disabled server could start without a fresh user action.
+        // A failure keeps the tombstone so cache repair is retried too.
+        if (this.deps.mcpServerManager) {
+          const { overrides } = await overridesService.getOverridesForWorkspace(workspaceId, {
+            mode: "strict",
+          });
+          await this.deps.mcpServerManager.applyWorkspaceOverrides(workspaceId, overrides);
+        }
       } catch (error) {
         failedWorkspaceIds.push(workspaceId);
         log.warn("Failed to prune plugin MCP overrides for workspace", {
@@ -2614,6 +2669,17 @@ export class AgentPluginInstallService {
           `'${entry.name}' is pinned to commit ${entry.lockedSha.slice(0, 12)}; uninstall and reinstall to change it.`
         );
       }
+      // A retained journal means a previous swap's recovery is unfinished
+      // (e.g. the target was occupied by an unidentifiable tree). Refuse
+      // BEFORE cloning and comparing capabilities: a new journal would
+      // clobber the trashDir reference protecting the recoverable original,
+      // and the capability comparison would run against the wrong tree.
+      const updateJournalPath = this.journalPath(UPDATE_JOURNAL_PREFIX, entry.name);
+      if (await pathExists(updateJournalPath)) {
+        throw new Error(
+          `A previous update of '${entry.name}' has unfinished recovery. Open Settings → Plugins to let recovery complete, then try again.`
+        );
+      }
 
       const resolved = await this.resolveRemoteRef(
         entry.source.url,
@@ -2666,7 +2732,11 @@ export class AgentPluginInstallService {
         // handles can make the rename itself fail on Windows.
         await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
 
-        const updateJournalPath = this.journalPath(UPDATE_JOURNAL_PREFIX, entry.name);
+        // The nonce marker rides inside the staged tree through the promote
+        // rename, letting crash recovery tell OUR promoted tree from an
+        // unmanaged one a user placed at the then-empty target.
+        const updateNonce = randomBytes(16).toString("hex");
+        await fsPromises.writeFile(path.join(stagedDir, PROMOTION_MARKER_FILE), updateNonce);
         if (hadOldTree) {
           // Journal the swap BEFORE the live tree moves: a crash between the
           // rename below and the promote would leave the registry recording
@@ -2676,7 +2746,7 @@ export class AgentPluginInstallService {
           // additions. reconcileJournals restores the old tree on recovery.
           await fsPromises.writeFile(
             updateJournalPath,
-            JSON.stringify({ name: entry.name, trashDir, stagedAt: Date.now() })
+            JSON.stringify({ name: entry.name, trashDir, nonce: updateNonce, stagedAt: Date.now() })
           );
           try {
             await this.renameIntoStaging(targetPath, trashDir);
@@ -2707,9 +2777,13 @@ export class AgentPluginInstallService {
           }
           throw error;
         }
+        // The new tree is live: the marker did its crash-recovery job.
+        await fsPromises
+          .rm(path.join(targetPath, PROMOTION_MARKER_FILE), { force: true })
+          .catch(() => undefined);
         if (hadOldTree) {
-          // The new tree is live: the journal's recovery job is done (the
-          // staged old tree is plain trash now).
+          // The journal's recovery job is done (the staged old tree is plain
+          // trash now).
           await fsPromises.rm(updateJournalPath, { force: true }).catch(() => undefined);
           // Best-effort: the trash dir sits under the staging root, where
           // stale-dir reclamation cleans up leftovers.

@@ -886,6 +886,131 @@ describe("AgentPluginInstallService", () => {
     expect(await pathExists(dataTrashDir)).toBe(false);
   });
 
+  test("uninstall repairs the MCP manager's override cache after pruning disk", async () => {
+    // MCPServerManager.latestWorkspaceOverrides wins over freshly read
+    // files: pruning only the on-disk overrides would leave the stale
+    // in-memory enable, letting a same-name reinstall's default-disabled
+    // server start without a fresh user action.
+    const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
+    const serverKey = `plugin:${instanceId}:echo`;
+    let storedOverrides: { enabledServers: string[] } = { enabledServers: [serverKey] };
+    const overridesStub = {
+      prunePluginOverrideKeys: (_id: string, keyPrefix: string) => {
+        storedOverrides = {
+          enabledServers: storedOverrides.enabledServers.filter(
+            (key) => !key.startsWith(keyPrefix)
+          ),
+        };
+        return Promise.resolve();
+      },
+      getOverridesForWorkspace: () =>
+        Promise.resolve({ overrides: storedOverrides, revision: "r" }),
+    };
+    const applied: Array<{ workspaceId: string; overrides: unknown }> = [];
+    const mcpStub = {
+      stopServersWithKeyPrefix: () => Promise.resolve(),
+      applyWorkspaceOverrides: (workspaceId: string, overrides: unknown) => {
+        applied.push({ workspaceId, overrides });
+        return Promise.resolve();
+      },
+    };
+    const serviceWithDeps = new AgentPluginInstallService(config, {
+      isEnabled: () => true,
+      workspaceMcpOverridesService: overridesStub as unknown as WorkspaceMcpOverridesService,
+      mcpServerManager: mcpStub as unknown as MCPServerManager,
+    });
+    const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
+      Promise.resolve([{ id: "ws-1", runtimeConfig: { type: "local" } }] as unknown as Awaited<
+        ReturnType<Config["getAllWorkspaceMetadata"]>
+      >)
+    );
+    try {
+      const preview = await serviceWithDeps.preview({ input: remoteDir });
+      await serviceWithDeps.install({ source: preview.source, expectedSha: preview.lockedSha });
+      await serviceWithDeps.uninstall({ name: "demo-plugin", deletePluginData: false });
+    } finally {
+      metadataSpy.mockRestore();
+    }
+    // The manager cache received the PRUNED overrides (disk first, then memory).
+    expect(applied).toEqual([{ workspaceId: "ws-1", overrides: { enabledServers: [] } }]);
+  });
+
+  test("update recovery leaves a user-placed tree at the vacated path alone", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const targetPath = path.join(pluginsDir(), "demo-plugin");
+
+    // Crash window: old tree staged, replacement never promoted — and the
+    // user created their OWN unmanaged plugin at the now-empty target while
+    // the app was stopped. It carries no marker matching the journal nonce,
+    // so recovery must not let the registry claim it (a later Update or
+    // Uninstall would overwrite/delete it); the journal stays, pinning the
+    // staged original.
+    const trashDir = path.join(stagingDir(), `trash-${Date.now()}-demo-plugin`);
+    await fsPromises.rename(targetPath, trashDir);
+    await fsPromises.mkdir(targetPath, { recursive: true });
+    await fsPromises.writeFile(
+      path.join(targetPath, "plugin.json"),
+      JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "demo-plugin", version: "9" })
+    );
+    const journalPath = path.join(stagingDir(), "update-demo-plugin.json");
+    await fsPromises.writeFile(
+      journalPath,
+      JSON.stringify({
+        name: "demo-plugin",
+        trashDir,
+        nonce: "the-swap-nonce",
+        stagedAt: Date.now(),
+      })
+    );
+
+    await service.list();
+    expect(await pathExists(targetPath)).toBe(true);
+    expect(
+      JSON.parse(await fsPromises.readFile(path.join(targetPath, "plugin.json"), "utf8"))
+    ).toMatchObject({ version: "9" });
+    expect(await pathExists(trashDir)).toBe(true);
+    expect(await pathExists(journalPath)).toBe(true);
+
+    // Further updates refuse while recovery is unresolved: a new journal
+    // would clobber the trashDir reference protecting the original.
+    await writePluginFixture(remoteDir, { version: "2.0.0" });
+    await commitAll(remoteDir, "new upstream");
+    await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(/unfinished recovery/);
+  });
+
+  test("update recovery finishes cleanup when the promoted tree carries the nonce", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const targetPath = path.join(pluginsDir(), "demo-plugin");
+
+    // Crash window: promote landed (marker still inside) but journal/trash
+    // cleanup was lost. Recovery must finish it, not misread the tree.
+    const trashDir = path.join(stagingDir(), `trash-${Date.now()}-demo-plugin`);
+    await fsPromises.mkdir(trashDir, { recursive: true });
+    await fsPromises.writeFile(path.join(targetPath, ".mux-promotion-marker"), "swap-nonce");
+    const journalPath = path.join(stagingDir(), "update-demo-plugin.json");
+    await fsPromises.writeFile(
+      journalPath,
+      JSON.stringify({ name: "demo-plugin", trashDir, nonce: "swap-nonce", stagedAt: Date.now() })
+    );
+
+    const items = await service.list();
+    expect(items.find((item) => item.name === "demo-plugin")?.managed).toBe(true);
+    expect(await pathExists(path.join(targetPath, ".mux-promotion-marker"))).toBe(false);
+    expect(await pathExists(trashDir)).toBe(false);
+    expect(await pathExists(journalPath)).toBe(false);
+  });
+
+  test("repositories shipping the reserved recovery marker name are rejected", async () => {
+    // install/update write a nonce file at this path pre-rename; a repo
+    // shipping it would get that file clobbered then deleted, making the
+    // installed tree differ from the consented commit.
+    await fsPromises.writeFile(path.join(remoteDir, ".mux-promotion-marker"), "shipped");
+    await commitAll(remoteDir, "reserved marker name");
+    await expect(service.preview({ input: remoteDir })).rejects.toThrow(/reserved file name/);
+  });
+
   test("an update swap interrupted between rename and promote is restored", async () => {
     const preview = await service.preview({ input: remoteDir });
     await service.install({ source: preview.source, expectedSha: preview.lockedSha });
