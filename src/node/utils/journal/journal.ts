@@ -17,25 +17,13 @@
  */
 
 import assert from "node:assert";
-import crypto from "node:crypto";
 import * as fs from "fs/promises";
 import * as path from "path";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import { log } from "@/node/services/log";
 
-/** Poll interval while another live process holds the append lock. */
-const APPEND_LOCK_RETRY_MS = 10;
 /** Default bound on waiting for the append lock (see JournalOptions). */
 const APPEND_LOCK_TIMEOUT_MS = 5_000;
-
-/** True when a signal-0 probe reaches the pid (EPERM = alive, not ours). */
-function isPidAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
 
 /** Minimal schema contract (zod-compatible) so the kit stays dependency-light. */
 export interface JournalRowSchema<T> {
@@ -57,6 +45,15 @@ export interface JournalOptions<T> {
    * doctrine) beats writing an unserialized — possibly seq-colliding — row.
    */
   appendLockTimeoutMs?: number;
+  /**
+   * Fires synchronously right after a row is durably appended, inside the
+   * append's exclusive section, with the file sizes observed before and
+   * after the write. `preAppendFileSize` differing from the previous
+   * `postAppendFileSize` tells the consumer a FOREIGN writer (another
+   * instance or process) appended in between — used by DurableEventJournal
+   * to keep its blob-mention index verifiably fresh.
+   */
+  onAppended?: (row: T, sizes: { preAppendFileSize: number; postAppendFileSize: number }) => void;
 }
 
 export class Journal<T> {
@@ -66,6 +63,7 @@ export class Journal<T> {
   private readonly getSeq: (row: T) => number;
   private readonly getId: (row: T) => string;
   private readonly appendLockTimeoutMs: number;
+  private readonly onAppended?: JournalOptions<T>["onAppended"];
   /** Next sequence to assign; null until the file has been scanned once. */
   private nextSeq: number | null = null;
   /**
@@ -87,6 +85,7 @@ export class Journal<T> {
     this.getId = options.getId;
     this.appendLockTimeoutMs = options.appendLockTimeoutMs ?? APPEND_LOCK_TIMEOUT_MS;
     assert(this.appendLockTimeoutMs > 0, "Journal appendLockTimeoutMs must be positive");
+    this.onAppended = options.onAppended;
   }
 
   /**
@@ -100,7 +99,11 @@ export class Journal<T> {
       // Cross-process serialization: seq derivation and the write must be one
       // exclusive unit, or a concurrent writer in another process (debug CLI
       // vs live backend) could assign the same sequence number.
-      await using _lock = await this.acquireAppendLock();
+      await using _lock = await acquireProcessFileLock({
+        lockPath: this.lockPath,
+        timeoutMs: this.appendLockTimeoutMs,
+        label: "append lock",
+      });
       const { seq, fileSize } = await this.nextSeqLocked();
       const row = build(seq);
       assert(
@@ -121,7 +124,11 @@ export class Journal<T> {
       const payload = `${separator}${line}\n`;
       await fs.appendFile(this.filePath, payload, "utf-8");
       this.nextSeq = seq + 1;
-      this.lastKnownSize = fileSize + Buffer.byteLength(payload, "utf-8");
+      const postAppendFileSize = fileSize + Buffer.byteLength(payload, "utf-8");
+      this.lastKnownSize = postAppendFileSize;
+      // Synchronous, still inside the exclusive section: consumers observe
+      // the row and both sizes as one atomic unit.
+      this.onAppended?.(row, { preAppendFileSize: fileSize, postAppendFileSize });
       return row;
     });
     // Keep the queue alive even if this append fails.
@@ -201,92 +208,6 @@ export class Journal<T> {
     const rows = await this.read();
     const maxSeq = rows.reduce((max, row) => Math.max(max, this.getSeq(row)), -1);
     return { seq: maxSeq + 1, fileSize };
-  }
-
-  /**
-   * Acquire the cross-process append lockfile (`<file>.lock`). Lock birth is
-   * atomic-with-content: the token (`pid:nonce`) is fully written to a temp
-   * file first and hard-linked into place (link fails EEXIST when held), so a
-   * reader can never observe a token-less lock. Waiting is a bounded jittered
-   * poll — there is no portable cross-process wake primitive available here.
-   */
-  private async acquireAppendLock(): Promise<AsyncDisposable> {
-    const token = `${process.pid}:${crypto.randomBytes(8).toString("hex")}`;
-    const tempPath = `${this.lockPath}.tmp-${token.replace(":", "-")}`;
-    const deadline = Date.now() + this.appendLockTimeoutMs;
-    await fs.writeFile(tempPath, token, "utf-8");
-    try {
-      for (;;) {
-        try {
-          await fs.link(tempPath, this.lockPath);
-          return { [Symbol.asyncDispose]: () => this.releaseAppendLock(token) };
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
-            throw error;
-          }
-        }
-        await this.reclaimStaleAppendLock();
-        if (Date.now() >= deadline) {
-          throw new Error(
-            `Journal: timed out acquiring append lock ${this.lockPath} after ${this.appendLockTimeoutMs}ms`
-          );
-        }
-        await new Promise((resolve) =>
-          setTimeout(resolve, APPEND_LOCK_RETRY_MS + Math.random() * APPEND_LOCK_RETRY_MS)
-        );
-      }
-    } finally {
-      await fs.unlink(tempPath).catch(() => undefined);
-    }
-  }
-
-  /**
-   * Reclaim the append lock if its recorded owner is provably dead (crash
-   * remnant). Claim-by-rename makes reclamation atomic: of two concurrent
-   * reclaimers only one rename succeeds (the loser gets ENOENT and simply
-   * retries acquisition). Reading the claimed file AFTER the rename verifies
-   * we claimed the token we judged dead; in the narrow release-then-relock
-   * window we could have grabbed a fresh live lock instead, which is restored
-   * via link (atomic, loses gracefully to an even newer lock — that victim's
-   * release tolerates the loss, see releaseAppendLock).
-   */
-  private async reclaimStaleAppendLock(): Promise<void> {
-    let observed: string;
-    try {
-      observed = await fs.readFile(this.lockPath, "utf-8");
-    } catch {
-      return; // Already released or reclaimed; retry acquisition.
-    }
-    const pid = Number.parseInt(observed.split(":")[0], 10);
-    if (!Number.isSafeInteger(pid) || pid <= 0 || isPidAlive(pid)) {
-      return;
-    }
-    const graveyard = `${this.lockPath}.stale-${crypto.randomBytes(4).toString("hex")}`;
-    try {
-      await fs.rename(this.lockPath, graveyard);
-    } catch {
-      return; // Another reclaimer won the rename; retry acquisition.
-    }
-    const claimed = await fs.readFile(graveyard, "utf-8").catch(() => null);
-    if (claimed !== null && claimed !== observed) {
-      log.warn(`Journal: reclaim raced a fresh append lock on ${this.lockPath}; restoring it`);
-      await fs.link(graveyard, this.lockPath).catch(() => undefined);
-    }
-    await fs.unlink(graveyard).catch(() => undefined);
-  }
-
-  /** Release only if we still own the lock (a raced reclaim may have replaced it). */
-  private async releaseAppendLock(token: string): Promise<void> {
-    try {
-      const content = await fs.readFile(this.lockPath, "utf-8");
-      if (content !== token) {
-        log.warn(`Journal: append lock ${this.lockPath} changed owners before release; leaving it`);
-        return;
-      }
-      await fs.unlink(this.lockPath);
-    } catch (error) {
-      log.debug(`Journal: failed to release append lock ${this.lockPath}`, { error });
-    }
   }
 
   /** True when the file exists, is non-empty, and does not end with "\n". */
