@@ -3,14 +3,17 @@ import { describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
-import { REFINEMENT_INLINE_MAX_CHARS } from "@/common/types/refinement";
+import {
+  REFINEMENT_INLINE_MAX_CHARS,
+  REFINEMENT_INVERSE_BLOB_QUOTA_BYTES,
+} from "@/common/types/refinement";
 import { Config } from "@/node/config";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import { MemoryService, type MemoryScopeContext } from "@/node/services/memoryService";
 import { TestTempDir } from "@/node/services/tools/testHelpers";
 import { sharedDurableEventJournal } from "@/node/utils/journal/durableEventJournal";
-import { appendRefinementEvent } from "./refinementJournal";
+import { appendRefinementEvent, reclaimExcessRefinementInverseBlobs } from "./refinementJournal";
 import {
   acquireRollbackFileLock,
   listRefinements,
@@ -150,13 +153,54 @@ describe("refinementRollback", () => {
     });
     expect(result.success).toBe(false);
     if (result.success) throw new Error("unreachable");
-    expect(result.error).toContain("Blob");
+    // The error names the unavailable payload (eviction and corruption read
+    // the same way — the blob is simply gone).
+    expect(result.error).toContain(blobbed!.blobRef!);
     // Phase 1 failed before any write: the small file must NOT be restored...
     const smallPath = path.join(fixture.muxHome, "memory", "global", "notes", "a-small.md");
     expect(await pathExists(smallPath)).toBe(false);
     // ...and no rollback row was appended.
     const rows = await listRefinements(fixture.sessionDir);
     expect(rows.some((row) => row.data.rollbackOf === deleteRow.id)).toBe(false);
+  });
+
+  it("refuses rollback of a row whose inverse payload was evicted beyond the horizon", async () => {
+    using fixture = await createFixture();
+    const big = `start\n${"y".repeat(REFINEMENT_INLINE_MAX_CHARS + 100)}\n`;
+    await fixture.service.create(fixture.ctx, "/memories/global/evicted.md", big, "agent");
+    await fixture.service.strReplace(
+      fixture.ctx,
+      "/memories/global/evicted.md",
+      "start",
+      "s",
+      "agent"
+    );
+    const editRow = await lastRow(fixture.sessionDir);
+    const inverse = editRow.data.inverse as { files: Array<{ blobRef?: string }> };
+    const blobRef = inverse.files[0].blobRef;
+    expect(blobRef).toBeDefined();
+
+    // Simulate quota pressure: a new inverse payload whose recorded size
+    // fills the whole horizon pushes the edit row's payload past it.
+    const journal = sharedDurableEventJournal(fixture.sessionDir);
+    await reclaimExcessRefinementInverseBlobs(journal, [
+      { ref: `sha256:${"f".repeat(64)}`, size: REFINEMENT_INVERSE_BLOB_QUOTA_BYTES },
+    ]);
+    expect(await journal.blobs.has(blobRef as never)).toBe(false);
+
+    const result = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: editRow.id,
+      evidence: EVIDENCE,
+    });
+    expect(result.success).toBe(false);
+    if (result.success) throw new Error("unreachable");
+    // Descriptive refusal naming the evicted payload; no partial apply.
+    expect(result.error).toContain(blobRef!);
+    const physicalPath = path.join(fixture.muxHome, "memory", "global", "evicted.md");
+    expect(await fsPromises.readFile(physicalPath, "utf-8")).toBe(big.replace("start", "s"));
+    const rows = await listRefinements(fixture.sessionDir);
+    expect(rows.some((row) => row.data.rollbackOf === editRow.id)).toBe(false);
   });
 
   it("compensates already-written files when a multi-file restore fails midway", async () => {

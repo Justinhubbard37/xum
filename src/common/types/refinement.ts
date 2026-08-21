@@ -31,6 +31,21 @@ export const REFINEMENT_CAPTURE_MAX_FILE_BYTES = 1024 * 1024;
 export const REFINEMENT_CAPTURE_MAX_TOTAL_BYTES = 4 * 1024 * 1024;
 export const REFINEMENT_CAPTURE_MAX_FILES = 200;
 
+/**
+ * Per-session quota on TOTAL retained refinement-inverse blob bytes — the
+ * rollback horizon. The capture budgets above bound one event, but nothing
+ * bounded the aggregate: a prompt-influenced loop mutating a large memory
+ * file with a changing suffix captures the complete prior content per edit,
+ * each unique version over the inline cap becoming a durable blob, growing
+ * disk without any bash/file grant. Newest inverses keep their payloads up
+ * to this quota; older payload blobs are deleted while the refinement rows
+ * remain as an audit record (rolling them back fails with a descriptive
+ * beyond-the-horizon error). 4x the per-event capture budget retains the
+ * most recent edits — e.g. the last ~160 unique 100KB memory-file versions —
+ * comfortably beyond any practical rollback need.
+ */
+export const REFINEMENT_INVERSE_BLOB_QUOTA_BYTES = 16 * 1024 * 1024;
+
 /** One file to restore: exactly one of `text` (small) or `blobRef` (large). */
 export const RefinementFileSchema = z
   .object({

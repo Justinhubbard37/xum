@@ -20,6 +20,8 @@ import { createHash } from "node:crypto";
 import assert from "@/common/utils/assert";
 import {
   REFINEMENT_INLINE_MAX_CHARS,
+  REFINEMENT_INVERSE_BLOB_QUOTA_BYTES,
+  RefinementInverseSchema,
   type MemoryRefinementAction,
   type RefinementEvidence,
   type RefinementInverse,
@@ -27,7 +29,15 @@ import {
   type SkillRefinementAction,
 } from "@/common/types/refinement";
 import type { BlobStore } from "@/node/utils/journal/blobStore";
-import { sharedDurableEventJournal } from "@/node/utils/journal/durableEventJournal";
+import {
+  sharedDurableEventJournal,
+  type DurableEventJournal,
+} from "@/node/utils/journal/durableEventJournal";
+import {
+  blobOnlyMentionedBy,
+  walkBlobQuota,
+  type BlobQuotaEntry,
+} from "@/node/utils/journal/blobReclamation";
 import { log } from "@/node/services/log";
 
 /** Prior-content capture with inline content; the emitter offloads large contents to blobs. */
@@ -73,24 +83,96 @@ export function sha256Hex(text: string): string {
  * Offload large captured contents to the blob store; small ones stay inline.
  * Exported so the rollback service (refinementRollback.ts) resolves the
  * inverses of its own rollback rows through the identical offload policy.
+ * `publishedBlobs` reports every offloaded payload so callers can feed the
+ * inverse-blob quota (reclaimExcessRefinementInverseBlobs) incrementally.
  */
 export async function resolveRefinementInverse(
   blobs: BlobStore,
   draft: RefinementInverseDraft
-): Promise<RefinementInverse> {
+): Promise<{ inverse: RefinementInverse; publishedBlobs: BlobQuotaEntry[] }> {
   if (draft.op !== "restore-files") {
-    return draft;
+    return { inverse: draft, publishedBlobs: [] };
   }
+  const publishedBlobs: BlobQuotaEntry[] = [];
   const files = await Promise.all(
     draft.files.map(async (file) => {
       if (file.content.length <= REFINEMENT_INLINE_MAX_CHARS) {
         return { path: file.path, text: file.content };
       }
-      const { ref } = await blobs.put(file.content);
+      const { ref, size } = await blobs.put(file.content);
+      publishedBlobs.push({ ref, size });
       return { path: file.path, blobRef: ref };
     })
   );
-  return { op: "restore-files", files };
+  return { inverse: { op: "restore-files", files }, publishedBlobs };
+}
+
+/**
+ * Per-journal incremental quota state for refinement inverse payloads,
+ * mirroring the sandbox host's reclamation state: keyed by the
+ * (process-shared) journal instance, first pass per process runs a full
+ * recovery sweep, later passes do O(1)-ish work over the retained list.
+ */
+interface RefinementReclamationState {
+  /** Inverse payloads currently retained under the quota, newest first;
+   * null until the recovery sweep. */
+  retainedInverseBlobs: BlobQuotaEntry[] | null;
+}
+
+const reclamationStates = new WeakMap<DurableEventJournal, RefinementReclamationState>();
+
+/**
+ * Enforce the per-session quota on retained refinement-inverse blob bytes
+ * (see REFINEMENT_INVERSE_BLOB_QUOTA_BYTES). Newest-first: recent inverses
+ * stay rollbackable; once the cumulative size crosses the quota, older
+ * payload blobs are deleted while their refinement rows remain (rollback of
+ * an evicted row fails with a descriptive beyond-the-horizon error).
+ * Reference safety: a hash also mentioned by any other event kind survives
+ * (content addressing can share payloads). Holds the journal blob lock
+ * across the decide→delete window; callers must NOT already hold it.
+ *
+ * Exported for tests (quota interleavings need synthetic payloads).
+ */
+export async function reclaimExcessRefinementInverseBlobs(
+  journal: DurableEventJournal,
+  published: BlobQuotaEntry[]
+): Promise<void> {
+  await journal.withBlobLock(async () => {
+    let state = reclamationStates.get(journal);
+    if (!state) {
+      state = { retainedInverseBlobs: null };
+      reclamationStates.set(journal, state);
+    }
+    const index = await journal.blobMentionIndex();
+    let entries: BlobQuotaEntry[];
+    if (state.retainedInverseBlobs !== null) {
+      entries = [...published, ...state.retainedInverseBlobs];
+    } else {
+      // Recovery sweep: walk refinement rows newest-first and re-derive the
+      // retained set. Rows never recorded payload sizes, so stat the blobs;
+      // a missing blob was already evicted (or never landed) — skip it.
+      const events = await journal.read();
+      entries = [];
+      for (let i = events.length - 1; i >= 0; i--) {
+        const event = events[i];
+        if (event.kind !== "refinement") continue;
+        const inverse = RefinementInverseSchema.safeParse(event.data.inverse);
+        if (!inverse.success || inverse.data.op !== "restore-files") continue;
+        for (const file of inverse.data.files) {
+          if (file.blobRef === undefined) continue;
+          const size = await journal.blobs.size(file.blobRef);
+          if (size === null) continue;
+          entries.push({ ref: file.blobRef, size });
+        }
+      }
+    }
+    const { retained, evictable } = walkBlobQuota(entries, REFINEMENT_INVERSE_BLOB_QUOTA_BYTES);
+    state.retainedInverseBlobs = retained;
+    for (const ref of evictable) {
+      if (!blobOnlyMentionedBy(index.get(ref), "refinement")) continue;
+      await journal.blobs.delete(ref);
+    }
+  });
 }
 
 /**
@@ -105,8 +187,11 @@ export async function appendRefinementEvent(args: RefinementEmitArgs): Promise<v
     // Inverse blob puts and the append referencing them run under the journal
     // blob lock: a concurrent reclamation pass must never observe the
     // put→append window (see DurableEventJournal.withBlobLock).
+    let publishedBlobs: BlobQuotaEntry[] = [];
     await journal.withBlobLock(async () => {
-      const inverse = await resolveRefinementInverse(journal.blobs, args.inverse);
+      const resolved = await resolveRefinementInverse(journal.blobs, args.inverse);
+      const inverse = resolved.inverse;
+      publishedBlobs = resolved.publishedBlobs;
       // Optional fields are spread conditionally: an explicit `undefined` value
       // would fail the JsonValue schema validation on append and drop the row.
       const evidence: RefinementEvidence = {
@@ -137,6 +222,14 @@ export async function appendRefinementEvent(args: RefinementEmitArgs): Promise<v
         },
       });
     });
+    // Bound retained inverse payloads per session AFTER releasing the publish
+    // lock (reclaim takes it itself; the mutex is non-reentrant). Best-effort:
+    // failure must never fail the mutation this row describes.
+    try {
+      await reclaimExcessRefinementInverseBlobs(journal, publishedBlobs);
+    } catch (error) {
+      log.debug("[refinement] inverse blob reclamation failed; continuing", { error });
+    }
   } catch (error) {
     log.debug("[refinement] failed to journal refinement event; continuing", {
       kind: args.kind,

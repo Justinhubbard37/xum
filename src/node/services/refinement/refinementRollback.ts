@@ -42,8 +42,10 @@ import {
 import { getErrorMessage } from "@/common/utils/errors";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import { sharedDurableEventJournal } from "@/node/utils/journal/durableEventJournal";
+import type { BlobQuotaEntry } from "@/node/utils/journal/blobReclamation";
 import { log } from "@/node/services/log";
 import {
+  reclaimExcessRefinementInverseBlobs,
   resolveRefinementInverse,
   sha256Hex,
   type RefinementFileCapture,
@@ -895,7 +897,15 @@ export async function rollbackRefinement(
         assert(file.blobRef !== undefined, "refinement file has neither text nor blobRef");
         const text = await journal.blobs.getText(file.blobRef);
         if (text === null) {
-          throw new RollbackError(`Blob ${file.blobRef} for '${file.path}' is missing or corrupt`);
+          // Most likely evicted by the inverse-blob quota (the row outlives
+          // its payload as an audit record); corruption reads the same way.
+          // Phase-1 staging below resolves every payload before any write,
+          // so this aborts with the tree untouched — no partial apply.
+          throw new RollbackError(
+            `Inverse payload for '${file.path}' (blob ${file.blobRef}) is no longer available — ` +
+              `older inverse payloads are reclaimed once the per-session rollback horizon is ` +
+              `exceeded (or the blob is corrupt). This refinement can no longer be rolled back.`
+          );
         }
         return text;
       },
@@ -995,14 +1005,17 @@ export async function rollbackRefinement(
       // Inverse blob puts + the append referencing them run under the journal
       // blob lock: a concurrent reclamation pass must never observe the
       // put→append window (see DurableEventJournal.withBlobLock).
-      const row = await journal.withBlobLock(async () =>
-        journal.append({
+      let publishedBlobs: BlobQuotaEntry[] = [];
+      const row = await journal.withBlobLock(async () => {
+        const resolved = await resolveRefinementInverse(journal.blobs, newInverse);
+        publishedBlobs = resolved.publishedBlobs;
+        return journal.append({
           workspaceId: target.workspaceId,
           kind: "refinement",
           data: {
             kind,
             action,
-            inverse: await resolveRefinementInverse(journal.blobs, newInverse),
+            inverse: resolved.inverse,
             evidence: {
               workspaceId: target.workspaceId,
               toolName: opts.evidence.toolName,
@@ -1013,9 +1026,17 @@ export async function rollbackRefinement(
             },
             rollbackOf: opts.id,
           },
-        })
-      );
+        });
+      });
       applied.rollbackRowId = row.id;
+      // Rollback rows publish inverse payloads too: same per-session quota,
+      // same best-effort contract (never fail an applied rollback). Called
+      // after the publish lock releases — the mutex is non-reentrant.
+      try {
+        await reclaimExcessRefinementInverseBlobs(journal, publishedBlobs);
+      } catch (error) {
+        log.debug("[refinement] inverse blob reclamation failed; continuing", { error });
+      }
     } catch (error) {
       log.error("[refinement] rollback applied but journaling the rollback row failed", {
         id: opts.id,
