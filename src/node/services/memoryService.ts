@@ -929,19 +929,7 @@ export class MemoryService extends EventEmitter {
       const store = await this.resolveStore(ctx, scope, parsed.relPath);
       return withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), async () => {
         const content = await this.readTextFileForEdit(store, parsed.relPath, virtualPath);
-        const occurrences = countOccurrences(content, oldStr);
-        if (occurrences === 0) {
-          throw new MemoryCommandError(
-            `No replacement was performed: old_str was not found in ${virtualPath}`
-          );
-        }
-        if (occurrences > 1) {
-          const lines = findMatchingLines(content, oldStr);
-          throw new MemoryCommandError(
-            `No replacement was performed: old_str matches ${occurrences} locations (lines ${lines.join(", ")}) in ${virtualPath}. Provide a longer, unique old_str.`
-          );
-        }
-        const updated = content.replace(oldStr, newStr);
+        const updated = computeStrReplaceUpdate(content, oldStr, newStr, virtualPath);
         assertWithinFileSizeCap(updated);
         await store.writeFile(parsed.relPath, updated);
         // Row is written before the edit is acknowledged (mutation → row → ack).
@@ -977,17 +965,7 @@ export class MemoryService extends EventEmitter {
       const store = await this.resolveStore(ctx, scope, parsed.relPath);
       return withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), async () => {
         const content = await this.readTextFileForEdit(store, parsed.relPath, virtualPath);
-        const lines = content === "" ? [] : content.split("\n");
-        if (insertLine < 0 || insertLine > lines.length) {
-          throw new MemoryCommandError(
-            `insert_line must be between 0 and ${lines.length} (0 inserts at the top; N inserts after line N)`
-          );
-        }
-        const insertedLines = insertText.split("\n");
-        // Trailing newline in insert_text would otherwise produce a stray blank line.
-        if (insertedLines.at(-1) === "") insertedLines.pop();
-        lines.splice(insertLine, 0, ...insertedLines);
-        const updated = lines.join("\n");
+        const { updated, insertedLineCount } = computeInsertUpdate(content, insertLine, insertText);
         assertWithinFileSizeCap(updated);
         await store.writeFile(parsed.relPath, updated);
         // Row is written before the edit is acknowledged (mutation → row → ack).
@@ -1006,10 +984,69 @@ export class MemoryService extends EventEmitter {
         this.emitChange(ctx, scope, parsed.relPath, actor);
         return {
           success: true as const,
-          output: `Inserted ${insertedLines.length} line(s) into ${toVirtualPath(scope, parsed.relPath)} after line ${insertLine}`,
+          output: `Inserted ${insertedLineCount} line(s) into ${toVirtualPath(scope, parsed.relPath)} after line ${insertLine}`,
         };
       });
     });
+  }
+
+  /**
+   * Non-mutating validation for a proposed mutation: runs the same
+   * path/arg/occurrence checks as the real command and simulates the
+   * RESULTING file against the size cap (reading the current target for
+   * state-dependent commands) without writing, journaling, or recording
+   * usage. Used by refine staging so a proposal the write path would reject
+   * can never be staged, rendered, and approved. Advisory by design: no
+   * mutation lock is taken (the state can change between staging and apply,
+   * where the real command re-validates authoritatively).
+   */
+  async validateMutation(
+    ctx: MemoryScopeContext,
+    command:
+      | { command: "create"; path: string; file_text: string }
+      | { command: "str_replace"; path: string; old_str: string; new_str: string }
+      | { command: "insert"; path: string; insert_line: number; insert_text: string }
+  ): Promise<{ ok: true } | { ok: false; error: string }> {
+    const result = await this.runCommand(async () => {
+      const parsed = parseMemoryPath(command.path);
+      const scope = this.requireFilePath(parsed, command.path);
+      switch (command.command) {
+        case "create": {
+          assertWithinFileSizeCap(command.file_text);
+          // No createRoot: validation must not materialize scope roots.
+          const store = this.getStore(ctx, scope);
+          await store.assertContained(parsed.relPath);
+          const existing = await store.kind(parsed.relPath);
+          if (existing !== null) {
+            throw new MemoryCommandError(
+              `A ${existing === "dir" ? "directory" : "file"} already exists at ${command.path}. To overwrite a file, delete it first, then create it.`
+            );
+          }
+          break;
+        }
+        case "str_replace": {
+          if (command.old_str.length === 0) {
+            throw new MemoryCommandError("old_str must not be empty");
+          }
+          const store = await this.resolveStore(ctx, scope, parsed.relPath);
+          const content = await this.readTextFileForEdit(store, parsed.relPath, command.path);
+          assertWithinFileSizeCap(
+            computeStrReplaceUpdate(content, command.old_str, command.new_str, command.path)
+          );
+          break;
+        }
+        case "insert": {
+          const store = await this.resolveStore(ctx, scope, parsed.relPath);
+          const content = await this.readTextFileForEdit(store, parsed.relPath, command.path);
+          assertWithinFileSizeCap(
+            computeInsertUpdate(content, command.insert_line, command.insert_text).updated
+          );
+          break;
+        }
+      }
+      return { success: true as const, output: "valid" };
+    });
+    return result.success ? { ok: true } : { ok: false, error: result.error };
   }
 
   async deletePath(
@@ -1395,6 +1432,51 @@ export function formatMemoryIndexForToolDescription(
 
 function sha256Hex(content: string): string {
   return createHash("sha256").update(content, "utf-8").digest("hex");
+}
+
+/**
+ * Pure update computations shared by the mutating commands and
+ * validateMutation, so staging-time validation can never drift from what the
+ * real write path enforces. Both throw MemoryCommandError with the exact
+ * write-path messages.
+ */
+function computeStrReplaceUpdate(
+  content: string,
+  oldStr: string,
+  newStr: string,
+  virtualPath: string
+): string {
+  const occurrences = countOccurrences(content, oldStr);
+  if (occurrences === 0) {
+    throw new MemoryCommandError(
+      `No replacement was performed: old_str was not found in ${virtualPath}`
+    );
+  }
+  if (occurrences > 1) {
+    const lines = findMatchingLines(content, oldStr);
+    throw new MemoryCommandError(
+      `No replacement was performed: old_str matches ${occurrences} locations (lines ${lines.join(", ")}) in ${virtualPath}. Provide a longer, unique old_str.`
+    );
+  }
+  return content.replace(oldStr, newStr);
+}
+
+function computeInsertUpdate(
+  content: string,
+  insertLine: number,
+  insertText: string
+): { updated: string; insertedLineCount: number } {
+  const lines = content === "" ? [] : content.split("\n");
+  if (insertLine < 0 || insertLine > lines.length) {
+    throw new MemoryCommandError(
+      `insert_line must be between 0 and ${lines.length} (0 inserts at the top; N inserts after line N)`
+    );
+  }
+  const insertedLines = insertText.split("\n");
+  // Trailing newline in insert_text would otherwise produce a stray blank line.
+  if (insertedLines.at(-1) === "") insertedLines.pop();
+  lines.splice(insertLine, 0, ...insertedLines);
+  return { updated: lines.join("\n"), insertedLineCount: insertedLines.length };
 }
 
 function assertWithinFileSizeCap(content: string): void {

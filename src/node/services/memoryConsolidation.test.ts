@@ -367,6 +367,53 @@ describe("consolidation memory tool rails", () => {
     expect(fixture.journal.every((op) => !op.applied && op.note !== "dry-run")).toBe(true);
   });
 
+  it("dry-run rejects state-dependent mutations whose RESULT exceeds the cap", async () => {
+    // Codex round 19: the round-18 check measured only the NEW text, but the
+    // real write path caps the RESULTING file — inserting 2KiB into a 99KiB
+    // file staged successfully, rendered approvable, then apply rejected it
+    // and consumed the proposal. Validation must simulate the result.
+    using fixture = await createFixture({ dryRun: true });
+    const nearCap = `UNIQUE_MARKER${"x".repeat(MEMORY_MAX_FILE_BYTES - 1024)}`;
+    await fsPromises.writeFile(path.join(fixture.globalMemoryDir, "near-cap.md"), nearCap);
+
+    const smallInsert = await execute(fixture.tool, {
+      command: "insert",
+      path: "/memories/global/near-cap.md",
+      insert_line: 0,
+      insert_text: "y".repeat(2 * 1024),
+    });
+    expect(smallInsert.success).toBe(false);
+    if (!smallInsert.success) expect(smallInsert.error).toContain(`${MEMORY_MAX_FILE_BYTES}`);
+
+    // Same result-size rule for str_replace growth on an existing file
+    // (unique old_str so the failure is the cap, not the occurrence check).
+    const growingReplace = await execute(fixture.tool, {
+      command: "str_replace",
+      path: "/memories/global/near-cap.md",
+      old_str: "UNIQUE_MARKER",
+      new_str: "y".repeat(2 * 1024),
+    });
+    expect(growingReplace.success).toBe(false);
+    if (!growingReplace.success) {
+      expect(growingReplace.error).toContain(`${MEMORY_MAX_FILE_BYTES}`);
+    }
+
+    // A result that stays under the cap still stages.
+    const fits = await execute(fixture.tool, {
+      command: "insert",
+      path: "/memories/global/near-cap.md",
+      insert_line: 0,
+      insert_text: "small note",
+    });
+    expect(fits.success).toBe(true);
+    // Dry-run: the target file is untouched.
+    const onDisk = await fsPromises.readFile(
+      path.join(fixture.globalMemoryDir, "near-cap.md"),
+      "utf-8"
+    );
+    expect(onDisk).toBe(nearCap);
+  });
+
   it("journals failed dispatches as unapplied with the error note", async () => {
     using fixture = await createFixture();
     const result = await execute(fixture.tool, {
