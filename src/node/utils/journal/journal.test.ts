@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import * as fs from "fs/promises";
 import * as path from "path";
 import { z } from "zod";
@@ -12,12 +13,13 @@ const RowSchema = z.object({
 });
 type Row = z.infer<typeof RowSchema>;
 
-function makeJournal(dir: string): Journal<Row> {
+function makeJournal(dir: string, appendLockTimeoutMs?: number): Journal<Row> {
   return new Journal<Row>({
     filePath: path.join(dir, "test.jsonl"),
     schema: RowSchema,
     getSeq: (row) => row.seq,
     getId: (row) => row.id,
+    ...(appendLockTimeoutMs !== undefined ? { appendLockTimeoutMs } : {}),
   });
 }
 
@@ -82,6 +84,64 @@ describe("Journal", () => {
     );
     const rows = await makeJournal(tmp.path).read();
     expect(rows.map((r) => r.value)).toEqual(["first", "second", "third"]);
+  });
+
+  test("interleaved appends from independent instances keep seq unique and increasing", async () => {
+    using tmp = new DisposableTempDir("journal-test");
+    // Two instances over one file model the debug CLI appending while the
+    // backend is live: each caches its own next-seq, so without cross-process
+    // revalidation the second writer reuses an already-assigned sequence.
+    const a = makeJournal(tmp.path);
+    const b = makeJournal(tmp.path);
+    const r1 = await a.append((seq) => ({ seq, id: "a1", value: "a-first" }));
+    const r2 = await b.append((seq) => ({ seq, id: "b1", value: "b-first" }));
+    const r3 = await a.append((seq) => ({ seq, id: "a2", value: "a-second" }));
+    expect([r1.seq, r2.seq, r3.seq]).toEqual([0, 1, 2]);
+    const rows = await makeJournal(tmp.path).read();
+    expect(rows.map((r) => r.seq)).toEqual([0, 1, 2]);
+  });
+
+  test("append reclaims a stale lock whose owner is provably dead", async () => {
+    using tmp = new DisposableTempDir("journal-test");
+    const journal = makeJournal(tmp.path, 2_000);
+    // A short-lived child that has already exited gives a provably dead PID
+    // (ESRCH from kill(pid, 0)); crash remnants must not block appends.
+    const child = spawnSync(process.execPath, ["--version"]);
+    expect(child.pid).toBeGreaterThan(0);
+    await fs.mkdir(tmp.path, { recursive: true });
+    const lockPath = path.join(tmp.path, "test.jsonl.lock");
+    await fs.writeFile(lockPath, `${child.pid}:deadbeef`, { encoding: "utf-8", flag: "wx" });
+
+    const row = await journal.append((seq) => ({ seq, id: "a", value: "after-reclaim" }));
+    expect(row.seq).toBe(0);
+    // The reclaimed lock was released after the append.
+    expect(
+      await fs.access(lockPath).then(
+        () => true,
+        () => false
+      )
+    ).toBe(false);
+  });
+
+  test("append times out (without corrupting seq) while a live process holds the lock", async () => {
+    using tmp = new DisposableTempDir("journal-test");
+    const journal = makeJournal(tmp.path, 150);
+    await journal.append((seq) => ({ seq, id: "a", value: "before" }));
+    // Our own (live) pid holds the lock: reclamation must refuse and the
+    // append must give up after the timeout instead of writing unserialized.
+    await fs.mkdir(tmp.path, { recursive: true });
+    const lockPath = path.join(tmp.path, "test.jsonl.lock");
+    await fs.writeFile(lockPath, `${process.pid}:feedface`, { encoding: "utf-8", flag: "wx" });
+    try {
+      await journal.append((seq) => ({ seq, id: "b", value: "blocked" }));
+      expect.unreachable("append must time out while the lock is held by a live process");
+    } catch (error) {
+      expect(String(error)).toContain("append lock");
+    }
+    await fs.unlink(lockPath);
+    // Recovery after release: the failed attempt must not poison the counter.
+    const row = await journal.append((seq) => ({ seq, id: "c", value: "after" }));
+    expect(row.seq).toBe(1);
   });
 
   test("append rejects rows that fail schema validation", async () => {
