@@ -828,6 +828,56 @@ describe("refinementRollback", () => {
     expect(await pathExists(path.join(fixture.muxHome, "memory", "global", "new.md"))).toBe(false);
   });
 
+  it("journals the rollback row before releasing the target locks (no durable-order inversion)", async () => {
+    using fixture = await createFixture();
+    const virtualPath = "/memories/global/order.md";
+    const physicalPath = path.join(fixture.muxHome, "memory", "global", "order.md");
+    await fixture.service.create(fixture.ctx, virtualPath, "v1\n", "agent");
+    await fixture.service.strReplace(fixture.ctx, virtualPath, "v1", "v2", "agent");
+    const editRow = await lastRow(fixture.sessionDir); // T
+
+    // r19: interleave an ordinary writer into the apply→journal window. The
+    // writer is STARTED (not awaited) inside the seam: with the fix it parks
+    // on the still-held target lock and lands after the rollback row; the
+    // sleep only gives a NOT-blocked (buggy) writer time to mutate + journal
+    // first — correctness is asserted on journal order below, never timing.
+    let writerPromise: Promise<unknown> | null = null;
+    const result = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: editRow.id,
+      evidence: EVIDENCE,
+      testOnlyBeforeRollbackJournal: async () => {
+        // Rollback already applied: disk is back to v1.
+        expect(await fsPromises.readFile(physicalPath, "utf-8")).toBe("v1\n");
+        writerPromise = fixture.service.strReplace(fixture.ctx, virtualPath, "v1", "v3", "agent");
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      },
+    });
+    expect(result.success).toBe(true);
+    expect(writerPromise).not.toBeNull();
+    await writerPromise;
+    expect(await fsPromises.readFile(physicalPath, "utf-8")).toBe("v3\n");
+
+    // Durable order must match mutation order: T, R (rollback-of-T), W.
+    const rows = await listRefinements(fixture.sessionDir);
+    const rollbackRow = rows.find((row) => row.data.rollbackOf === editRow.id);
+    expect(rollbackRow).toBeDefined();
+    const writerRow = rows[rows.length - 1];
+    expect(writerRow.data.rollbackOf).toBeUndefined();
+    expect(rollbackRow!.seq).toBeLessThan(writerRow.seq);
+
+    // The inverted order made collectDivergence treat R as a later
+    // conflicting effect of W; with correct ordering, rolling back the
+    // writer's edit is clean.
+    const rollbackW = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: writerRow.id,
+      evidence: EVIDENCE,
+    });
+    expect(rollbackW.success).toBe(true);
+    expect(await fsPromises.readFile(physicalPath, "utf-8")).toBe("v1\n");
+  });
+
   describe("cross-process target mutation lock", () => {
     /** A verified-live foreign-owner token (this process, real birth). */
     const foreignLiveToken = (): string => {
