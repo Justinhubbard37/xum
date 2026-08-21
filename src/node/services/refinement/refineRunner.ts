@@ -33,6 +33,7 @@ import {
   createMutationBudget,
   type MemoryConsolidationOp,
 } from "@/node/services/memoryConsolidation";
+import type { StagedRefineEdit } from "@/node/services/refinement/refineStaging";
 import type { MemoryMetaService } from "@/node/services/memoryMeta";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
 
@@ -40,20 +41,20 @@ export interface RefinePassResult {
   /** Memory-tool mutation audit (same shape as the dream journal). */
   ops: MemoryConsolidationOp[];
   /**
-   * Tool-call ids issued by this pass. The service correlates them against
-   * `evidence.toolCallId` on r2 refinement journal rows to list exactly this
-   * run's applied edits (concurrent main-agent edits never match).
+   * Tool-call ids issued by this pass. Reused verbatim at apply time so the
+   * r2 refinement journal rows written then correlate back to exactly this
+   * staged set (concurrent main-agent edits never match).
    */
   toolCallIds: string[];
   /** The model's closing text (per-edit rationales, or a no-op statement). */
   summary: string;
   /**
-   * Mutations the tools THEMSELVES reported as applied (memory ops with
-   * applied=true plus successful skill writes). Journal-independent ground
-   * truth: appendRefinementEvent swallows journal failures by design, so the
-   * caller must not infer "nothing changed" from an empty journal alone.
+   * SECURITY: mutations the pass STAGED instead of applying. The pass runs a
+   * model over attacker-influenceable trajectory text, so its tool wrappers
+   * never write — every accepted mutation is captured here for an explicit
+   * user-approved `/refine apply` (see refineStaging.ts for the rationale).
    */
-  appliedMutations: number;
+  stagedEdits: StagedRefineEdit[];
   budgetExhausted: boolean;
   usage?: { inputTokens: number; outputTokens: number };
   /** Fatal stream error (provider failure or abort/timeout). */
@@ -61,19 +62,20 @@ export interface RefinePassResult {
 }
 
 /**
- * Wrap the standard agent_skill_write tool with the shared mutation budget.
- * The inner tool keeps its own containment (skills roots only) and r2
- * journaling; this wrapper only charges the budget before delegating.
+ * Staging wrapper for the standard agent_skill_write tool: charges the shared
+ * mutation budget and records the intended write WITHOUT invoking the inner
+ * tool (the inner tool's containment + journaling run at apply time instead).
+ * The model sees a success acknowledgment so it can reference the edit in its
+ * closing summary.
  */
-function wrapSkillWriteWithBudget(
-  inner: Tool,
+function wrapSkillWriteWithStaging(
   budget: { limit: number; tryConsume(): boolean },
-  /** Reports each write the inner tool acknowledged as successful. */
-  onApplied: () => void
+  onStaged: (input: unknown, toolCallId: string) => void
 ): Tool {
   return tool({
     description: TOOL_DEFINITIONS.agent_skill_write.description,
     inputSchema: TOOL_DEFINITIONS.agent_skill_write.schema,
+    // eslint-disable-next-line @typescript-eslint/require-await -- AI SDK Tool.execute must return a Promise
     execute: async (input, options): Promise<unknown> => {
       if (!budget.tryConsume()) {
         return {
@@ -81,16 +83,11 @@ function wrapSkillWriteWithBudget(
           error: `Mutation budget exhausted (${budget.limit} per run); stop and summarize.`,
         };
       }
-      assert(typeof inner.execute === "function", "agent_skill_write tool must have execute");
-      const result: unknown = await inner.execute(input, options);
-      if (
-        typeof result === "object" &&
-        result !== null &&
-        (result as { success?: unknown }).success === true
-      ) {
-        onApplied();
-      }
-      return result;
+      onStaged(input, options.toolCallId);
+      return {
+        success: true,
+        output: "[staged] skill write recorded; it is applied when the user runs /refine apply",
+      };
     },
   });
 }
@@ -146,7 +143,7 @@ function sumStepUsages(steps: Array<{ usage: LanguageModelV2Usage }>): LanguageM
 function buildRefineSystemPrompt(hasSkillTool: boolean): string {
   return [
     "You are Mux's refine agent. You are given a recent trajectory (chat transcript, possibly timeline events) of ONE workspace.",
-    "Distill AT MOST a handful of durable, evidence-backed lessons worth persisting, then apply the SMALLEST possible edits:",
+    "Distill AT MOST a handful of durable, evidence-backed lessons worth persisting, then propose the SMALLEST possible edits (they are STAGED for the user's explicit approval, not applied):",
     "- Use the memory tool for facts, preferences, environment quirks, and debugging lessons (prefer extending existing files over creating near-duplicates).",
     hasSkillTool
       ? "- Use agent_skill_write only when a lesson is a reusable procedure that clearly belongs in a project skill."
@@ -156,7 +153,7 @@ function buildRefineSystemPrompt(hasSkillTool: boolean): string {
     "- Only persist lessons with concrete supporting evidence in the trajectory. When unsure, do nothing.",
     "- Never store secrets, tokens, or credentials.",
     "- A no-op is a first-class outcome: if nothing is worth distilling, make no edits.",
-    "Finish with a short closing message: one line per applied edit in the form '<path>: <one-line rationale>', or exactly 'Nothing worth distilling.' when you made no edits.",
+    "Finish with a short closing message: one line per proposed edit in the form '<path>: <one-line rationale>', or exactly 'Nothing worth distilling.' when you made no edits.",
   ].join("\n");
 }
 
@@ -174,8 +171,11 @@ export async function runRefinePass(args: {
   transcript: string;
   /** Optional timeline digest (Timeline experiment on). */
   timelineText?: string;
-  /** Standard agent_skill_write tool, already confined to the workspace's skills dirs. */
-  skillWriteTool?: Tool;
+  /**
+   * Whether skill writes can be staged for this workspace (host-local
+   * single-project). The pass never executes the real tool — apply does.
+   */
+  skillWriteAvailable?: boolean;
   abortSignal?: AbortSignal;
   /**
    * Best-effort cost telemetry (headless pass bypasses the chat cost
@@ -193,24 +193,47 @@ export async function runRefinePass(args: {
   // ONE budget across memory and skill mutations: "a handful" bounds the
   // whole pass, not each tool separately.
   const budget = createMutationBudget(REFINE_OP_BUDGET);
+  // SECURITY: the pass STAGES mutations instead of applying them (see
+  // refineStaging.ts). Memory runs in dry-run mode — guard + budget still
+  // vet every command, reads still execute — and skill writes go through a
+  // stage-only wrapper. Nothing touches disk until /refine apply.
+  const stagedEdits: StagedRefineEdit[] = [];
   const { tool: memoryTool, getMutationCount } = createConsolidationMemoryTool({
     memoryService: args.memoryService,
     metaService: args.metaService,
     ctx: args.ctx,
-    dryRun: false,
+    dryRun: true,
     journal,
     budget,
+    onStagedMutation: (input, toolCallId) => {
+      const pathLabel = input.command === "rename" ? (input.old_path ?? input.path) : input.path;
+      stagedEdits.push({
+        tool: "memory",
+        toolCallId,
+        description: `memory ${input.command} ${pathLabel ?? "?"}`,
+        input,
+      });
+    },
   });
 
   const pendingToolRuns = new Set<Promise<unknown>>();
-  let appliedSkillWrites = 0;
   const tools: Record<string, Tool> = {
     memory: trackToolExecutions(memoryTool, pendingToolRuns),
   };
-  if (args.skillWriteTool !== undefined) {
+  if (args.skillWriteAvailable === true) {
     tools.agent_skill_write = trackToolExecutions(
-      wrapSkillWriteWithBudget(args.skillWriteTool, budget, () => {
-        appliedSkillWrites += 1;
+      wrapSkillWriteWithStaging(budget, (input, toolCallId) => {
+        const rawName =
+          typeof input === "object" && input !== null && "name" in input
+            ? (input as { name?: unknown }).name
+            : undefined;
+        const skillName = typeof rawName === "string" ? rawName : "?";
+        stagedEdits.push({
+          tool: "agent_skill_write",
+          toolCallId,
+          description: `skill write ${skillName}`,
+          input,
+        });
       }),
       pendingToolRuns
     );
@@ -228,7 +251,7 @@ export async function runRefinePass(args: {
 
   const stream = streamText({
     model: args.model,
-    system: buildRefineSystemPrompt(args.skillWriteTool !== undefined),
+    system: buildRefineSystemPrompt(args.skillWriteAvailable === true),
     prompt: promptSections.join("\n\n"),
     tools,
     stopWhen: stepCountIs(REFINE_MAX_STEPS),
@@ -381,7 +404,7 @@ export async function runRefinePass(args: {
     ops: journal,
     toolCallIds,
     summary,
-    appliedMutations: journal.filter((op) => op.applied).length + appliedSkillWrites,
+    stagedEdits,
     budgetExhausted: getMutationCount() >= REFINE_OP_BUDGET,
     usage,
     streamError: streamErrors[0],

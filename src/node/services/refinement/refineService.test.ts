@@ -306,10 +306,10 @@ describe("RefineService", () => {
   });
 
   it("reports applied-but-unjournaled edits instead of classifying them as a no-op", async () => {
-    // The memory write succeeds but its r2 journal append fails (swallowed by
-    // design so user writes stay self-healing). The file changed with no
-    // rollback id: the pass must say so — not report "nothing worth
-    // distilling" while leaving a silent, untracked edit behind.
+    // At APPLY time the memory write succeeds but its r2 journal append fails
+    // (swallowed by design so user writes stay self-healing). The file
+    // changed with no rollback id: the apply must say so — not report a
+    // no-op while leaving a silent, untracked edit behind.
     using fixture = await createFixture({
       modelFactory: () =>
         toolCallModel(
@@ -328,6 +328,9 @@ describe("RefineService", () => {
         ),
     });
     await fixture.seedTrajectory();
+    const stagedResult = await fixture.service.run(WORKSPACE_ID);
+    expect(stagedResult.success).toBe(true);
+
     // Same process-wide journal instance the service and MemoryService use.
     const journal = sharedDurableEventJournal(fixture.sessionDir);
     // Lazy rejection (not mockRejectedValue): bun creates that rejected
@@ -337,19 +340,20 @@ describe("RefineService", () => {
       Promise.reject(new Error("journal unavailable"))
     );
     try {
-      const result = await fixture.service.run(WORKSPACE_ID);
+      const result = await fixture.service.apply(WORKSPACE_ID);
       expect(result.success).toBe(true);
       if (!result.success) return;
       // No journal row landed...
       expect(await listRefinements(fixture.sessionDir)).toHaveLength(0);
       expect(result.data.applied).toHaveLength(0);
-      // ...but the edit is real, so the pass is NOT a no-op and the untracked
-      // count is surfaced.
+      // ...but the edit is real, so the apply is NOT a no-op and the
+      // untracked count is surfaced.
       expect(result.data.noOp).toBe(false);
       expect(result.data.untrackedApplied).toBe(1);
-      // The chat summary warns that rollback is unavailable for these edits.
-      expect(fixture.emittedMessages).toHaveLength(1);
-      const text = fixture.emittedMessages[0].parts.find((part) => part.type === "text");
+      // The chat summary warns that rollback is unavailable for these edits
+      // (the staged proposal row from the run is emittedMessages[0]).
+      expect(fixture.emittedMessages).toHaveLength(2);
+      const text = fixture.emittedMessages[1].parts.find((part) => part.type === "text");
       expect(text?.type === "text" && text.text).toContain("could not be journaled");
       expect(text?.type === "text" && text.text).not.toContain("Rollback with:");
     } finally {
@@ -406,15 +410,16 @@ describe("RefineService", () => {
     expect(usages[0].outputTokens).toBeGreaterThan(0);
   });
 
-  it("does not resolve a cancelled pass while a tool write is still settling", async () => {
-    // The deadline fires while the memory write is mid-flight. The pass must
-    // not settle (releasing the run lock and letting removal delete the
-    // session directory) until that write — including its journal append —
-    // has fully settled; a detached late write would recreate the removed
-    // session.
-    let releaseWrite: () => void = () => undefined;
-    const writeGate = new Promise<void>((resolve) => {
-      releaseWrite = resolve;
+  it("does not resolve a cancelled pass while a tool execution is still settling", async () => {
+    // The deadline fires while a staging tool execution is mid-flight (the
+    // memory tool's pin guard awaits metaService.getEntries for deletes).
+    // The pass must not settle (releasing the run lock and letting removal
+    // delete the session directory) until that execution has fully settled;
+    // a detached late execution could otherwise write session state after
+    // removal.
+    let releaseGuard: () => void = () => undefined;
+    const guardGate = new Promise<void>((resolve) => {
+      releaseGuard = resolve;
     });
     using fixture = await createFixture({
       timeoutMs: 150,
@@ -422,51 +427,46 @@ describe("RefineService", () => {
         toolCallModel(
           [
             {
-              toolCallId: "refine-slow-write-1",
+              toolCallId: "refine-slow-guard-1",
               toolName: "memory",
-              input: {
-                command: "create",
-                path: LESSON_PATH,
-                file_text: "A slow write that outlives the deadline.\n",
-              },
+              input: { command: "delete", path: LESSON_PATH },
             },
           ],
-          `${LESSON_PATH}: written slowly.`
+          `${LESSON_PATH}: deletion proposed slowly.`
         ),
     });
     await fixture.seedTrajectory();
-    const realCreate = fixture.memoryService.create.bind(fixture.memoryService);
-    const createSpy = spyOn(fixture.memoryService, "create").mockImplementation(
-      async (...createArgs) => {
-        await writeGate;
-        return realCreate(...createArgs);
+    const metaService = (
+      fixture.service as unknown as {
+        metaService: { getEntries: () => Promise<Map<string, never>> };
       }
-    );
+    ).metaService;
+    const entriesSpy = spyOn(metaService, "getEntries").mockImplementation(async () => {
+      await guardGate;
+      return new Map<string, never>();
+    });
     try {
       let settled = false;
       const runPromise = fixture.service.run(WORKSPACE_ID).then((result) => {
         settled = true;
         return result;
       });
-      // Wait for the write to start, then let the 150ms deadline pass well by.
+      // Wait for the guard to start, then let the 150ms deadline pass well by.
       const spinDeadline = Date.now() + 5_000;
-      while (createSpy.mock.calls.length === 0 && Date.now() < spinDeadline) {
+      while (entriesSpy.mock.calls.length === 0 && Date.now() < spinDeadline) {
         await new Promise((resolve) => setTimeout(resolve, 5));
       }
-      expect(createSpy.mock.calls.length).toBe(1);
+      expect(entriesSpy.mock.calls.length).toBe(1);
       await new Promise((resolve) => setTimeout(resolve, 400));
-      // The pass is deadline-cancelled but the write has not settled: the run
-      // must still be pending.
+      // The pass is deadline-cancelled but the tool execution has not
+      // settled: the run must still be pending.
       expect(settled).toBe(false);
 
-      releaseWrite();
+      releaseGuard();
       const result = await runPromise;
       expect(result.success).toBe(false);
-      // The write settled BEFORE the pass resolved, so its journal row is
-      // already durable by the time removal could delete the session dir.
-      expect(await listRefinements(fixture.sessionDir)).toHaveLength(1);
     } finally {
-      createSpy.mockRestore();
+      entriesSpy.mockRestore();
     }
   });
 
@@ -509,10 +509,16 @@ describe("RefineService", () => {
     const result = await runPromise;
     expect(result.success).toBe(false);
 
-    // No tool-driven writes, no journal rows, no summary row, no emission.
+    // No tool-driven writes, no journal rows, no summary row, no emission —
+    // and nothing staged: a later apply must find nothing to execute.
     expect(await listRefinements(fixture.sessionDir)).toHaveLength(0);
     expect(await fixture.readChat()).toHaveLength(chatBefore.length);
     expect(fixture.emittedMessages).toHaveLength(0);
+    const applyAfterCancel = await fixture.service.apply(WORKSPACE_ID);
+    expect(applyAfterCancel.success).toBe(false);
+    if (!applyAfterCancel.success) {
+      expect(applyAfterCancel.error).toContain("no staged refine edits");
+    }
 
     // The lock is cleared: a later invocation is not rejected as running.
     const second = await fixture.service.run(WORKSPACE_ID);
@@ -611,7 +617,7 @@ describe("RefineService", () => {
     expect(fixture.emittedMessages).toHaveLength(0);
   });
 
-  it("applies a memory edit with a journaled inverse, posts the summary row, and rolls back via r6", async () => {
+  it("stages a memory edit, applies it only on approval, and rolls back via r6", async () => {
     using fixture = await createFixture({
       modelFactory: () =>
         toolCallModel(
@@ -631,14 +637,14 @@ describe("RefineService", () => {
     });
     await fixture.seedTrajectory();
 
-    const result = await fixture.service.run(WORKSPACE_ID);
-    expect(result.success).toBe(true);
-    if (!result.success) return;
-    expect(result.data.noOp).toBe(false);
-    expect(result.data.applied).toHaveLength(1);
-    expect(result.data.applied[0].description).toBe(`memory create ${LESSON_PATH}`);
+    // SECURITY contract: the run only STAGES the model-proposed edit.
+    const staged = await fixture.service.run(WORKSPACE_ID);
+    expect(staged.success).toBe(true);
+    if (!staged.success) return;
+    expect(staged.data.noOp).toBe(false);
+    expect(staged.data.applied).toHaveLength(0);
+    expect(staged.data.staged).toEqual([{ description: `memory create ${LESSON_PATH}` }]);
 
-    // The edit landed on disk.
     const lessonFile = path.join(
       fixture.muxHome,
       "sessions",
@@ -646,10 +652,28 @@ describe("RefineService", () => {
       "memory",
       "refine-lessons.md"
     );
+    // NOTHING landed yet: no file, no journal row. The staged summary row
+    // tells the user how to approve.
+    expect(await pathExists(lessonFile)).toBe(false);
+    expect(await listRefinements(fixture.sessionDir)).toHaveLength(0);
+    expect(fixture.emittedMessages).toHaveLength(1);
+    const stagedText = fixture.emittedMessages[0].parts
+      .map((part) => (part.type === "text" ? part.text : ""))
+      .join("");
+    expect(stagedText).toContain(REFINE_SUMMARY_LABEL);
+    expect(stagedText).toContain("/refine apply");
+
+    // Explicit approval applies through the journaled tool path.
+    const result = await fixture.service.apply(WORKSPACE_ID);
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.data.noOp).toBe(false);
+    expect(result.data.applied).toHaveLength(1);
+    expect(result.data.applied[0].description).toBe(`memory create ${LESSON_PATH}`);
     expect(await fsPromises.readFile(lessonFile, "utf-8")).toContain("bun install");
 
     // r2: exactly one journaled refinement row with an invertible payload,
-    // attributed to this pass's tool call.
+    // attributed to the staged tool call.
     const rows = await listRefinements(fixture.sessionDir);
     expect(rows).toHaveLength(1);
     expect(rows[0].id).toBe(result.data.applied[0].refinementId);
@@ -666,8 +690,12 @@ describe("RefineService", () => {
     expect(summaryText).toContain(REFINE_SUMMARY_LABEL);
     expect(summaryText).toContain(result.data.applied[0].refinementId);
     expect(summaryText).toContain("refinement_rollback");
-    expect(fixture.emittedMessages).toHaveLength(1);
-    expect(fixture.emittedMessages[0].id).toBe(summaryRow.id);
+    expect(fixture.emittedMessages).toHaveLength(2);
+
+    // The staged set is consumed: a second apply has nothing to do.
+    const reapply = await fixture.service.apply(WORKSPACE_ID);
+    expect(reapply.success).toBe(false);
+    if (!reapply.success) expect(reapply.error).toContain("no staged refine edits");
 
     // r6: rolling the refine edit back restores the pre-edit state.
     const rollback = await rollbackRefinement({
@@ -744,7 +772,15 @@ describe("RefineService", () => {
     });
     await fixture.seedTrajectory();
 
-    const result = await fixture.service.run(WORKSPACE_ID);
+    // Both writes (including the escape attempt) are STAGED — the standard
+    // tool's containment runs at apply time and refuses the escape there.
+    const stagedResult = await fixture.service.run(WORKSPACE_ID);
+    expect(stagedResult.success).toBe(true);
+    if (!stagedResult.success) return;
+    expect(stagedResult.data.staged).toHaveLength(2);
+    expect(await listRefinements(fixture.sessionDir)).toHaveLength(0);
+
+    const result = await fixture.service.apply(WORKSPACE_ID);
     expect(result.success).toBe(true);
     if (!result.success) return;
     expect(result.data.applied).toHaveLength(1);

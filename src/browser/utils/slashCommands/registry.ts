@@ -126,8 +126,11 @@ const refineCommandDefinition: SlashCommandDefinition = {
   key: "refine",
   experimentGate: EXPERIMENT_IDS.RLM,
   description:
-    "Distill durable lessons from this workspace's trajectory into memory/skills (auto-applied, rollbackable)",
-  handler: (): ParsedCommand => ({ type: "refine" }),
+    "Distill durable lessons from this workspace's trajectory into staged memory/skill edits; approve them with '/refine apply'",
+  handler: ({ rawInput }): ParsedCommand =>
+    // Security: /refine only STAGES model-proposed edits; the explicit
+    // "apply" argument is the user's approval step that writes them.
+    rawInput.trim() === "apply" ? { type: "refine", apply: true } : { type: "refine" },
 };
 
 const compactCommandDefinition: SlashCommandDefinition = {

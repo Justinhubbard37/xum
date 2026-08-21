@@ -33,9 +33,11 @@ import {
 } from "@/common/types/refinement";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
+import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import {
   REFINE_MAX_MESSAGES,
+  REFINE_OP_BUDGET,
   REFINE_SUMMARY_LABEL,
   REFINE_TIMELINE_EVENT_LIMIT,
   REFINE_TIMEOUT_MS,
@@ -48,6 +50,10 @@ import type { HistoryService } from "@/node/services/historyService";
 import { runLanguageModelCleanup } from "@/node/services/languageModelCleanup";
 import { log } from "@/node/services/log";
 import {
+  createConsolidationMemoryTool,
+  createMutationBudget,
+} from "@/node/services/memoryConsolidation";
+import {
   resolveConsolidationProjectPath,
   resolveDreamModelString,
 } from "@/node/services/memoryConsolidationService";
@@ -58,6 +64,11 @@ import {
   listRefinements,
   type RefinementEvent,
 } from "@/node/services/refinement/refinementRollback";
+import {
+  clearStagedRefineSet,
+  loadStagedRefineSet,
+  saveStagedRefineSet,
+} from "@/node/services/refinement/refineStaging";
 import { runRefinePass } from "@/node/services/refinement/refineRunner";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { TimelineService } from "@/node/services/timelineService";
@@ -115,25 +126,42 @@ export function describeRefinementRow(row: RefinementEvent): string {
   return `${row.data.kind} edit`;
 }
 
-/** Build the durable, clearly-labeled summary row for an applied refine pass. */
-export function createRefineSummaryMessage(record: RefineRecord): MuxMessage {
-  const lines = [
-    REFINE_SUMMARY_LABEL,
-    "",
-    ...record.applied.map((edit) => `- ${edit.description} (refinement ${edit.refinementId})`),
-  ];
-  if (record.untrackedApplied !== undefined && record.untrackedApplied > 0) {
-    // Real edits with no journal row: the user must learn about them even
-    // though the r6 rollback path cannot address them.
+/**
+ * Build the durable, clearly-labeled summary row for a refine pass. "staged"
+ * mode announces the proposal and how to approve it; "applied" mode reports
+ * the executed edits with their rollback addresses.
+ */
+export function createRefineSummaryMessage(
+  record: RefineRecord,
+  mode: "staged" | "applied"
+): MuxMessage {
+  const lines = [REFINE_SUMMARY_LABEL, ""];
+  if (mode === "staged") {
+    lines.push(...(record.staged ?? []).map((edit) => `- [staged] ${edit.description}`));
+  } else {
     lines.push(
-      `- ${record.untrackedApplied} applied edit(s) could not be journaled; rollback is unavailable for them.`
+      ...record.applied.map((edit) => `- ${edit.description} (refinement ${edit.refinementId})`)
     );
+    if (record.untrackedApplied !== undefined && record.untrackedApplied > 0) {
+      // Real edits with no journal row: the user must learn about them even
+      // though the r6 rollback path cannot address them.
+      lines.push(
+        `- ${record.untrackedApplied} applied edit(s) could not be journaled; rollback is unavailable for them.`
+      );
+    }
   }
   if (record.summary.length > 0) {
     lines.push("", record.summary);
   }
-  // The rollback pointer only applies to journaled rows.
-  if (record.applied.length > 0) {
+  if (mode === "staged") {
+    // SECURITY: nothing has been written yet — the approval affordance is
+    // this instruction (see refineStaging.ts for the rationale).
+    lines.push(
+      "",
+      "Nothing has been applied yet. Apply with /refine apply, or run /refine again to replace the proposal."
+    );
+  } else if (record.applied.length > 0) {
+    // The rollback pointer only applies to journaled rows.
     lines.push(
       "",
       "Rollback with: /debug refinements (bun run debug refinements <workspace-id> --rollback <id>) or the refinement_rollback tool."
@@ -224,6 +252,163 @@ export class RefineService {
     await entry.promise.catch(() => undefined);
   }
 
+  /**
+   * Apply the staged edits from the last /refine run. This is the explicit
+   * approval step of the staging contract (see refineStaging.ts): the staged
+   * inputs replay through the SAME journaled tool paths a live agent uses —
+   * the consolidation memory tool (scope guard + pin protection re-checked)
+   * and the standard agent_skill_write tool (containment re-checked) — so
+   * every applied edit lands as an invertible r2 refinement row and r6
+   * rollback keeps working. Shares the per-workspace lock with run().
+   */
+  async apply(workspaceId: string): Promise<Result<RefineRecord, string>> {
+    if (!this.enabled()) {
+      return Err("rlm-mode experiment is disabled (enable Programmatic Tool Calling + RLM Mode)");
+    }
+    if (this.inFlight.has(workspaceId)) {
+      return Err("a refine pass is already running for this workspace");
+    }
+    const controller = new AbortController();
+    const run = this.applyLocked(workspaceId, controller.signal);
+    const entry: InFlightRefinePass = { promise: run, controller };
+    this.inFlight.set(workspaceId, entry);
+    try {
+      return await run;
+    } finally {
+      if (this.inFlight.get(workspaceId) === entry) {
+        this.inFlight.delete(workspaceId);
+      }
+    }
+  }
+
+  private async applyLocked(
+    workspaceId: string,
+    cancellationSignal: AbortSignal
+  ): Promise<Result<RefineRecord, string>> {
+    const workspace = this.config.findWorkspace(workspaceId);
+    if (!workspace) return Err(`workspace not found: ${workspaceId}`);
+    const sessionDir = this.config.getSessionDir(workspaceId);
+    const staged = await loadStagedRefineSet(sessionDir);
+    if (staged === null) {
+      return Err("no staged refine edits (run /refine first)");
+    }
+
+    // Baseline BEFORE applying: rows appended by this apply have seq >
+    // baseline. Correlation additionally requires the row's
+    // evidence.toolCallId to be one of the staged tool calls, so concurrent
+    // main-agent self-edits in the same journal can never be misattributed.
+    const baselineSeq = await this.readMaxJournalSeq(sessionDir);
+
+    const projectPath = resolveConsolidationProjectPath(workspace);
+    const ctx: MemoryScopeContext = {
+      runtime: null,
+      checkoutCwd: "",
+      workspaceId,
+      projectPath,
+    };
+    const { tool: memoryTool } = createConsolidationMemoryTool({
+      memoryService: this.memoryService,
+      metaService: this.metaService,
+      ctx,
+      dryRun: false,
+      journal: [],
+      budget: createMutationBudget(REFINE_OP_BUDGET),
+    });
+    const skillWriteTool = await this.buildSkillWriteTool(workspaceId, sessionDir);
+
+    let succeeded = 0;
+    for (const edit of staged.edits) {
+      // Removal wins mid-apply: stop before the next write.
+      if (cancellationSignal.aborted) break;
+      try {
+        const tool = edit.tool === "memory" ? memoryTool : skillWriteTool;
+        if (tool === undefined || typeof tool.execute !== "function") {
+          log.warn("[Refine] staged edit skipped: tool unavailable at apply time", {
+            workspaceId,
+            tool: edit.tool,
+          });
+          continue;
+        }
+        // The staged file is on-disk state: validate the input against the
+        // tool's own schema before executing (defense against tampering and
+        // schema drift across upgrades).
+        const schema =
+          edit.tool === "memory"
+            ? TOOL_DEFINITIONS.memory.schema
+            : TOOL_DEFINITIONS.agent_skill_write.schema;
+        const parsedInput = schema.safeParse(edit.input);
+        if (!parsedInput.success) {
+          log.warn("[Refine] staged edit skipped: input failed schema validation", {
+            workspaceId,
+            tool: edit.tool,
+            error: parsedInput.error.message,
+          });
+          continue;
+        }
+        const result: unknown = await tool.execute(parsedInput.data, {
+          toolCallId: edit.toolCallId,
+          messages: [],
+          // Neither tool declares a context schema; undefined matches the
+          // unknown-context Tool shape.
+          context: undefined,
+        });
+        if (
+          typeof result === "object" &&
+          result !== null &&
+          (result as { success?: unknown }).success === true
+        ) {
+          succeeded += 1;
+        }
+      } catch (error) {
+        log.warn("[Refine] staged edit failed to apply", {
+          workspaceId,
+          tool: edit.tool,
+          error: getErrorMessage(error),
+        });
+      }
+    }
+    // Consume the staged set regardless of per-edit outcomes so a re-run of
+    // apply can never double-apply; failures were reported above and a fresh
+    // /refine can restage.
+    await clearStagedRefineSet(sessionDir);
+
+    const applied = await this.collectAppliedEdits(
+      sessionDir,
+      workspaceId,
+      baselineSeq,
+      staged.edits.map((edit) => edit.toolCallId)
+    );
+    // Journal acknowledgement can fail while the mutation itself succeeded
+    // (appendRefinementEvent swallows journal/blob failures by design so
+    // user-facing writes stay self-healing). Those edits are real — files
+    // changed with no rollback id — so they must be reported, never
+    // classified as a no-op. The tools' own success results are the ground
+    // truth; anything applied beyond the journaled rows is untracked.
+    const untrackedApplied = Math.max(0, succeeded - applied.length);
+    const record: RefineRecord = {
+      applied,
+      summary: staged.summary,
+      noOp: applied.length === 0 && untrackedApplied === 0,
+      ...(untrackedApplied > 0 ? { untrackedApplied } : {}),
+    };
+
+    log.debug("[Refine] apply complete", {
+      workspaceId,
+      staged: staged.edits.length,
+      applied: applied.length,
+      untrackedApplied,
+    });
+
+    // Cancellation gate before the chat write (same rationale as runLocked).
+    if (cancellationSignal.aborted) {
+      return Err("refine apply cancelled (workspace removed)");
+    }
+    if (!record.noOp) {
+      await this.appendSummaryMessage(workspaceId, record, "applied");
+    }
+    return Ok(record);
+  }
+
   private async runLocked(
     workspaceId: string,
     cancellationSignal: AbortSignal
@@ -272,13 +457,12 @@ export class RefineService {
       };
 
       const sessionDir = this.config.getSessionDir(workspaceId);
-      // Baseline BEFORE the pass: rows appended by this run have seq > baseline.
-      // Correlation additionally requires the row's evidence.toolCallId to be
-      // one of this pass's tool calls, so concurrent main-agent self-edits in
-      // the same journal can never be misattributed to the refine pass.
-      const baselineSeq = await this.readMaxJournalSeq(sessionDir);
-
-      const skillWriteTool = await this.buildSkillWriteTool(workspaceId, sessionDir);
+      // The pass only STAGES edits (see refineStaging.ts) — journal-baseline
+      // bookkeeping happens at apply time. Skill-tool availability is still
+      // resolved here so the model only sees agent_skill_write when a later
+      // apply could actually execute it.
+      const skillWriteAvailable =
+        (await this.buildSkillWriteTool(workspaceId, sessionDir)) !== undefined;
 
       const result = await runRefinePass({
         model: modelResult.data.model,
@@ -287,7 +471,7 @@ export class RefineService {
         ctx,
         transcript,
         timelineText,
-        skillWriteTool,
+        skillWriteAvailable,
         // Hard timeout: a wedged provider stream must not hold the run lock
         // forever. Workspace-removal cancellation is folded into the same
         // signal so it stops the stream (and its tool-driven writes) promptly.
@@ -310,54 +494,57 @@ export class RefineService {
         },
       });
       if (result.streamError !== undefined) {
-        // Edits applied before the failure remain journaled + rollbackable;
-        // point the user at the audit trail instead of hiding them.
-        return Err(
-          `refine stream failed: ${result.streamError} (any applied edits are listed by 'bun run debug refinements ${workspaceId}')`
-        );
+        // Nothing was applied (the pass only stages); a previous staged set,
+        // if any, stays intact for a later apply.
+        return Err(`refine stream failed: ${result.streamError}`);
       }
 
-      const applied = await this.collectAppliedEdits(
-        sessionDir,
-        workspaceId,
-        baselineSeq,
-        result.toolCallIds
-      );
-      // Journal acknowledgement can fail while the mutation itself succeeded
-      // (appendRefinementEvent swallows journal/blob failures by design so
-      // user-facing writes stay self-healing). Those edits are real — files
-      // changed with no rollback id — so they must be reported, never
-      // classified as a no-op. The tools' own applied counts are the ground
-      // truth; anything they applied beyond the journaled rows is untracked.
-      const untrackedApplied = Math.max(0, result.appliedMutations - applied.length);
+      const summary = result.summary.length > 0 ? result.summary : "Nothing worth distilling.";
       const record: RefineRecord = {
-        applied,
-        summary: result.summary.length > 0 ? result.summary : "Nothing worth distilling.",
-        noOp: applied.length === 0 && untrackedApplied === 0,
-        ...(untrackedApplied > 0 ? { untrackedApplied } : {}),
+        applied: [],
+        summary,
+        noOp: result.stagedEdits.length === 0,
+        ...(result.stagedEdits.length > 0
+          ? { staged: result.stagedEdits.map((edit) => ({ description: edit.description })) }
+          : {}),
         usage: result.usage,
       };
 
-      log.debug("[Refine] pass complete", {
+      log.debug("[Refine] staging pass complete", {
         workspaceId,
-        applied: applied.length,
+        staged: result.stagedEdits.length,
         budgetExhausted: result.budgetExhausted,
         usage: result.usage,
       });
 
-      // Cancellation gate before the chat write: removal aborts and drains
-      // in-flight passes before deleting the session directory, and a summary
-      // append past this point would recreate it. (A stream that drained
+      // Cancellation gate before the disk/chat writes: removal aborts and
+      // drains in-flight passes before deleting the session directory, and a
+      // write past this point would recreate it. (A stream that drained
       // cleanly just before the abort still reaches here, so the mid-stream
       // abort alone is not enough.)
       if (cancellationSignal.aborted) {
         return Err("refine pass cancelled (workspace removed)");
       }
 
-      // Completion UX: post the labeled summary row ONLY when edits were
-      // applied — a no-op stays out of chat (the invoking toast reports it).
+      // Every completed pass REPLACES the staged set (one per workspace):
+      // stale proposals from an older trajectory must not linger behind a
+      // newer no-op result.
+      if (result.stagedEdits.length > 0) {
+        await saveStagedRefineSet(sessionDir, {
+          version: 1,
+          workspaceId,
+          createdAt: Date.now(),
+          summary,
+          edits: result.stagedEdits,
+        });
+      } else {
+        await clearStagedRefineSet(sessionDir);
+      }
+
+      // Completion UX: post the labeled proposal row ONLY when edits were
+      // staged — a no-op stays out of chat (the invoking toast reports it).
       if (!record.noOp) {
-        await this.appendSummaryMessage(workspaceId, record);
+        await this.appendSummaryMessage(workspaceId, record, "staged");
       }
       return Ok(record);
     } finally {
@@ -476,9 +663,13 @@ export class RefineService {
   }
 
   /** Best-effort: append + emit the summary row; failures log and continue. */
-  private async appendSummaryMessage(workspaceId: string, record: RefineRecord): Promise<void> {
+  private async appendSummaryMessage(
+    workspaceId: string,
+    record: RefineRecord,
+    mode: "staged" | "applied"
+  ): Promise<void> {
     try {
-      const message = createRefineSummaryMessage(record);
+      const message = createRefineSummaryMessage(record, mode);
       const appendResult = await this.historyService.appendToHistory(workspaceId, message);
       if (!appendResult.success) {
         log.warn("[Refine] failed to append summary row", {

@@ -29,7 +29,7 @@ export type ParsedCommand =
   | { type: "clear"; mode: "hard" | "soft" }
   | { type: "compact"; maxOutputTokens?: number; continueMessage?: string; model?: string }
   | { type: "dream" }
-  | { type: "refine" }
+  | { type: "refine"; apply?: boolean }
   | { type: "fork"; startMessage?: string }
   | { type: "new"; startMessage?: string }
   | { type: "vim-toggle" }

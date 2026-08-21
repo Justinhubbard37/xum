@@ -823,12 +823,18 @@ export async function processSlashCommand(
         }
         // Fire-and-forget like /dream: the pass runs in the background and
         // posts its own labeled summary row into the chat when edits were
-        // applied. Only the settle toast is shown — an optimistic "started"
-        // toast would flash green-then-red when the backend rejects
-        // immediately (RLM off, run already in flight).
+        // staged/applied. Only the settle toast is shown — an optimistic
+        // "started" toast would flash green-then-red when the backend rejects
+        // immediately (RLM off, run already in flight). Plain /refine only
+        // STAGES edits (security: model output is never auto-applied);
+        // /refine apply is the explicit approval step.
         const refineWorkspaceId = context.workspaceId;
-        void refineClient.refinements
-          .run({ workspaceId: refineWorkspaceId })
+        const refineApply = parsed.apply === true;
+        void (
+          refineApply
+            ? refineClient.refinements.apply({ workspaceId: refineWorkspaceId })
+            : refineClient.refinements.run({ workspaceId: refineWorkspaceId })
+        )
           .then((result) => {
             context.setToast(
               result.success
@@ -836,10 +842,14 @@ export async function processSlashCommand(
                     id: Date.now().toString(),
                     type: "success",
                     message: result.data.noOp
-                      ? "Refine: nothing worth distilling"
-                      : // untrackedApplied: edits that succeeded but could not be
-                        // journaled (no rollback id) — still real, so counted.
-                        `Refine: ${result.data.applied.length + (result.data.untrackedApplied ?? 0)} edit(s) applied (see chat summary)`,
+                      ? refineApply
+                        ? "Refine: nothing was applied"
+                        : "Refine: nothing worth distilling"
+                      : refineApply
+                        ? // untrackedApplied: edits that succeeded but could not
+                          // be journaled (no rollback id) — still real, so counted.
+                          `Refine: ${result.data.applied.length + (result.data.untrackedApplied ?? 0)} edit(s) applied (see chat summary)`
+                        : `Refine: ${result.data.staged?.length ?? 0} edit(s) staged — approve with /refine apply`,
                   }
                 : {
                     id: Date.now().toString(),

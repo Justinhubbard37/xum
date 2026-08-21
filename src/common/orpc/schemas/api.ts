@@ -1141,6 +1141,12 @@ export const RefineRecordSchema = z.object({
    * silently classifying the pass as a no-op.
    */
   untrackedApplied: z.number().optional(),
+  /**
+   * Edits a /refine run STAGED for explicit approval (security: the pass
+   * never auto-applies model output). Present only on staging results;
+   * applied via refinements.apply.
+   */
+  staged: z.array(z.object({ description: z.string() })).optional(),
   usage: z.object({ inputTokens: z.number(), outputTokens: z.number() }).optional(),
 });
 
@@ -1150,8 +1156,13 @@ export type RefineAppliedEditPayload = z.infer<typeof RefineAppliedEditSchema>;
 export type RefineRecordPayload = z.infer<typeof RefineRecordSchema>;
 
 export const refinements = {
-  /** Manual /refine trajectory-distillation pass (RLM mode only; the backend refuses otherwise). */
+  /** Manual /refine trajectory-distillation pass (RLM mode only; the backend refuses otherwise). Stages edits; nothing is applied until `apply`. */
   run: {
+    input: z.object({ workspaceId: z.string() }),
+    output: ResultSchema(RefineRecordSchema, z.string()),
+  },
+  /** Apply the staged edits from the last run (explicit user approval step). */
+  apply: {
     input: z.object({ workspaceId: z.string() }),
     output: ResultSchema(RefineRecordSchema, z.string()),
   },

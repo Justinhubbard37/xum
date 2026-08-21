@@ -125,6 +125,13 @@ export function createConsolidationMemoryTool(args: {
   journal: MemoryConsolidationOp[];
   /** Injectable budget (refine shares one across memory + skill tools). */
   budget?: MutationBudget;
+  /**
+   * Invoked for every mutation ACCEPTED in dry-run mode (guard + budget
+   * passed, nothing applied). The refine staging flow uses this to capture
+   * the full command input for a later explicit apply; the plain dream
+   * dry-run ignores it.
+   */
+  onStagedMutation?: (input: MemoryCommandInput, toolCallId: string) => void;
 }): { tool: Tool; getMutationCount: () => number } {
   const { memoryService, metaService, ctx, dryRun, journal } = args;
   const budget = args.budget ?? createMutationBudget(MEMORY_CONSOLIDATION_OP_BUDGET);
@@ -202,6 +209,7 @@ export function createConsolidationMemoryTool(args: {
 
       if (dryRun) {
         journal.push({ ...target, applied: false, note: "dry-run" });
+        args.onStagedMutation?.(input, toolCallId);
         return { success: true, output: `[dry-run] recorded ${target.command} ${target.path}` };
       }
 

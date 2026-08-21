@@ -4237,6 +4237,17 @@ export const router = (authToken?: string) => {
             ? { success: true as const, data: result.data }
             : { success: false as const, error: result.error };
         }),
+      // Explicit approval step: applies the staged edits from the last run
+      // through the same journaled tool paths (rollback keeps working).
+      apply: t
+        .input(schemas.refinements.apply.input)
+        .output(schemas.refinements.apply.output)
+        .handler(async ({ context, input }) => {
+          const result = await context.refineService.apply(input.workspaceId);
+          return result.success
+            ? { success: true as const, data: result.data }
+            : { success: false as const, error: result.error };
+        }),
     },
     workspace: {
       list: t
