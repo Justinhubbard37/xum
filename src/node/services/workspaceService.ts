@@ -2720,6 +2720,10 @@ export class WorkspaceService extends EventEmitter {
   private workspaceGoalService?: WorkspaceGoalService;
   /** Narrow DevTools cleanup surface; wired by coreServices when a DevToolsService exists. */
   private devToolsService?: { removeWorkspaceData(workspaceId: string): Promise<void> };
+  /** Narrow overrides-cleanup surface; wired by ServiceContainer for plugin-key pruning on removal. */
+  private workspaceMcpOverridesService?: {
+    prunePluginOverrideKeys(workspaceId: string, keyPrefix: string): Promise<void>;
+  };
 
   setTimelineRecorder(recorder: TimelineRecorder): void {
     this.timelineRecorder = recorder;
@@ -2731,6 +2735,12 @@ export class WorkspaceService extends EventEmitter {
    */
   setMCPServerManager(manager: MCPServerManager): void {
     this.mcpServerManager = manager;
+  }
+
+  setWorkspaceMcpOverridesService(service: {
+    prunePluginOverrideKeys(workspaceId: string, keyPrefix: string): Promise<void>;
+  }): void {
+    this.workspaceMcpOverridesService = service;
   }
 
   setWorkspaceGoalService(service: WorkspaceGoalService): void {
@@ -5311,6 +5321,26 @@ export class WorkspaceService extends EventEmitter {
       // Stop MCP servers for this workspace
       if (this.mcpServerManager) {
         await this.mcpServerManager.stopServers(workspaceId);
+      }
+
+      // Strip Agent Plugin override keys from the workspace's override files
+      // BEFORE the metadata is dropped (pruning needs it to resolve the
+      // workspace path). LocalRuntime removal preserves the checkout — and
+      // its .mux/mcp.local.jsonc — but a removed workspace is invisible to
+      // the plugin uninstaller's pruning/tombstones, so a surviving
+      // `plugin:` enable could silently re-enable a same-name reinstall's
+      // server when the directory is re-registered later. Best-effort:
+      // removal must never brick on a corrupted overrides file (worktree
+      // removals delete the checkout anyway, and a missing file is a no-op).
+      if (this.workspaceMcpOverridesService) {
+        try {
+          await this.workspaceMcpOverridesService.prunePluginOverrideKeys(workspaceId, "plugin:");
+        } catch (error) {
+          log.warn("Failed to prune plugin override keys during workspace removal", {
+            workspaceId,
+            error: getErrorMessage(error),
+          });
+        }
       }
 
       // Close any terminal sessions for this workspace

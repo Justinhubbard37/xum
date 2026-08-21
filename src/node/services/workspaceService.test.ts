@@ -8663,6 +8663,74 @@ describe("WorkspaceService remove lifecycle coordination", () => {
   });
 });
 
+describe("WorkspaceService remove prunes plugin override keys", () => {
+  // LocalRuntime removal preserves the checkout and its .mux/mcp.local.jsonc,
+  // but a removed workspace is invisible to the Agent Plugin uninstaller's
+  // pruning/tombstones: a surviving `plugin:` enable could silently
+  // re-activate a same-name reinstall's server when the directory is
+  // re-registered. Removal must strip plugin keys while metadata still
+  // resolves — and must never brick on a failing prune.
+  async function runRemoval(
+    prunePluginOverrideKeys: (workspaceId: string, keyPrefix: string) => Promise<void>
+  ): Promise<{ result: Result<void>; order: string[] }> {
+    const sessionRoot = await fsPromises.mkdtemp(path.join(tmpdir(), "ws-remove-prune-"));
+    const order: string[] = [];
+    try {
+      const workspaceService = createWorkspaceServiceForTest({
+        config: {
+          srcDir: "/tmp/src",
+          getSessionDir: mock((id: string) => path.join(sessionRoot, id)),
+          removeWorkspace: mock(() => {
+            order.push("config-removed");
+            return Promise.resolve();
+          }),
+          findWorkspace: mock(() => null),
+          loadConfigOrDefault: mock(() => ({ projects: new Map() })),
+        } as unknown as Config,
+        aiService: createMockAIService({
+          getWorkspaceMetadata: mock(() =>
+            Promise.resolve({
+              success: true as const,
+              data: {
+                id: "ws-1",
+                name: "branch",
+                projectPath: "/tmp/proj",
+                runtimeConfig: { type: "local" as const },
+              },
+            })
+          ),
+        } as unknown as Partial<AIService>),
+      });
+      workspaceService.setWorkspaceMcpOverridesService({
+        prunePluginOverrideKeys: (workspaceId, keyPrefix) => {
+          order.push(`pruned:${workspaceId}:${keyPrefix}`);
+          return prunePluginOverrideKeys(workspaceId, keyPrefix);
+        },
+      });
+      const result = await workspaceService.remove("ws-1", true);
+      return { result, order };
+    } finally {
+      await fsPromises.rm(sessionRoot, { recursive: true, force: true });
+    }
+  }
+
+  test("prunes plugin: keys before the metadata is dropped", async () => {
+    const { result, order } = await runRemoval(() => Promise.resolve());
+    expect(result.success).toBe(true);
+    // Pruning needs the metadata to resolve the workspace path, so it must
+    // run before config.removeWorkspace — and with the all-plugins prefix.
+    expect(order).toEqual(["pruned:ws-1:plugin:", "config-removed"]);
+  });
+
+  test("a failing prune never blocks removal", async () => {
+    const { result, order } = await runRemoval(() =>
+      Promise.reject(new Error("EBUSY: overrides file locked"))
+    );
+    expect(result.success).toBe(true);
+    expect(order).toEqual(["pruned:ws-1:plugin:", "config-removed"]);
+  });
+});
+
 describe("WorkspaceService remove timing rollup", () => {
   let historyService: HistoryService;
   let cleanupHistory: () => Promise<void>;
