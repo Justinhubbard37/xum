@@ -334,14 +334,14 @@ describe("maybeAppendAbandonedBranchSummary", () => {
         abandonedMessages: meatyExchange("usage"),
         experiments: RLM_ON,
         sessionUsageService: {
-          recordHeadlessUsage: async (workspaceId, modelString, usage, _metadata, options) => {
+          recordHeadlessUsage: (workspaceId, modelString, usage, _metadata, options) => {
             usageCalls.push({
               workspaceId,
               modelString,
               usage: usage as { inputTokens?: number; outputTokens?: number },
               options: options as { analyticsSource?: string; metadataModel?: string },
             });
-            return undefined;
+            return Promise.resolve(undefined);
           },
         },
       });
@@ -391,9 +391,9 @@ describe("maybeAppendAbandonedBranchSummary", () => {
         experiments: RLM_ON,
         timeoutMs: 150,
         sessionUsageService: {
-          recordHeadlessUsage: async () => {
+          recordHeadlessUsage: () => {
             usageRecorded += 1;
-            return undefined;
+            return Promise.resolve(undefined);
           },
         },
       });
