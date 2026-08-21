@@ -90,6 +90,8 @@ interface RefineServiceOptions {
   sessionUsageService?: SessionUsageService;
   /** Live-session emission hook so the appended summary row renders immediately. */
   emitChatMessage?: (workspaceId: string, message: MuxMessage) => void;
+  /** Test seam: overrides REFINE_TIMEOUT_MS as the pass deadline. */
+  timeoutMs?: number;
 }
 
 /** Human-readable action line for a refinement journal row. */
@@ -238,7 +240,7 @@ export class RefineService {
       timelineText,
       skillWriteTool,
       // Hard timeout: a wedged provider stream must not hold the run lock forever.
-      abortSignal: AbortSignal.timeout(REFINE_TIMEOUT_MS),
+      abortSignal: AbortSignal.timeout(this.options.timeoutMs ?? REFINE_TIMEOUT_MS),
       recordUsage: async (usage, providerMetadata) => {
         await this.options.sessionUsageService?.recordHeadlessUsage(
           workspaceId,

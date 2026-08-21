@@ -131,6 +131,8 @@ async function createFixture(options?: {
   /** Provide workspace metadata so the skill-write tool is available. */
   withSkillTool?: boolean;
   timelineEvents?: Array<{ kind: string; description: string }>;
+  /** Shortens the pass deadline (wedged-provider tests). */
+  timeoutMs?: number;
 }): Promise<Fixture> {
   const tempDir = new TestTempDir("test-refine-service");
   const muxHome = path.join(tempDir.path, "mux-home");
@@ -187,6 +189,7 @@ async function createFixture(options?: {
       emitChatMessage: (_workspaceId, message) => {
         emittedMessages.push(message);
       },
+      ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
       timelineService:
         options?.timelineEvents !== undefined
           ? {
@@ -281,6 +284,35 @@ describe("RefineService", () => {
     // After the first run settles, the lock is released.
     const third = await fixture.service.run(WORKSPACE_ID);
     expect(third.success).toBe(true);
+    expect(fixture.modelCalls).toHaveLength(2);
+  });
+
+  it("releases the run lock at the deadline even when the provider ignores abort", async () => {
+    // A wedged stream: never yields, never closes, ignores the abort signal
+    // entirely. The pass must still settle at the deadline and release the
+    // per-workspace lock; previously the consumer stayed pinned in read()
+    // forever and every later /refine was rejected as already running.
+    const wedgedModel = () =>
+      new MockLanguageModelV3({
+        doStream: () =>
+          Promise.resolve({
+            stream: new ReadableStream<LanguageModelV3StreamPart>({
+              pull: () => new Promise<never>(() => undefined),
+            }),
+          }),
+      });
+    using fixture = await createFixture({ modelFactory: wedgedModel, timeoutMs: 150 });
+    await fixture.seedTrajectory();
+
+    const result = await fixture.service.run(WORKSPACE_ID);
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toContain("refine stream failed");
+
+    // The lock was released: a second invocation starts a fresh pass instead
+    // of being rejected as already running.
+    const second = await fixture.service.run(WORKSPACE_ID);
+    expect(second.success).toBe(false);
+    if (!second.success) expect(second.error).not.toContain("already running");
     expect(fixture.modelCalls).toHaveLength(2);
   });
 

@@ -162,15 +162,68 @@ export async function runRefinePass(args: {
     abortSignal: args.abortSignal,
   });
 
-  // Drain the stream; tool executions happen as the loop runs. consumeStream
-  // (vs awaiting .text directly) surfaces mid-stream errors via onError
-  // instead of throwing per-part.
+  // Drain the stream; tool executions happen as the loop runs. Explicit
+  // reader over fullStream (vs consumeStream) so the deadline path below can
+  // cancel the consumer from OUTSIDE: a provider that ignores the abort
+  // signal would otherwise leave this await pinned forever, and the service's
+  // per-workspace run lock would never be released (every later /refine
+  // rejected as "already running"). Error parts replicate consumeStream's
+  // onError semantics: mid-stream errors are collected without throwing.
   const streamErrors: string[] = [];
-  await stream.consumeStream({
-    onError: (error) => {
+  // True only when the provider stream closed on its own: distinguishes a
+  // clean finish (late abort must not fail the pass) from a deadline cutoff.
+  let streamDrained = false;
+  const reader = stream.fullStream.getReader();
+  const consume = (async () => {
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          streamDrained = true;
+          break;
+        }
+        // Deadline already fired: stop consuming and tear the stream down.
+        if (args.abortSignal?.aborted === true) break;
+        // Cap retained errors defensively: only the first is reported, and a
+        // pathological provider could flood error parts until the deadline.
+        if (value.type === "error" && streamErrors.length < 8) {
+          streamErrors.push(getErrorMessage(value.error));
+        }
+      }
+    } catch (error) {
       streamErrors.push(getErrorMessage(error));
-    },
+    } finally {
+      // Cancel (not just release) on ANY exit so an early break stops the
+      // underlying stream instead of leaving it producing into a locked
+      // reader. No-op when already closed; rejects when errored, hence the
+      // swallow.
+      void reader.cancel().catch(() => undefined);
+    }
+  })();
+  // Deadline promise: resolves when the abort signal fires so the race stays
+  // bounded even when the provider ignores the signal entirely. Without a
+  // signal the consumer is the only exit (callers always pass the timeout).
+  const deadline = new Promise<void>((resolve) => {
+    const signal = args.abortSignal;
+    if (signal === undefined) return;
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    signal.addEventListener("abort", () => resolve(), { once: true });
   });
+  await Promise.race([consume, deadline]);
+  if (!streamDrained && args.abortSignal?.aborted === true) {
+    // The deadline won (or fired mid-read): actively cancel the losing
+    // consumer — a wedged provider leaves it pinned in read() — and record
+    // the timeout as a stream error so the result awaits below (which would
+    // drain a wedged stream indefinitely) are skipped and the caller reports
+    // the failure instead of hanging.
+    void reader.cancel().catch(() => undefined);
+    if (streamErrors.length === 0) {
+      streamErrors.push("refine pass deadline exceeded before the stream finished");
+    }
+  }
 
   let summary = "";
   let toolCallIds: string[] = [];
