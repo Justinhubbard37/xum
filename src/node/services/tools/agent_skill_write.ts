@@ -205,14 +205,38 @@ export const createAgentSkillWriteTool: ToolFactory = (config: ToolConfiguration
             }
           }
 
-          let originalContent = "";
+          // Existence is probed separately from readability: treating a
+          // failed read as "did not exist" would journal a delete-files
+          // inverse for an existing-but-unreadable file, and rolling back the
+          // write would then DELETE the pre-existing file instead of
+          // restoring it. Unknown existence (transient stat failure) also
+          // skips journaling.
           let fileExisted = false;
+          let priorStateKnown = true;
           try {
-            originalContent = await readFileString(config.runtime, resolvedTarget.resolvedPath);
-            fileExisted = true;
-          } catch {
-            // Best-effort read for diff generation + refinement inverse
-            // (unreadable is treated as "did not exist").
+            const priorStat = await config.runtime.stat(resolvedTarget.resolvedPath);
+            fileExisted = !priorStat.isDirectory;
+          } catch (error) {
+            // Same ENOENT matching as agent_skill_delete's runtime probes.
+            if (!/enoent|no such file|does not exist/i.test(getErrorMessage(error))) {
+              priorStateKnown = false;
+              log.debug("[agent_skill_write] skipping refinement inverse: prior stat failed", {
+                resolvedPath: resolvedTarget.resolvedPath,
+                error,
+              });
+            }
+          }
+          let originalContent = "";
+          if (fileExisted) {
+            try {
+              originalContent = await readFileString(config.runtime, resolvedTarget.resolvedPath);
+            } catch (error) {
+              priorStateKnown = false;
+              log.debug("[agent_skill_write] skipping refinement inverse: prior read failed", {
+                resolvedPath: resolvedTarget.resolvedPath,
+                error,
+              });
+            }
           }
 
           await config.runtime.ensureDir(path.dirname(resolvedTarget.resolvedPath));
@@ -223,8 +247,9 @@ export const createAgentSkillWriteTool: ToolFactory = (config: ToolConfiguration
           // unjournalable prior capture skips the row entirely — a delete
           // inverse in its place would destroy the prior file on rollback.
           if (
-            !fileExisted ||
-            isJournalablePriorContent(resolvedTarget.resolvedPath, originalContent)
+            priorStateKnown &&
+            (!fileExisted ||
+              isJournalablePriorContent(resolvedTarget.resolvedPath, originalContent))
           ) {
             await appendRefinementEventFromTool(config, {
               kind: "skill",

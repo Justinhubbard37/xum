@@ -908,6 +908,69 @@ describe("refinement journal", () => {
     expect(await readRefinementEvents(sessionDirOf(tempDir.path))).toHaveLength(0);
   });
 
+  it("skips journaling when an existing runtime prior file cannot be read", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-write-refinement-unreadable-runtime");
+    const skillName = "my-skill";
+    const remoteWorkspaceRoot = "/remote/workspace";
+
+    await writeProjectSkill(tempDir.path, skillName, {
+      description: "fixture",
+      files: { "references/locked.txt": "precious prior content\n" },
+    });
+
+    // The prior file EXISTS (stat succeeds) but reading it fails — e.g. a
+    // permission error or transient remote failure. Treating that as "did
+    // not exist" would journal a delete-files inverse whose rollback deletes
+    // the pre-existing file instead of restoring it.
+    class UnreadableFileRuntime extends RemotePathMappedRuntime {
+      override readFile(
+        filePath: string,
+        abortSignal?: AbortSignal
+      ): ReturnType<RemotePathMappedRuntime["readFile"]> {
+        if (filePath.endsWith("locked.txt")) {
+          throw new Error("EACCES: permission denied");
+        }
+        return super.readFile(filePath, abortSignal);
+      }
+    }
+
+    const remoteRuntime = new UnreadableFileRuntime(tempDir.path, remoteWorkspaceRoot);
+    const sessionsDir = path.join(tempDir.path, "session-dir");
+    await fs.mkdir(sessionsDir, { recursive: true });
+    const baseConfig = createTestToolConfig(tempDir.path, {
+      workspaceId: "regular-workspace",
+      sessionsDir,
+      runtime: remoteRuntime,
+      muxScope: {
+        type: "project",
+        muxHome: tempDir.path,
+        projectRoot: "/host/project",
+        projectStorageAuthority: "runtime",
+      },
+    });
+    const config = { ...baseConfig, cwd: remoteWorkspaceRoot };
+
+    const tool = createAgentSkillWriteTool(config);
+    const result = (await tool.execute!(
+      { name: skillName, filePath: "references/locked.txt", content: "overwritten\n" },
+      mockToolCallOptions
+    )) as AgentSkillWriteToolResult;
+
+    // The write proceeds; only journaling is skipped (no delete-files row
+    // that would destroy the prior file on rollback).
+    expect(result.success).toBe(true);
+    const written = path.join(
+      tempDir.path,
+      ".mux",
+      "skills",
+      skillName,
+      "references",
+      "locked.txt"
+    );
+    expect(await fs.readFile(written, "utf-8")).toBe("overwritten\n");
+    expect(await readRefinementEvents(sessionsDir)).toHaveLength(0);
+  });
+
   it("skips journaling oversized prior files on the runtime-backed path", async () => {
     using tempDir = new TestTempDir("test-agent-skill-write-refinement-budget-runtime");
     const skillName = "my-skill";
