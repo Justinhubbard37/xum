@@ -5215,6 +5215,12 @@ export class WorkspaceService extends EventEmitter {
       // delete, recreating the session directory for a workspace the user removed.
       this.disposeSession(workspaceId);
 
+      // Cancel and drain any background branch-summary writer BEFORE deleting
+      // the session directory: a mid-flight append could otherwise recreate
+      // the directory after removal, leaving an orphaned session. This also
+      // drops the retained registration a fork that never sent would leak.
+      await clearPendingBranchSummary(workspaceId);
+
       // Drop any persistent sandbox mount BEFORE deleting the session
       // directory: dropScope disposes the runtime without disk writes and
       // waits for in-flight evaluation, so a late vars snapshot cannot
@@ -5287,10 +5293,6 @@ export class WorkspaceService extends EventEmitter {
       await this.config.removeWorkspace(workspaceId);
       removedFromConfig = true;
       this.autoTitlingWorkspaces.delete(workspaceId);
-      // Branch-summary registrations are retained until the first send
-      // consumes them; a fork removed before ever sending must drop its
-      // registration here or it leaks.
-      clearPendingBranchSummary(workspaceId);
 
       this.emit("metadata", {
         workspaceId,

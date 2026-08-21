@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider";
@@ -689,9 +689,110 @@ describe("branch summary placement on fork/truncate flows", () => {
 
       // Workspace removal must disconnect the retained registration so it
       // cannot leak (results are otherwise kept until the first send).
-      clearPendingBranchSummary(ws);
+      await clearPendingBranchSummary(ws);
       expect(await awaitPendingBranchSummary(ws)).toBeNull();
     } finally {
+      await cleanup();
+    }
+  });
+
+  test("clearPendingBranchSummary invalidates an in-flight writer so it never appends", async () => {
+    const { historyService, cleanup } = await createTestHistoryService();
+    const appendSpy = spyOn(historyService, "appendToHistoryIfTailMatches");
+    try {
+      const ws = "ws-invalidated";
+      const branchPoint = createMuxMessage("inv-1", "assistant", "branch point", { timestamp: 1 });
+      expect((await historyService.appendToHistory(ws, branchPoint)).success).toBe(true);
+
+      // Streams a complete sentence then stalls: without invalidation, the
+      // deadline salvage path would append a row after removal.
+      const slowModel = new MockLanguageModelV3({
+        doStream: () =>
+          Promise.resolve({
+            stream: new ReadableStream<LanguageModelV3StreamPart>({
+              start: (controller) => {
+                controller.enqueue({ type: "text-start", id: "t1" });
+                controller.enqueue({
+                  type: "text-delta",
+                  id: "t1",
+                  delta: "A salvageable sentence streamed before removal.",
+                });
+              },
+            }),
+          }),
+      });
+      startAbandonedBranchSummaryInBackground({
+        historyService,
+        aiService: fakeAiService(slowModel),
+        workspaceId: ws,
+        abandonedMessages: meatyExchange("invalidated"),
+        experiments: RLM_ON,
+        guardTailMessageId: "inv-1",
+        timeoutMs: 400,
+      });
+      // Let the sentence stream in first so the salvage path (not an empty
+      // result) is what the invalidation gate must stop.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      await clearPendingBranchSummary(ws);
+
+      // The writer settled without appending, and the registration is gone.
+      expect(appendSpy).not.toHaveBeenCalled();
+      const history = await historyService.getHistoryFromLatestBoundary(ws);
+      expect(history.success && history.data.map((m) => m.id)).toEqual(["inv-1"]);
+      expect(await awaitPendingBranchSummary(ws)).toBeNull();
+    } finally {
+      appendSpy.mockRestore();
+      await cleanup();
+    }
+  });
+
+  test("clearPendingBranchSummary waits for an in-flight append before resolving", async () => {
+    const { historyService, cleanup } = await createTestHistoryService();
+    // Gate the guarded append so the writer is mid-append when removal starts.
+    let releaseAppend: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      releaseAppend = resolve;
+    });
+    const realAppend = historyService.appendToHistoryIfTailMatches.bind(historyService);
+    const appendSpy = spyOn(historyService, "appendToHistoryIfTailMatches").mockImplementation(
+      async (workspaceId, message, tailMessageId) => {
+        await gate;
+        return realAppend(workspaceId, message, tailMessageId);
+      }
+    );
+    try {
+      const ws = "ws-serialized";
+      const branchPoint = createMuxMessage("ser-1", "assistant", "branch point", { timestamp: 1 });
+      expect((await historyService.appendToHistory(ws, branchPoint)).success).toBe(true);
+
+      startAbandonedBranchSummaryInBackground({
+        historyService,
+        aiService: fakeAiService(summaryModel("Summary appended mid-removal.")),
+        workspaceId: ws,
+        abandonedMessages: meatyExchange("serialized"),
+        experiments: RLM_ON,
+        guardTailMessageId: "ser-1",
+      });
+      const deadline = Date.now() + 5_000;
+      while (appendSpy.mock.calls.length === 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(appendSpy.mock.calls.length).toBe(1);
+
+      // Removal is serialized behind the in-flight writer: it must not
+      // proceed (and delete the session directory) while the append is
+      // mid-flight, or the append could recreate the directory afterward.
+      let cleared = false;
+      const clearPromise = clearPendingBranchSummary(ws).then(() => {
+        cleared = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(cleared).toBe(false);
+      releaseAppend();
+      await clearPromise;
+      expect(cleared).toBe(true);
+    } finally {
+      appendSpy.mockRestore();
       await cleanup();
     }
   });

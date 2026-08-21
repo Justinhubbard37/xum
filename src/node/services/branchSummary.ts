@@ -220,10 +220,16 @@ async function generateAbandonedBranchSummaryText(input: {
   candidates: string[];
   prompt: string;
   timeoutMs: number;
+  cancellationSignal?: AbortSignal;
 }): Promise<string | null> {
   // One shared deadline across all candidates: callers may block on this, so
   // the total wait must stay bounded regardless of how many models fail over.
-  const abortSignal = AbortSignal.timeout(input.timeoutMs);
+  // Caller cancellation (workspace removal) is folded into the same signal so
+  // invalidation ends generation promptly instead of waiting out the deadline.
+  const timeoutSignal = AbortSignal.timeout(input.timeoutMs);
+  const abortSignal = input.cancellationSignal
+    ? AbortSignal.any([timeoutSignal, input.cancellationSignal])
+    : timeoutSignal;
   // Defensive double-bound: abortSignal cancels well-behaved providers, but a
   // provider that ignores abort must not hold the fork/edit operation hostage,
   // so the consume loop below also races against this deadline promise.
@@ -397,6 +403,13 @@ export interface AbandonedBranchSummaryInput {
    */
   guardTailMessageId?: string;
   timeoutMs?: number;
+  /**
+   * Invalidation signal for background writers: workspace removal aborts it
+   * (clearPendingBranchSummary). Generation stops promptly and the append
+   * step must not run once aborted — a late append could recreate the
+   * just-deleted session directory.
+   */
+  cancellationSignal?: AbortSignal;
 }
 
 /**
@@ -451,8 +464,19 @@ export async function maybeAppendAbandonedBranchSummary(
       candidates,
       prompt: buildAbandonedBranchSummaryPrompt(transcript),
       timeoutMs: input.timeoutMs ?? BRANCH_SUMMARY_TIMEOUT_MS,
+      cancellationSignal: input.cancellationSignal,
     });
     if (summaryText === null) {
+      return null;
+    }
+
+    // Invalidation gate before the write: workspace removal may have started
+    // while we were generating, and an append past this point could recreate
+    // the session directory after removal deletes it. clearPendingBranchSummary
+    // aborts first and then awaits this promise, so either the abort is
+    // visible here (no append) or removal waits for the append to finish.
+    if (input.cancellationSignal?.aborted) {
+      log.debug("Branch summary: cancelled before append", { workspaceId: input.workspaceId });
       return null;
     }
 
@@ -518,7 +542,12 @@ export async function maybeAppendAbandonedBranchSummary(
  * consumption (awaitPendingBranchSummary) or workspace removal
  * (clearPendingBranchSummary), so retained results cannot accumulate.
  */
-const pendingBranchSummaries = new Map<string, Promise<MuxMessage | null>>();
+interface PendingBranchSummary {
+  promise: Promise<MuxMessage | null>;
+  /** Invalidates the background writer (see clearPendingBranchSummary). */
+  controller: AbortController;
+}
+const pendingBranchSummaries = new Map<string, PendingBranchSummary>();
 
 /**
  * Start abandoned-branch summarization WITHOUT blocking the caller. Used by
@@ -533,8 +562,13 @@ const pendingBranchSummaries = new Map<string, Promise<MuxMessage | null>>();
 export function startAbandonedBranchSummaryInBackground(
   input: AbandonedBranchSummaryInput & { guardTailMessageId: string }
 ): void {
-  const promise = maybeAppendAbandonedBranchSummary(input);
-  pendingBranchSummaries.set(input.workspaceId, promise);
+  const controller = new AbortController();
+  const promise = maybeAppendAbandonedBranchSummary({
+    ...input,
+    cancellationSignal: controller.signal,
+  });
+  const entry: PendingBranchSummary = { promise, controller };
+  pendingBranchSummaries.set(input.workspaceId, entry);
   void promise.then((appended) => {
     // A null result has nothing left for the first send to consume, so drop
     // the registration eagerly. A produced row must STAY registered: deleting
@@ -543,7 +577,7 @@ export function startAbandonedBranchSummaryInBackground(
     // in the open chat until a reload. Only clear our own registration (a
     // re-fork of the same workspace id cannot happen, but stay defensive
     // about overwrites).
-    if (appended === null && pendingBranchSummaries.get(input.workspaceId) === promise) {
+    if (appended === null && pendingBranchSummaries.get(input.workspaceId) === entry) {
       pendingBranchSummaries.delete(input.workspaceId);
     }
   });
@@ -557,22 +591,34 @@ export function startAbandonedBranchSummaryInBackground(
  * row keeps its before-the-next-request ordering.
  */
 export async function awaitPendingBranchSummary(workspaceId: string): Promise<MuxMessage | null> {
-  const pending = pendingBranchSummaries.get(workspaceId);
-  if (!pending) {
+  const entry = pendingBranchSummaries.get(workspaceId);
+  if (!entry) {
     return null;
   }
   // Consume up front so exactly one send observes (and emits) the row;
   // subsequent sends resolve null immediately.
   pendingBranchSummaries.delete(workspaceId);
-  return pending;
+  return entry.promise;
 }
 
 /**
- * Drop any pending/retained registration for a removed workspace. Settled
- * results are kept consumable until the first send (see the map doc above),
- * so a fork that never sends must be cleaned up here or its registration
- * would leak forever.
+ * Invalidate and drain any pending/retained registration for a removed
+ * workspace. Settled results are kept consumable until the first send (see
+ * the map doc above), so a fork that never sends must be cleaned up here or
+ * its registration would leak forever.
+ *
+ * Removal MUST await this before deleting the session directory: the abort
+ * stops generation and blocks the append step, and awaiting the (never
+ * rejecting) promise serializes removal behind a writer whose append is
+ * already in flight — otherwise that late append could recreate the session
+ * directory after deletion, leaving an orphan.
  */
-export function clearPendingBranchSummary(workspaceId: string): void {
+export async function clearPendingBranchSummary(workspaceId: string): Promise<void> {
+  const entry = pendingBranchSummaries.get(workspaceId);
   pendingBranchSummaries.delete(workspaceId);
+  if (!entry) {
+    return;
+  }
+  entry.controller.abort();
+  await entry.promise;
 }
