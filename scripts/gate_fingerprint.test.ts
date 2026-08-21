@@ -181,6 +181,28 @@ test("check misses when an untracked file's executable bit or symlink target cha
   expect((await gate(repo, "check", "static-check")).exitCode).toBe(1);
 });
 
+test("newline-bearing filenames cannot forge another worktree's manifest", async () => {
+  // Pre-fix, records were newline-terminated with the raw path as the last
+  // field, so ONE file named `a\n<hash> - b` (same contents as `a`) emitted
+  // the exact manifest bytes of TWO files `a` and `b` — letting a cached
+  // passing gate be reused for a different worktree. NUL terminators make
+  // the encoding injective (paths cannot contain NUL).
+  const contents = "same contents";
+  const contentsHash = new Bun.CryptoHasher("sha256").update(contents).digest("hex");
+
+  await writeFile(path.join(repo, "a"), contents);
+  await writeFile(path.join(repo, "b"), contents);
+  const twoFiles = await fingerprint(repo);
+
+  await rm(path.join(repo, "a"));
+  await rm(path.join(repo, "b"));
+  // Legal Linux filename: embedded newline + spaces forging b's record.
+  await writeFile(path.join(repo, `a\n${contentsHash} - b`), contents);
+  const forged = await fingerprint(repo);
+
+  expect(forged).not.toBe(twoFiles);
+});
+
 test("record is refused when the worktree changed after the fingerprint was captured", async () => {
   // Simulates a mid-gate worktree change: fingerprint captured, then another
   // process edits a file before record runs. The stale outcome must not be

@@ -96,7 +96,12 @@ resolve_store_path() {
 # chmod +x changes how builds/tests run the file) and symlink identity (a
 # symlink must fingerprint as its target STRING, not the referent's content,
 # and must never collide with a regular file of the same bytes).
-# NUL-delimited plumbing so arbitrary file names cannot corrupt the stream.
+# NUL-delimited plumbing AND NUL-terminated records: paths are the final
+# field and may legally contain newlines, so a newline-terminated record
+# would be ambiguous (one crafted filename could encode the same bytes as
+# two separate records, letting a cached gate be reused for a different
+# worktree). Paths can never contain NUL, so a NUL terminator keeps every
+# record boundary unambiguous.
 emit_untracked_manifest() {
   git status --porcelain=v1 -z -uall --no-renames \
     | while IFS= read -r -d '' entry; do
@@ -108,14 +113,14 @@ emit_untracked_manifest() {
     | while IFS= read -r -d '' path; do
       if [ -h "$path" ]; then
         # Hash the link target text (targets may contain arbitrary bytes).
-        printf 'symlink %s %s\n' "$(readlink "$path" | sha256_stream)" "$path"
+        printf 'symlink %s %s\0' "$(readlink "$path" | sha256_stream)" "$path"
       elif [ -f "$path" ] && [ -r "$path" ]; then
         if [ -x "$path" ]; then mode=x; else mode=-; fi
-        printf '%s %s %s\n' "$(sha256_stream <"$path")" "$mode" "$path"
+        printf '%s %s %s\0' "$(sha256_stream <"$path")" "$mode" "$path"
       else
         # Unreadable/special entries still perturb the fingerprint
         # deterministically instead of aborting.
-        printf 'unhashable %s\n' "$path"
+        printf 'unhashable %s\0' "$path"
       fi
     done
 }
