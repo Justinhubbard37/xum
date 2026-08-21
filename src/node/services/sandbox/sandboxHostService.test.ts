@@ -2,18 +2,23 @@
  * QuickJS-heavy suite: keep out of broad Bun filters (runs isolated in CI,
  * see .github/workflows: isolated_unit_tests).
  */
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { readdirSync, statSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tool } from "ai";
 import { z } from "zod";
+import type { BlobRef } from "@/common/types/durableEvent";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { ToolBridge } from "@/node/services/ptc/toolBridge";
 import { FULL_GRANTS, LEAST_PRIVILEGE_GRANTS } from "@/common/types/capabilityGrants";
-import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
+import {
+  DurableEventJournal,
+  sharedDurableEventJournal,
+} from "@/node/utils/journal/durableEventJournal";
 import {
   reclaimExcessResultHandleBlobs,
+  reclaimSupersededSnapshotBlobs,
   SandboxHostService,
   VarsSnapshotBudgetError,
 } from "./sandboxHostService";
@@ -181,7 +186,10 @@ describe("SandboxHostService", () => {
       scopeKey: "ws-reclaim",
       sessionDir: tmp.path,
     });
-    const journal = new DurableEventJournal(tmp.path);
+    // Appends below must go through the process-shared instance the mount
+    // persists with: reclamation's blob-mention index is per-instance, and
+    // all live writers are required to share it (see sharedJournals).
+    const journal = sharedDurableEventJournal(tmp.path);
     const snapshotRefs = async () => {
       const events = await journal.read();
       return events
@@ -217,6 +225,147 @@ describe("SandboxHostService", () => {
     expect(await journal.blobs.has(secondRef as never)).toBe(true);
 
     await host.disposeScope("ws-reclaim");
+  });
+
+  test("snapshot churn deletes exactly the previous-latest blob per persist", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const host = new SandboxHostService();
+    // Spy on the process-shared instance the mount persists through so every
+    // reclamation deletion attempt is observed.
+    const journal = sharedDurableEventJournal(tmp.path);
+    const deleteSpy = spyOn(journal.blobs, "delete");
+    const mount = await host.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-churn",
+      sessionDir: tmp.path,
+    });
+
+    const refs: BlobRef[] = [];
+    for (let i = 0; i < 4; i++) {
+      await mount.runtime.eval(`vars.state = "v${i}"; return true;`);
+      await mount.persistVars();
+      const snapshots = (await journal.read()).filter((e) => e.kind === "sandbox-vars-snapshot");
+      refs.push((snapshots[snapshots.length - 1].data as { blobHash: BlobRef }).blobHash);
+    }
+
+    // The first persist finds nothing superseded; each later persist deletes
+    // ONLY the blob that just ceased being latest — refs already deleted by
+    // earlier passes are never re-attempted (quadratic-reclamation guard).
+    expect(deleteSpy.mock.calls.map((call) => call[0])).toEqual([refs[0], refs[1], refs[2]]);
+    expect(await journal.blobs.has(refs[3])).toBe(true);
+    deleteSpy.mockRestore();
+    // dropScope: disposing normally would persist (and reclaim) once more.
+    await host.dropScope("ws-churn");
+  });
+
+  test("handle quota: later persists evict only newly over-quota payloads", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const journal = new DurableEventJournal(tmp.path);
+    const deleteSpy = spyOn(journal.blobs, "delete");
+    // Recorded sizes make three retained handles cross the quota, so every
+    // publish beyond the second evicts exactly the oldest retained payload
+    // (payload bytes are tiny; the quota math uses event sizes).
+    const size = Math.ceil(RESULT_HANDLE_BLOB_QUOTA_BYTES * 0.4);
+    const publish = async (i: number) => {
+      const { ref } = await journal.publishWithBlob(`payload-${i}`, (blobHash) => ({
+        workspaceId: "ws-quota-inc",
+        kind: "result-handle",
+        data: { handle: `vars.__h${i}`, preview: "p", blobHash, size },
+      }));
+      await reclaimExcessResultHandleBlobs(journal, { ref, size });
+      return ref;
+    };
+
+    const h1 = await publish(1); // recovery sweep: fits
+    const h2 = await publish(2); // incremental: fits (0.8x quota)
+    expect(deleteSpy).toHaveBeenCalledTimes(0);
+    const h3 = await publish(3); // 1.2x quota → oldest (h1) evicted
+    const h4 = await publish(4); // h2 evicted; h1 must NOT be re-attempted
+    expect(deleteSpy.mock.calls.map((call) => call[0])).toEqual([h1, h2]);
+    expect(await journal.blobs.has(h1)).toBe(false);
+    expect(await journal.blobs.has(h2)).toBe(false);
+    expect(await journal.blobs.has(h3)).toBe(true);
+    expect(await journal.blobs.has(h4)).toBe(true);
+    deleteSpy.mockRestore();
+  });
+
+  test("reclamation cannot delete a blob a publisher has put but not yet appended", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const journal = new DurableEventJournal(tmp.path);
+    // An over-quota, otherwise-unreferenced handle payload: the natural
+    // eviction target for the reclamation pass below.
+    const { ref: sharedRef } = await journal.publishWithBlob("shared-content", (blobHash) => ({
+      workspaceId: "ws-race",
+      kind: "result-handle",
+      data: {
+        handle: "vars.__h1",
+        preview: "p",
+        blobHash,
+        size: RESULT_HANDLE_BLOB_QUOTA_BYTES + 1,
+      },
+    }));
+
+    // A publisher re-puts identical content (same hash — content addressing)
+    // for a snapshot event and pauses inside the put→append window.
+    let releasePublisher!: () => void;
+    const gate = new Promise<void>((resolve) => (releasePublisher = resolve));
+    let putDone!: () => void;
+    const paused = new Promise<void>((resolve) => (putDone = resolve));
+    const publisher = journal.withBlobLock(async () => {
+      const { ref } = await journal.blobs.put("shared-content");
+      expect(ref).toBe(sharedRef);
+      putDone();
+      await gate;
+      await journal.append({
+        workspaceId: "ws-race",
+        kind: "sandbox-vars-snapshot",
+        data: { scopeKey: "ws-race", blobHash: ref, size: 14 },
+      });
+    });
+    await paused;
+
+    // Reclamation must queue behind the publisher's lock instead of deciding
+    // from an event snapshot that cannot see the in-flight reference.
+    let reclaimFinished = false;
+    const reclaim = reclaimExcessResultHandleBlobs(journal).then(() => {
+      reclaimFinished = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(reclaimFinished).toBe(false);
+
+    releasePublisher();
+    await publisher;
+    await reclaim;
+    // The event published under the lock references the hash, so the
+    // over-quota handle payload must survive.
+    expect(await journal.blobs.has(sharedRef)).toBe(true);
+  });
+
+  test("recovery sweep on the first pass after a restart cleans leftover superseded blobs", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const publishSnapshot = async (journal: DurableEventJournal, content: string) => {
+      const { ref } = await journal.publishWithBlob(content, (blobHash, size) => ({
+        workspaceId: "ws-recover",
+        kind: "sandbox-vars-snapshot",
+        data: { scopeKey: "ws-recover", blobHash, size },
+      }));
+      return ref;
+    };
+    // "Process 1" persists twice but crashes before ever reclaiming.
+    const journal1 = new DurableEventJournal(tmp.path);
+    const stale1 = await publishSnapshot(journal1, '{"v":1}');
+    const stale2 = await publishSnapshot(journal1, '{"v":2}');
+
+    // "Process 2" (fresh journal instance = fresh reclamation state): the
+    // first persist's recovery sweep heals BOTH leftovers, not just the
+    // immediately superseded one.
+    const journal2 = new DurableEventJournal(tmp.path);
+    const latest = await publishSnapshot(journal2, '{"v":3}');
+    await reclaimSupersededSnapshotBlobs(journal2, "ws-recover", latest);
+    expect(await journal2.blobs.has(stale1)).toBe(false);
+    expect(await journal2.blobs.has(stale2)).toBe(false);
+    expect(await journal2.blobs.has(latest)).toBe(true);
   });
 
   test("host→guest events: queue + drain via drainHostEvents()", async () => {

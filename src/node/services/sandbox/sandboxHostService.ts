@@ -27,6 +27,7 @@ import type { IJSRuntime, IJSRuntimeFactory } from "@/node/services/ptc/runtime"
 import { resolveCapabilityGrants, type CapabilityGrants } from "@/common/types/capabilityGrants";
 import {
   sharedDurableEventJournal,
+  type BlobMentions,
   type DurableEventJournal,
 } from "@/node/utils/journal/durableEventJournal";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
@@ -56,92 +57,186 @@ export class VarsSnapshotBudgetError extends Error {
   }
 }
 
+/** One result-handle blob payload as the quota accounting sees it. */
+interface HandleBlobEntry {
+  ref: BlobRef;
+  /** Recorded event size (bytes of the serialized value). */
+  size: number;
+}
+
 /**
- * Delete blob payloads of superseded vars snapshots for one scope. A blob is
- * reclaimable only when (a) it is not the latest snapshot and (b) no OTHER
- * journal event references its hash — content addressing means identical
- * content shares one blob (e.g. a result-handle that stored the same bytes),
- * and deleting a shared payload would corrupt that other event. The reference
- * check is a generic serialized-containment scan so every current and future
- * event kind that embeds a blob hash is honored without maintaining a
- * per-kind field list; 64-hex-char hashes make false positives a
- * non-concern (a false positive merely retains a blob).
+ * Per-journal incremental reclamation state (Codex round 6: both passes ran
+ * after EVERY kernel call and re-derived their candidates from the full
+ * journal, retrying deletions earlier passes already performed — quadratic
+ * work over a long session). Keyed by the journal instance, NOT the mount:
+ * mounts are rebuilt on grant/bridge changes without a process restart, and
+ * the shared journal is the one identity that lives exactly as long as the
+ * in-memory index this state depends on. A fresh process starts empty, so
+ * the first pass per concern runs a full recovery sweep — that is also what
+ * heals leftovers from crashes or failed best-effort deletions.
  */
-async function reclaimSupersededSnapshotBlobs(
+interface JournalReclamationState {
+  /** Latest published snapshot ref per scope. A present key means this
+   * process already swept the scope, so each later persist reclaims exactly
+   * the one ref that just ceased being latest. */
+  latestSnapshotRef: Map<string, BlobRef>;
+  /** Handle payloads currently retained under the quota, newest first
+   * (bounded by quota/offload-threshold); null until the recovery sweep. */
+  retainedHandles: HandleBlobEntry[] | null;
+}
+
+const reclamationStates = new WeakMap<DurableEventJournal, JournalReclamationState>();
+
+function reclamationStateFor(journal: DurableEventJournal): JournalReclamationState {
+  let state = reclamationStates.get(journal);
+  if (!state) {
+    state = { latestSnapshotRef: new Map(), retainedHandles: null };
+    reclamationStates.set(journal, state);
+  }
+  return state;
+}
+
+/**
+ * Reference safety: a blob may be deleted only when every event mentioning
+ * its hash belongs to the reclaiming pass's own kind (and, for snapshots, its
+ * own scope) — content addressing means identical content shares one blob,
+ * and deleting a payload referenced by any other event would corrupt that
+ * event. Backed by the journal's blob-mention index (O(1) per candidate)
+ * instead of a per-persist journal scan.
+ */
+function onlyMentionedBy(
+  mentions: BlobMentions | undefined,
+  kind: "sandbox-vars-snapshot" | "result-handle",
+  scopeKey?: string
+): boolean {
+  // Candidates come from journal events, so an unindexed ref means the index
+  // and the journal disagree — retain, never guess.
+  if (mentions === undefined) return false;
+  for (const mentionKind of mentions.kinds) {
+    if (mentionKind !== kind) return false;
+  }
+  if (scopeKey !== undefined) {
+    for (const scope of mentions.snapshotScopes) {
+      if (scope !== scopeKey) return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Delete blob payloads of superseded vars snapshots for one scope: only the
+ * LATEST snapshot per scope is ever restored, so older versions are pure
+ * disk growth. Incremental — after the first persist's recovery sweep, each
+ * pass considers exactly the previous latest ref (see
+ * JournalReclamationState). The whole decide→delete window holds the journal
+ * blob lock so a publisher's put→append window can never be observed.
+ *
+ * Exported for tests (restart/recovery interleavings need direct calls).
+ */
+export async function reclaimSupersededSnapshotBlobs(
   journal: DurableEventJournal,
   scopeKey: string,
   latestRef: BlobRef
 ): Promise<void> {
-  const events = await journal.read();
-  const superseded = new Set<BlobRef>();
-  for (const event of events) {
-    if (
-      event.kind === "sandbox-vars-snapshot" &&
-      event.data.scopeKey === scopeKey &&
-      event.data.blobHash !== latestRef
-    ) {
-      superseded.add(event.data.blobHash);
-    }
-  }
-  if (superseded.size === 0) return;
+  assert(scopeKey.length > 0, "reclaimSupersededSnapshotBlobs requires a scopeKey");
+  await journal.withBlobLock(async () => {
+    const state = reclamationStateFor(journal);
+    const previousRef = state.latestSnapshotRef.get(scopeKey);
+    // Record the new latest BEFORE deleting: a failed best-effort deletion
+    // must not be retried on every later persist (the next process's
+    // recovery sweep heals it instead).
+    state.latestSnapshotRef.set(scopeKey, latestRef);
+    if (previousRef === latestRef) return;
 
-  for (const event of events) {
-    if (superseded.size === 0) break;
-    // Superseded snapshot rows of THIS scope are exactly what we are
-    // reclaiming; every other event keeps its references alive.
-    if (event.kind === "sandbox-vars-snapshot" && event.data.scopeKey === scopeKey) continue;
-    const serialized = JSON.stringify(event);
-    for (const hash of superseded) {
-      if (serialized.includes(hash)) superseded.delete(hash);
+    const index = await journal.blobMentionIndex();
+    const candidates =
+      previousRef !== undefined
+        ? [previousRef]
+        : // Recovery sweep: first persist for this scope since process start.
+          // A ref mentioned by a snapshot row of this scope IS some
+          // snapshot's blobHash — that is the kind's only ref-valued field.
+          [...index.entries()]
+            .filter(([ref, mentions]) => mentions.snapshotScopes.has(scopeKey) && ref !== latestRef)
+            .map(([ref]) => ref);
+    for (const ref of candidates) {
+      if (!onlyMentionedBy(index.get(ref), "sandbox-vars-snapshot", scopeKey)) continue;
+      await journal.blobs.delete(ref);
     }
-  }
-
-  for (const hash of superseded) {
-    await journal.blobs.delete(hash);
-  }
+  });
 }
 
 /**
  * Enforce the per-session quota on retained result-handle blob bytes.
  * Newest-first: recent handles keep their durable payloads (they may still be
  * recoverable from vars or wanted for a follow-up read); once the cumulative
- * size crosses the quota, older payloads are deleted. Same reference-safety
- * rule as snapshot reclamation: a hash referenced by any retained event or
- * any other event kind survives (content addressing can share payloads).
+ * size crosses the quota, older payloads are deleted. Incremental — pass the
+ * just-published handle and the quota walk runs over the in-memory retained
+ * list instead of the journal, so payloads evicted by earlier passes are
+ * never revisited. The first pass per process (or a call without
+ * `published`) runs a full recovery sweep. Reference safety and locking:
+ * see onlyMentionedBy / reclaimSupersededSnapshotBlobs.
  *
  * Exported for tests (quota interleavings need synthetic event sizes).
  */
-export async function reclaimExcessResultHandleBlobs(journal: DurableEventJournal): Promise<void> {
-  const events = await journal.read();
-  const handleEvents = events.filter((event) => event.kind === "result-handle");
-  const retained = new Set<BlobRef>();
+export async function reclaimExcessResultHandleBlobs(
+  journal: DurableEventJournal,
+  published?: HandleBlobEntry
+): Promise<void> {
+  await journal.withBlobLock(async () => {
+    const state = reclamationStateFor(journal);
+    const index = await journal.blobMentionIndex();
+    let entries: HandleBlobEntry[];
+    if (state.retainedHandles !== null && published !== undefined) {
+      entries = [published, ...state.retainedHandles];
+    } else {
+      // Recovery sweep: replay every result-handle row newest-first. Rows
+      // whose payloads were already reclaimed re-enter the walk, but their
+      // deletions are idempotent no-ops and this runs once per process.
+      const events = await journal.read();
+      entries = [];
+      for (let i = events.length - 1; i >= 0; i--) {
+        const event = events[i];
+        if (event.kind !== "result-handle") continue;
+        entries.push({ ref: event.data.blobHash, size: event.data.size });
+      }
+    }
+    const { retained, evictable } = walkHandleQuota(entries);
+    state.retainedHandles = retained;
+    for (const ref of evictable) {
+      if (!onlyMentionedBy(index.get(ref), "result-handle")) continue;
+      await journal.blobs.delete(ref);
+    }
+  });
+}
+
+/**
+ * The newest-first quota walk shared by the recovery sweep (all journal
+ * rows) and the incremental path (previous retained list + the new handle).
+ * Content addressing can repeat a ref; its NEWEST occurrence decides
+ * retention (duplicates are one blob, counted once). Note the walk keeps
+ * accumulating after an entry fails to fit, so an older-but-smaller payload
+ * can stay retained past a newer oversized one — retention is per-entry
+ * "fits the remaining quota", not a suffix cut.
+ */
+function walkHandleQuota(entries: HandleBlobEntry[]): {
+  retained: HandleBlobEntry[];
+  evictable: Set<BlobRef>;
+} {
+  const seen = new Set<BlobRef>();
+  const retained: HandleBlobEntry[] = [];
   const evictable = new Set<BlobRef>();
   let retainedBytes = 0;
-  for (let i = handleEvents.length - 1; i >= 0; i--) {
-    const { blobHash, size } = handleEvents[i].data;
-    if (retained.has(blobHash)) continue;
-    if (retainedBytes + size <= RESULT_HANDLE_BLOB_QUOTA_BYTES) {
-      retainedBytes += size;
-      retained.add(blobHash);
-      evictable.delete(blobHash);
+  for (const entry of entries) {
+    if (seen.has(entry.ref)) continue;
+    seen.add(entry.ref);
+    if (retainedBytes + entry.size <= RESULT_HANDLE_BLOB_QUOTA_BYTES) {
+      retainedBytes += entry.size;
+      retained.push(entry);
     } else {
-      evictable.add(blobHash);
+      evictable.add(entry.ref);
     }
   }
-  if (evictable.size === 0) return;
-
-  for (const event of events) {
-    if (evictable.size === 0) break;
-    if (event.kind === "result-handle") continue;
-    const serialized = JSON.stringify(event);
-    for (const hash of evictable) {
-      if (serialized.includes(hash)) evictable.delete(hash);
-    }
-  }
-
-  for (const hash of evictable) {
-    await journal.blobs.delete(hash);
-  }
+  return { retained, evictable };
 }
 
 export type SandboxMountLifetime = "ephemeral" | "persistent";
@@ -640,7 +735,7 @@ export class SandboxHostService {
         // The blob is the durable copy of the full offloaded value; the event
         // row carries exactly the model-visible {handle, preview, size}. Both
         // publish as one unit under the journal blob lock (see publishWithBlob).
-        await journal.publishWithBlob(serialized, (blobHash, blobSize) => ({
+        const { ref, size } = await journal.publishWithBlob(serialized, (blobHash, blobSize) => ({
           workspaceId: scopeKey,
           kind: "result-handle",
           data: { handle, preview, blobHash, size: blobSize },
@@ -648,7 +743,7 @@ export class SandboxHostService {
         // Bound retained handle payloads per session (best-effort — failure
         // must never fail the persist, mirroring snapshot reclamation).
         try {
-          await reclaimExcessResultHandleBlobs(journal);
+          await reclaimExcessResultHandleBlobs(journal, { ref, size });
         } catch (error) {
           log.debug("SandboxHostService: result-handle blob reclamation failed; continuing", {
             error,
@@ -848,11 +943,14 @@ export class SandboxHostService {
         (event) => event.kind === "sandbox-vars-snapshot" && event.data.scopeKey === scopeKey
       );
       if (!hasSnapshot) return;
-      await journal.publishWithBlob("{}", (blobHash, size) => ({
+      const { ref } = await journal.publishWithBlob("{}", (blobHash, size) => ({
         workspaceId: scopeKey,
         kind: "sandbox-vars-snapshot",
         data: { scopeKey, blobHash, size },
       }));
+      // The pre-reset snapshot is superseded like any other: reclaim it now
+      // so the per-journal latest-ref state stays true to the journal.
+      await reclaimSupersededSnapshotBlobs(journal, scopeKey, ref);
     } catch (error) {
       // Never let discard bookkeeping block a context reset.
       log.warn(`SandboxHostService: vars discard failed for scope ${scopeKey}`, { error });

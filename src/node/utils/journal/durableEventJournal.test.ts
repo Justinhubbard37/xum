@@ -94,6 +94,22 @@ describe("DurableEventJournal", () => {
     }
   });
 
+  test("publishWithBlob stores the blob and appends the event referencing it", async () => {
+    using tmp = new DisposableTempDir("durable-journal-test");
+    const journal = new DurableEventJournal(tmp.path);
+    const { event, ref, size } = await journal.publishWithBlob("payload", (blobHash, blobSize) => ({
+      workspaceId: "ws-1",
+      kind: "result-handle",
+      data: { handle: "vars.__h1", preview: "p", blobHash, size: blobSize },
+    }));
+    expect(size).toBe(7);
+    expect(await journal.blobs.getText(ref)).toBe("payload");
+    const rows = await journal.read();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].id).toBe(event.id);
+    expect(rows[0].kind === "result-handle" && rows[0].data.blobHash === ref).toBe(true);
+  });
+
   test("interleaved writers through the shared registry keep seq strictly increasing", async () => {
     using tmp = new DisposableTempDir("shared-journal");
     // Two producers (turn envelopes + sandbox snapshots) obtaining the journal
