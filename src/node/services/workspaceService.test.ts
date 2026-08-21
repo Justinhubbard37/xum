@@ -22,6 +22,11 @@ import { createTestHistoryService } from "./testHistoryService";
 import type { SessionTimingService } from "./sessionTimingService";
 import { SessionUsageService } from "./sessionUsageService";
 import type { AIService } from "./aiService";
+import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
+import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import type { ExperimentsService } from "./experimentsService";
+import { awaitPendingBranchSummary } from "./branchSummary";
 import type { InitStateManager, InitStatus } from "./initStateManager";
 import {
   ExtensionMetadataService,
@@ -13937,5 +13942,166 @@ describe("WorkspaceService.getLastUserPrompt", () => {
     });
 
     expect(prompt).toBe("newest prompt");
+  });
+});
+
+describe("WorkspaceService.fork branch-summary rollback ordering", () => {
+  test("a fork whose setup fails never leaves a summary writer or registration behind", async () => {
+    // Codex round-11: the background summary writer used to start BEFORE
+    // staged-attachment copying and usage reset. Their failure handler
+    // deletes newSessionDir without cancelling the registration, so a racing
+    // guarded append (tail verified pre-rollback, append landing after)
+    // recreated the failed fork's session dir, and the settled entry leaked
+    // forever because the fork never returned. The writer now starts only
+    // after all failure-prone setup completed.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const projectDir = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-fork-src-"));
+    const sourceId = "fork-src-ws";
+    // Gate the guarded append so the writer (old ordering) is mid-append when
+    // the rollback deletes the session dir — Codex's exact race window.
+    let releaseAppend: () => void = () => undefined;
+    const appendGate = new Promise<void>((resolve) => {
+      releaseAppend = resolve;
+    });
+    const realGuardedAppend = historyService.appendToHistoryIfTailMatches.bind(historyService);
+    const guardedAppendSpy = spyOn(
+      historyService,
+      "appendToHistoryIfTailMatches"
+    ).mockImplementation(async (workspaceId, message, tailMessageId) => {
+      await appendGate;
+      // Model the lost race deterministically: the tail was verified before
+      // the rollback, so the append itself lands unconditionally.
+      void tailMessageId;
+      const result = await historyService.appendToHistory(workspaceId, message);
+      return result.success ? Ok("appended" as const) : result;
+    });
+    try {
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectDir, {
+          trusted: true,
+          workspaces: [{ path: projectDir, id: sourceId, name: sourceId }],
+        });
+        return cfg;
+      });
+      // Meaty abandoned tail (clears BRANCH_SUMMARY_MIN_SEGMENT_TOKENS).
+      const filler = "explored the fork rollback race and traced the write path ".repeat(200);
+      const branchPoint = createMuxMessage("fork-bp", "assistant", "branch point", {
+        timestamp: 1,
+      });
+      for (const message of [
+        createMuxMessage("fork-m1", "user", "original question", { timestamp: 0 }),
+        branchPoint,
+        createMuxMessage("fork-tail-u", "user", filler, { timestamp: 2 }),
+        createMuxMessage("fork-tail-a", "assistant", filler, { timestamp: 3 }),
+      ]) {
+        expect((await historyService.appendToHistory(sourceId, message)).success).toBe(true);
+      }
+
+      const sourceMetadata: WorkspaceMetadata = {
+        id: sourceId,
+        name: sourceId,
+        projectName: "fork-src",
+        projectPath: projectDir,
+        runtimeConfig: { type: "local" },
+      };
+      const summaryChunks: LanguageModelV3StreamPart[] = [
+        { type: "text-start", id: "t1" },
+        { type: "text-delta", id: "t1", delta: "The abandoned branch explored a race." },
+        { type: "text-end", id: "t1" },
+        {
+          type: "finish",
+          finishReason: { unified: "stop", raw: "stop" },
+          usage: {
+            inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+            outputTokens: { total: 1, text: 1, reasoning: 0 },
+          },
+        },
+      ];
+      const aiService = {
+        on: mock(() => undefined),
+        off: mock(() => undefined),
+        isStreaming: mock(() => false),
+        getWorkspaceMetadata: mock((workspaceId: string) =>
+          Promise.resolve(
+            workspaceId === sourceId ? Ok(sourceMetadata) : Err("workspace not found")
+          )
+        ),
+        createModelWithPinnedMetadata: mock((modelString: string) =>
+          Promise.resolve(
+            Ok({
+              model: new MockLanguageModelV3({
+                doStream: () =>
+                  Promise.resolve({ stream: simulateReadableStream({ chunks: summaryChunks }) }),
+              }),
+              metadataModel: modelString,
+            })
+          )
+        ),
+      } as unknown as AIService;
+      const initStateManager = {
+        on: mock(() => undefined),
+        off: mock(() => undefined),
+        getInitState: mock(() => undefined),
+        startInit: mock(() => undefined),
+        appendOutput: mock(() => undefined),
+        endInit: mock(() => Promise.resolve()),
+        enterHookPhase: mock(() => undefined),
+        clearInMemoryState: mock(() => undefined),
+      } as unknown as InitStateManager;
+      // Failure injection: the usage reset (the LAST failure-prone setup
+      // step) rejects, driving the fork into its rollback path.
+      const sessionUsageService = {
+        resetSessionUsage: mock(() => Promise.reject(new Error("usage reset failed"))),
+        recordHeadlessUsage: mock(() => Promise.resolve(undefined)),
+      } as unknown as SessionUsageService;
+      const experimentsService = {
+        isExperimentEnabled: (id: string) =>
+          id === EXPERIMENT_IDS.RLM || id === EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING,
+      } as unknown as ExperimentsService;
+
+      const service = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        aiService,
+        initStateManager,
+        sessionUsageService,
+        experimentsService,
+      });
+      let newWorkspaceId = "";
+      const realGenerateId = config.generateStableId.bind(config);
+      const idSpy = spyOn(config, "generateStableId").mockImplementation(() => {
+        newWorkspaceId = realGenerateId();
+        return newWorkspaceId;
+      });
+      try {
+        const forkResult = await service.fork(sourceId, "fork-rollback-target", "fork-bp");
+        expect(forkResult.success).toBe(false);
+        if (forkResult.success) return;
+        expect(forkResult.error).toContain("Failed to copy fork state");
+        expect(newWorkspaceId.length).toBeGreaterThan(0);
+
+        // Unblock any (old-ordering) writer mid-append and let it settle.
+        releaseAppend();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+
+        // No writer ran, so no registration leaked and the rolled-back
+        // session's chat.jsonl was not recreated by a late guarded append.
+        expect(await awaitPendingBranchSummary(newWorkspaceId)).toBeNull();
+        expect(guardedAppendSpy).not.toHaveBeenCalled();
+        const chatFile = path.join(config.getSessionDir(newWorkspaceId), "chat.jsonl");
+        const chatExists = await fsPromises.access(chatFile).then(
+          () => true,
+          () => false
+        );
+        expect(chatExists).toBe(false);
+      } finally {
+        idSpy.mockRestore();
+      }
+    } finally {
+      guardedAppendSpy.mockRestore();
+      void realGuardedAppend;
+      await fsPromises.rm(projectDir, { recursive: true, force: true });
+      await cleanup();
+    }
   });
 });

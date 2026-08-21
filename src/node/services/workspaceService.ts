@@ -8124,6 +8124,9 @@ export class WorkspaceService extends EventEmitter {
       const sourceSessionDir = this.config.getSessionDir(sourceWorkspaceId);
       const newSessionDir = this.config.getSessionDir(newWorkspaceId);
 
+      // Removed tail captured inside the try, summarized only after setup
+      // survives the rollback window (see the comment at the capture site).
+      let abandonedBranchMessages: MuxMessage[] | null = null;
       try {
         const historyCopyResult = await this.historyService.copyHistorySnapshotToNewWorkspace(
           sourceWorkspaceId,
@@ -8168,24 +8171,15 @@ export class WorkspaceService extends EventEmitter {
             await fsPromises.rm(path.join(newSessionDir, "session-timing.json"), { force: true });
           }
 
-          // RLM mode: summarize the abandoned tail into a durable labeled row on
-          // the fork. Runs in the BACKGROUND so the user-facing fork returns
-          // immediately (a synchronous wait stalled forks for the full deadline
-          // when generation missed it). Ordering stays safe: the fork's first
-          // send awaits the pending summary before building its request, and
-          // the tail guard drops the row if anything else landed first. Fork
-          // IPC carries no send-option experiments, so gating falls back to the
-          // persisted machine overrides. Best-effort — never fails the fork.
-          startAbandonedBranchSummaryInBackground({
-            historyService: this.historyService,
-            aiService: this.aiService,
-            workspaceId: newWorkspaceId,
-            abandonedMessages: truncateResult.data.removedMessages,
-            isExperimentEnabled: (experimentId) => this.isExperimentEnabled(experimentId),
-            guardTailMessageId: sourceMessageId,
-            // Side-channel spend must reach session usage / the cost UI.
-            ...(this.sessionUsageService ? { sessionUsageService: this.sessionUsageService } : {}),
-          });
+          // The abandoned tail is summarized in the background — but only
+          // AFTER the failure-prone fork setup below completes (see the
+          // startAbandonedBranchSummaryInBackground call past the catch).
+          // Starting the writer here let a setup failure delete newSessionDir
+          // without cancelling the registration: a racing append could
+          // recreate the failed fork's session dir, and an early-settling
+          // summary left its map entry permanently unconsumed because the
+          // fork never returned.
+          abandonedBranchMessages = truncateResult.data.removedMessages;
         }
 
         await materializeForkedPartialSnapshot({
@@ -8310,6 +8304,32 @@ export class WorkspaceService extends EventEmitter {
 
       await this.config.addWorkspace(foundProjectPath, metadata);
       await this.workspaceGoalService?.inheritFromFork(sourceWorkspaceId, newWorkspaceId);
+
+      if (sourceMessageId && abandonedBranchMessages !== null) {
+        // RLM mode: summarize the abandoned tail into a durable labeled row on
+        // the fork. Runs in the BACKGROUND so the user-facing fork returns
+        // immediately (a synchronous wait stalled forks for the full deadline
+        // when generation missed it). Ordering stays safe: the fork's first
+        // send awaits the pending summary before building its request, and
+        // the tail guard drops the row if anything else landed first.
+        // Deliberately started only AFTER every failure-prone setup step and
+        // config registration: a rollback can no longer race the writer, and
+        // once the workspace is in config, removal can always cancel + drain
+        // the registration. Also keeps the summary's recorded usage from
+        // being wiped by resetForkedSessionUsage above. Fork IPC carries no
+        // send-option experiments, so gating falls back to the persisted
+        // machine overrides. Best-effort — never fails the fork.
+        startAbandonedBranchSummaryInBackground({
+          historyService: this.historyService,
+          aiService: this.aiService,
+          workspaceId: newWorkspaceId,
+          abandonedMessages: abandonedBranchMessages,
+          isExperimentEnabled: (experimentId) => this.isExperimentEnabled(experimentId),
+          guardTailMessageId: sourceMessageId,
+          // Side-channel spend must reach session usage / the cost UI.
+          ...(this.sessionUsageService ? { sessionUsageService: this.sessionUsageService } : {}),
+        });
+      }
 
       const enrichedMetadata = this.enrichFrontendMetadata(metadata);
       session.emitMetadata(enrichedMetadata);
