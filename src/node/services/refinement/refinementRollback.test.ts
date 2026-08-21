@@ -946,6 +946,82 @@ describe("refinementRollback", () => {
       expect(await fsPromises.readFile(evilPath, "utf-8")).toBe("code");
     });
 
+    it("refuses a link-substituted .mux/skills root, even with force", async () => {
+      using fixture = await createFixture();
+      const skillsRoot = path.join(fixture.checkout, ".mux", "skills");
+      const target = path.join(skillsRoot, "my-skill", "SKILL.md");
+      // Row journaled while the root was a real directory (a write that
+      // created the file → delete-files inverse).
+      await appendRefinementEvent({
+        sessionDir: fixture.sessionDir,
+        workspaceId: WORKSPACE_ID,
+        kind: "skill",
+        action: { op: "write", skillName: "my-skill", filePath: "SKILL.md" },
+        inverse: { op: "delete-files", paths: [target] },
+        evidence: { toolName: "agent_skill_write" },
+      });
+      const row = await lastRow(fixture.sessionDir);
+
+      // A later repo revision replaces the skills root with a symlink to an
+      // attacker-selected external dir that contains a matching file, so the
+      // divergence checks pass and rm(target) would delete the OUTSIDE file.
+      const outside = path.join(fixture.checkout, "outside-root");
+      await fsPromises.mkdir(path.join(outside, "my-skill"), { recursive: true });
+      await fsPromises.writeFile(path.join(outside, "my-skill", "SKILL.md"), "victim\n", "utf-8");
+      await fsPromises.mkdir(path.join(fixture.checkout, ".mux"), { recursive: true });
+      await fsPromises.symlink(outside, skillsRoot);
+
+      const result = await rollbackRefinement({
+        sessionDir: fixture.sessionDir,
+        id: row.id,
+        force: true, // Confinement is never overridable.
+        evidence: EVIDENCE,
+      });
+      expect(result.success).toBe(false);
+      if (result.success) throw new Error("unreachable");
+      expect(result.error).toContain("symbolic link");
+      // The file behind the link substitution is untouched.
+      expect(await fsPromises.readFile(path.join(outside, "my-skill", "SKILL.md"), "utf-8")).toBe(
+        "victim\n"
+      );
+    });
+
+    it("refuses a link-substituted .mux directory itself", async () => {
+      using fixture = await createFixture();
+      const target = path.join(fixture.checkout, ".mux", "skills", "my-skill", "SKILL.md");
+      await appendRefinementEvent({
+        sessionDir: fixture.sessionDir,
+        workspaceId: WORKSPACE_ID,
+        kind: "skill",
+        action: { op: "write", skillName: "my-skill", filePath: "SKILL.md" },
+        inverse: { op: "delete-files", paths: [target] },
+        evidence: { toolName: "agent_skill_write" },
+      });
+      const row = await lastRow(fixture.sessionDir);
+
+      const outside = path.join(fixture.checkout, "outside-mux");
+      await fsPromises.mkdir(path.join(outside, "skills", "my-skill"), { recursive: true });
+      await fsPromises.writeFile(
+        path.join(outside, "skills", "my-skill", "SKILL.md"),
+        "victim\n",
+        "utf-8"
+      );
+      await fsPromises.symlink(outside, path.join(fixture.checkout, ".mux"));
+
+      const result = await rollbackRefinement({
+        sessionDir: fixture.sessionDir,
+        id: row.id,
+        force: true,
+        evidence: EVIDENCE,
+      });
+      expect(result.success).toBe(false);
+      if (result.success) throw new Error("unreachable");
+      expect(result.error).toContain("symbolic link");
+      expect(
+        await fsPromises.readFile(path.join(outside, "skills", "my-skill", "SKILL.md"), "utf-8")
+      ).toBe("victim\n");
+    });
+
     it("refuses symlink escapes out of the skills root", async () => {
       using fixture = await createFixture();
       const skillsRoot = path.join(fixture.checkout, ".mux", "skills");

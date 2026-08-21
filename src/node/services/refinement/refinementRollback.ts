@@ -499,10 +499,57 @@ function resolveConfinementRoot(
 }
 
 /**
+ * The components of a confinement root that repo (or harness-writable)
+ * content controls and could substitute with a symlink: `.mux`/`.agents` and
+ * their `skills` child for project roots; the `skills`/`memory` dir itself
+ * for muxRoot-derived roots. Ancestors ABOVE these (the checkout path,
+ * muxRoot) are environmental — worktree layouts and macOS /tmp legitimately
+ * traverse symlinks — so they are intentionally not listed.
+ */
+function repoControlledRootComponents(rootAbs: string): string[] {
+  const parent = path.dirname(rootAbs);
+  const parentBase = path.basename(parent);
+  if (parentBase === ".mux" || parentBase === ".agents") {
+    return [parent, rootAbs];
+  }
+  return [rootAbs];
+}
+
+/**
+ * Reject link-substituted confinement roots. assertNoSymlinkEscape trusts
+ * realpath(rootAbs) as its anchor, so a repo revision that replaces
+ * `.mux/skills` (or `.agents/skills`) with a symlink would make the
+ * attacker-selected external directory the trust anchor — targets appear
+ * "inside" it and the later rm/writeFileAtomic follows the link outside the
+ * checkout. lstat each repo-controlled component and refuse when any is a
+ * symlink; a missing component is fine (nothing exists to escape through).
+ */
+async function assertRootComponentsNotSymlinked(rootAbs: string): Promise<void> {
+  for (const component of repoControlledRootComponents(rootAbs)) {
+    let stat;
+    try {
+      stat = await fsPromises.lstat(component);
+    } catch (error) {
+      if (errnoCode(error) === "ENOENT") {
+        continue;
+      }
+      throw error;
+    }
+    if (stat.isSymbolicLink()) {
+      throw new RollbackError(
+        `Refusing rollback: confinement root component '${component}' is a symbolic link (possible link substitution of a skills/memory root)`
+      );
+    }
+  }
+}
+
+/**
  * Symlink-escape prevention (mirrors LocalMemoryStore.assertContained):
  * realpath the deepest existing ancestor of the target and require it to stay
  * inside the (realpathed) root. A missing root means nothing exists under it,
- * so there is nothing to escape through.
+ * so there is nothing to escape through. Callers must first reject
+ * link-substituted roots (assertRootComponentsNotSymlinked) — realpath here
+ * would otherwise legitimize a symlinked root as the trust anchor.
  */
 async function assertNoSymlinkEscape(rootAbs: string, targetAbs: string): Promise<void> {
   let realRoot: string;
@@ -882,14 +929,20 @@ export async function rollbackRefinement(
 
     // Confinement first — never overridable. A corrupted inverse must never
     // write outside the memory/skill roots (repo AGENTS.md, built-in skills,
-    // or anything else).
+    // or anything else). Re-run at the sink (assertConfinement below) because
+    // the staging/capture phases between plan and write are slow enough for a
+    // repo revision to swap a root for a symlink in the meantime.
     const roots = new Map<string, string>();
     for (const p of inversePaths(inverse)) {
       roots.set(p, resolveConfinementRoot(opts.sessionDir, kind, p));
     }
-    for (const [p, root] of roots) {
-      await assertNoSymlinkEscape(root, path.resolve(p));
-    }
+    const assertConfinement = async (): Promise<void> => {
+      for (const [p, root] of roots) {
+        await assertRootComponentsNotSymlinked(root);
+        await assertNoSymlinkEscape(root, path.resolve(p));
+      }
+    };
+    await assertConfinement();
 
     const readContent: InverseContentReader = {
       read: async (file) => {
@@ -929,6 +982,12 @@ export async function rollbackRefinement(
     // aborts with nothing mutated.
     await fileLock.assertStillOwned();
 
+    // Sink recheck: the divergence + pre-rollback capture reads above take
+    // long enough for a link substitution race; nothing has been mutated yet,
+    // so a swapped root still aborts cleanly here (delete-files and rename
+    // mutate immediately after this; restore-files rechecks again post-stage).
+    await assertConfinement();
+
     // Apply the target's inverse to disk. Multi-file ops are two-phase: a
     // failure after the first mutation would otherwise leave an unjournaled
     // partial rollback behind (no rollbackOf row, and a retry refuses on the
@@ -954,6 +1013,9 @@ export async function rollbackRefinement(
         for (const file of inverse.files) {
           staged.push({ path: file.path, content: await readContent.read(file) });
         }
+        // Sink recheck after staging: blob reads are the slowest window
+        // between plan-time confinement and the writes below.
+        await assertConfinement();
         // Phase 2 — write. A mid-apply failure (e.g. an unwritable
         // destination) is compensated from the pre-rollback capture so the
         // tree returns to its pre-rollback state.
