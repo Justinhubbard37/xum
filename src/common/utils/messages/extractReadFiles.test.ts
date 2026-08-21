@@ -64,6 +64,47 @@ describe("extractReadFilePaths", () => {
     expect(extractReadFilePaths(messages)).toEqual(["/ok.ts"]);
   });
 
+  it("extracts nested kernel reads (xum.file_read / xum.load) from code_execution output", () => {
+    // RLM exclusive posture: reads happen inside code_execution as nested
+    // records, so the outer part is code_execution and the paths live in
+    // output.toolCalls. Kernel compact records use ok; load records have no
+    // ok field and signal failure via error.
+    const codeExecutionMessage: MuxMessage = {
+      id: "msg-kernel",
+      role: "assistant",
+      parts: [
+        {
+          type: "dynamic-tool" as const,
+          toolCallId: "tc-kernel",
+          toolName: "code_execution",
+          state: "output-available" as const,
+          input: { code: "..." },
+          output: {
+            success: true,
+            toolCalls: [
+              { toolName: "file_read", args: { path: "/nested-read.ts" }, ok: true, bytes: 10 },
+              { toolName: "load", args: { path: "/loaded.jsonl", key: "data" } },
+              // Failures and non-read nested calls are ignored.
+              { toolName: "file_read", args: { path: "/nested-failed.ts" }, error: "denied" },
+              { toolName: "load", args: { path: "/load-failed.txt", key: "x" }, error: "missing" },
+              { toolName: "bash", args: { path: "/not-a-read.sh" }, ok: true },
+            ],
+          },
+        },
+      ],
+    };
+    const messages: MuxMessage[] = [
+      createAssistantMessage([{ toolName: "file_read", filePath: "/direct.ts" }]),
+      codeExecutionMessage,
+    ];
+
+    expect(extractReadFilePaths(messages)).toEqual([
+      "/nested-read.ts",
+      "/loaded.jsonl",
+      "/direct.ts",
+    ]);
+  });
+
   it("caps the extracted list", () => {
     const messages = [
       createAssistantMessage(

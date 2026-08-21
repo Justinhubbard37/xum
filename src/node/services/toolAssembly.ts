@@ -299,16 +299,20 @@ export async function applyToolPolicyAndExperiments(
       // byte-identical. The env-var mount override deliberately does NOT
       // expose it: persistent mounts are a dev override, RLM is the opt-in.
       if (experiments?.rlm === true && sandbox) {
-        // Grants are a ceiling over the whole model-visible set; this tool is
-        // synthesized after the ceiling above, so re-apply it here — a
-        // least-privilege assembly must not gain a harness-rollback surface.
-        const rollback = { refinement_rollback: createRefinementRollbackTool(sandbox) };
-        toolsForModel = {
-          ...toolsForModel,
-          ...(opts.capabilityGrants
-            ? applyCapabilityGrants(rollback, opts.capabilityGrants)
-            : rollback),
+        // Policy and grants are both ceilings over the whole model-visible
+        // set; this tool is synthesized after they were applied above, so
+        // re-apply BOTH here — a least-privilege assembly (or a policy that
+        // disables the tool, e.g. a broad regex disable rule) must not gain a
+        // harness-rollback surface. Unlike code_execution in exclusive mode,
+        // rollback is never mandatory, so policy may freely remove it.
+        let rollback: Record<string, Tool> = {
+          refinement_rollback: createRefinementRollbackTool(sandbox),
         };
+        rollback = applyToolPolicy(rollback, effectiveToolPolicy);
+        if (opts.capabilityGrants) {
+          rollback = applyCapabilityGrants(rollback, opts.capabilityGrants);
+        }
+        toolsForModel = { ...toolsForModel, ...rollback };
       }
     } catch (error) {
       // Fall back to policy-filtered tools if PTC creation fails

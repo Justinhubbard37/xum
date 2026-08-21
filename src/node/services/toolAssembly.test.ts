@@ -385,6 +385,47 @@ describe("toolset composition (PTC × RLM × exclusive)", () => {
     }
   });
 
+  test("tool policy disables the synthesized refinement_rollback (exact and broad rules)", async () => {
+    // refinement_rollback is synthesized AFTER the assembly-wide policy pass,
+    // so the policy ceiling must be re-applied to it — otherwise even a
+    // disable-everything policy would leave a model-facing tool that can
+    // delete/restore memory and skill files.
+    const assembleWithPolicy = (
+      scopeKey: string,
+      sessionDir: string,
+      policy: Parameters<typeof applyToolPolicyAndExperiments>[0]["effectiveToolPolicy"]
+    ) =>
+      applyToolPolicyAndExperiments({
+        allTools: compositionTools(),
+        effectiveToolPolicy: policy,
+        experiments: { programmaticToolCalling: true, rlm: true },
+        emitNestedToolEvent: () => undefined,
+        sandbox: { workspaceId: scopeKey, sessionDir },
+      });
+
+    using tmp = new DisposableTempDir("compose-rollback-policy");
+    try {
+      const exact = await assembleWithPolicy("ws-rollback-policy", tmp.path, [
+        { regex_match: "refinement_rollback", action: "disable" },
+      ]);
+      expect(exact.refinement_rollback).toBeUndefined();
+      // Only the targeted tool is removed.
+      expect(exact.code_execution).toBeDefined();
+
+      const broad = await assembleWithPolicy("ws-rollback-policy", tmp.path, [
+        { regex_match: ".*", action: "disable" },
+      ]);
+      expect(broad.refinement_rollback).toBeUndefined();
+
+      // Sanity: without a policy the tool is present (guards a silently
+      // over-broad filter that would make the disable assertions vacuous).
+      const none = await assembleWithPolicy("ws-rollback-policy", tmp.path, undefined);
+      expect(none.refinement_rollback).toBeDefined();
+    } finally {
+      await sandboxHostService.disposeScope("ws-rollback-policy");
+    }
+  });
+
   test("turn-envelope manifest fingerprints the narrowed exclusive + RLM toolset", async () => {
     using tmp = new DisposableTempDir("compose-envelope");
     try {
