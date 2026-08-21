@@ -51,6 +51,20 @@ describe("extractReadFilePaths", () => {
     expect(extractReadFilePaths(messages)).toEqual(["/c.ts", "/a.ts", "/b.ts"]);
   });
 
+  it("preserves whitespace in path identity (no trim)", () => {
+    // Leading/trailing whitespace is legal in path bytes. Normalizing would
+    // advertise " report.txt" as "report.txt" post-compaction — a DIFFERENT
+    // file — so the agent both believes it read a file it never touched and
+    // loses the reference to the one it did.
+    const messages = [
+      createAssistantMessage([
+        { toolName: "file_read", filePath: " report.txt" },
+        { toolName: "file_read", filePath: "report.txt " },
+      ]),
+    ];
+    expect(extractReadFilePaths(messages)).toEqual(["report.txt ", " report.txt"]);
+  });
+
   it("ignores failed reads, interrupted calls, and non-read tools", () => {
     const messages: MuxMessage[] = [
       createAssistantMessage([

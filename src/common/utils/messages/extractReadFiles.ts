@@ -54,10 +54,13 @@ export function extractReadFilePaths(messages: readonly MuxMessage[]): string[] 
   const seen = new Set<string>();
 
   const add = (filePath: string): boolean => {
-    const trimmed = filePath.trim();
-    if (trimmed.length === 0 || seen.has(trimmed)) return false;
-    seen.add(trimmed);
-    readFiles.push(trimmed);
+    // Do NOT trim: leading/trailing whitespace is legal in path bytes, and
+    // normalizing here changes the file's identity — a read of " report.txt"
+    // would be advertised post-compaction as "report.txt", making the agent
+    // believe it already read a different file. Reject only empty strings.
+    if (filePath.length === 0 || seen.has(filePath)) return false;
+    seen.add(filePath);
+    readFiles.push(filePath);
     return readFiles.length >= MAX_POST_COMPACTION_READ_FILES;
   };
 
