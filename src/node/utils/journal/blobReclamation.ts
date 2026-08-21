@@ -66,7 +66,7 @@ export function makeSnapshotLatestResolver(
 ): (scope: string) => Promise<BlobRef | null> {
   let loaded: Promise<Map<string, BlobRef>> | null = null;
   return async (scope: string): Promise<BlobRef | null> => {
-    if (seed !== undefined && scope === seed.scopeKey) return seed.ref;
+    if (seed?.scopeKey === scope) return seed.ref;
     loaded ??= journal.read().then((events) => {
       const latest = new Map<string, BlobRef>();
       for (let i = events.length - 1; i >= 0; i--) {
