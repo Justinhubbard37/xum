@@ -30,7 +30,9 @@ import {
   type DurableEventJournal,
 } from "@/node/utils/journal/durableEventJournal";
 import {
-  blobOnlyMentionedBy,
+  canDeleteEvictedBlob,
+  makeSnapshotLatestResolver,
+  publishQuotaRetention,
   walkBlobQuota,
   type BlobQuotaEntry,
 } from "@/node/utils/journal/blobReclamation";
@@ -128,8 +130,17 @@ export async function reclaimSupersededSnapshotBlobs(
           [...index.entries()]
             .filter(([ref, mentions]) => mentions.snapshotScopes.has(scopeKey) && ref !== latestRef)
             .map(([ref]) => ref);
+    // Seed our own scope's latest (just published) so the common
+    // single-scope case never needs a journal read.
+    const resolveLatestSnapshot = makeSnapshotLatestResolver(journal, { scopeKey, ref: latestRef });
     for (const ref of candidates) {
-      if (!blobOnlyMentionedBy(index.get(ref), "sandbox-vars-snapshot", scopeKey)) continue;
+      const deletable = await canDeleteEvictedBlob({
+        journal,
+        ref,
+        mentions: index.get(ref),
+        resolveLatestSnapshot,
+      });
+      if (!deletable) continue;
       await journal.blobs.delete(ref);
     }
   });
@@ -144,7 +155,7 @@ export async function reclaimSupersededSnapshotBlobs(
  * list instead of the journal, so payloads evicted by earlier passes are
  * never revisited. The first pass per process (or a call without
  * `published`) runs a full recovery sweep. Reference safety and locking:
- * see blobOnlyMentionedBy / reclaimSupersededSnapshotBlobs.
+ * see canDeleteEvictedBlob / reclaimSupersededSnapshotBlobs.
  *
  * Exported for tests (quota interleavings need synthetic event sizes).
  */
@@ -172,8 +183,18 @@ export async function reclaimExcessResultHandleBlobs(
     }
     const { retained, evictable } = walkBlobQuota(entries, RESULT_HANDLE_BLOB_QUOTA_BYTES);
     state.retainedHandles = retained;
+    // Publish BEFORE deleting so joint retention decisions (ours and other
+    // quotas') always see this pass's eviction verdicts.
+    publishQuotaRetention(journal, "result-handle", new Set(retained.map((entry) => entry.ref)));
+    const resolveLatestSnapshot = makeSnapshotLatestResolver(journal);
     for (const ref of evictable) {
-      if (!blobOnlyMentionedBy(index.get(ref), "result-handle")) continue;
+      const deletable = await canDeleteEvictedBlob({
+        journal,
+        ref,
+        mentions: index.get(ref),
+        resolveLatestSnapshot,
+      });
+      if (!deletable) continue;
       await journal.blobs.delete(ref);
     }
   });

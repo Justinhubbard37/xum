@@ -34,7 +34,9 @@ import {
   type DurableEventJournal,
 } from "@/node/utils/journal/durableEventJournal";
 import {
-  blobOnlyMentionedBy,
+  canDeleteEvictedBlob,
+  makeSnapshotLatestResolver,
+  publishQuotaRetention,
   walkBlobQuota,
   type BlobQuotaEntry,
 } from "@/node/utils/journal/blobReclamation";
@@ -182,8 +184,18 @@ export async function reclaimExcessRefinementInverseBlobs(
     }
     const { retained, evictable } = walkBlobQuota(entries, REFINEMENT_INVERSE_BLOB_QUOTA_BYTES);
     state.retainedInverseBlobs = retained;
+    // Publish BEFORE deleting so joint retention decisions (ours and other
+    // quotas') always see this pass's eviction verdicts.
+    publishQuotaRetention(journal, "refinement", new Set(retained.map((entry) => entry.ref)));
+    const resolveLatestSnapshot = makeSnapshotLatestResolver(journal);
     for (const ref of evictable) {
-      if (!blobOnlyMentionedBy(index.get(ref), "refinement")) continue;
+      const deletable = await canDeleteEvictedBlob({
+        journal,
+        ref,
+        mentions: index.get(ref),
+        resolveLatestSnapshot,
+      });
+      if (!deletable) continue;
       await journal.blobs.delete(ref);
     }
   });
