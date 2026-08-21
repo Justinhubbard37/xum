@@ -362,19 +362,23 @@ export async function discoverAgentPluginAt(args: {
 
 /**
  * Crash-recovery gate for container scans. AgentPluginInstallService installs
- * its startup journal reconciliation here so no discovery path (MCP config,
- * hooks, skills, workflows, agents — they all funnel through
- * discoverAgentPlugins) can scan the managed container while recovery is
- * still restoring or removing trees: an agent request arriving right after a
- * crash would otherwise load an orphaned promotion — hook included — before
- * cleanup ran. The barrier must never reject (the service catches); it
- * defaults to resolved so tests and contexts without the install service are
+ * a gate here so no discovery path (MCP config, hooks, skills, workflows,
+ * agents — they all funnel through discoverAgentPlugins) can scan the managed
+ * container while journal recovery is still restoring or removing trees: an
+ * agent request arriving right after a crash would otherwise load an orphaned
+ * promotion — hook included — before cleanup ran. The gate resolves to the
+ * container paths that must be SUPPRESSED from the scan: when recovery
+ * FAILED (unreadable registry, failed restore/quarantine), merely waiting
+ * would release discovery over the unreconciled tree, so the managed
+ * container is omitted until a later recovery attempt succeeds. The returned
+ * promise must never reject (the service catches); the default gate
+ * suppresses nothing so tests and contexts without the install service are
  * unaffected.
  */
-let discoveryBarrier: Promise<void> = Promise.resolve();
+let discoveryGate: () => Promise<readonly string[]> = () => Promise.resolve([]);
 
-export function setAgentPluginDiscoveryBarrier(barrier: Promise<void>): void {
-  discoveryBarrier = barrier;
+export function setAgentPluginDiscoveryGate(gate: () => Promise<readonly string[]>): void {
+  discoveryGate = gate;
 }
 
 /**
@@ -388,7 +392,7 @@ export function setAgentPluginDiscoveryBarrier(barrier: Promise<void>): void {
 export async function discoverAgentPlugins(
   containers: AgentPluginContainer[]
 ): Promise<DiscoverAgentPluginsResult> {
-  await discoveryBarrier;
+  const suppressedContainers = new Set(await discoveryGate());
   const plugins: AgentPluginInfo[] = [];
   const diagnostics: AgentPluginDiagnostic[] = [];
 
@@ -401,6 +405,16 @@ export async function discoverAgentPlugins(
       continue;
     }
     seenContainers.add(container.path);
+    if (suppressedContainers.has(container.path)) {
+      diagnostics.push({
+        path: container.path,
+        scope: container.scope,
+        severity: "warning",
+        message:
+          "Managed plugin container skipped: crash recovery has not completed (see logs); its plugins are unavailable until it succeeds.",
+      });
+      continue;
+    }
 
     for (const entryName of await listChildDirectories(container.path)) {
       const plugin = await discoverPluginAt({

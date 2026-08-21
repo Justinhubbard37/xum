@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import type { Dirent } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
@@ -34,7 +35,7 @@ import { execFileAsync } from "@/node/utils/disposableExec";
 import {
   discoverAgentPluginAt,
   discoverAgentPlugins,
-  setAgentPluginDiscoveryBarrier,
+  setAgentPluginDiscoveryGate,
   type AgentPluginContainer,
   type AgentPluginInfo,
 } from "./discovery";
@@ -123,6 +124,16 @@ const JOURNAL_PREFIXES = [
   UNINSTALL_JOURNAL_PREFIX,
 ] as const;
 
+/**
+ * Marker file written into a staged tree just before its promote rename,
+ * holding the random nonce also recorded in the promotion journal. Orphan
+ * recovery deletes a tree only when the nonces match: this proves the tree is
+ * the one WE promoted. Filesystem identities (dev/ino) are NOT sufficient —
+ * deleting the orphan and recreating a directory at the same path can reuse
+ * the inode immediately. The marker is removed once the install commits.
+ */
+const PROMOTION_MARKER_FILE = ".mux-promotion-marker";
+
 function isJournalName(entry: string): boolean {
   return JOURNAL_PREFIXES.some((prefix) => entry.startsWith(prefix));
 }
@@ -153,19 +164,20 @@ function gitEnv(): Record<string, string> {
 }
 
 /**
- * True when the aggregate file bytes OR the non-directory entry count under
- * `dir` exceed the quota. Counts every non-directory entry (empty files,
- * symlinks) like assertStagedTreeWithinQuota: a repo of tens of thousands of
- * empty files consumes inodes and allocation metadata without moving the byte
- * total. Walks with early exit; entries vanishing mid-walk (git renames temp
- * files) are skipped.
+ * True when the aggregate file bytes OR the entry count under `dir` exceed
+ * the quota. Counts EVERY entry — files, symlinks, and directories — like
+ * assertStagedTreeWithinQuota: each one consumes an inode and filesystem
+ * metadata without necessarily moving the byte total (a tiny pack of repeated
+ * git tree objects can materialize thousands of directories). Walks with
+ * early exit; entries vanishing mid-walk (git renames temp files) are
+ * skipped.
  */
 async function directoryQuotaExceeded(
   dir: string,
   quota: { maxBytes: number; maxFiles: number }
 ): Promise<boolean> {
   let bytes = 0;
-  let files = 0;
+  let entryCount = 0;
   const pending: string[] = [dir];
   while (pending.length > 0) {
     const current = pending.pop();
@@ -178,19 +190,17 @@ async function directoryQuotaExceeded(
     }
     for (const entry of entries) {
       const entryPath = path.join(current, entry.name);
+      entryCount += 1;
       if (entry.isDirectory()) {
         pending.push(entryPath);
-        continue;
-      }
-      files += 1;
-      if (entry.isFile()) {
+      } else if (entry.isFile()) {
         try {
           bytes += (await fsPromises.lstat(entryPath)).size;
         } catch {
-          continue;
+          // Entry vanished mid-walk.
         }
       }
-      if (bytes > quota.maxBytes || files > quota.maxFiles) {
+      if (bytes > quota.maxBytes || entryCount > quota.maxFiles) {
         return true;
       }
     }
@@ -358,15 +368,18 @@ export class AgentPluginInstallService {
   private readonly activeStagingPaths = new Set<string>();
 
   /**
-   * Startup crash-recovery pass. Kicked off at construction because a
-   * session can serve agent requests (whose global plugin discovery, MCP
-   * config, and hook loading scan the container) without ever opening the
-   * Plugins section — an orphaned promotion would load as an unmanaged
-   * plugin, hooks included, before list()'s reconciliation ever ran. Errors
-   * are logged, never thrown (startup must not crash the app); list() awaits
-   * this so section open cannot race it.
+   * Latest journal-reconciliation attempt, resolving to whether it SUCCEEDED.
+   * Kicked off at construction because a session can serve agent requests
+   * (whose global plugin discovery, MCP config, and hook loading scan the
+   * container) without ever opening the Plugins section — an orphaned
+   * promotion would load as an unmanaged plugin, hooks included, before
+   * list()'s reconciliation ever ran. The discovery gate consumes the status:
+   * `false` (unreadable registry, failed restore/quarantine) suppresses the
+   * managed container from scans until a later attempt succeeds — merely
+   * awaiting a failed pass would release discovery over the unreconciled
+   * tree. Never rejects (startup must not crash the app).
    */
-  private readonly startupReconciliation: Promise<void>;
+  private reconciliationState: Promise<boolean>;
 
   constructor(
     private readonly config: Config,
@@ -388,16 +401,29 @@ export class AgentPluginInstallService {
     // something, and cleaning up our own crash leftovers is correct even if
     // the experiment was disabled afterwards (a missing staging root makes
     // this a single readdir). Failures retry on the next section open.
-    this.startupReconciliation = this.reconcileJournals().catch((error: unknown) => {
-      log.warn("Startup plugin journal reconciliation failed", {
-        error: getErrorMessage(error),
-      });
-    });
+    this.reconciliationState = this.attemptReconcileJournals("startup");
     // Every global discovery consumer (MCP config, hooks, skills, workflows,
     // agents) funnels through discoverAgentPlugins; gate those scans on the
-    // startup pass so an agent request cannot load an orphaned tree while
-    // recovery is still running. The promise never rejects (caught above).
-    setAgentPluginDiscoveryBarrier(this.startupReconciliation);
+    // LATEST reconciliation attempt so an agent request cannot load an
+    // orphaned tree while recovery is running — and cannot scan the managed
+    // container at all while the latest attempt has FAILED (the journaled
+    // tree may still be sitting in it).
+    setAgentPluginDiscoveryGate(async () =>
+      (await this.reconciliationState) ? [] : [this.containerDir]
+    );
+  }
+
+  /** Run reconcileJournals, mapping the outcome to a never-rejecting health flag. */
+  private attemptReconcileJournals(context: string): Promise<boolean> {
+    return this.reconcileJournals().then(
+      () => true,
+      (error: unknown) => {
+        log.warn(`Plugin journal reconciliation failed (${context})`, {
+          error: getErrorMessage(error),
+        });
+        return false;
+      }
+    );
   }
 
   /**
@@ -813,15 +839,17 @@ export class AgentPluginInstallService {
   }
 
   /**
-   * Enforce the staged-checkout quota (bytes + file count, .git excluded,
-   * symlinks not followed). Runs immediately after every staged clone so an
-   * oversized tree is deleted by the caller's error path before any
-   * validation reads it.
+   * Enforce the staged-checkout quota (bytes + entry count, .git excluded,
+   * symlinks not followed). Directories count too: each consumes an inode
+   * and filesystem metadata, and repeated git tree objects can amplify a
+   * tiny pack into thousands of them. Runs immediately after every staged
+   * clone so an oversized tree is deleted by the caller's error path before
+   * any validation reads it.
    */
   private async assertStagedTreeWithinQuota(dir: string): Promise<void> {
     const quota = this.stagingQuota();
     let bytes = 0;
-    let files = 0;
+    let entryCount = 0;
     const pending: string[] = [dir];
     while (pending.length > 0) {
       const current = pending.pop();
@@ -831,16 +859,14 @@ export class AgentPluginInstallService {
           continue;
         }
         const entryPath = path.join(current, entry.name);
+        entryCount += 1;
         if (entry.isDirectory()) {
           pending.push(entryPath);
-          continue;
-        }
-        files += 1;
-        if (entry.isFile()) {
+        } else if (entry.isFile()) {
           const stat = await fsPromises.lstat(entryPath);
           bytes += stat.size;
         }
-        if (files > quota.maxFiles || bytes > quota.maxBytes) {
+        if (entryCount > quota.maxFiles || bytes > quota.maxBytes) {
           throw new Error(
             `The repository is too large to install as a plugin (limit: ${quota.maxFiles} files, ${Math.floor(quota.maxBytes / (1024 * 1024))} MiB).`
           );
@@ -1412,21 +1438,17 @@ export class AgentPluginInstallService {
         // the rename and the registry write would otherwise strand a tree
         // that discovery lists as unmanaged, assertNoCollision blocks, and
         // uninstall refuses — reconcileJournals uses this record to clean it
-        // up on startup or the next section open. The staged dir's filesystem
-        // identity (preserved by the rename) proves the tree recovery finds
+        // up on startup or the next section open. The marker nonce (riding
+        // inside the tree through the rename) proves the tree recovery finds
         // at the target is the one WE promoted: a user could delete the
         // orphan while the app is stopped and place their own unmanaged
         // plugin at the same path, which cleanup must never delete.
-        const stagedStat = await fsPromises.stat(stagedDir, { bigint: true });
+        const promotionNonce = randomBytes(16).toString("hex");
+        await fsPromises.writeFile(path.join(stagedDir, PROMOTION_MARKER_FILE), promotionNonce);
         const journalPath = this.journalPath(PROMOTION_JOURNAL_PREFIX, name);
         await fsPromises.writeFile(
           journalPath,
-          JSON.stringify({
-            name,
-            stagedAt: Date.now(),
-            treeDev: stagedStat.dev.toString(),
-            treeIno: stagedStat.ino.toString(),
-          })
+          JSON.stringify({ name, stagedAt: Date.now(), nonce: promotionNonce })
         );
 
         await fsPromises.mkdir(this.containerDir, { recursive: true });
@@ -1522,6 +1544,11 @@ export class AgentPluginInstallService {
           // handled the tree): the journal's crash-recovery job is done.
           await fsPromises.rm(journalPath, { force: true }).catch(() => undefined);
         }
+        // Committed: the marker did its crash-recovery job (a failed removal
+        // leaves a stray dotfile the next update swap discards — harmless).
+        await fsPromises
+          .rm(path.join(targetPath, PROMOTION_MARKER_FILE), { force: true })
+          .catch(() => undefined);
         log.info(`Installed agent plugin '${name}' at ${args.expectedSha.slice(0, 12)}`);
         return entry;
       } finally {
@@ -1634,27 +1661,30 @@ export class AgentPluginInstallService {
     registryNames: Set<string>
   ): Promise<boolean> {
     const targetPath = this.targetPathFor(name);
-    // Only an ORPHAN (tree without registry entry) needs cleanup; a registry
-    // entry means the install committed and only the journal deletion was lost.
-    if (!registryNames.has(name) && (await pathExists(targetPath))) {
+    if (registryNames.has(name)) {
+      // The install committed and only the journal deletion was lost; sweep
+      // the marker the commit path would have removed.
+      await fsPromises
+        .rm(path.join(targetPath, PROMOTION_MARKER_FILE), { force: true })
+        .catch(() => undefined);
+      return true;
+    }
+    // Only an ORPHAN (tree without registry entry) needs cleanup.
+    if (await pathExists(targetPath)) {
       // Verify the tree is the one WE promoted before deleting anything: the
       // user can delete the orphan while the app is stopped and place their
       // own unmanaged plugin at the same path (a supported use of the
-      // globally scanned container). The journal's dev/ino stamp survives the
-      // promote rename; a mismatch (or an unverifiable stamp) means our
-      // orphan is already gone, so consume the journal WITHOUT touching the
+      // globally scanned container). The marker nonce is non-reusable —
+      // unlike dev/ino, which the filesystem can hand right back to a
+      // recreated directory. A mismatch or missing marker means our orphan
+      // is already gone, so consume the journal WITHOUT touching the
       // replacement.
-      const journalDev = await this.readJournalField(journalPath, "treeDev");
-      const journalIno = await this.readJournalField(journalPath, "treeIno");
-      const currentStat = await fsPromises
-        .stat(targetPath, { bigint: true })
+      const journalNonce = await this.readJournalField(journalPath, "nonce");
+      const treeNonce = await fsPromises
+        .readFile(path.join(targetPath, PROMOTION_MARKER_FILE), "utf-8")
         .catch(() => undefined);
       const isPromotedTree =
-        journalDev !== undefined &&
-        journalIno !== undefined &&
-        currentStat !== undefined &&
-        currentStat.dev.toString() === journalDev &&
-        currentStat.ino.toString() === journalIno;
+        journalNonce !== undefined && treeNonce !== undefined && treeNonce === journalNonce;
       if (!isPromotedTree) {
         log.warn(
           "Skipping orphaned-promotion cleanup: the tree at the plugin path is not the promoted one",
@@ -1819,12 +1849,13 @@ export class AgentPluginInstallService {
     // or predates recent journals) BEFORE discovery scans the container, so
     // an orphaned promotion never renders as an unmanaged row and interrupted
     // update/uninstall swaps are restored before their rows would look wrong.
-    await this.startupReconciliation;
-    await this.reconcileJournals().catch((error: unknown) => {
-      log.warn("Failed to reconcile plugin journals", {
-        error: getErrorMessage(error),
-      });
-    });
+    // Reassigning the state BEFORE awaiting lets a concurrent discovery gate
+    // wait on this fresh attempt (reconcileJournals serializes internally via
+    // runExclusive); a success here re-opens a previously suppressed
+    // container.
+    await this.reconciliationState;
+    this.reconciliationState = this.attemptReconcileJournals("section open");
+    await this.reconciliationState;
 
     // Section open is the natural retry moment for override-prune tombstones
     // left by uninstalls whose workspaces were temporarily unreachable.

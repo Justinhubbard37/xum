@@ -429,6 +429,28 @@ describe("AgentPluginInstallService", () => {
     );
   });
 
+  test("directories count toward the staged-checkout entry quota", async () => {
+    // Repeated git tree objects can amplify a tiny pack into thousands of
+    // directories, each consuming an inode and filesystem metadata; the
+    // entry quota must charge them even when the FILE count stays low.
+    for (let i = 0; i < 6; i += 1) {
+      const dir = path.join(remoteDir, `nested-${i}`);
+      await fsPromises.mkdir(dir, { recursive: true });
+      await fsPromises.writeFile(path.join(dir, "f"), "x");
+    }
+    await commitAll(remoteDir, "many directories");
+
+    // Tree: 9 files (3 fixture + 6 nested) but 17 entries once the 8
+    // directories are charged — a files-only count would pass this quota.
+    const quotaService = new AgentPluginInstallService(config, {
+      isEnabled: () => true,
+      stagingQuota: { maxBytes: 1024 * 1024, maxFiles: 12 },
+    });
+    await expect(quotaService.preview({ input: remoteDir })).rejects.toThrow(
+      /too large to install/
+    );
+  });
+
   test("consent preview discloses full env assignments, not just key names", async () => {
     // NODE_OPTIONS=--require=./payload.js changes what executes without
     // appearing in the argv; the consent card must show the value.
@@ -521,18 +543,20 @@ describe("AgentPluginInstallService", () => {
     }
   });
 
-  test("withDiskQuotaWatchdog aborts on file count independently of bytes", async () => {
-    // Many empty files consume inodes and allocation metadata without moving
-    // the byte total, so the in-flight watchdog must enforce maxFiles DURING
-    // checkout too — the post-clone count only runs after git returns.
+  test("withDiskQuotaWatchdog aborts on entry count independently of bytes", async () => {
+    // Empty files and directories consume inodes and allocation metadata
+    // without moving the byte total, so the in-flight watchdog must enforce
+    // maxFiles DURING checkout too — the post-clone count only runs after
+    // git returns. Directories must charge the count like files.
     const dir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "quota-watchdog-files-"));
     try {
       await expect(
         withDiskQuotaWatchdog(
           { dir, maxBytes: 1024 * 1024, maxFiles: 8, pollMs: 10 },
           async (signal) => {
-            for (let i = 0; i < 20; i += 1) {
+            for (let i = 0; i < 10; i += 1) {
               await fsPromises.writeFile(path.join(dir, `empty-${i}`), "");
+              await fsPromises.mkdir(path.join(dir, `dir-${i}`));
             }
             await new Promise((_resolve, reject) => {
               signal.addEventListener("abort", () => reject(new Error("killed")), { once: true });
@@ -643,18 +667,17 @@ describe("AgentPluginInstallService", () => {
     expect(items.filter((item) => item.name === "demo-plugin")).toHaveLength(1);
   });
 
-  /** The identity-stamped journal install() writes before the promote rename. */
+  /**
+   * The nonce-stamped journal install() writes before the promote rename,
+   * plus the matching marker file the staged tree carries through it.
+   */
   const writePromotionJournal = async (journalPath: string, treePath: string): Promise<void> => {
-    const stat = await fsPromises.stat(treePath, { bigint: true });
+    const nonce = `test-nonce-${Date.now()}`;
+    await fsPromises.writeFile(path.join(treePath, ".mux-promotion-marker"), nonce);
     await fsPromises.mkdir(path.dirname(journalPath), { recursive: true });
     await fsPromises.writeFile(
       journalPath,
-      JSON.stringify({
-        name: path.basename(treePath),
-        stagedAt: Date.now(),
-        treeDev: stat.dev.toString(),
-        treeIno: stat.ino.toString(),
-      })
+      JSON.stringify({ name: path.basename(treePath), stagedAt: Date.now(), nonce })
     );
   };
 
@@ -719,28 +742,21 @@ describe("AgentPluginInstallService", () => {
   test("promotion recovery leaves a user-replaced tree at the same path alone", async () => {
     // The user deleted the orphan while the app was stopped and placed their
     // OWN unmanaged plugin at the same path — a supported use of the global
-    // container. The journal's dev/ino stamp no longer matches, so recovery
-    // must not delete their directory; the journal is spent (our orphan is
-    // gone).
+    // container. Their tree carries no marker matching the journal's nonce
+    // (unlike dev/ino, a nonce cannot be reused by the filesystem when the
+    // recreated directory gets the deleted one's inode), so recovery must
+    // not delete their directory; the journal is spent (our orphan is gone).
     const targetPath = path.join(pluginsDir(), "demo-plugin");
     await fsPromises.mkdir(targetPath, { recursive: true });
     await fsPromises.writeFile(
       path.join(targetPath, "plugin.json"),
       JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "demo-plugin", version: "1" })
     );
-    // Stamp the journal with a DIFFERENT directory's identity (stands in for
-    // the promoted tree that no longer exists).
     await fsPromises.mkdir(stagingDir(), { recursive: true });
-    const otherStat = await fsPromises.stat(stagingDir(), { bigint: true });
     const journalPath = path.join(stagingDir(), "promotion-demo-plugin.json");
     await fsPromises.writeFile(
       journalPath,
-      JSON.stringify({
-        name: "demo-plugin",
-        stagedAt: Date.now(),
-        treeDev: otherStat.dev.toString(),
-        treeIno: otherStat.ino.toString(),
-      })
+      JSON.stringify({ name: "demo-plugin", stagedAt: Date.now(), nonce: "the-promoted-nonce" })
     );
 
     const items = await service.list();
@@ -748,6 +764,34 @@ describe("AgentPluginInstallService", () => {
     expect(items.find((item) => item.name === "demo-plugin")?.managed).toBe(false);
     expect(await pathExists(targetPath)).toBe(true);
     expect(await pathExists(journalPath)).toBe(false);
+  });
+
+  test("failed journal recovery suppresses the managed container from discovery", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    // A journal plus an unreadable registry: recovery FAILS (strict read),
+    // and merely waiting for it must not release discovery over the managed
+    // container — the journaled tree may still be sitting in it. The
+    // unmanaged sibling container stays discoverable.
+    const journalPath = path.join(stagingDir(), "promotion-demo-plugin.json");
+    await writePromotionJournal(journalPath, path.join(pluginsDir(), "demo-plugin"));
+    const goodRegistry = await fsPromises.readFile(registryFile(), "utf8");
+    await fsPromises.writeFile(registryFile(), "{ not json");
+
+    const freshService = new AgentPluginInstallService(config, { isEnabled: () => true });
+    const suppressed = await discoverAgentPlugins([{ path: pluginsDir(), scope: "global" }]);
+    expect(suppressed.plugins).toEqual([]);
+    expect(
+      suppressed.diagnostics.some((diagnostic) => diagnostic.message.includes("crash recovery"))
+    ).toBe(true);
+
+    // Once the registry reads again, a successful recovery (section open)
+    // re-opens the container for discovery.
+    await fsPromises.writeFile(registryFile(), goodRegistry);
+    await freshService.list();
+    const reopened = await discoverAgentPlugins([{ path: pluginsDir(), scope: "global" }]);
+    expect(reopened.plugins.map((plugin) => plugin.dirName)).toEqual(["demo-plugin"]);
   });
 
   test("reinstalling is blocked while an uninstall journal awaits recovery", async () => {
