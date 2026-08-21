@@ -145,6 +145,7 @@ async function waitForTurn(
 }
 
 interface CellResult {
+  status: "ok";
   scenario: string;
   config: string;
   seed: number;
@@ -156,6 +157,24 @@ interface CellResult {
   thinking: string;
   metrics: CellMetrics;
 }
+
+/**
+ * A cell that could not run at all (timeout, API/runtime error). Recorded in
+ * the results + JSONL so requested cells are never silently omitted, but
+ * excluded from the aggregate table (no metrics to average).
+ */
+interface FailedCell {
+  status: "error";
+  scenario: string;
+  config: string;
+  seed: number;
+  gitSha: string;
+  model: string;
+  thinking: string;
+  error: string;
+}
+
+type CellRow = CellResult | FailedCell;
 
 async function runCell(
   args: CliArgs,
@@ -198,6 +217,7 @@ async function runCell(
   const metrics = extractMetrics(sessionDir);
   const verdict = scenario.verify(truth, metrics.assistantTextPerTurn);
   return {
+    status: "ok",
     scenario: scenario.id,
     config: config.id,
     seed,
@@ -260,7 +280,7 @@ async function main(): Promise<void> {
   const gitSha = execSync("git rev-parse --short HEAD", { encoding: "utf-8" }).trim();
   // devtools.jsonl (providerRequests metric) only exists when debug logs are on.
   await post(args.baseUrl, "/config/updateLlmDebugLogs", { enabled: true });
-  const results: CellResult[] = [];
+  const results: CellRow[] = [];
   for (const scenarioId of args.scenarios) {
     for (const configId of args.configs) {
       for (let seed = 0; seed < args.seeds; seed++) {
@@ -274,12 +294,36 @@ async function main(): Promise<void> {
               `handles=${result.metrics.resultHandleCount} ws=${result.workspaceId} (${result.verifyDetail})`
           );
         } catch (err) {
+          // A cell that cannot run must still land in the results + JSONL and
+          // fail the command: silently omitting it would corrupt comparisons
+          // (missing cells look identical to never-requested cells).
+          const failed: FailedCell = {
+            status: "error",
+            scenario: scenarioId,
+            config: configId,
+            seed,
+            gitSha,
+            model: args.model,
+            thinking: args.thinking,
+            error: String(err),
+          };
+          results.push(failed);
+          fs.appendFileSync(args.out, JSON.stringify(failed) + "\n");
           console.error(`${label}: ERROR ${String(err)}`);
         }
       }
     }
   }
-  printAggregate(results);
+  // Failed cells carry no metrics: aggregate only over completed cells.
+  printAggregate(results.filter((row): row is CellResult => row.status === "ok"));
+  const failures = results.filter((row): row is FailedCell => row.status === "error");
+  if (failures.length > 0) {
+    console.error(`\n${failures.length}/${results.length} requested cells FAILED to run:`);
+    for (const failure of failures) {
+      console.error(`  - ${failure.scenario}/${failure.config}/s${failure.seed}: ${failure.error}`);
+    }
+    process.exitCode = 1;
+  }
   console.log(`\nResults appended to ${args.out} (gitSha ${gitSha})`);
 }
 
