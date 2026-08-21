@@ -15,6 +15,7 @@ import {
   applyRefinementInverse,
   readRefinementEvents,
 } from "@/node/services/refinement/refinementTestHelpers";
+import { sharedDurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { createAgentSkillDeleteTool } from "./agent_skill_delete";
 import {
   createTestToolConfig,
@@ -1107,12 +1108,18 @@ describe("refinement journal", () => {
     const inverse = RefinementInverseSchema.parse(events[0].data.inverse);
     expect(inverse.op).toBe("restore-files");
     if (inverse.op === "restore-files") {
-      // Paths are runtime-namespace; contents were captured through the runtime.
+      // Paths are runtime-namespace; contents were captured through the
+      // runtime. Captures are always blob-offloaded (no inline immunity), so
+      // resolve contents through the session blob store — runtime paths are
+      // not host-addressable, ruling out the applyRefinementInverse helper.
+      const blobs = sharedDurableEventJournal(sessionsDir).blobs;
+      const resolveText = async (file: { text?: string; blobRef?: string }) =>
+        file.text ?? (file.blobRef ? await blobs.getText(file.blobRef) : undefined);
       const skillMd = inverse.files.find((file) => file.path.endsWith("SKILL.md"));
       expect(skillMd?.path).toBe(`${remoteWorkspaceRoot}/.mux/skills/${skillName}/SKILL.md`);
-      expect(skillMd?.text).toBe(originalSkillMd);
+      expect(skillMd && (await resolveText(skillMd))).toBe(originalSkillMd);
       const reference = inverse.files.find((file) => file.path.endsWith("foo.txt"));
-      expect(reference?.text).toBe("fixture");
+      expect(reference && (await resolveText(reference))).toBe("fixture");
     }
   });
 });
