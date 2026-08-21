@@ -750,6 +750,9 @@ describe("refinement journal", () => {
     return path.join(muxHome, "sessions", GLOBAL_WORKSPACE_ID);
   }
 
+  /** Bytes that cannot round-trip through UTF-8 (0xff/0xfe are never valid). */
+  const BINARY_BYTES = Buffer.from([0xff, 0xfe, 0x00, 0x01]);
+
   it("journals a file delete with a restore inverse that round-trips", async () => {
     using tempDir = new TestTempDir("test-agent-skill-delete-refinement-file");
 
@@ -870,6 +873,146 @@ describe("refinement journal", () => {
 
     expect(result).toMatchObject({ success: true, deleted: "skill" });
     expect(await readRefinementEvents(sessionDirOf(tempDir.path))).toHaveLength(0);
+  });
+
+  /** Runtime-backed delete tool over a project skill (shared by budget/lossless tests). */
+  async function createRuntimeDeleteContext(tempDirPath: string, skillName: string) {
+    const remoteWorkspaceRoot = "/remote/workspace";
+    const remoteRuntime = new RemotePathMappedRuntime(tempDirPath, remoteWorkspaceRoot);
+    const sessionsDir = path.join(tempDirPath, "session-dir");
+    await fs.mkdir(sessionsDir, { recursive: true });
+    const baseConfig = createTestToolConfig(tempDirPath, {
+      workspaceId: "regular-workspace",
+      sessionsDir,
+      runtime: remoteRuntime,
+      muxScope: {
+        type: "project",
+        muxHome: tempDirPath,
+        projectRoot: "/host/project",
+        projectStorageAuthority: "runtime",
+      },
+    });
+    const tool = createAgentSkillDeleteTool({ ...baseConfig, cwd: remoteWorkspaceRoot });
+    const deleteSkill = async () =>
+      (await tool.execute!(
+        { name: skillName, target: "skill", confirm: true },
+        mockToolCallOptions
+      )) as AgentSkillDeleteToolResult;
+    return { sessionsDir, deleteSkill };
+  }
+
+  it("skips journaling when a skill file is not valid UTF-8 (binary)", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-delete-refinement-binary");
+
+    await writeSkillWithReference(tempDir.path, "demo-skill");
+    const skillDir = path.join(tempDir.path, "skills", "demo-skill");
+    // Invalid UTF-8: a text capture would replace bytes with U+FFFD and a
+    // rollback would restore the corrupted content.
+    await fs.writeFile(path.join(skillDir, "references", "asset.bin"), BINARY_BYTES);
+
+    const tool = await createDeleteTool(tempDir.path);
+    const result = (await tool.execute!(
+      { name: "demo-skill", target: "skill", confirm: true },
+      mockToolCallOptions
+    )) as AgentSkillDeleteToolResult;
+
+    expect(result).toMatchObject({ success: true, deleted: "skill" });
+    expect(await readRefinementEvents(sessionDirOf(tempDir.path))).toHaveLength(0);
+  });
+
+  it("skips journaling a single-file delete of a binary file", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-delete-refinement-binary-file");
+
+    await writeSkillWithReference(tempDir.path, "demo-skill");
+    const binPath = path.join(tempDir.path, "skills", "demo-skill", "references", "asset.bin");
+    await fs.writeFile(binPath, BINARY_BYTES);
+
+    const tool = await createDeleteTool(tempDir.path);
+    const result = (await tool.execute!(
+      { name: "demo-skill", filePath: "references/asset.bin", confirm: true },
+      mockToolCallOptions
+    )) as AgentSkillDeleteToolResult;
+
+    expect(result).toMatchObject({ success: true, deleted: "file" });
+    expect(await readRefinementEvents(sessionDirOf(tempDir.path))).toHaveLength(0);
+  });
+
+  it("skips journaling when the skill contains a symlink", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-delete-refinement-symlink");
+
+    await writeSkillWithReference(tempDir.path, "demo-skill");
+    const skillDir = path.join(tempDir.path, "skills", "demo-skill");
+    // A files-only inverse cannot restore the link entry; restoring its
+    // target's content as a regular file would silently change the skill.
+    await fs.symlink("SKILL.md", path.join(skillDir, "alias.md"));
+
+    const tool = await createDeleteTool(tempDir.path);
+    const result = (await tool.execute!(
+      { name: "demo-skill", target: "skill", confirm: true },
+      mockToolCallOptions
+    )) as AgentSkillDeleteToolResult;
+
+    expect(result).toMatchObject({ success: true, deleted: "skill" });
+    expect(await readRefinementEvents(sessionDirOf(tempDir.path))).toHaveLength(0);
+  });
+
+  it("skips journaling when the skill contains an empty directory", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-delete-refinement-emptydir");
+
+    await writeSkillWithReference(tempDir.path, "demo-skill");
+    await fs.mkdir(path.join(tempDir.path, "skills", "demo-skill", "empty"));
+
+    const tool = await createDeleteTool(tempDir.path);
+    const result = (await tool.execute!(
+      { name: "demo-skill", target: "skill", confirm: true },
+      mockToolCallOptions
+    )) as AgentSkillDeleteToolResult;
+
+    expect(result).toMatchObject({ success: true, deleted: "skill" });
+    expect(await readRefinementEvents(sessionDirOf(tempDir.path))).toHaveLength(0);
+  });
+
+  it("skips journaling binary skill files on the runtime-backed path", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-delete-refinement-binary-runtime");
+    await writeProjectSkill(tempDir.path, "my-skill", { description: "fixture" });
+    await fs.writeFile(
+      path.join(tempDir.path, ".mux", "skills", "my-skill", "asset.bin"),
+      BINARY_BYTES
+    );
+
+    const ctx = await createRuntimeDeleteContext(tempDir.path, "my-skill");
+    expect(await ctx.deleteSkill()).toMatchObject({ success: true, deleted: "skill" });
+    expect(await readRefinementEvents(ctx.sessionsDir)).toHaveLength(0);
+  });
+
+  it("skips journaling symlinked entries on the runtime-backed path", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-delete-refinement-symlink-runtime");
+    await writeProjectSkill(tempDir.path, "my-skill", { description: "fixture" });
+    const skillDir = path.join(tempDir.path, ".mux", "skills", "my-skill");
+    await fs.symlink("SKILL.md", path.join(skillDir, "alias.md"));
+
+    const ctx = await createRuntimeDeleteContext(tempDir.path, "my-skill");
+    expect(await ctx.deleteSkill()).toMatchObject({ success: true, deleted: "skill" });
+    expect(await readRefinementEvents(ctx.sessionsDir)).toHaveLength(0);
+  });
+
+  it("skips journaling when the runtime listing exceeds the file cap", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-delete-refinement-count-runtime");
+    // SKILL.md + REFINEMENT_CAPTURE_MAX_FILES references = one over the cap;
+    // the bounded find listing must bail before any file is read.
+    await writeProjectSkill(tempDir.path, "my-skill", {
+      description: "fixture",
+      files: Object.fromEntries(
+        Array.from({ length: REFINEMENT_CAPTURE_MAX_FILES }, (_, i) => [
+          `references/f${i}.txt`,
+          "x",
+        ])
+      ),
+    });
+
+    const ctx = await createRuntimeDeleteContext(tempDir.path, "my-skill");
+    expect(await ctx.deleteSkill()).toMatchObject({ success: true, deleted: "skill" });
+    expect(await readRefinementEvents(ctx.sessionsDir)).toHaveLength(0);
   });
 
   it("skips journaling oversized skills on the runtime-backed path", async () => {

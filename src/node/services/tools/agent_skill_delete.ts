@@ -39,8 +39,15 @@ interface AgentSkillDeleteToolArgs {
   confirm: boolean;
 }
 
+/**
+ * Capture cannot produce a faithful inverse (budget exceeded, binary content,
+ * entries a files-only inverse cannot represent): skip journaling entirely
+ * (never a partial or lossy inverse) while the delete still proceeds.
+ */
+class CaptureSkippedError extends Error {}
+
 /** Capture budget violation: skip journaling entirely (never a partial inverse). */
-class CaptureBudgetExceededError extends Error {}
+class CaptureBudgetExceededError extends CaptureSkippedError {}
 
 /**
  * Enforce the inverse-capture budgets. `sizeBytes` is the file's on-disk size
@@ -68,11 +75,26 @@ function assertCaptureBudget(fileCount: number, sizeBytes: number, totalBytes: n
 }
 
 /**
+ * Assert the captured bytes are valid UTF-8. Decoding replaces invalid byte
+ * sequences with U+FFFD, so restoring the decoded text would silently corrupt
+ * binary assets on rollback. Lossless binary capture (e.g. blob-backed raw
+ * bytes) is possible future work; until then a lossy inverse must not be
+ * journaled at all.
+ */
+function assertLosslessUtf8(entryPath: string, bytes: Buffer): string {
+  const content = bytes.toString("utf-8");
+  if (!bytes.equals(Buffer.from(content, "utf-8"))) {
+    throw new CaptureSkippedError(`'${entryPath}' is not valid UTF-8 (binary content)`);
+  }
+  return content;
+}
+
+/**
  * Capture every regular file under a local skill dir (refinement inverse for a
- * whole-skill delete). Contents are captured as UTF-8 text; symlinks are
- * skipped (the tool refuses symlink targets anyway). Returns null when capture
- * fails or exceeds the capture budgets: the delete then proceeds unjournaled
- * (log-only) rather than failing.
+ * whole-skill delete). Returns null when capture fails, exceeds the capture
+ * budgets, or the tree cannot be represented faithfully by a files-only
+ * text inverse (binary files, symlinks/special entries, empty directories):
+ * the delete then proceeds unjournaled (log-only) rather than failing.
  */
 async function captureLocalSkillFiles(skillDir: string): Promise<RefinementFileCapture[] | null> {
   try {
@@ -80,6 +102,11 @@ async function captureLocalSkillFiles(skillDir: string): Promise<RefinementFileC
     let totalBytes = 0;
     const walk = async (dir: string): Promise<void> => {
       const entries = await fsPromises.readdir(dir, { withFileTypes: true });
+      if (entries.length === 0) {
+        // restore-files recreates parent dirs of files only; an empty dir
+        // would silently vanish from a rollback-restored skill.
+        throw new CaptureSkippedError(`'${dir}' is an empty directory`);
+      }
       entries.sort((a, b) => (a.name < b.name ? -1 : 1));
       for (const entry of entries) {
         const entryPath = path.join(dir, entry.name);
@@ -88,18 +115,19 @@ async function captureLocalSkillFiles(skillDir: string): Promise<RefinementFileC
         } else if (entry.isFile()) {
           const { size } = await fsPromises.stat(entryPath);
           totalBytes = assertCaptureBudget(captures.length, size, totalBytes);
-          captures.push({
-            path: entryPath,
-            content: await fsPromises.readFile(entryPath, "utf-8"),
-          });
+          const content = assertLosslessUtf8(entryPath, await fsPromises.readFile(entryPath));
+          captures.push({ path: entryPath, content });
+        } else {
+          // Symlink/socket/fifo: unrepresentable in a restore-files inverse.
+          throw new CaptureSkippedError(`'${entryPath}' is not a regular file or directory`);
         }
       }
     };
     await walk(skillDir);
     return captures;
   } catch (error) {
-    if (error instanceof CaptureBudgetExceededError) {
-      log.debug("[agent_skill_delete] skipping refinement inverse: capture budget exceeded", {
+    if (error instanceof CaptureSkippedError) {
+      log.debug("[agent_skill_delete] skipping refinement inverse", {
         skillDir,
         reason: error.message,
       });
@@ -114,6 +142,14 @@ async function captureLocalSkillFiles(skillDir: string): Promise<RefinementFileC
 }
 
 /**
+ * Byte bound for the remote `find` listing: one entry beyond the file cap at
+ * a generous ~1KB per path. Hitting the bound (or parsing more paths than the
+ * cap) means the skill exceeds the capture budget anyway, so the listing is
+ * never allocated unbounded.
+ */
+const FIND_MAX_OUTPUT_BYTES = (REFINEMENT_CAPTURE_MAX_FILES + 1) * 1024;
+
+/**
  * Runtime-path variant of captureLocalSkillFiles. `find` runs relative to the
  * skill dir so its output stays namespace-agnostic (remote runtimes translate
  * paths embedded in commands); results are resolved back to runtime paths.
@@ -123,9 +159,25 @@ async function captureRuntimeSkillFiles(
   skillDir: string
 ): Promise<RefinementFileCapture[] | null> {
   try {
+    // Entries a files-only inverse cannot represent: anything that is neither
+    // a regular file nor a directory (symlink/socket/fifo), or an empty
+    // directory (including an empty skill root). One match is enough; head
+    // caps output and terminates find early via the closed pipe.
+    const probe = await execBuffered(
+      runtime,
+      String.raw`find . \( ! -type f ! -type d \) -o \( -type d -empty \) | head -n 1`,
+      { cwd: skillDir, timeout: 10, maxOutputBytes: 4096 }
+    );
+    if (probe.exitCode !== 0 || probe.stdout.trim().length > 0) {
+      throw new CaptureSkippedError(
+        `skill contains entries a files-only inverse cannot represent (found '${probe.stdout.trim() || probe.stderr.trim()}')`
+      );
+    }
+
     const findResult = await execBuffered(runtime, "find . -type f", {
       cwd: skillDir,
       timeout: 10,
+      maxOutputBytes: FIND_MAX_OUTPUT_BYTES,
     });
     if (findResult.exitCode !== 0) {
       log.debug("[agent_skill_delete] find failed while capturing refinement inverse", {
@@ -134,24 +186,46 @@ async function captureRuntimeSkillFiles(
       });
       return null;
     }
+    // Output at the cap means the listing was truncated (and the final line
+    // possibly torn): over budget either way.
+    if (Buffer.byteLength(findResult.stdout, "utf-8") >= FIND_MAX_OUTPUT_BYTES) {
+      throw new CaptureBudgetExceededError(
+        `find output exceeds ${FIND_MAX_OUTPUT_BYTES} bytes (listing truncated)`
+      );
+    }
     const relPaths = findResult.stdout
       .split("\n")
       .map((line) => line.trim())
       .filter((line) => line.length > 0)
       .map((line) => line.replace(/^\.\//, ""))
       .sort();
+    if (relPaths.length > REFINEMENT_CAPTURE_MAX_FILES) {
+      throw new CaptureBudgetExceededError(
+        `skill has more than ${REFINEMENT_CAPTURE_MAX_FILES} files`
+      );
+    }
     const captures: RefinementFileCapture[] = [];
     let totalBytes = 0;
     for (const relPath of relPaths) {
       const runtimePath = runtime.normalizePath(relPath, skillDir);
       const { size } = await runtime.stat(runtimePath);
       totalBytes = assertCaptureBudget(captures.length, size, totalBytes);
-      captures.push({ path: runtimePath, content: await readFileString(runtime, runtimePath) });
+      const content = await readFileString(runtime, runtimePath);
+      // Runtime reads decode to text on the wire, so the original bytes are
+      // not available for an exact round-trip check. A lossy decode always
+      // yields U+FFFD replacement chars, so treat any U+FFFD (or a re-encoded
+      // size mismatch against stat) as binary. Files legitimately containing
+      // U+FFFD are skipped too — a rare false positive whose only cost is an
+      // unjournaled delete.
+      if (content.includes("\uFFFD") || Buffer.byteLength(content, "utf-8") !== size) {
+        throw new CaptureSkippedError(`'${runtimePath}' is not valid UTF-8 (binary content)`);
+      }
+      captures.push({ path: runtimePath, content });
     }
     return captures;
   } catch (error) {
-    if (error instanceof CaptureBudgetExceededError) {
-      log.debug("[agent_skill_delete] skipping refinement inverse: capture budget exceeded", {
+    if (error instanceof CaptureSkippedError) {
+      log.debug("[agent_skill_delete] skipping refinement inverse", {
         skillDir,
         reason: error.message,
       });
@@ -320,10 +394,17 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
                 { resolvedPath, size }
               );
             } else {
-              fileCapture = {
-                path: resolvedPath,
-                content: await readFileString(config.runtime, resolvedPath),
-              };
+              const content = await readFileString(config.runtime, resolvedPath);
+              // Same lossy-decode detection as captureRuntimeSkillFiles: a
+              // U+FFFD or size mismatch means the text inverse would corrupt
+              // the binary file on rollback.
+              if (content.includes("\uFFFD") || Buffer.byteLength(content, "utf-8") !== size) {
+                log.debug("[agent_skill_delete] skipping refinement inverse: binary content", {
+                  resolvedPath,
+                });
+              } else {
+                fileCapture = { path: resolvedPath, content };
+              }
             }
           } catch (error) {
             log.debug("[agent_skill_delete] failed to capture file for refinement inverse", {
@@ -497,13 +578,20 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
           try {
             localFileCapture = {
               path: targetPath,
-              content: await fsPromises.readFile(targetPath, "utf-8"),
+              content: assertLosslessUtf8(targetPath, await fsPromises.readFile(targetPath)),
             };
           } catch (error) {
-            log.debug("[agent_skill_delete] failed to capture file for refinement inverse", {
-              targetPath,
-              error,
-            });
+            if (error instanceof CaptureSkippedError) {
+              log.debug("[agent_skill_delete] skipping refinement inverse", {
+                targetPath,
+                reason: error.message,
+              });
+            } else {
+              log.debug("[agent_skill_delete] failed to capture file for refinement inverse", {
+                targetPath,
+                error,
+              });
+            }
           }
         }
 
