@@ -9,8 +9,11 @@
  */
 
 import type { Runtime } from "@/node/runtime/Runtime";
-import { readFileString } from "@/node/utils/runtime/helpers";
-import { resolvePathWithinCwd, validateFileSize } from "./fileCommon";
+import {
+  StreamByteCeilingExceededError,
+  streamToStringWithByteCeiling,
+} from "@/node/runtime/streamUtils";
+import { MAX_FILE_SIZE, resolvePathWithinCwd, validateFileSize } from "./fileCommon";
 import { KERNEL_LOAD_PREVIEW_CHARS } from "@/constants/kernelOutput";
 
 /** Full content + bounded model-visible summary of one loaded file. */
@@ -61,7 +64,25 @@ export function createKernelFileLoader(config: {
     if (sizeValidation) {
       throw new Error(sizeValidation.error);
     }
-    const content = await readFileString(config.runtime, resolvedPath, abortSignal);
+    // The stat-based check alone is insufficient: device files report size 0
+    // (/dev/zero streams forever) and a concurrently growing file races
+    // stat→read — either would buffer unboundedly in the Electron process,
+    // and local readFile ignores the abort signal. Enforce the same ceiling
+    // WHILE consuming the stream, cancelling as soon as it is exceeded.
+    let content: string;
+    try {
+      content = await streamToStringWithByteCeiling(
+        config.runtime.readFile(resolvedPath, abortSignal),
+        MAX_FILE_SIZE
+      );
+    } catch (error) {
+      if (error instanceof StreamByteCeilingExceededError) {
+        throw new Error(
+          `File grew past or misreported its size: read exceeded ${MAX_FILE_SIZE} bytes for ${resolvedPath}`
+        );
+      }
+      throw error;
+    }
     const bytes = Buffer.byteLength(content, "utf8");
     // Count newline-delimited records, not split segments: a conventional
     // newline-terminated file yields a trailing empty segment that would

@@ -28,6 +28,61 @@ describe("createKernelFileLoader line counting", () => {
   });
 });
 
+describe("createKernelFileLoader byte ceiling", () => {
+  it("fails and cancels when the stream exceeds the size the stat reported", async () => {
+    // Models /dev/zero (stat size 0, infinite stream) and stat→read growth
+    // races without depending on platform device files: the pre-read size
+    // check passes, so only a ceiling enforced WHILE consuming the stream
+    // bounds host memory. Local readFile ignores the abort signal, so the
+    // execution deadline cannot save us either.
+    using tmp = new DisposableTempDir("kernel-load-ceiling");
+    await fs.writeFile(nodePath.join(tmp.path, "a.txt"), "x", "utf8");
+
+    let cancelled = false;
+    const inner = new LocalRuntime(tmp.path);
+    const lyingRuntime = new Proxy(inner, {
+      get(target, prop, receiver) {
+        if (prop === "stat") {
+          return async (path: string, signal?: AbortSignal) => ({
+            ...(await target.stat(path, signal)),
+            size: 0,
+          });
+        }
+        if (prop === "readFile") {
+          // 4MB in 64KB chunks — over the 1MB ceiling but finite, so a
+          // regression fails this test cleanly instead of hanging it.
+          let enqueued = 0;
+          return () =>
+            new ReadableStream<Uint8Array>({
+              pull(controller) {
+                if (enqueued >= 4 * 1024 * 1024) {
+                  controller.close();
+                  return;
+                }
+                enqueued += 64 * 1024;
+                controller.enqueue(new Uint8Array(64 * 1024));
+              },
+              cancel() {
+                cancelled = true;
+              },
+            });
+        }
+        return Reflect.get(target, prop, receiver) as unknown;
+      },
+    });
+
+    const load = createKernelFileLoader({ cwd: tmp.path, runtime: lyingRuntime });
+    try {
+      await load({ path: "a.txt" });
+      expect.unreachable("Should have thrown");
+    } catch (e) {
+      expect(String(e)).toContain("read exceeded");
+    }
+    // The ceiling must stop the source early — not consume all 4MB first.
+    expect(cancelled).toBe(true);
+  });
+});
+
 describe("createKernelFileLoader cancellation", () => {
   it("threads the abort signal into runtime.stat and runtime.readFile", async () => {
     // Kernel cancellation must reach the underlying I/O: on RemoteRuntime a
