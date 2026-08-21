@@ -5158,6 +5158,18 @@ export class WorkspaceService extends EventEmitter {
         childTaskModelString = metadata.taskModelString;
         childTaskThinkingLevel = coerceThinkingLevel(metadata.taskThinkingLevel);
 
+        // Cancel and drain BOTH background usage producers BEFORE the usage
+        // rollup below reads its snapshot: a draining branch-summary writer
+        // or /refine pass records headless usage as it settles, and spend
+        // landing after getSessionUsage would be permanently lost from parent
+        // accounting (the child is archived/deleted with no second rollup).
+        // Deliberately after the runtime deletion above — its force=false
+        // early return keeps the workspace, and a kept workspace must not
+        // have its producers cancelled. Both calls are idempotent; they run
+        // again later for the phantom-metadata path.
+        await clearPendingBranchSummary(workspaceId);
+        await this.refinePassCanceller?.cancelInFlightRefinePass(workspaceId);
+
         // If this workspace is a sub-agent/task, roll its accumulated timing into the parent BEFORE
         // deleting ~/.xum/sessions/<workspaceId>/session-timing.json.
         if (parentWorkspaceId && this.sessionTimingService) {
@@ -5230,6 +5242,8 @@ export class WorkspaceService extends EventEmitter {
       // the session directory: a mid-flight append could otherwise recreate
       // the directory after removal, leaving an orphaned session. This also
       // drops the retained registration a fork that never sent would leak.
+      // Normally already drained before the usage rollup above (idempotent);
+      // this covers the phantom-metadata path, which skips that block.
       await clearPendingBranchSummary(workspaceId);
 
       // Same posture for a running /refine pass: abort + drain so its

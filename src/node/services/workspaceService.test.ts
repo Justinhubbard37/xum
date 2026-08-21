@@ -13945,6 +13945,82 @@ describe("WorkspaceService.getLastUserPrompt", () => {
   });
 });
 
+describe("WorkspaceService.remove usage-rollup ordering", () => {
+  test("usage recorded while draining background producers reaches the parent rollup", async () => {
+    // Codex round 13: the child's usage snapshot was read BEFORE the
+    // cancel-and-drain calls for the pending branch summary and in-flight
+    // /refine pass. A draining producer records headless usage as it
+    // settles, so that spend landed after the snapshot and was permanently
+    // lost from parent accounting (the child is deleted with no second
+    // rollup). Drains must complete before the snapshot is read.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const projectDir = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-rollup-"));
+    const parentId = "rollup-parent-ws";
+    const childId = "rollup-child-ws";
+    try {
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectDir, {
+          trusted: true,
+          workspaces: [
+            { path: projectDir, id: parentId, name: parentId },
+            { path: projectDir, id: childId, name: childId, parentWorkspaceId: parentId },
+          ],
+        });
+        return cfg;
+      });
+
+      // Fake usage ledger: the draining refine pass records the child's
+      // spend only when cancelInFlightRefinePass runs (modelling a settle-
+      // time recordHeadlessUsage write).
+      const usageByWorkspace = new Map<string, Record<string, unknown>>();
+      const rollupCalls: Array<{ parent: string; child: string; byModel: object }> = [];
+      const sessionUsageService = {
+        getSessionUsage: (workspaceId: string) =>
+          Promise.resolve({ byModel: usageByWorkspace.get(workspaceId) ?? {} }),
+        rollUpUsageIntoParent: (parent: string, child: string, byModel: object) => {
+          rollupCalls.push({ parent, child, byModel });
+          return Promise.resolve({ didRollUp: true });
+        },
+      } as unknown as SessionUsageService;
+      const cancelInFlightRefinePass = mock((workspaceId: string) => {
+        // The drained pass settles and records its spend against the child.
+        usageByWorkspace.set(workspaceId, {
+          "anthropic:claude-sonnet-4-5": { input: { tokens: 42, cost_usd: 0.01 } },
+        });
+        return Promise.resolve();
+      });
+
+      const service = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        sessionUsageService,
+        aiService: createMockAIService({
+          getWorkspaceMetadata: (async (workspaceId: string) => {
+            const metadata = (await config.getAllWorkspaceMetadata()).find(
+              (m) => m.id === workspaceId
+            );
+            return metadata ? Ok(metadata) : Err("workspace not found");
+          }) as AIService["getWorkspaceMetadata"],
+        }),
+      });
+      service.setRefinePassCanceller({ cancelInFlightRefinePass });
+
+      const result = await service.remove(childId);
+      expect(result.success).toBe(true);
+      expect(cancelInFlightRefinePass).toHaveBeenCalled();
+
+      // The drain-recorded spend made it into the parent rollup snapshot.
+      expect(rollupCalls).toHaveLength(1);
+      expect(rollupCalls[0].parent).toBe(parentId);
+      expect(rollupCalls[0].child).toBe(childId);
+      expect(Object.keys(rollupCalls[0].byModel)).toContain("anthropic:claude-sonnet-4-5");
+    } finally {
+      await fsPromises.rm(projectDir, { recursive: true, force: true });
+      await cleanup();
+    }
+  });
+});
+
 describe("WorkspaceService.fork branch-summary rollback ordering", () => {
   test("a fork whose setup fails never leaves a summary writer or registration behind", async () => {
     // Codex round-11: the background summary writer used to start BEFORE
