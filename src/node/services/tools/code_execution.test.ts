@@ -1027,6 +1027,53 @@ describe("createCodeExecutionTool", () => {
       await host.disposeScope("ws-args-bound");
     });
 
+    it("bounds oversized nested-call ERRORS in records and events (no guest-path echo)", async () => {
+      // Host error messages can embed guest data verbatim — ENAMETOOLONG
+      // echoes a multi-megabyte path — and record errors stay model-visible
+      // through compaction, so they must be bounded at creation and again
+      // before return like args/results.
+      using tmp = new DisposableTempDir("code-exec-offload");
+      const host = new SandboxHostService();
+      const hugePathErrorTools: Record<string, Tool> = {
+        touchy: createMockTool("touchy", z.object({ path: z.string() }), (input) => {
+          throw new Error(
+            `ENAMETOOLONG: name too long, open '${(input as { path: string }).path}'`
+          );
+        }),
+      };
+      const emitted: Array<{ toolName?: string; error?: string }> = [];
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(hugePathErrorTools),
+        (event) => {
+          emitted.push(event as { toolName?: string; error?: string });
+        },
+        persistentRunner(host, "ws-error-bound", tmp.path)
+      );
+
+      const result = (await tool.execute!(
+        {
+          code: "try { mux.touchy({path: 'x'.repeat(2_000_000)}); } catch (e) {} return 'done';",
+        },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+
+      // The compact record's error is bounded, reporting the true size.
+      const record = result.toolCalls.find((r) => r.toolName === "touchy");
+      expect(record).toBeDefined();
+      expect(record!.error).toBeDefined();
+      expect(record!.error!.length).toBeLessThan(4 * 1024);
+      expect(record!.error).toContain("truncated");
+      // Emitted events (streamed into session history) are bounded too.
+      const errorEvents = emitted.filter((e) => e.toolName === "touchy" && e.error !== undefined);
+      expect(errorEvents.length).toBeGreaterThan(0);
+      for (const event of errorEvents) {
+        expect(event.error!.length).toBeLessThan(4 * 1024);
+      }
+      await host.disposeScope("ws-error-bound");
+    });
+
     it("truncates over-cap return values to a bounded preview (no handle, no inline value)", async () => {
       // A value over the retention cap can be neither a handle (retention
       // would protect it while it blows the snapshot budget) nor inline (it

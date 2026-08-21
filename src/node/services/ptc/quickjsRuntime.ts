@@ -325,12 +325,13 @@ export class QuickJSRuntime implements IJSRuntime {
         const endTime = Date.now();
         const duration_ms = endTime - startTime;
         const errorStr = error instanceof Error ? error.message : String(error);
+        const recordError = this.boundCaptureError(errorStr);
 
         // Record failed tool call
         this.toolCalls.push({
           toolName: name,
           args: recordArgs,
-          error: errorStr,
+          error: recordError,
           duration_ms,
         });
 
@@ -340,7 +341,7 @@ export class QuickJSRuntime implements IJSRuntime {
           callId,
           toolName: name,
           args: recordArgs,
-          error: errorStr,
+          error: recordError,
           startTime,
           endTime,
         });
@@ -487,11 +488,12 @@ export class QuickJSRuntime implements IJSRuntime {
         } catch (error) {
           const endTime = Date.now();
           const errorStr = error instanceof Error ? error.message : String(error);
+          const recordError = this.boundCaptureError(errorStr);
           const recordArgs = this.boundCaptureArgs(args[0]);
           toolCalls.push({
             toolName: name,
             args: recordArgs,
-            error: errorStr,
+            error: recordError,
             duration_ms: endTime - startTime,
           });
           eventHandler?.({
@@ -499,7 +501,7 @@ export class QuickJSRuntime implements IJSRuntime {
             callId,
             toolName: name,
             args: recordArgs,
-            error: errorStr,
+            error: recordError,
             startTime,
             endTime,
           });
@@ -580,6 +582,22 @@ export class QuickJSRuntime implements IJSRuntime {
     return this.kernelRecordBounds === undefined
       ? value
       : this.boundCapture(value, this.kernelRecordBounds.argsCapBytes);
+  }
+
+  /**
+   * Bound error strings captured into records/events (kernel mode). Host
+   * error messages can embed guest-supplied data verbatim — e.g. ENAMETOOLONG
+   * echoes a multi-megabyte path — and record errors stay model-visible
+   * through compaction, so an unbounded message would reopen the context
+   * leak that args/result bounding closed. The guest-facing rejection keeps
+   * the full message (kernel-side only; return values are bounded anyway).
+   */
+  private boundCaptureError(errorStr: string): string {
+    if (this.kernelRecordBounds === undefined) return errorStr;
+    const capBytes = this.kernelRecordBounds.argsCapBytes;
+    const bytes = Buffer.byteLength(errorStr, "utf8");
+    if (bytes <= capBytes) return errorStr;
+    return `${errorStr.slice(0, capBytes)}…[${bytes} bytes total; truncated]`;
   }
 
   private boundCaptureResult(value: unknown): unknown {
@@ -709,11 +727,12 @@ export class QuickJSRuntime implements IJSRuntime {
           const endTime = Date.now();
           const duration_ms = endTime - startTime;
           const errorStr = error instanceof Error ? error.message : String(error);
+          const recordError = this.boundCaptureError(errorStr);
 
           this.toolCalls.push({
             toolName: methodName,
             args: recordArgs,
-            error: errorStr,
+            error: recordError,
             duration_ms,
           });
 
@@ -722,7 +741,7 @@ export class QuickJSRuntime implements IJSRuntime {
             callId,
             toolName: methodName,
             args: recordArgs,
-            error: errorStr,
+            error: recordError,
             startTime,
             endTime,
           });

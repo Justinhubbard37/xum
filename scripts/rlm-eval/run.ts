@@ -91,9 +91,30 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+/** Read one JSONL file leniently (torn/malformed lines skipped). */
+function readJsonlRows(filePath: string): unknown[] {
+  if (!fs.existsSync(filePath)) return [];
+  const rows: unknown[] = [];
+  for (const line of fs.readFileSync(filePath, "utf-8").trim().split("\n")) {
+    if (line.trim() === "") continue;
+    try {
+      rows.push(JSON.parse(line));
+    } catch {
+      // skip torn line
+    }
+  }
+  return rows;
+}
+
 /**
- * Wait for the turn to finish: the last chat.jsonl row is an assistant message,
- * assistant turns >= expected count, and no partial.json (streaming) remains.
+ * Wait for the turn to finish: the last chat row is an assistant message,
+ * REAL scenario user turns >= expected count, and no partial.json
+ * (streaming) remains. Mirrors extractMetrics' row accounting: compaction
+ * rotates pre-boundary rows into chat-archive.jsonl (full history = archive
+ * ++ active), so reading only chat.jsonl would undercount settled turns and
+ * hang a compacted multi-turn cell until timeout; synthetic rows
+ * (compaction-request users, preserved-tail copies) must not count as
+ * scenario turns.
  */
 async function waitForTurn(
   sessionDir: string,
@@ -104,34 +125,41 @@ async function waitForTurn(
   let stableTicks = 0;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 3000));
-    const chatPath = path.join(sessionDir, "chat.jsonl");
-    if (!fs.existsSync(chatPath)) continue;
-    const lines = fs.readFileSync(chatPath, "utf-8").trim().split("\n");
+    if (!fs.existsSync(path.join(sessionDir, "chat.jsonl"))) continue;
+    const rows = [
+      ...readJsonlRows(path.join(sessionDir, "chat-archive.jsonl")),
+      ...readJsonlRows(path.join(sessionDir, "chat.jsonl")),
+    ];
     let users = 0;
     let lastRole = "";
     let lastAssistantHasText = false;
-    for (const line of lines) {
-      try {
-        const row: unknown = JSON.parse(line);
-        if (isRecord(row) && typeof row.role === "string") {
-          if (row.role === "user") users += 1;
-          lastRole = row.role;
-          if (row.role === "assistant") {
-            // Mid-turn tool-call steps commit assistant rows without the final
-            // text; treating those as settled races the extractor against the
-            // closing text part (observed with Opus 5 @ medium thinking).
-            const parts = Array.isArray(row.parts) ? row.parts : [];
-            lastAssistantHasText = parts.some(
-              (p: unknown) =>
-                isRecord(p) &&
-                p.type === "text" &&
-                typeof p.text === "string" &&
-                p.text.trim() !== ""
-            );
-          }
-        }
-      } catch {
-        // skip torn line
+    for (const row of rows) {
+      if (!isRecord(row) || typeof row.role !== "string") continue;
+      const meta = isRecord(row.metadata) ? row.metadata : undefined;
+      // Preserved-tail copies duplicate rows already counted above them.
+      if (meta?.rlmPreservedTailCopy === true) continue;
+      const muxType =
+        isRecord(meta?.muxMetadata) && typeof meta.muxMetadata.type === "string"
+          ? meta.muxMetadata.type
+          : undefined;
+      // Internal rows (compaction-request users, compaction-summary
+      // assistants) are neither scenario turns NOR settle evidence: a
+      // summary row landing after a real pending question must not read as
+      // "the assistant answered".
+      if (muxType !== undefined && muxType !== "normal") continue;
+      if (row.role === "user") {
+        users += 1;
+      }
+      lastRole = row.role;
+      if (row.role === "assistant") {
+        // Mid-turn tool-call steps commit assistant rows without the final
+        // text; treating those as settled races the extractor against the
+        // closing text part (observed with Opus 5 @ medium thinking).
+        const parts = Array.isArray(row.parts) ? row.parts : [];
+        lastAssistantHasText = parts.some(
+          (p: unknown) =>
+            isRecord(p) && p.type === "text" && typeof p.text === "string" && p.text.trim() !== ""
+        );
       }
     }
     const streaming = fs.existsSync(path.join(sessionDir, "partial.json"));

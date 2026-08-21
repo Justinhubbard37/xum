@@ -98,9 +98,11 @@ describe("extractReadFilePaths", () => {
       codeExecutionMessage,
     ];
 
+    // Newest-first at every level: within the execution, /loaded.jsonl is
+    // chronologically after /nested-read.ts, so it surfaces first.
     expect(extractReadFilePaths(messages)).toEqual([
-      "/nested-read.ts",
       "/loaded.jsonl",
+      "/nested-read.ts",
       "/direct.ts",
     ]);
   });
@@ -116,6 +118,43 @@ describe("extractReadFilePaths", () => {
     ];
 
     expect(extractReadFilePaths(messages)).toHaveLength(MAX_POST_COMPACTION_READ_FILES);
+  });
+
+  it("keeps the NEWEST reads when a single batched execution exceeds the cap", () => {
+    // Nested kernel records are chronological within one code_execution; the
+    // cap must evict the OLDEST reads, so traversal is reversed at every
+    // level. A forward inner loop would retain the earliest paths and drop
+    // the files the agent just used.
+    const overCap = MAX_POST_COMPACTION_READ_FILES + 20;
+    const message: MuxMessage = {
+      id: "msg-big-batch",
+      role: "assistant",
+      parts: [
+        {
+          type: "dynamic-tool" as const,
+          toolCallId: "tc-big-batch",
+          toolName: "code_execution",
+          state: "output-available" as const,
+          input: { code: "..." },
+          output: {
+            success: true,
+            toolCalls: Array.from({ length: overCap }, (_, i) => ({
+              toolName: "file_read",
+              args: { path: `/batched-${i}.ts` },
+              ok: true,
+              bytes: 10,
+            })),
+          },
+        },
+      ],
+    };
+
+    const extracted = extractReadFilePaths([message]);
+    expect(extracted).toHaveLength(MAX_POST_COMPACTION_READ_FILES);
+    // Newest (chronologically last) read first; oldest reads evicted.
+    expect(extracted[0]).toBe(`/batched-${overCap - 1}.ts`);
+    expect(extracted).not.toContain("/batched-0.ts");
+    expect(extracted).not.toContain(`/batched-${overCap - MAX_POST_COMPACTION_READ_FILES - 1}.ts`);
   });
 });
 

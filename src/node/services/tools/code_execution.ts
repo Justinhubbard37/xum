@@ -271,11 +271,16 @@ function compactKernelToolCallRecords(result: PTCExecutionResult, loadActive: bo
   result.toolCalls = result.toolCalls.map((record) => {
     // Load records keep their result ({key, bytes, lines, preview} — bounded
     // by construction: parseLoadArgs caps the key, the preview is capped
-    // host-side), but their ARGS are still guest-supplied: a rejected call's
-    // record can carry an unbounded key/path, so bound them like every other
-    // record.
+    // host-side), but their ARGS and ERROR are still guest-influenced: a
+    // rejected call's record can carry an unbounded key/path, and host error
+    // messages echo guest paths verbatim (ENAMETOOLONG), so bound both like
+    // every other record.
     if (loadActive && record.toolName === "load") {
-      return { ...record, args: boundCompactRecordArgs(record.args) };
+      return {
+        ...record,
+        args: boundCompactRecordArgs(record.args),
+        ...(record.error !== undefined ? { error: boundCompactRecordError(record.error) } : {}),
+      };
     }
     let bytes = 0;
     if (record.result !== undefined) {
@@ -299,10 +304,23 @@ function compactKernelToolCallRecords(result: PTCExecutionResult, loadActive: bo
       args: boundCompactRecordArgs(record.args),
       ok: record.error === undefined,
       bytes,
-      ...(record.error !== undefined ? { error: record.error } : {}),
+      ...(record.error !== undefined ? { error: boundCompactRecordError(record.error) } : {}),
       duration_ms: record.duration_ms,
     };
   });
+}
+
+/**
+ * Bound the error echoed in a compact kernel record (defense in depth behind
+ * the runtime's creation-time bounding). Host error messages can embed
+ * guest-supplied data verbatim — ENAMETOOLONG echoes the full oversized path —
+ * and the compact record is the model-visible surface, so an unbounded error
+ * would persist megabytes into history and provider context.
+ */
+function boundCompactRecordError(error: string): string {
+  const bytes = Buffer.byteLength(error, "utf8");
+  if (bytes <= KERNEL_COMPACT_ARGS_CAP_BYTES) return error;
+  return `${error.slice(0, KERNEL_COMPACT_ARGS_CAP_BYTES)}…[${bytes} bytes total; truncated]`;
 }
 
 /**

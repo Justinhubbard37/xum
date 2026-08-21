@@ -61,20 +61,26 @@ export function extractReadFilePaths(messages: readonly MuxMessage[]): string[] 
     return readFiles.length >= MAX_POST_COMPACTION_READ_FILES;
   };
 
-  // Iterate in reverse to get most recent reads first.
+  // Iterate in reverse AT EVERY LEVEL — messages, parts within a message,
+  // and nested kernel records within one code_execution — so the cap always
+  // evicts the OLDEST reads. A single batched execution can exceed the cap
+  // by itself; a forward inner loop would keep its earliest reads and drop
+  // the files the agent just used.
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i];
     if (message.role !== "assistant") continue;
 
-    for (const part of message.parts) {
+    for (let p = message.parts.length - 1; p >= 0; p--) {
+      const part = message.parts[p];
       if (part.type !== "dynamic-tool") continue;
       if (part.state !== "output-available") continue;
 
       if (part.toolName === "code_execution") {
         // The execution's overall success is irrelevant: nested reads that
         // completed before a later failure still loaded those files.
-        for (const nested of collectNestedReadPaths(part.output)) {
-          if (add(nested)) return readFiles;
+        const nestedPaths = collectNestedReadPaths(part.output);
+        for (let n = nestedPaths.length - 1; n >= 0; n--) {
+          if (add(nestedPaths[n])) return readFiles;
         }
         continue;
       }
