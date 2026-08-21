@@ -470,6 +470,141 @@ describe("RefineService", () => {
     }
   });
 
+  it("an admitted apply runs to completion when removal races in", async () => {
+    // Removal aborts mid-apply after the first staged edit was admitted.
+    // Breaking between edits left a partially applied mutation while removal
+    // deleted the session journal holding its rollback IDs. Once admitted,
+    // the apply must finish every edit and persist the audit row (removal
+    // awaits the drain, so it lands before session teardown).
+    const secondLesson = "/memories/workspace/second-lesson.md";
+    using fixture = await createFixture({
+      modelFactory: () =>
+        toolCallModel(
+          [
+            {
+              toolCallId: "apply-race-1",
+              toolName: "memory",
+              input: {
+                command: "create",
+                path: LESSON_PATH,
+                file_text: "First lesson, gated mid-apply.\n",
+              },
+            },
+            {
+              toolCallId: "apply-race-2",
+              toolName: "memory",
+              input: {
+                command: "create",
+                path: secondLesson,
+                file_text: "Second lesson, must still land.\n",
+              },
+            },
+          ],
+          "two lessons staged"
+        ),
+    });
+    await fixture.seedTrajectory();
+    expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
+
+    // Gate the FIRST write so removal can race in while it is admitted.
+    let releaseWrite: () => void = () => undefined;
+    const writeGate = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    const realCreate = fixture.memoryService.create.bind(fixture.memoryService);
+    let gated = false;
+    const createSpy = spyOn(fixture.memoryService, "create").mockImplementation(
+      async (...createArgs) => {
+        if (!gated) {
+          gated = true;
+          await writeGate;
+        }
+        return realCreate(...createArgs);
+      }
+    );
+    try {
+      const applyPromise = fixture.service.apply(WORKSPACE_ID);
+      const spinDeadline = Date.now() + 5_000;
+      while (!gated && Date.now() < spinDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(gated).toBe(true);
+      // Removal races in: abort + drain while the first edit is mid-write.
+      const cancelPromise = fixture.service.cancelInFlightRefinePass(WORKSPACE_ID);
+      releaseWrite();
+      await cancelPromise;
+
+      const result = await applyPromise;
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      // BOTH edits applied with journaled rollback IDs, none stranded.
+      expect(result.data.applied).toHaveLength(2);
+      expect(await listRefinements(fixture.sessionDir)).toHaveLength(2);
+      // The audit row (the only durable record of the rollback IDs) was
+      // persisted before removal could tear the session down.
+      const chat = await fixture.readChat();
+      const auditRow = chat[chat.length - 1];
+      expect(auditRow.metadata?.muxMetadata?.type).toBe("refine-summary");
+    } finally {
+      createSpy.mockRestore();
+    }
+  });
+
+  it("a cancellation before the first mutation still applies nothing", async () => {
+    using fixture = await createFixture({
+      modelFactory: () =>
+        toolCallModel(
+          [
+            {
+              toolCallId: "apply-preempt-1",
+              toolName: "memory",
+              input: {
+                command: "create",
+                path: LESSON_PATH,
+                file_text: "Must never land: cancelled before admission.\n",
+              },
+            },
+          ],
+          "one lesson staged"
+        ),
+    });
+    await fixture.seedTrajectory();
+    expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
+    const journalRowsAfterStage = (await listRefinements(fixture.sessionDir)).length;
+
+    // Gate BEFORE admission: hold the staged-set load so the abort fires
+    // before the first mutation is attempted.
+    let releaseLoad: () => void = () => undefined;
+    const loadGate = new Promise<void>((resolve) => {
+      releaseLoad = resolve;
+    });
+    const realCreate = fixture.memoryService.create.bind(fixture.memoryService);
+    const createSpy = spyOn(fixture.memoryService, "create").mockImplementation(realCreate);
+    const readSpy = spyOn(
+      fixture.service as unknown as { readMaxJournalSeq: (dir: string) => Promise<number> },
+      "readMaxJournalSeq"
+    ).mockImplementation(async () => {
+      await loadGate;
+      return -1;
+    });
+    try {
+      const applyPromise = fixture.service.apply(WORKSPACE_ID);
+      const cancelPromise = fixture.service.cancelInFlightRefinePass(WORKSPACE_ID);
+      releaseLoad();
+      await cancelPromise;
+
+      const result = await applyPromise;
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("cancelled");
+      // Nothing was written: no memory mutation, no new journal rows.
+      expect(createSpy).not.toHaveBeenCalled();
+      expect(await listRefinements(fixture.sessionDir)).toHaveLength(journalRowsAfterStage);
+    } finally {
+      readSpy.mockRestore();
+      createSpy.mockRestore();
+    }
+  });
+
   it("cancelInFlightRefinePass aborts a running pass so no writes or summary land", async () => {
     // Removal races a pass that WOULD apply a memory edit and post a summary
     // row. Gate model creation to hold the race window open deterministically;

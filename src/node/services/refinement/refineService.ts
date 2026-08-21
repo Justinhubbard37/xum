@@ -326,10 +326,20 @@ export class RefineService {
     });
     const skillWriteTool = await this.buildSkillWriteTool(workspaceId, sessionDir);
 
+    // Cancellation is honored ONLY before the first mutation. Once admitted,
+    // the apply runs to completion: aborting between edits left a partially
+    // applied global/project mutation while removal deleted the session
+    // journal holding its rollback IDs — surviving with no audit or rollback
+    // path. Applies are local journaled file mutations with no model calls,
+    // so removal (which awaits this promise via cancelInFlightRefinePass
+    // before deleting the session directory) waits out the full run instead;
+    // the audit row below is persisted before session teardown.
+    if (cancellationSignal.aborted) {
+      return Err("refine apply cancelled (workspace removed)");
+    }
+
     let succeeded = 0;
     for (const edit of staged.edits) {
-      // Removal wins mid-apply: stop before the next write.
-      if (cancellationSignal.aborted) break;
       try {
         const tool = edit.tool === "memory" ? memoryTool : skillWriteTool;
         if (tool === undefined || typeof tool.execute !== "function") {
@@ -409,10 +419,10 @@ export class RefineService {
       untrackedApplied,
     });
 
-    // Cancellation gate before the chat write (same rationale as runLocked).
-    if (cancellationSignal.aborted) {
-      return Err("refine apply cancelled (workspace removed)");
-    }
+    // No cancellation gate here (unlike runLocked): an admitted apply's
+    // audit row — the only durable record of the rollback IDs — must persist
+    // even when removal is racing. Removal awaits this promise before
+    // deleting the session directory, so the append still precedes teardown.
     if (!record.noOp) {
       await this.appendSummaryMessage(workspaceId, record, "applied");
     }
