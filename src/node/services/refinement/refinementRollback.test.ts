@@ -841,7 +841,8 @@ describe("refinementRollback", () => {
     // on the still-held target lock and lands after the rollback row; the
     // sleep only gives a NOT-blocked (buggy) writer time to mutate + journal
     // first — correctness is asserted on journal order below, never timing.
-    let writerPromise: Promise<unknown> | null = null;
+    let writerStarted = false;
+    let writerPromise: Promise<unknown> = Promise.resolve();
     const result = await rollbackRefinement({
       sessionDir: fixture.sessionDir,
       id: editRow.id,
@@ -849,12 +850,13 @@ describe("refinementRollback", () => {
       testOnlyBeforeRollbackJournal: async () => {
         // Rollback already applied: disk is back to v1.
         expect(await fsPromises.readFile(physicalPath, "utf-8")).toBe("v1\n");
+        writerStarted = true;
         writerPromise = fixture.service.strReplace(fixture.ctx, virtualPath, "v1", "v3", "agent");
         await new Promise((resolve) => setTimeout(resolve, 100));
       },
     });
     expect(result.success).toBe(true);
-    expect(writerPromise).not.toBeNull();
+    expect(writerStarted).toBe(true);
     await writerPromise;
     expect(await fsPromises.readFile(physicalPath, "utf-8")).toBe("v3\n");
 
