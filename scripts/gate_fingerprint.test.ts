@@ -64,6 +64,13 @@ async function fingerprint(cwd: string): Promise<string> {
   return result.stdout;
 }
 
+// The documented workflow: capture the fingerprint BEFORE the gate runs,
+// then bind the record to it (record refuses when the tree changed mid-run).
+async function record(cwd: string, gateName: string, result: "pass" | "fail"): Promise<RunResult> {
+  const fp = await fingerprint(cwd);
+  return gate(cwd, "record", gateName, result, fp);
+}
+
 let repo: string;
 
 beforeEach(async () => {
@@ -82,8 +89,8 @@ test("fingerprint is stable across runs and unperturbed by record", async () => 
   const before = await fingerprint(repo);
   expect(await fingerprint(repo)).toBe(before);
 
-  const record = await gate(repo, "record", "static-check", "pass");
-  expect(record.exitCode).toBe(0);
+  const recorded = await record(repo, "static-check", "pass");
+  expect(recorded.exitCode).toBe(0);
   // The store lives inside the git dir, so recording must not change the
   // fingerprint (a self-invalidating cache would never hit).
   expect(await fingerprint(repo)).toBe(before);
@@ -96,8 +103,8 @@ test("check hits with unchanged tree; pass and fail both round-trip", async () =
   // No record yet: miss.
   expect((await gate(repo, "check", "static-check")).exitCode).toBe(1);
 
-  expect((await gate(repo, "record", "static-check", "pass")).exitCode).toBe(0);
-  expect((await gate(repo, "record", "unit-tests", "fail")).exitCode).toBe(0);
+  expect((await record(repo, "static-check", "pass")).exitCode).toBe(0);
+  expect((await record(repo, "unit-tests", "fail")).exitCode).toBe(0);
 
   const pass = await gate(repo, "check", "static-check");
   expect(pass.exitCode).toBe(0);
@@ -112,43 +119,62 @@ test("check hits with unchanged tree; pass and fail both round-trip", async () =
 });
 
 test("check misses after editing a tracked file", async () => {
-  await gate(repo, "record", "static-check", "pass");
+  await record(repo, "static-check", "pass");
   await appendFile(path.join(repo, "tracked.txt"), "edited\n");
 
   expect((await gate(repo, "check", "static-check")).exitCode).toBe(1);
 
   // Re-recording against the changed tree makes check hit again.
-  expect((await gate(repo, "record", "static-check", "fail")).exitCode).toBe(0);
+  expect((await record(repo, "static-check", "fail")).exitCode).toBe(0);
   const rechecked = await gate(repo, "check", "static-check");
   expect(rechecked.exitCode).toBe(0);
   expect(rechecked.stdout).toBe("fail");
 });
 
 test("check misses when an untracked file appears or changes", async () => {
-  await gate(repo, "record", "static-check", "pass");
+  await record(repo, "static-check", "pass");
   await writeFile(path.join(repo, "scratch.txt"), "one\n");
   expect((await gate(repo, "check", "static-check")).exitCode).toBe(1);
 
   // Content changes of an existing untracked file must also invalidate.
-  await gate(repo, "record", "static-check", "pass");
+  await record(repo, "static-check", "pass");
   await writeFile(path.join(repo, "scratch.txt"), "two\n");
   expect((await gate(repo, "check", "static-check")).exitCode).toBe(1);
 
   // Fingerprint is content-based: deleting the file restores the original
   // fingerprint, so the very first record becomes fresh again.
   await rm(path.join(repo, "scratch.txt"));
-  await gate(repo, "record", "static-check", "pass");
+  await record(repo, "static-check", "pass");
   expect((await gate(repo, "check", "static-check")).exitCode).toBe(0);
 });
 
 test("check misses after staging a change", async () => {
-  await gate(repo, "record", "static-check", "pass");
+  await record(repo, "static-check", "pass");
 
   // Stage a brand-new file: it leaves the untracked list and must be caught
   // via the tracked diff instead.
   await writeFile(path.join(repo, "staged.txt"), "staged\n");
   await git(repo, "add", "staged.txt");
   expect((await gate(repo, "check", "static-check")).exitCode).toBe(1);
+});
+
+test("record is refused when the worktree changed after the fingerprint was captured", async () => {
+  // Simulates a mid-gate worktree change: fingerprint captured, then another
+  // process edits a file before record runs. The stale outcome must not be
+  // bound to the new tree, or check would skip validating untested changes.
+  const before = await fingerprint(repo);
+  await appendFile(path.join(repo, "tracked.txt"), "changed while gate ran\n");
+
+  const rejected = await gate(repo, "record", "static-check", "pass", before);
+  expect(rejected.exitCode).toBe(1);
+  expect(rejected.stderr).toContain("worktree changed while the gate ran");
+  // Nothing was recorded: check still misses on the current tree.
+  expect((await gate(repo, "check", "static-check")).exitCode).toBe(1);
+
+  // A malformed fingerprint argument is rejected up front.
+  const malformed = await gate(repo, "record", "static-check", "pass", "not-a-sha");
+  expect(malformed.exitCode).toBe(1);
+  expect(malformed.stderr).toContain("sha256");
 });
 
 test("corrupt store self-heals instead of failing the caller", async () => {
@@ -164,7 +190,7 @@ test("corrupt store self-heals instead of failing the caller", async () => {
 
   // check treats a corrupt store as a miss; record rewrites it cleanly.
   expect((await gate(repo, "check", "static-check")).exitCode).toBe(1);
-  expect((await gate(repo, "record", "static-check", "pass")).exitCode).toBe(0);
+  expect((await record(repo, "static-check", "pass")).exitCode).toBe(0);
   const rechecked = await gate(repo, "check", "static-check");
   expect(rechecked.exitCode).toBe(0);
   expect(rechecked.stdout).toBe("pass");

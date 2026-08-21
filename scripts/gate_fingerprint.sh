@@ -11,8 +11,12 @@
 #   scripts/gate_fingerprint.sh fingerprint
 #     Print the current worktree fingerprint (sha256 hex) and exit 0.
 #
-#   scripts/gate_fingerprint.sh record <gate> <pass|fail>
-#     Store the result for <gate> keyed by the current fingerprint.
+#   scripts/gate_fingerprint.sh record <gate> <pass|fail> <fingerprint>
+#     Store the result for <gate> keyed by <fingerprint>, which MUST be the
+#     fingerprint captured BEFORE the gate ran. Recording is refused when the
+#     worktree no longer matches it: the gate's outcome describes the tree it
+#     actually tested, and binding the record to a tree that changed mid-run
+#     would let later `check` calls skip validation of untested changes.
 #
 #   scripts/gate_fingerprint.sh check <gate>
 #     Exit 0 and print the cached result (pass|fail) when the recorded
@@ -24,10 +28,11 @@
 #   if result=$(scripts/gate_fingerprint.sh check static-check); then
 #     [ "$result" = pass ] || exit 1   # cached fail
 #   else
+#     fp=$(scripts/gate_fingerprint.sh fingerprint)
 #     if make static-check; then
-#       scripts/gate_fingerprint.sh record static-check pass
+#       scripts/gate_fingerprint.sh record static-check pass "$fp"
 #     else
-#       scripts/gate_fingerprint.sh record static-check fail
+#       scripts/gate_fingerprint.sh record static-check fail "$fp"
 #       exit 1
 #     fi
 #   fi
@@ -54,7 +59,10 @@ usage() {
   cat >&2 <<'EOF'
 Usage: gate_fingerprint.sh <subcommand>
   fingerprint                Print the current worktree fingerprint.
-  record <gate> <pass|fail>  Store a gate result for the current fingerprint.
+  record <gate> <pass|fail> <fingerprint>
+                             Store a gate result for <fingerprint> (captured
+                             via `fingerprint` BEFORE the gate ran). Refused
+                             when the worktree changed since then.
   check <gate>               Print cached result and exit 0 when fresh;
                              exit 1 when stale or missing (caller re-runs).
 EOF
@@ -135,14 +143,21 @@ cmd_fingerprint() {
 }
 
 cmd_record() {
-  local gate="$1" result="$2" fp store tmp
+  local gate="$1" result="$2" fp="$3" current store tmp
   assert_gate_name "$gate"
   case "$result" in
     pass | fail) ;;
     *) die "result must be 'pass' or 'fail', got '$result'" ;;
   esac
+  [[ "$fp" =~ ^[0-9a-f]{64}$ ]] || die "fingerprint must be a sha256 hex string (capture it via 'fingerprint' before running the gate)"
 
-  fp=$(compute_fingerprint)
+  # Bind the record to the tree the gate actually tested: if the worktree
+  # changed while the gate ran, the outcome does not describe the current
+  # tree and caching it would let `check` skip validating untested changes.
+  current=$(compute_fingerprint)
+  [ "$current" = "$fp" ] \
+    || die "worktree changed while the gate ran (fingerprint $fp -> $current); re-run the gate on the current tree"
+
   store=$(resolve_store_path)
   # Write via temp file + rename so a crash cannot leave a torn store.
   tmp=$(mktemp "${store}.tmp.XXXXXX")
@@ -196,8 +211,8 @@ case "$SUBCOMMAND" in
     cmd_fingerprint
     ;;
   record)
-    [ $# -eq 2 ] || usage
-    cmd_record "$1" "$2"
+    [ $# -eq 3 ] || usage
+    cmd_record "$1" "$2" "$3"
     ;;
   check)
     [ $# -eq 1 ] || usage

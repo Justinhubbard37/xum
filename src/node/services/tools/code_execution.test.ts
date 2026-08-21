@@ -932,6 +932,43 @@ describe("createCodeExecutionTool", () => {
       await host.disposeScope("ws-offload");
     });
 
+    it("bounds oversized nested-call args in compact records (no echo of kernel data)", async () => {
+      using tmp = new DisposableTempDir("code-exec-offload");
+      const host = new SandboxHostService();
+      const sinkTools: Record<string, Tool> = {
+        big_fetch: createMockTool("big_fetch", z.object({}), () => bigPayload),
+        sink: createMockTool("sink", z.object({ content: z.string() }), () => "ok"),
+      };
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(sinkTools),
+        undefined,
+        persistentRunner(host, "ws-args-bound", tmp.path)
+      );
+
+      // Kernel data passed as a nested tool's args must not be echoed back
+      // through the compact record — that would reopen the context leak that
+      // result suppression closed.
+      const result = (await tool.execute!(
+        {
+          code: "const r = mux.big_fetch({}); mux.sink({content: r.data}); return r.data.length;",
+        },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+
+      const sinkRecord = result.toolCalls.find((r) => r.toolName === "sink");
+      expect(sinkRecord).toBeDefined();
+      const args = sinkRecord!.args as { argsPreview?: string; argsBytes?: number };
+      expect(typeof args.argsPreview).toBe("string");
+      expect(args.argsPreview!.length).toBeLessThan(3 * 1024);
+      expect(args.argsBytes).toBeGreaterThan(10_000);
+      // Small args pass through untouched.
+      const fetchRecord = result.toolCalls.find((r) => r.toolName === "big_fetch");
+      expect(fetchRecord!.args).toEqual({});
+      await host.disposeScope("ws-args-bound");
+    });
+
     it("handle vars survive a simulated restart: a later eval after remount can slice vars.__hN", async () => {
       using tmp = new DisposableTempDir("code-exec-offload");
       const host = new SandboxHostService();

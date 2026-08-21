@@ -23,7 +23,7 @@ import {
   RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES,
   RESULT_HANDLE_VARS_CAP_BYTES,
 } from "@/constants/resultHandles";
-import { KERNEL_CONSOLE_CAP_BYTES } from "@/constants/kernelOutput";
+import { KERNEL_COMPACT_ARGS_CAP_BYTES, KERNEL_CONSOLE_CAP_BYTES } from "@/constants/kernelOutput";
 
 // Default limits
 const DEFAULT_MEMORY_BYTES = 64 * 1024 * 1024; // 64MB
@@ -231,13 +231,37 @@ function compactKernelToolCallRecords(result: PTCExecutionResult, loadActive: bo
     }
     return {
       toolName: record.toolName,
-      args: record.args,
+      args: boundCompactRecordArgs(record.args),
       ok: record.error === undefined,
       bytes,
       ...(record.error !== undefined ? { error: record.error } : {}),
       duration_ms: record.duration_ms,
     };
   });
+}
+
+/**
+ * Bound the args echoed in a compact kernel record. Args are guest-supplied
+ * and can embed kernel data (e.g. `xum.file_write({content: vars.large})`),
+ * which would reopen the context leak that result suppression closed. Small
+ * args pass through untouched; oversized args are replaced with a bounded
+ * head preview plus the true size.
+ */
+function boundCompactRecordArgs(args: unknown): unknown {
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(args) ?? "";
+  } catch {
+    // Bridged args are JSON round-tripped, so this is unreachable in
+    // practice; suppress entirely rather than risk leaking via toString.
+    return { argsPreview: "[unserializable]", argsBytes: 0 };
+  }
+  const size = Buffer.byteLength(serialized, "utf8");
+  if (size <= KERNEL_COMPACT_ARGS_CAP_BYTES) return args;
+  return {
+    argsPreview: `${serialized.slice(0, KERNEL_COMPACT_ARGS_CAP_BYTES)}…[${size} bytes total; truncated]`,
+    argsBytes: size,
+  };
 }
 
 /**
