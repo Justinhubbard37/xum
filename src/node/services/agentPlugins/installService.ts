@@ -39,6 +39,14 @@ import {
   type AgentPluginContainer,
   type AgentPluginInfo,
 } from "./discovery";
+import {
+  isJournalName,
+  JOURNAL_PREFIXES,
+  PROMOTION_JOURNAL_PREFIX,
+  STAGING_DIR_NAME,
+  UNINSTALL_JOURNAL_PREFIX,
+  UPDATE_JOURNAL_PREFIX,
+} from "./journals";
 import type { AgentPluginManifest } from "./manifest";
 import {
   buildPluginServerKey,
@@ -85,44 +93,22 @@ import {
 /** Registry file name under the mux home dir. */
 const REGISTRY_FILE_NAME = "plugins.json";
 
-/** Preview/staging clones live here — NOT under ~/.mux/plugins, which discovery scans. */
-const STAGING_DIR_NAME = "plugin-staging";
-
-/**
- * Journal file recording an install promotion that has renamed the staged
- * tree into the container but not yet written its registry entry. A crash in
- * that window would otherwise strand an orphaned tree that discovery lists as
- * unmanaged, assertNoCollision blocks from reinstalling, and uninstall
- * refuses (not managed) — recoverable only by manual deletion.
- * reconcileJournals cleans such trees up on startup and on section open.
+/*
+ * Journal semantics (prefixes and helpers live in ./journals so discovery can
+ * derive suppression without an import cycle):
+ * - PROMOTION: an install renamed the staged tree into the container but has
+ *   not yet written its registry entry. A crash in that window would strand
+ *   an orphaned tree that discovery lists as unmanaged, assertNoCollision
+ *   blocks, and uninstall refuses — recoverable only by manual deletion.
+ * - UPDATE: the OLD live tree moved into staging but the staged replacement
+ *   is not yet promoted. The registry then records an install whose path is
+ *   missing, and retrying Update cannot self-heal because
+ *   assertNoCapabilityIncrease treats the missing tree as an empty surface.
+ * - UNINSTALL: the plugin tree (and optionally its data dir) is staged into
+ *   trash but the registry write has not committed; the assets would hide
+ *   under plugin-staging while the registry still owns the plugin.
+ * reconcileJournals resolves all three on startup and on section open.
  */
-const PROMOTION_JOURNAL_PREFIX = "promotion-";
-
-/**
- * Journal recording an update swap that has renamed the OLD live tree into
- * staging but not yet promoted the staged replacement. A crash in that window
- * leaves the registry recording an install whose path is missing — and
- * retrying Update cannot self-heal because assertNoCapabilityIncrease treats
- * the missing tree as an empty surface and rejects the staged capabilities as
- * additions. reconcileJournals restores the old tree from staging.
- */
-const UPDATE_JOURNAL_PREFIX = "update-";
-
-/**
- * Journal recording an uninstall that has staged the plugin tree (and
- * optionally its data dir) into staging but not yet committed the registry
- * write. A crash in that window hides the assets under plugin-staging while
- * the registry still owns the plugin. reconcileJournals restores the staged
- * assets when the registry entry still exists, and finishes the trash cleanup
- * when the commit landed.
- */
-const UNINSTALL_JOURNAL_PREFIX = "uninstall-";
-
-const JOURNAL_PREFIXES = [
-  PROMOTION_JOURNAL_PREFIX,
-  UPDATE_JOURNAL_PREFIX,
-  UNINSTALL_JOURNAL_PREFIX,
-] as const;
 
 /**
  * Marker file written into a staged tree just before a promote/swap rename,
@@ -135,10 +121,6 @@ const JOURNAL_PREFIXES = [
  * reserved name so the write can never clobber plugin-owned content.
  */
 const PROMOTION_MARKER_FILE = ".mux-promotion-marker";
-
-function isJournalName(entry: string): boolean {
-  return JOURNAL_PREFIXES.some((prefix) => entry.startsWith(prefix));
-}
 
 /** Staging dirs left behind by crashes are reclaimed after this age. */
 const STALE_STAGING_MAX_AGE_MS = 60 * 60 * 1000;
@@ -413,6 +395,17 @@ export class AgentPluginInstallService {
     setAgentPluginDiscoveryGate(async () =>
       (await this.reconciliationState) ? [] : [this.containerDir]
     );
+  }
+
+  /**
+   * Immediately mark reconciliation unhealthy for the discovery gate. Called
+   * when an INLINE mutation path retains a journal for an unremovable tree in
+   * the managed container: the next reconcileJournals run would report the
+   * retained journal anyway, but the current process's health snapshot is
+   * stale until then, and discovery must not load the orphan in the interim.
+   */
+  private markUnreconciled(): void {
+    this.reconciliationState = Promise.resolve(false);
   }
 
   /**
@@ -1525,6 +1518,7 @@ export class AgentPluginInstallService {
           // isolated so a failure (e.g. a locked file on Windows) cannot
           // skip the others or mask the registry error.
           const cleanupNotes: string[] = [];
+          let promotedTreeHandled = true;
           let treeRemoved = false;
           try {
             await this.removeDir(targetPath);
@@ -1561,8 +1555,14 @@ export class AgentPluginInstallService {
                 await this.renameIntoStaging(targetPath, quarantineDir);
                 await this.removeDir(quarantineDir).catch(() => undefined);
               } catch (cleanupError) {
+                // The tree is stuck in the container (marker still inside):
+                // the journal must SURVIVE as the recovery record — the next
+                // reconciliation identifies the orphan by nonce and retries
+                // the quarantine once the lock clears; without it the failed
+                // install permanently blocks reinstalls via assertNoCollision.
+                promotedTreeHandled = false;
                 cleanupNotes.push(
-                  `the promoted plugin tree could not be removed — delete ${shortenHome(targetPath)} manually (${getErrorMessage(cleanupError)})`
+                  `the promoted plugin tree could not be removed — it will be cleaned up automatically, or delete ${shortenHome(targetPath)} manually (${getErrorMessage(cleanupError)})`
                 );
               }
             }
@@ -1581,15 +1581,24 @@ export class AgentPluginInstallService {
               );
             }
           }
+          if (!promotedTreeHandled) {
+            // Keep the discovery gate closed NOW: the orphan is discoverable
+            // in the container until reconciliation quarantines it, and the
+            // current process's health snapshot predates this failure.
+            this.markUnreconciled();
+          } else {
+            // Rollback handled the tree: the journal's crash-recovery job is
+            // done.
+            await fsPromises.rm(journalPath, { force: true }).catch(() => undefined);
+          }
           const notes = cleanupNotes.length > 0 ? ` Additionally, ${cleanupNotes.join("; ")}.` : "";
           throw new Error(
             `Failed to persist the plugin registry: ${getErrorMessage(error)}${notes}`
           );
-        } finally {
-          // Registry write settled (entry recorded, or the rollback above
-          // handled the tree): the journal's crash-recovery job is done.
-          await fsPromises.rm(journalPath, { force: true }).catch(() => undefined);
         }
+        // Registry write committed (entry recorded): the journal's
+        // crash-recovery job is done.
+        await fsPromises.rm(journalPath, { force: true }).catch(() => undefined);
         // Committed: the marker did its crash-recovery job (a failed removal
         // leaves a stray dotfile the next update swap discards — harmless).
         await fsPromises
@@ -1656,8 +1665,18 @@ export class AgentPluginInstallService {
       journalNames = (await fsPromises.readdir(this.stagingRoot)).filter(
         (entry) => isJournalName(entry) && entry.endsWith(".json")
       );
-    } catch {
-      return true; // No staging root: nothing was ever staged.
+    } catch (error) {
+      if (hasErrorCode(error, "ENOENT")) {
+        return true; // No staging root: nothing was ever staged.
+      }
+      // A staging root we cannot ENUMERATE (transient I/O, permissions) may
+      // hold journals for unreconciled trees; reporting healthy here would
+      // open the discovery gate over them. Fail closed and retry later.
+      log.warn("Failed to enumerate the plugin staging root for journal recovery", {
+        stagingRoot: this.stagingRoot,
+        error: getErrorMessage(error),
+      });
+      return false;
     }
     if (journalNames.length === 0) {
       return true;
@@ -2772,6 +2791,17 @@ export class AgentPluginInstallService {
       if (await pathExists(updateJournalPath)) {
         throw new Error(
           `A previous update of '${entry.name}' has unfinished recovery. Open Settings → Plugins to let recovery complete, then try again.`
+        );
+      }
+      // Same for an unresolved UNINSTALL journal (the registry still owns the
+      // plugin while its tree sits in staging): a skills-only plugin has an
+      // empty capability surface, so the missing target would NOT stop this
+      // update — it would promote a replacement, after which uninstall
+      // recovery sees the occupied target, keeps its journal forever, and the
+      // whole managed container stays suppressed.
+      if (await pathExists(this.journalPath(UNINSTALL_JOURNAL_PREFIX, entry.name))) {
+        throw new Error(
+          `A previous uninstall of '${entry.name}' has unfinished cleanup. Open Settings → Plugins to let recovery complete, then try again.`
         );
       }
 

@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
+import { containerHasUnreconciledJournals } from "./journals";
 import {
   isValidAgentPluginName,
   validatePluginManifest,
@@ -361,23 +362,41 @@ export async function discoverAgentPluginAt(args: {
 }
 
 /**
- * Crash-recovery gate for container scans. AgentPluginInstallService installs
- * a gate here so no discovery path (MCP config, hooks, skills, workflows,
- * agents — they all funnel through discoverAgentPlugins) can scan the managed
- * container while journal recovery is still restoring or removing trees: an
- * agent request arriving right after a crash would otherwise load an orphaned
- * promotion — hook included — before cleanup ran. The gate resolves to the
- * container paths that must be SUPPRESSED from the scan: when recovery
- * FAILED (unreadable registry, failed restore/quarantine), merely waiting
- * would release discovery over the unreconciled tree, so the managed
- * container is omitted until a later recovery attempt succeeds. The returned
- * promise must never reject (the service catches); the default gate
- * suppresses nothing so tests and contexts without the install service are
- * unaffected.
+ * Crash-recovery gate for container scans, so no discovery path (MCP config,
+ * hooks, skills, workflows, agents — they all funnel through
+ * discoverAgentPlugins) can scan the managed container while install-mutation
+ * journal recovery is pending or failed: an agent request arriving right
+ * after a crash would otherwise load an orphaned promotion — hook included —
+ * before cleanup ran. The gate receives the container paths being scanned and
+ * resolves to those that must be SUPPRESSED; it must never reject.
+ *
+ * The DEFAULT gate derives suppression directly from surviving journal files
+ * in each container's sibling staging root: processes that never construct
+ * AgentPluginInstallService (headless `mux workflow` resolving plugin://
+ * scripts) must not execute an unreconciled managed tree either. They never
+ * RUN recovery, so a journal keeps the managed container suppressed until a
+ * desktop/server session reconciles it. AgentPluginInstallService replaces
+ * this with its health-tracked gate at construction: when recovery FAILED
+ * (unreadable registry, failed restore/quarantine), merely waiting would
+ * release discovery over the unreconciled tree, so the managed container
+ * stays omitted until a later recovery attempt succeeds.
  */
-let discoveryGate: () => Promise<readonly string[]> = () => Promise.resolve([]);
+export function journalDerivedDiscoveryGate(
+  containerPaths: readonly string[]
+): Promise<readonly string[]> {
+  return Promise.all(
+    containerPaths.map(async (containerPath) =>
+      (await containerHasUnreconciledJournals(containerPath)) ? [containerPath] : []
+    )
+  ).then((nested) => nested.flat());
+}
 
-export function setAgentPluginDiscoveryGate(gate: () => Promise<readonly string[]>): void {
+let discoveryGate: (containerPaths: readonly string[]) => Promise<readonly string[]> =
+  journalDerivedDiscoveryGate;
+
+export function setAgentPluginDiscoveryGate(
+  gate: (containerPaths: readonly string[]) => Promise<readonly string[]>
+): void {
   discoveryGate = gate;
 }
 
@@ -392,7 +411,9 @@ export function setAgentPluginDiscoveryGate(gate: () => Promise<readonly string[
 export async function discoverAgentPlugins(
   containers: AgentPluginContainer[]
 ): Promise<DiscoverAgentPluginsResult> {
-  const suppressedContainers = new Set(await discoveryGate());
+  const suppressedContainers = new Set(
+    await discoveryGate(containers.map((container) => container.path))
+  );
   const plugins: AgentPluginInfo[] = [];
   const diagnostics: AgentPluginDiagnostic[] = [];
 

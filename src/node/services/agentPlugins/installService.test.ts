@@ -8,7 +8,11 @@ import { Config } from "@/node/config";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import { execFileAsync } from "@/node/utils/disposableExec";
-import { discoverAgentPlugins } from "./discovery";
+import {
+  discoverAgentPlugins,
+  journalDerivedDiscoveryGate,
+  setAgentPluginDiscoveryGate,
+} from "./discovery";
 import { AgentPluginInstallService, withDiskQuotaWatchdog } from "./installService";
 import {
   AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
@@ -1025,11 +1029,136 @@ describe("AgentPluginInstallService", () => {
       (JSON.parse(await fsPromises.readFile(journalPath, "utf8")) as { trashDir: string }).trashDir
     ).toBe(trashDir);
 
+    // Update is a third same-name mutation path and must refuse too: a
+    // skills-only plugin has an empty capability surface, so the missing
+    // target would not stop it — it would promote a replacement that
+    // permanently deadlocks uninstall recovery on the occupied target.
+    await writePluginFixture(remoteDir, { version: "3.0.0" });
+    await commitAll(remoteDir, "upstream moved during unresolved uninstall");
+    await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(/unfinished cleanup/);
+
     // Recovery restores the tree; the uninstall then proceeds normally.
     await service.list();
     expect(await pathExists(targetPath)).toBe(true);
     await service.uninstall({ name: "demo-plugin", deletePluginData: false });
     expect(await registry()).toEqual([]);
+  });
+
+  test("install rollback retains the journal when the tree cannot be removed or quarantined", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    const targetPath = path.join(pluginsDir(), "demo-plugin");
+
+    // Registry write fails AND the promoted tree can be neither deleted nor
+    // renamed into staging (e.g. a lock held by an external process): the
+    // journal must SURVIVE as the recovery record — consuming it would leave
+    // a discoverable unmanaged orphan that permanently blocks reinstalls.
+    const internals = service as unknown as {
+      writeRegistry: (envelope: Record<string, unknown>, entries: unknown[]) => Promise<void>;
+      removeDir: (dir: string) => Promise<void>;
+    };
+    const realRemoveDir = internals.removeDir.bind(internals);
+    const writeSpy = spyOn(internals, "writeRegistry").mockImplementationOnce(() =>
+      Promise.reject(new Error("ENOSPC: no space left on device"))
+    );
+    const removeSpy = spyOn(internals, "removeDir").mockImplementation((dir: string) =>
+      dir === targetPath ? Promise.reject(new Error("EBUSY: resource busy")) : realRemoveDir(dir)
+    );
+    const realRename = fsPromises.rename;
+    const renameSpy = spyOn(fsPromises, "rename").mockImplementation((from, to) => {
+      if (String(from) === targetPath && String(to).includes("trash-")) {
+        return Promise.reject(new Error("EBUSY: resource busy"));
+      }
+      return realRename(from, to);
+    });
+    try {
+      await expect(
+        service.install({ source: preview.source, expectedSha: preview.lockedSha })
+      ).rejects.toThrow(/cleaned up automatically/);
+    } finally {
+      writeSpy.mockRestore();
+      removeSpy.mockRestore();
+      renameSpy.mockRestore();
+    }
+
+    // Journal retained, tree still present (with its marker), and the
+    // discovery gate is closed IMMEDIATELY — not just after the next
+    // reconciliation run.
+    const journalPath = path.join(stagingDir(), "promotion-demo-plugin.json");
+    expect(await pathExists(journalPath)).toBe(true);
+    expect(await pathExists(targetPath)).toBe(true);
+    const suppressed = await discoverAgentPlugins([{ path: pluginsDir(), scope: "global" }]);
+    expect(suppressed.plugins).toEqual([]);
+
+    // Once the lock clears, reconciliation identifies the orphan by nonce,
+    // quarantines it, and the name becomes reinstallable.
+    await service.list();
+    expect(await pathExists(journalPath)).toBe(false);
+    expect(await pathExists(targetPath)).toBe(false);
+    const entry = await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    expect(entry.name).toBe("demo-plugin");
+  });
+
+  test("an unenumerable staging root keeps the discovery gate closed", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    // The staging root EXISTS but cannot be read (transient I/O/permissions):
+    // "cannot tell whether journals exist" must fail closed — an orphaned or
+    // half-swapped tree may still have a journal in there.
+    const realReaddir = fsPromises.readdir.bind(fsPromises) as (
+      ...args: unknown[]
+    ) => Promise<unknown>;
+    const readdirSpy = spyOn(fsPromises, "readdir").mockImplementation(((...args: unknown[]) => {
+      if (String(args[0]) === stagingDir()) {
+        return Promise.reject(new Error("EIO: input/output error"));
+      }
+      return realReaddir(...args);
+    }) as typeof fsPromises.readdir);
+    try {
+      const freshService = new AgentPluginInstallService(config, { isEnabled: () => true });
+      await (freshService as unknown as { reconciliationState: Promise<boolean> })
+        .reconciliationState;
+      const suppressed = await discoverAgentPlugins([{ path: pluginsDir(), scope: "global" }]);
+      expect(suppressed.plugins).toEqual([]);
+      expect(
+        suppressed.diagnostics.some((diagnostic) => diagnostic.message.includes("crash recovery"))
+      ).toBe(true);
+    } finally {
+      readdirSpy.mockRestore();
+    }
+  });
+
+  test("headless processes suppress journaled containers via the default gate", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    // A desktop crash left an update journal; a separate headless process
+    // (`mux workflow` resolving plugin:// scripts) never constructs
+    // AgentPluginInstallService, so the DEFAULT gate must derive suppression
+    // from the journal file in the container's sibling staging root.
+    await fsPromises.mkdir(stagingDir(), { recursive: true });
+    const journalPath = path.join(stagingDir(), "update-demo-plugin.json");
+    await fsPromises.writeFile(
+      journalPath,
+      JSON.stringify({ name: "demo-plugin", stagedAt: Date.now() })
+    );
+    setAgentPluginDiscoveryGate(journalDerivedDiscoveryGate);
+    try {
+      const suppressed = await discoverAgentPlugins([{ path: pluginsDir(), scope: "global" }]);
+      expect(suppressed.plugins).toEqual([]);
+      expect(
+        suppressed.diagnostics.some((diagnostic) => diagnostic.message.includes("crash recovery"))
+      ).toBe(true);
+
+      // Without journals the default gate suppresses nothing.
+      await fsPromises.rm(journalPath);
+      const reopened = await discoverAgentPlugins([{ path: pluginsDir(), scope: "global" }]);
+      expect(reopened.plugins.map((plugin) => plugin.dirName)).toEqual(["demo-plugin"]);
+    } finally {
+      // The next test's beforeEach constructs a fresh service, which
+      // re-installs the health-tracked gate.
+      setAgentPluginDiscoveryGate(journalDerivedDiscoveryGate);
+    }
   });
 
   test("update recovery keeps the tree marker when the journal cannot be deleted", async () => {
