@@ -14,6 +14,7 @@
 
 import assert from "node:assert";
 import crypto from "node:crypto";
+import * as fs from "fs/promises";
 import * as path from "path";
 import {
   DurableEventSchema,
@@ -23,11 +24,23 @@ import {
   type DurableEventDraft,
 } from "@/common/types/durableEvent";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import { Journal } from "./journal";
 import { BlobStore } from "./blobStore";
 
 export const DURABLE_EVENTS_FILE_NAME = "durable-events.jsonl";
 export const BLOBS_DIR_NAME = "blobs";
+export const BLOB_LOCK_FILE_NAME = "blobs.lock";
+
+/**
+ * Bound on waiting for the cross-process blob lock. Holders include
+ * once-per-process recovery sweeps (journal read + per-blob stats), so this
+ * is more generous than the append lock's 5s; hitting it means another
+ * process is wedged, and failing the operation (all blob-lock consumers are
+ * best-effort or self-healing) beats deciding reclamation from an
+ * unserialized view.
+ */
+const BLOB_LOCK_TIMEOUT_MS = 10_000;
 
 /**
  * Process-wide journal registry keyed by resolved session dir. Multiple
@@ -93,7 +106,10 @@ export class DurableEventJournal {
   private readonly journal: Journal<DurableEvent>;
   /** Blob store for content-addressed payloads referenced from rows. */
   public readonly blobs: BlobStore;
-  /** Serializes blob publication (put+append) against blob reclamation. */
+  private readonly journalFilePath: string;
+  private readonly blobLockPath: string;
+  /** In-process leg of the blob lock (fairness + reentrancy assertions);
+   * the cross-process leg is the blobs.lock file (see withBlobLock). */
   private readonly blobLock = new AsyncMutex();
   /**
    * Lazily built blob-mention index (see indexBlobMentions), maintained
@@ -102,20 +118,46 @@ export class DurableEventJournal {
    * bounded by journal size; rows are never removed, so it only grows.
    */
   private blobMentions: Map<BlobRef, BlobMentions> | null = null;
+  /**
+   * Journal file size up to which blobMentions is verifiably complete; null
+   * while no index exists. Our own appends advance it contiguously (see the
+   * onAppended hook); a stat mismatch at blobMentionIndex() means a FOREIGN
+   * instance/process appended rows we never indexed, forcing a rebuild —
+   * without this, a reclamation pass could delete a blob whose referencing
+   * row was appended by the debug CLI after our index was built.
+   */
+  private mentionSyncSize: number | null = null;
 
   constructor(sessionDir: string) {
+    this.journalFilePath = path.join(sessionDir, DURABLE_EVENTS_FILE_NAME);
+    this.blobLockPath = path.join(sessionDir, BLOB_LOCK_FILE_NAME);
     this.journal = new Journal<DurableEvent>({
-      filePath: path.join(sessionDir, DURABLE_EVENTS_FILE_NAME),
+      filePath: this.journalFilePath,
       schema: DurableEventSchema,
       getSeq: (row) => row.seq,
       getId: (row) => row.id,
+      onAppended: (row, sizes) => {
+        // Keep the lazily-built blob-mention index current (see
+        // blobMentionIndex). Runs synchronously inside the append's exclusive
+        // section so the index can never expose an appended-but-unindexed row.
+        if (this.blobMentions === null) return;
+        indexBlobMentions(this.blobMentions, row);
+        // Advance the freshness watermark only when this append extended the
+        // exact file state we had indexed; any gap (foreign bytes) leaves the
+        // watermark behind so the next blobMentionIndex() stat forces a
+        // rebuild. A mid-rebuild append leaves mentionSyncSize null and is
+        // covered by the rebuild's own read + this idempotent indexing.
+        if (this.mentionSyncSize !== null && this.mentionSyncSize === sizes.preAppendFileSize) {
+          this.mentionSyncSize = sizes.postAppendFileSize;
+        }
+      },
     });
     this.blobs = new BlobStore(path.join(sessionDir, BLOBS_DIR_NAME));
   }
 
   /** Append a draft; the journal assigns v/seq/ts (and id unless provided). */
   async append(draft: DurableEventDraft): Promise<DurableEvent> {
-    const row = await this.journal.append((seq) => {
+    return await this.journal.append((seq) => {
       const built = {
         ...draft,
         v: DURABLE_EVENT_VERSION,
@@ -127,11 +169,6 @@ export class DurableEventJournal {
       // discriminated union; the journal schema-validates the row on append.
       return built as DurableEvent;
     });
-    // Keep the lazily-built blob-mention index current (see blobMentionIndex).
-    if (this.blobMentions !== null) {
-      indexBlobMentions(this.blobMentions, row);
-    }
-    return row;
   }
 
   /** Read all events (self-healed: malformed/duplicate rows dropped, seq order). */
@@ -148,9 +185,23 @@ export class DurableEventJournal {
    * about to be appended. Reclamation passes hold the same lock across their
    * whole decide→delete window. Non-reentrant: do not nest (including
    * publishWithBlob, which takes the lock itself).
+   *
+   * Two-level like the journal's append serialization: the in-process mutex
+   * orders callers on this instance cheaply, and a cross-process lockfile
+   * (blobs.lock, same protocol as the append lock) excludes OTHER journal
+   * instances — the debug rollback CLI publishes inverse blobs from its own
+   * process, and without the file lock the live app's reclamation could
+   * observe (and delete inside) that publisher's put→append window.
+   * Lock order is blob → append (fn's appends take the append lock);
+   * nothing acquires them in the opposite order, so no deadlock.
    */
   async withBlobLock<T>(fn: () => Promise<T>): Promise<T> {
-    await using _lock = await this.blobLock.acquire();
+    await using _mutex = await this.blobLock.acquire();
+    await using _fileLock = await acquireProcessFileLock({
+      lockPath: this.blobLockPath,
+      timeoutMs: BLOB_LOCK_TIMEOUT_MS,
+      label: "blob lock",
+    });
     return await fn();
   }
 
@@ -171,24 +222,45 @@ export class DurableEventJournal {
 
   /**
    * Blob-mention index for reclamation decisions. Callers MUST hold the blob
-   * lock: the first call builds the index from a full read, and decisions on
-   * it are only race-free while publishers are excluded. Correctness also
-   * relies on all live writers sharing this instance (see sharedJournals):
-   * appends through a second instance would bypass the incremental index
-   * maintenance in append().
+   * lock: decisions on the index are only race-free while publishers are
+   * excluded. Freshness is verified against the journal file size
+   * (mentionSyncSize): our own appends advance the watermark incrementally,
+   * while foreign appends (a second in-process instance, or the debug CLI in
+   * another process) leave a size gap that forces a rebuild here — foreign
+   * publishers hold the cross-process blob lock, so their rows are fully
+   * appended (and thus visible to the rebuild's read) before we run.
    */
   async blobMentionIndex(): Promise<ReadonlyMap<BlobRef, BlobMentions>> {
     assert(this.blobLock.isLocked, "blobMentionIndex requires holding withBlobLock");
-    if (this.blobMentions === null) {
-      // Install the map BEFORE the read: appends that interleave with the
-      // read index themselves into it, and set semantics make the potential
-      // double-indexing of one row idempotent.
-      const index = new Map<BlobRef, BlobMentions>();
-      this.blobMentions = index;
-      for (const event of await this.read()) {
-        indexBlobMentions(index, event);
-      }
+    const fileSize = await this.journalFileSize();
+    if (this.blobMentions !== null && this.mentionSyncSize === fileSize) {
+      return this.blobMentions;
     }
-    return this.blobMentions;
+    // Install the map BEFORE the read: own appends that interleave with the
+    // read index themselves into it (see onAppended), and set semantics make
+    // the potential double-indexing of one row idempotent. The watermark is
+    // set only AFTER the read completes so an interleaved own append (whose
+    // watermark advance sees null and skips) triggers at most a harmless
+    // extra rebuild, never a stale-marked-fresh index.
+    const index = new Map<BlobRef, BlobMentions>();
+    this.blobMentions = index;
+    this.mentionSyncSize = null;
+    for (const event of await this.read()) {
+      indexBlobMentions(index, event);
+    }
+    this.mentionSyncSize = await this.journalFileSize();
+    return index;
+  }
+
+  /** Journal file size in bytes; 0 when the file does not exist yet. */
+  private async journalFileSize(): Promise<number> {
+    try {
+      return (await fs.stat(this.journalFilePath)).size;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return 0;
+      }
+      throw error;
+    }
   }
 }
