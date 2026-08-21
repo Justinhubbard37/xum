@@ -4,7 +4,11 @@ import * as path from "node:path";
 import { z } from "zod";
 import type { Tool } from "ai";
 
-import { applyToolPolicyAndExperiments, reconcileHookReplacedCodeExecution } from "./toolAssembly";
+import {
+  applyToolPolicyAndExperiments,
+  reconcileHookReplacedCodeExecution,
+  resolveBackendGatedPtcExperiments,
+} from "./toolAssembly";
 import { buildToolsetManifest } from "./turnEnvelope";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import { DisposableTempDir } from "@/node/services/tempDir";
@@ -479,5 +483,41 @@ describe("reconcileHookReplacedCodeExecution", () => {
 
     // Middleware took ownership of the model-facing contract; return it as-is.
     expect(result).toBe(hookReplacement);
+  });
+});
+
+describe("resolveBackendGatedPtcExperiments", () => {
+  const backendEnabled = new Set(["rlm-mode", "programmatic-tool-calling"]);
+  const isEnabled = (id: string) => backendEnabled.has(id);
+
+  test("backfills undefined flags from the backend override", () => {
+    // A renderer with no origin-local override sends undefined; the persisted
+    // backend override must win or tool assembly diverges from the effective
+    // UI / refine gate.
+    const resolved = resolveBackendGatedPtcExperiments(undefined, isEnabled);
+    expect(resolved.rlm).toBe(true);
+    expect(resolved.programmaticToolCalling).toBe(true);
+    expect(resolved.programmaticToolCallingExclusive).toBe(false);
+  });
+
+  test("explicit renderer values (true or false) win over the backend", () => {
+    // Widened annotation: literal inference would freeze T's fields to the
+    // exact literals and defeat the assertions below.
+    const flags: {
+      programmaticToolCalling?: boolean;
+      programmaticToolCallingExclusive?: boolean;
+      rlm?: boolean;
+    } = { rlm: false, programmaticToolCallingExclusive: true };
+    const resolved = resolveBackendGatedPtcExperiments(flags, isEnabled);
+    // Explicit false is NOT backfilled to the backend's true.
+    expect(resolved.rlm).toBe(false);
+    expect(resolved.programmaticToolCallingExclusive).toBe(true);
+    // Undefined still backfills.
+    expect(resolved.programmaticToolCalling).toBe(true);
+  });
+
+  test("preserves unrelated experiment flags untouched", () => {
+    const resolved = resolveBackendGatedPtcExperiments({ memory: true } as never, isEnabled);
+    expect((resolved as { memory?: boolean }).memory).toBe(true);
   });
 });

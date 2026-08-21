@@ -125,11 +125,26 @@ function renderCompletedReportsIndexWithBudget(
 }
 
 /**
+ * SECURITY AUDIT: serialize a repo-controlled path as explicitly untrusted
+ * data before it is embedded in a synthetic <system-update> block. Legal Unix
+ * paths can contain newlines and the characters needed to spell a closing
+ * </system-update> tag, so a crafted filename read by the agent could
+ * otherwise break out of the block and inject attacker text as instructions.
+ * JSON.stringify escapes control characters (no raw newlines survive) and the
+ * additional \u003c escape removes every literal "<", making tag injection
+ * impossible while keeping ordinary paths readable (just quoted).
+ */
+function serializeUntrustedPath(path: string): string {
+  return JSON.stringify(path).replace(/</g, "\\u003c");
+}
+
+/**
  * Render the RLM read-files list compactly: paths only (newest-first), so the
  * model knows which files it has already seen without re-reading them.
  */
 function renderReadFilesReference(attachment: ReadFilesReferenceAttachment): string {
-  return `Files previously read (contents summarized away; re-read only if needed): ${attachment.paths.join(", ")}`;
+  const serialized = attachment.paths.map(serializeUntrustedPath);
+  return `Files previously read (contents summarized away; re-read only if needed): ${serialized.join(", ")}`;
 }
 
 /**

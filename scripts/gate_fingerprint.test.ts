@@ -5,7 +5,7 @@
 // Not part of the `bun test src` CI lane (like other scripts/ tooling tests);
 // run explicitly: bun test ./scripts/gate_fingerprint.test.ts
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile, appendFile } from "node:fs/promises";
+import { appendFile, chmod, mkdtemp, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 
@@ -159,8 +159,6 @@ test("check misses after staging a change", async () => {
 });
 
 test("check misses when an untracked file's executable bit or symlink target changes", async () => {
-  const { chmod, symlink, unlink } = await import("node:fs/promises");
-
   // Executable bit: builds/tests can execute the file differently, so a
   // chmod alone must invalidate the recorded gate.
   const scriptPath = path.join(repo, "run.sh");

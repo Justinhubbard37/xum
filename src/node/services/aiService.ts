@@ -187,6 +187,7 @@ import {
   applyToolPolicyAndExperiments,
   captureMcpToolTelemetry,
   reconcileHookReplacedCodeExecution,
+  resolveBackendGatedPtcExperiments,
   retargetCodeExecution,
 } from "./toolAssembly";
 import {
@@ -1409,7 +1410,7 @@ export class AIService extends EventEmitter {
       recordFileState,
       postCompactionAttachments,
       resolveMemoryContext,
-      experiments,
+      experiments: experimentsFromOptions,
       allowAgentSetGoal,
       workspaceGoalService,
       disableWorkspaceAgents,
@@ -1419,6 +1420,17 @@ export class AIService extends EventEmitter {
       minThinkingLevel: providedMinThinkingLevel,
       activeTurnThinkingOverride,
     } = opts;
+    // Backfill the PTC/RLM trio from the backend's persisted experiment
+    // overrides (same `?? isExperimentEnabled` pattern as the other
+    // backend-gated experiments below). A renderer with no origin-local
+    // override sends `undefined` for these flags, and the effective UI and
+    // /refine gate already resolve against the backend override — tool
+    // assembly must agree or a persisted-RLM workspace silently streams with
+    // the non-persistent flat/PTC toolset. Explicit false stays false.
+    const experiments: StreamMessageOptions["experiments"] = resolveBackendGatedPtcExperiments(
+      experimentsFromOptions,
+      (experimentId) => this.experimentsService?.isExperimentEnabled(experimentId) === true
+    );
     // Support interrupts during startup (before StreamManager emits stream-start).
     // We register an AbortController up-front and let stopStream() abort it.
     const pendingAbortController = new AbortController();

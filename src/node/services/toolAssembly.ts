@@ -11,6 +11,7 @@
 
 import type { Tool } from "ai";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
+import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 
 import { applyToolPolicy, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { applyCapabilityGrants } from "@/common/utils/tools/capabilityGrants";
@@ -157,6 +158,33 @@ export interface ApplyToolPolicyAndExperimentsOptions {
 /** Env opt-in for persistent code_execution mounts (dogfooding/Track 2). */
 export function persistentSandboxMountsEnabled(): boolean {
   return resolveXumEnvironmentValue("SANDBOX_PERSISTENT_MOUNTS", process.env) === "1";
+}
+
+/**
+ * Backfill the PTC/RLM experiment trio from the backend's persisted overrides
+ * (same `?? isExperimentEnabled` pattern as other backend-gated experiments in
+ * streamMessage). A renderer with no origin-local override sends `undefined`
+ * for these flags while the effective UI and /refine gate resolve against the
+ * backend override — tool assembly must agree or a persisted-RLM workspace
+ * silently streams with the non-persistent flat/PTC toolset. Explicit
+ * renderer values (true or false) always win over the backend fallback.
+ */
+export function resolveBackendGatedPtcExperiments<
+  T extends NonNullable<ApplyToolPolicyAndExperimentsOptions["experiments"]>,
+>(experiments: T | undefined, isExperimentEnabled: (experimentId: ExperimentId) => boolean): T {
+  // Targeted cast: TypeScript cannot type a spread-with-override against a
+  // generic T, but the override only fills the three optional boolean PTC
+  // fields T declares, so the result is structurally a T.
+  return {
+    ...experiments,
+    programmaticToolCalling:
+      experiments?.programmaticToolCalling ??
+      isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING),
+    programmaticToolCallingExclusive:
+      experiments?.programmaticToolCallingExclusive ??
+      isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE),
+    rlm: experiments?.rlm ?? isExperimentEnabled(EXPERIMENT_IDS.RLM),
+  } as T;
 }
 
 /**
