@@ -131,6 +131,10 @@ interface RefinementReclamationState {
   /** Inverse payloads currently retained under the quota, newest first;
    * null until the recovery sweep. */
   retainedInverseBlobs: BlobQuotaEntry[] | null;
+  /** journal.blobIndexEpoch the list was derived at: foreign appends (debug
+   * CLI rollback rows) move the epoch, and a stale list must be re-derived
+   * from the journal before it may authorize releases (round 14). */
+  retainedEpoch: number;
 }
 
 const reclamationStates = new WeakMap<DurableEventJournal, RefinementReclamationState>();
@@ -154,12 +158,16 @@ export async function reclaimExcessRefinementInverseBlobs(
   await journal.withBlobLock(async () => {
     let state = reclamationStates.get(journal);
     if (!state) {
-      state = { retainedInverseBlobs: null };
+      state = { retainedInverseBlobs: null, retainedEpoch: -1 };
       reclamationStates.set(journal, state);
     }
     const index = await journal.blobMentionIndex();
+    // Epoch check AFTER blobMentionIndex(): that call detects foreign
+    // appends. A retained list from an older epoch may miss rollback rows a
+    // foreign CLI appended and must be re-derived from the journal.
+    const epoch = journal.blobIndexEpoch;
     let entries: BlobQuotaEntry[];
-    if (state.retainedInverseBlobs !== null) {
+    if (state.retainedInverseBlobs !== null && state.retainedEpoch === epoch) {
       entries = [...published, ...state.retainedInverseBlobs];
     } else {
       // Recovery sweep: walk refinement rows newest-first and re-derive the
@@ -184,6 +192,7 @@ export async function reclaimExcessRefinementInverseBlobs(
     }
     const { retained, evictable } = walkBlobQuota(entries, REFINEMENT_INVERSE_BLOB_QUOTA_BYTES);
     state.retainedInverseBlobs = retained;
+    state.retainedEpoch = epoch;
     // Publish BEFORE deleting so joint retention decisions (ours and other
     // quotas') always see this pass's eviction verdicts.
     publishQuotaRetention(journal, "refinement", new Set(retained.map((entry) => entry.ref)));

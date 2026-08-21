@@ -82,6 +82,10 @@ interface JournalReclamationState {
   /** Handle payloads currently retained under the quota, newest first
    * (bounded by quota/offload-threshold); null until the recovery sweep. */
   retainedHandles: BlobQuotaEntry[] | null;
+  /** journal.blobIndexEpoch retainedHandles was derived at: foreign appends
+   * (debug CLI) move the epoch, and a stale list must be re-derived from the
+   * journal before it may authorize releases (round 14). */
+  retainedHandlesEpoch: number;
 }
 
 const reclamationStates = new WeakMap<DurableEventJournal, JournalReclamationState>();
@@ -89,7 +93,7 @@ const reclamationStates = new WeakMap<DurableEventJournal, JournalReclamationSta
 function reclamationStateFor(journal: DurableEventJournal): JournalReclamationState {
   let state = reclamationStates.get(journal);
   if (!state) {
-    state = { latestSnapshotRef: new Map(), retainedHandles: null };
+    state = { latestSnapshotRef: new Map(), retainedHandles: null, retainedHandlesEpoch: -1 };
     reclamationStates.set(journal, state);
   }
   return state;
@@ -166,13 +170,22 @@ export async function reclaimExcessResultHandleBlobs(
   await journal.withBlobLock(async () => {
     const state = reclamationStateFor(journal);
     const index = await journal.blobMentionIndex();
+    // Epoch check AFTER blobMentionIndex(): that call detects foreign
+    // appends. A retained list from an older epoch may miss rows a foreign
+    // process (debug CLI) appended and must be re-derived from the journal.
+    const epoch = journal.blobIndexEpoch;
     let entries: BlobQuotaEntry[];
-    if (state.retainedHandles !== null && published !== undefined) {
+    if (
+      state.retainedHandles !== null &&
+      published !== undefined &&
+      state.retainedHandlesEpoch === epoch
+    ) {
       entries = [published, ...state.retainedHandles];
     } else {
       // Recovery sweep: replay every result-handle row newest-first. Rows
       // whose payloads were already reclaimed re-enter the walk, but their
-      // deletions are idempotent no-ops and this runs once per process.
+      // deletions are idempotent no-ops and this runs once per process (or
+      // per detected foreign append).
       const events = await journal.read();
       entries = [];
       for (let i = events.length - 1; i >= 0; i--) {
@@ -183,6 +196,7 @@ export async function reclaimExcessResultHandleBlobs(
     }
     const { retained, evictable } = walkBlobQuota(entries, RESULT_HANDLE_BLOB_QUOTA_BYTES);
     state.retainedHandles = retained;
+    state.retainedHandlesEpoch = epoch;
     // Publish BEFORE deleting so joint retention decisions (ours and other
     // quotas') always see this pass's eviction verdicts.
     publishQuotaRetention(journal, "result-handle", new Set(retained.map((entry) => entry.ref)));

@@ -36,10 +36,25 @@ export type QuotaKind = "result-handle" | "refinement";
  * retainer releases the hash last. A kind whose quota has not run this
  * process has no registry entry and retains conservatively (heals on its
  * next pass or the next process's recovery sweep).
+ *
+ * Entries are stamped with the journal's blob-index epoch (round 14): a
+ * foreign process (debug CLI rollback) can append a row that newly RETAINS a
+ * hash after a set was published, so a set from an older epoch proves
+ * nothing about the current journal and is treated as absent (conservative
+ * retain) until that quota's next pass re-derives from the journal.
  */
-const quotaRetention = new WeakMap<DurableEventJournal, Map<QuotaKind, ReadonlySet<BlobRef>>>();
+interface QuotaRetentionEntry {
+  refs: ReadonlySet<BlobRef>;
+  /** journal.blobIndexEpoch at publish time. */
+  epoch: number;
+}
 
-/** Record the refs a quota's latest pass retained (call BEFORE deleting). */
+const quotaRetention = new WeakMap<DurableEventJournal, Map<QuotaKind, QuotaRetentionEntry>>();
+
+/**
+ * Record the refs a quota's latest pass retained (call BEFORE deleting, and
+ * only after blobMentionIndex() in the same pass so the epoch is current).
+ */
 export function publishQuotaRetention(
   journal: DurableEventJournal,
   kind: QuotaKind,
@@ -50,7 +65,7 @@ export function publishQuotaRetention(
     registry = new Map();
     quotaRetention.set(journal, registry);
   }
-  registry.set(kind, retained);
+  registry.set(kind, { refs: retained, epoch: journal.blobIndexEpoch });
 }
 
 /**
@@ -91,7 +106,8 @@ export function makeSnapshotLatestResolver(
  *   so a guest cannot mint unbounded unique envelope-mentioned hashes);
  * - quota kinds (result-handle, refinement) release a hash once their pass
  *   no longer retains it (see publishQuotaRetention); a quota that never ran
- *   this process retains conservatively;
+ *   this process — or whose set predates the current blob-index epoch and so
+ *   cannot know about foreign appends — retains conservatively;
  * - snapshot mentions release once the hash is no longer the LATEST snapshot
  *   of any mentioning scope (superseded payloads are pure disk growth).
  * Callers must hold the journal blob lock and must have published their own
@@ -115,8 +131,10 @@ export async function canDeleteEvictedBlob(args: {
         return false;
       case "result-handle":
       case "refinement": {
-        const retained = quotaRetention.get(journal)?.get(kind);
-        if (retained === undefined || retained.has(ref)) return false;
+        const entry = quotaRetention.get(journal)?.get(kind);
+        if (entry === undefined || entry.epoch !== journal.blobIndexEpoch || entry.refs.has(ref)) {
+          return false;
+        }
         break;
       }
       case "sandbox-vars-snapshot": {

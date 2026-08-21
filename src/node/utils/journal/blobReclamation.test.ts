@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import crypto from "node:crypto";
+import * as fs from "fs/promises";
+import * as path from "path";
 import type { BlobRef } from "@/common/types/durableEvent";
 import { RESULT_HANDLE_BLOB_QUOTA_BYTES } from "@/constants/resultHandles";
 import { REFINEMENT_INVERSE_BLOB_QUOTA_BYTES } from "@/common/types/refinement";
@@ -116,6 +119,93 @@ describe("cross-quota blob reclamation (joint retention)", () => {
     await reclaimSupersededSnapshotBlobs(journal, "ws-snap", newer);
     expect(await journal.blobs.has(snapRef)).toBe(false);
     expect(await journal.blobs.has(newer)).toBe(true);
+  });
+
+  test("a foreign refinement append re-arms cross-quota retention before a release decision", async () => {
+    using tmp = new DisposableTempDir("blob-reclamation-test");
+    const journal = new DurableEventJournal(tmp.path);
+    // Both quotas have run: registry entries exist for both kinds.
+    await reclaimExcessRefinementInverseBlobs(journal, []);
+    const shared = await publishHandleRow(journal, "foreign-shared", 1_000);
+    await reclaimExcessResultHandleBlobs(journal);
+    expect(await journal.blobs.has(shared)).toBe(true);
+
+    // FOREIGN append (r14): the debug rollback CLI, in another process,
+    // journals a refinement row retaining the same hash (content addressing —
+    // the blob already exists). Written directly to the journal file, as a
+    // foreign journal instance would; this process's registry entries and
+    // retained lists know nothing about it.
+    const foreignRow = {
+      v: 1,
+      seq: 100,
+      id: crypto.randomUUID(),
+      ts: Date.now(),
+      workspaceId: "ws-joint",
+      kind: "refinement",
+      data: {
+        kind: "memory",
+        action: { op: "str_replace", path: "/memories/global/notes.md" },
+        inverse: { op: "restore-files", files: [{ path: "/m/notes.md", blobRef: shared }] },
+        evidence: { workspaceId: "ws-joint", toolName: "cli-rollback" },
+      },
+    };
+    await fs.appendFile(
+      path.join(tmp.path, "durable-events.jsonl"),
+      `${JSON.stringify(foreignRow)}\n`,
+      "utf-8"
+    );
+
+    // The app's next handle pass evicts the hash from ITS quota. The stale
+    // process-local refinement retention set (published before the foreign
+    // append) must not authorize deleting the rollback payload.
+    const big = await publishHandleRow(journal, "big-evictor", RESULT_HANDLE_BLOB_QUOTA_BYTES);
+    await reclaimExcessResultHandleBlobs(journal, {
+      ref: big,
+      size: RESULT_HANDLE_BLOB_QUOTA_BYTES,
+    });
+    expect(await journal.blobs.has(shared)).toBe(true);
+  });
+
+  test("after a foreign append the refinement quota re-derives its retained set from the journal", async () => {
+    using tmp = new DisposableTempDir("blob-reclamation-test");
+    const journal = new DurableEventJournal(tmp.path);
+    await reclaimExcessRefinementInverseBlobs(journal, []);
+    const shared = await publishHandleRow(journal, "resweep-shared", 1_000);
+    await reclaimExcessResultHandleBlobs(journal);
+
+    const foreignRow = {
+      v: 1,
+      seq: 100,
+      id: crypto.randomUUID(),
+      ts: Date.now(),
+      workspaceId: "ws-joint",
+      kind: "refinement",
+      data: {
+        kind: "memory",
+        action: { op: "str_replace", path: "/memories/global/notes.md" },
+        inverse: { op: "restore-files", files: [{ path: "/m/notes.md", blobRef: shared }] },
+        evidence: { workspaceId: "ws-joint", toolName: "cli-rollback" },
+      },
+    };
+    await fs.appendFile(
+      path.join(tmp.path, "durable-events.jsonl"),
+      `${JSON.stringify(foreignRow)}\n`,
+      "utf-8"
+    );
+
+    // The refinement pass runs AFTER the foreign append: an incremental pass
+    // over the process-local retained list would republish a fresh set that
+    // still misses the foreign payload — it must re-derive from the journal.
+    await reclaimExcessRefinementInverseBlobs(journal, []);
+
+    // A subsequent handle eviction consults the re-derived refinement set:
+    // the foreign rollback payload stays retained.
+    const big = await publishHandleRow(journal, "big-evictor-2", RESULT_HANDLE_BLOB_QUOTA_BYTES);
+    await reclaimExcessResultHandleBlobs(journal, {
+      ref: big,
+      size: RESULT_HANDLE_BLOB_QUOTA_BYTES,
+    });
+    expect(await journal.blobs.has(shared)).toBe(true);
   });
 
   test("a turn-envelope mention retains a hash permanently (replay purity)", async () => {

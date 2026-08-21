@@ -131,6 +131,15 @@ export class DurableEventJournal {
    * row was appended by the debug CLI after our index was built.
    */
   private mentionSyncSize: number | null = null;
+  /**
+   * Bumped on every mention-index (re)build — i.e. whenever foreign appends
+   * were detected (or on the first build). Derived reclamation caches
+   * (per-quota retained sets, incremental retained lists) record the epoch
+   * they were computed at and must re-derive from the journal when it moved:
+   * a foreign process (debug CLI rollback) can append rows that RETAIN a
+   * hash this process's caches believe released (round 14).
+   */
+  private mentionEpoch = 0;
 
   constructor(sessionDir: string) {
     this.journalFilePath = path.join(sessionDir, DURABLE_EVENTS_FILE_NAME);
@@ -278,6 +287,9 @@ export class DurableEventJournal {
     if (this.blobMentions !== null && this.mentionSyncSize === fileSize) {
       return this.blobMentions;
     }
+    // Foreign rows entered the journal (or this is the first build): move the
+    // epoch so derived reclamation caches re-derive before releasing blobs.
+    this.mentionEpoch += 1;
     // Install the map BEFORE the read: own appends that interleave with the
     // read index themselves into it (see onAppended), and set semantics make
     // the potential double-indexing of one row idempotent. The watermark is
@@ -292,6 +304,15 @@ export class DurableEventJournal {
     }
     this.mentionSyncSize = await this.journalFileSize();
     return index;
+  }
+
+  /**
+   * Epoch of the current blob-mention index (see mentionEpoch). Meaningful
+   * only under the blob lock AFTER calling blobMentionIndex() in the same
+   * pass — that call is what detects foreign appends and moves the epoch.
+   */
+  get blobIndexEpoch(): number {
+    return this.mentionEpoch;
   }
 
   /** Journal file size in bytes; 0 when the file does not exist yet. */
