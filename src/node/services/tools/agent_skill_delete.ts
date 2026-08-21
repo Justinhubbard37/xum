@@ -3,6 +3,11 @@ import * as path from "path";
 import { tool } from "ai";
 
 import { SkillNameSchema } from "@/common/orpc/schemas";
+import {
+  REFINEMENT_CAPTURE_MAX_FILE_BYTES,
+  REFINEMENT_CAPTURE_MAX_FILES,
+  REFINEMENT_CAPTURE_MAX_TOTAL_BYTES,
+} from "@/common/types/refinement";
 import type { AgentSkillDeleteToolResult } from "@/common/types/tools";
 import { getErrorMessage } from "@/common/utils/errors";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
@@ -34,15 +39,45 @@ interface AgentSkillDeleteToolArgs {
   confirm: boolean;
 }
 
+/** Capture budget violation: skip journaling entirely (never a partial inverse). */
+class CaptureBudgetExceededError extends Error {}
+
+/**
+ * Enforce the inverse-capture budgets. `sizeBytes` is the file's on-disk size
+ * (checked BEFORE reading so an attacker-sized file is never buffered).
+ * Returns the new running total; throws when any budget is exceeded.
+ */
+function assertCaptureBudget(fileCount: number, sizeBytes: number, totalBytes: number): number {
+  if (fileCount >= REFINEMENT_CAPTURE_MAX_FILES) {
+    throw new CaptureBudgetExceededError(
+      `skill has more than ${REFINEMENT_CAPTURE_MAX_FILES} files`
+    );
+  }
+  if (sizeBytes > REFINEMENT_CAPTURE_MAX_FILE_BYTES) {
+    throw new CaptureBudgetExceededError(
+      `file exceeds ${REFINEMENT_CAPTURE_MAX_FILE_BYTES} bytes (${sizeBytes})`
+    );
+  }
+  const newTotal = totalBytes + sizeBytes;
+  if (newTotal > REFINEMENT_CAPTURE_MAX_TOTAL_BYTES) {
+    throw new CaptureBudgetExceededError(
+      `skill exceeds ${REFINEMENT_CAPTURE_MAX_TOTAL_BYTES} total bytes`
+    );
+  }
+  return newTotal;
+}
+
 /**
  * Capture every regular file under a local skill dir (refinement inverse for a
  * whole-skill delete). Contents are captured as UTF-8 text; symlinks are
  * skipped (the tool refuses symlink targets anyway). Returns null when capture
- * fails: the delete then proceeds unjournaled (log-only) rather than failing.
+ * fails or exceeds the capture budgets: the delete then proceeds unjournaled
+ * (log-only) rather than failing.
  */
 async function captureLocalSkillFiles(skillDir: string): Promise<RefinementFileCapture[] | null> {
   try {
     const captures: RefinementFileCapture[] = [];
+    let totalBytes = 0;
     const walk = async (dir: string): Promise<void> => {
       const entries = await fsPromises.readdir(dir, { withFileTypes: true });
       entries.sort((a, b) => (a.name < b.name ? -1 : 1));
@@ -51,6 +86,8 @@ async function captureLocalSkillFiles(skillDir: string): Promise<RefinementFileC
         if (entry.isDirectory()) {
           await walk(entryPath);
         } else if (entry.isFile()) {
+          const { size } = await fsPromises.stat(entryPath);
+          totalBytes = assertCaptureBudget(captures.length, size, totalBytes);
           captures.push({
             path: entryPath,
             content: await fsPromises.readFile(entryPath, "utf-8"),
@@ -61,6 +98,13 @@ async function captureLocalSkillFiles(skillDir: string): Promise<RefinementFileC
     await walk(skillDir);
     return captures;
   } catch (error) {
+    if (error instanceof CaptureBudgetExceededError) {
+      log.debug("[agent_skill_delete] skipping refinement inverse: capture budget exceeded", {
+        skillDir,
+        reason: error.message,
+      });
+      return null;
+    }
     log.debug("[agent_skill_delete] failed to capture skill files for refinement inverse", {
       skillDir,
       error,
@@ -97,12 +141,22 @@ async function captureRuntimeSkillFiles(
       .map((line) => line.replace(/^\.\//, ""))
       .sort();
     const captures: RefinementFileCapture[] = [];
+    let totalBytes = 0;
     for (const relPath of relPaths) {
       const runtimePath = runtime.normalizePath(relPath, skillDir);
+      const { size } = await runtime.stat(runtimePath);
+      totalBytes = assertCaptureBudget(captures.length, size, totalBytes);
       captures.push({ path: runtimePath, content: await readFileString(runtime, runtimePath) });
     }
     return captures;
   } catch (error) {
+    if (error instanceof CaptureBudgetExceededError) {
+      log.debug("[agent_skill_delete] skipping refinement inverse: capture budget exceeded", {
+        skillDir,
+        reason: error.message,
+      });
+      return null;
+    }
     log.debug("[agent_skill_delete] failed to capture skill files for refinement inverse", {
       skillDir,
       error,
@@ -255,13 +309,22 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
           }
 
           // Prior content must be captured before removal (refinement inverse).
-          // Null capture (e.g. unreadable file) skips journaling, never the delete.
+          // Null capture (e.g. unreadable or over-budget file) skips
+          // journaling, never the delete.
           let fileCapture: RefinementFileCapture | null = null;
           try {
-            fileCapture = {
-              path: resolvedPath,
-              content: await readFileString(config.runtime, resolvedPath),
-            };
+            const { size } = await config.runtime.stat(resolvedPath);
+            if (size > REFINEMENT_CAPTURE_MAX_FILE_BYTES) {
+              log.debug(
+                "[agent_skill_delete] skipping refinement inverse: capture budget exceeded",
+                { resolvedPath, size }
+              );
+            } else {
+              fileCapture = {
+                path: resolvedPath,
+                content: await readFileString(config.runtime, resolvedPath),
+              };
+            }
           } catch (error) {
             log.debug("[agent_skill_delete] failed to capture file for refinement inverse", {
               resolvedPath,
@@ -421,18 +484,27 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
         }
 
         // Prior content must be captured before removal (refinement inverse).
-        // Null capture (e.g. unreadable file) skips journaling, never the delete.
+        // Null capture (e.g. unreadable or over-budget file) skips journaling,
+        // never the delete. lstat size is checked before reading so an
+        // attacker-sized file is never buffered.
         let localFileCapture: RefinementFileCapture | null = null;
-        try {
-          localFileCapture = {
-            path: targetPath,
-            content: await fsPromises.readFile(targetPath, "utf-8"),
-          };
-        } catch (error) {
-          log.debug("[agent_skill_delete] failed to capture file for refinement inverse", {
+        if (targetStat.size > REFINEMENT_CAPTURE_MAX_FILE_BYTES) {
+          log.debug("[agent_skill_delete] skipping refinement inverse: capture budget exceeded", {
             targetPath,
-            error,
+            size: targetStat.size,
           });
+        } else {
+          try {
+            localFileCapture = {
+              path: targetPath,
+              content: await fsPromises.readFile(targetPath, "utf-8"),
+            };
+          } catch (error) {
+            log.debug("[agent_skill_delete] failed to capture file for refinement inverse", {
+              targetPath,
+              error,
+            });
+          }
         }
 
         await fsPromises.unlink(targetPath);

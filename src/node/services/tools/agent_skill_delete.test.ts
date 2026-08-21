@@ -5,6 +5,8 @@ import { describe, it, expect } from "bun:test";
 import type { MuxToolScope } from "@/common/types/toolScope";
 import type { AgentSkillDeleteToolResult } from "@/common/types/tools";
 import {
+  REFINEMENT_CAPTURE_MAX_FILE_BYTES,
+  REFINEMENT_CAPTURE_MAX_FILES,
   RefinementEvidenceSchema,
   RefinementInverseSchema,
   SkillRefinementActionSchema,
@@ -23,6 +25,7 @@ import {
   TEST_GLOBAL_WORKSPACE_ID as GLOBAL_WORKSPACE_ID,
   TestTempDir,
   writeGlobalSkill,
+  writeProjectSkill,
   writeSkillWithReference,
 } from "./testHelpers";
 
@@ -819,6 +822,90 @@ describe("refinement journal", () => {
     expect(await fs.readFile(path.join(skillDir, "references", "big.txt"), "utf-8")).toBe(
       bigContent
     );
+  });
+
+  it("skips journaling when a skill file exceeds the per-file capture budget", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-delete-refinement-budget-file");
+
+    // Repo-controlled skill content: an attacker-sized file must not be
+    // buffered into memory or duplicated into journal blobs.
+    await writeGlobalSkill(tempDir.path, "demo-skill", {
+      description: "fixture",
+      files: { "references/huge.txt": "x".repeat(REFINEMENT_CAPTURE_MAX_FILE_BYTES + 1) },
+    });
+    const skillDir = path.join(tempDir.path, "skills", "demo-skill");
+
+    const tool = await createDeleteTool(tempDir.path);
+    const result = (await tool.execute!(
+      { name: "demo-skill", target: "skill", confirm: true },
+      mockToolCallOptions
+    )) as AgentSkillDeleteToolResult;
+
+    // The delete itself must still succeed; only journaling is skipped.
+    expect(result).toMatchObject({ success: true, deleted: "skill" });
+    const statErr = await fs.stat(skillDir).catch((error: NodeJS.ErrnoException) => error);
+    expect(statErr).toMatchObject({ code: "ENOENT" });
+    expect(await readRefinementEvents(sessionDirOf(tempDir.path))).toHaveLength(0);
+  });
+
+  it("skips journaling when the skill exceeds the capture file-count budget", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-delete-refinement-budget-count");
+
+    // SKILL.md + REFINEMENT_CAPTURE_MAX_FILES references = one over budget.
+    await writeGlobalSkill(tempDir.path, "demo-skill", {
+      description: "fixture",
+      files: Object.fromEntries(
+        Array.from({ length: REFINEMENT_CAPTURE_MAX_FILES }, (_, i) => [
+          `references/f${i}.txt`,
+          "x",
+        ])
+      ),
+    });
+
+    const tool = await createDeleteTool(tempDir.path);
+    const result = (await tool.execute!(
+      { name: "demo-skill", target: "skill", confirm: true },
+      mockToolCallOptions
+    )) as AgentSkillDeleteToolResult;
+
+    expect(result).toMatchObject({ success: true, deleted: "skill" });
+    expect(await readRefinementEvents(sessionDirOf(tempDir.path))).toHaveLength(0);
+  });
+
+  it("skips journaling oversized skills on the runtime-backed path", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-delete-refinement-budget-runtime");
+    const skillName = "my-skill";
+    const remoteWorkspaceRoot = "/remote/workspace";
+
+    await writeProjectSkill(tempDir.path, skillName, {
+      description: "fixture",
+      files: { "references/huge.txt": "x".repeat(REFINEMENT_CAPTURE_MAX_FILE_BYTES + 1) },
+    });
+
+    const remoteRuntime = new RemotePathMappedRuntime(tempDir.path, remoteWorkspaceRoot);
+    const sessionsDir = path.join(tempDir.path, "session-dir");
+    await fs.mkdir(sessionsDir, { recursive: true });
+    const baseConfig = createTestToolConfig(tempDir.path, {
+      workspaceId: "regular-workspace",
+      sessionsDir,
+      runtime: remoteRuntime,
+      muxScope: {
+        type: "project",
+        muxHome: tempDir.path,
+        projectRoot: "/host/project",
+        projectStorageAuthority: "runtime",
+      },
+    });
+    const config = { ...baseConfig, cwd: remoteWorkspaceRoot };
+
+    const tool = createAgentSkillDeleteTool(config);
+    const result = (await tool.execute!(
+      { name: skillName, target: "skill", confirm: true },
+      mockToolCallOptions
+    )) as AgentSkillDeleteToolResult;
+
+    expect(result).toMatchObject({ success: true, deleted: "skill" });
+    expect(await readRefinementEvents(sessionsDir)).toHaveLength(0);
   });
 
   it("writes no row when the delete fails", async () => {

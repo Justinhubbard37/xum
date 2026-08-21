@@ -19,6 +19,18 @@ import { BlobRefSchema } from "./durableEvent";
  */
 export const REFINEMENT_INLINE_MAX_CHARS = 4_096;
 
+/**
+ * Budgets for pre-delete inverse capture (agent_skill_delete). Skill content
+ * is repo-controlled, so an attacker-sized skill dir must not make a routine
+ * cleanup call buffer unbounded bytes in memory or duplicate them into
+ * journal blobs. When any budget is exceeded, journaling is skipped entirely
+ * (the delete still proceeds): a partial inverse is worse than none because
+ * rollback would silently restore an incomplete skill.
+ */
+export const REFINEMENT_CAPTURE_MAX_FILE_BYTES = 1024 * 1024;
+export const REFINEMENT_CAPTURE_MAX_TOTAL_BYTES = 4 * 1024 * 1024;
+export const REFINEMENT_CAPTURE_MAX_FILES = 200;
+
 /** One file to restore: exactly one of `text` (small) or `blobRef` (large). */
 export const RefinementFileSchema = z
   .object({
