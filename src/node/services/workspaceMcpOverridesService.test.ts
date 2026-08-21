@@ -203,7 +203,7 @@ describe("WorkspaceMcpOverridesService", () => {
 
     const service = new WorkspaceMcpOverridesService(config);
     await service.setOverridesForWorkspace(workspaceId, {
-      enabledServers: ["plugin:abc:server"],
+      enabledServers: ["plugin:0123456789abcdef:server"],
     });
 
     // Dialog snapshot taken here...
@@ -253,7 +253,7 @@ describe("WorkspaceMcpOverridesService", () => {
     // never read, resurrecting stale enabledServers on reinstall.
     await fs.writeFile(
       path.join(workspacePath, ".mux", "mcp.local.jsonc"),
-      '{ "enabledServers": ["plugin:abc:echo"'
+      '{ "enabledServers": ["plugin:0123456789abcdef:echo"'
     );
 
     await config.editConfig((cfg) => {
@@ -304,9 +304,9 @@ describe("WorkspaceMcpOverridesService", () => {
       filePath,
       JSON.stringify({
         futureField: { keep: "me" },
-        enabledServers: ["plugin:abc:echo", "other-server"],
-        disabledServers: ["plugin:abc:beta"],
-        toolAllowlist: { "plugin:abc:echo": ["t1"], "other-server": ["t2"] },
+        enabledServers: ["plugin:0123456789abcdef:echo", "other-server"],
+        disabledServers: ["plugin:0123456789abcdef:beta"],
+        toolAllowlist: { "plugin:0123456789abcdef:echo": ["t1"], "other-server": ["t2"] },
       })
     );
 
@@ -325,7 +325,7 @@ describe("WorkspaceMcpOverridesService", () => {
     });
 
     const service = new WorkspaceMcpOverridesService(config);
-    await service.prunePluginOverrideKeys(workspaceId, "plugin:abc:");
+    await service.prunePluginOverrideKeys(workspaceId, "plugin:0123456789abcdef:");
 
     const after = JSON.parse(await fs.readFile(filePath, "utf-8")) as Record<string, unknown>;
     expect(after).toEqual({
@@ -338,14 +338,62 @@ describe("WorkspaceMcpOverridesService", () => {
     // Unreadable content must throw (callers keep their retry tombstones).
     await fs.writeFile(filePath, "{ not json");
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
-    await expect(service.prunePluginOverrideKeys(workspaceId, "plugin:abc:")).rejects.toThrow(
-      /parse errors/
-    );
+    await expect(
+      service.prunePluginOverrideKeys(workspaceId, "plugin:0123456789abcdef:")
+    ).rejects.toThrow(/parse errors/);
 
     // A missing file is nothing to prune (plugin keys only ever live in
     // workspace-local files).
     await fs.rm(filePath);
-    await service.prunePluginOverrideKeys(workspaceId, "plugin:abc:");
+    await service.prunePluginOverrideKeys(workspaceId, "plugin:0123456789abcdef:");
+  });
+
+  it("prunePluginOverrideKeys matches only canonical plugin keys", async () => {
+    const projectPath = "/fake/project";
+    const workspaceId = "ws-id";
+    const workspaceName = "branch";
+
+    const workspacePath = getWorkspacePath({
+      srcDir: config.srcDir,
+      projectName: "project",
+      workspaceName,
+    });
+    const filePath = path.join(workspacePath, ".mux", "mcp.local.jsonc");
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    // MCP server names are arbitrary user strings: a user-defined server may
+    // legitimately be named "plugin:custom". Only canonical
+    // plugin:<16-hex instanceId>:<server> keys are plugin-owned; a broad
+    // "plugin:" prune (registration-time sanitization) must leave the
+    // ordinary server's enables and allowlists intact.
+    await fs.writeFile(
+      filePath,
+      JSON.stringify({
+        enabledServers: ["plugin:0123456789abcdef:echo", "plugin:custom", "other"],
+        toolAllowlist: { "plugin:0123456789abcdef:echo": ["t1"], "plugin:custom": ["t2"] },
+      })
+    );
+    await config.editConfig((cfg) => {
+      cfg.projects.set(projectPath, {
+        workspaces: [
+          {
+            path: workspacePath,
+            id: workspaceId,
+            name: workspaceName,
+            runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+          },
+        ],
+      });
+      return cfg;
+    });
+
+    const service = new WorkspaceMcpOverridesService(config);
+    await service.prunePluginOverrideKeys(workspaceId, "plugin:");
+
+    const after = JSON.parse(await fs.readFile(filePath, "utf-8")) as Record<string, unknown>;
+    expect(after).toEqual({
+      enabledServers: ["plugin:custom", "other"],
+      toolAllowlist: { "plugin:custom": ["t2"] },
+    });
   });
 
   it("publish hooks run in write order with the persisted overrides", async () => {
@@ -362,7 +410,7 @@ describe("WorkspaceMcpOverridesService", () => {
     await fs.mkdir(path.dirname(filePath), { recursive: true });
     await fs.writeFile(
       filePath,
-      JSON.stringify({ enabledServers: ["plugin:abc:echo", "other-server"] })
+      JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:echo", "other-server"] })
     );
     await config.editConfig((cfg) => {
       cfg.projects.set(projectPath, {
@@ -386,7 +434,7 @@ describe("WorkspaceMcpOverridesService", () => {
     // exclusive write queue, so concurrent launches publish in write order.
     const published: Array<{ via: string; enabled: unknown }> = [];
     await Promise.all([
-      service.prunePluginOverrideKeys(workspaceId, "plugin:abc:", {
+      service.prunePluginOverrideKeys(workspaceId, "plugin:0123456789abcdef:", {
         publish: (persisted) => {
           published.push({ via: "prune", enabled: persisted.enabledServers });
           return Promise.resolve();
@@ -434,12 +482,12 @@ describe("WorkspaceMcpOverridesService", () => {
       `{
   // Keep me: explains why other-server is enabled.
   "enabledServers": [
-    "plugin:abc:echo",
+    "plugin:0123456789abcdef:echo",
     "other-server" // trailing comment survives too
   ],
   /* block comment */
   "toolAllowlist": {
-    "plugin:abc:echo": ["t1"],
+    "plugin:0123456789abcdef:echo": ["t1"],
     "other-server": ["t2"]
   }
 }
@@ -461,13 +509,13 @@ describe("WorkspaceMcpOverridesService", () => {
     });
 
     const service = new WorkspaceMcpOverridesService(config);
-    await service.prunePluginOverrideKeys(workspaceId, "plugin:abc:");
+    await service.prunePluginOverrideKeys(workspaceId, "plugin:0123456789abcdef:");
 
     const after = await fs.readFile(filePath, "utf-8");
     expect(after).toContain("// Keep me: explains why other-server is enabled.");
     expect(after).toContain("// trailing comment survives too");
     expect(after).toContain("/* block comment */");
-    expect(after).not.toContain("plugin:abc:echo");
+    expect(after).not.toContain("plugin:0123456789abcdef:echo");
     const parsed = jsoncParse(after) as Record<string, unknown>;
     expect(parsed).toEqual({
       enabledServers: ["other-server"],
@@ -505,29 +553,38 @@ describe("WorkspaceMcpOverridesService", () => {
     // A newer release may represent an owned field with a shape this build
     // cannot inspect; "successfully pruning" it would retire the caller's
     // tombstone while plugin keys embedded in that shape survive.
-    await fs.writeFile(filePath, JSON.stringify({ enabledServers: { v2: ["plugin:abc:echo"] } }));
-    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
-    await expect(service.prunePluginOverrideKeys(workspaceId, "plugin:abc:")).rejects.toThrow(
-      /unrecognized "enabledServers" shape/
+    await fs.writeFile(
+      filePath,
+      JSON.stringify({ enabledServers: { v2: ["plugin:0123456789abcdef:echo"] } })
     );
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(
+      service.prunePluginOverrideKeys(workspaceId, "plugin:0123456789abcdef:")
+    ).rejects.toThrow(/unrecognized "enabledServers" shape/);
 
-    await fs.writeFile(filePath, JSON.stringify({ toolAllowlist: ["plugin:abc:echo"] }));
-    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
-    await expect(service.prunePluginOverrideKeys(workspaceId, "plugin:abc:")).rejects.toThrow(
-      /unrecognized "toolAllowlist" shape/
+    await fs.writeFile(
+      filePath,
+      JSON.stringify({ toolAllowlist: ["plugin:0123456789abcdef:echo"] })
     );
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(
+      service.prunePluginOverrideKeys(workspaceId, "plugin:0123456789abcdef:")
+    ).rejects.toThrow(/unrecognized "toolAllowlist" shape/);
 
     // Absent fields stay fine (nothing to prune).
     await fs.writeFile(filePath, JSON.stringify({ somethingElse: true }));
-    await service.prunePluginOverrideKeys(workspaceId, "plugin:abc:");
+    await service.prunePluginOverrideKeys(workspaceId, "plugin:0123456789abcdef:");
 
     // A non-object ROOT is equally opaque: a newer build may store the whole
     // document in a different shape with plugin keys embedded inside it.
-    await fs.writeFile(filePath, JSON.stringify([{ enabledServers: ["plugin:abc:echo"] }]));
-    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
-    await expect(service.prunePluginOverrideKeys(workspaceId, "plugin:abc:")).rejects.toThrow(
-      /unrecognized root shape/
+    await fs.writeFile(
+      filePath,
+      JSON.stringify([{ enabledServers: ["plugin:0123456789abcdef:echo"] }])
     );
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(
+      service.prunePluginOverrideKeys(workspaceId, "plugin:0123456789abcdef:")
+    ).rejects.toThrow(/unrecognized root shape/);
   });
 
   it("prunePluginOverrideKeys rejects duplicate properties instead of mis-editing", async () => {
@@ -564,14 +621,14 @@ describe("WorkspaceMcpOverridesService", () => {
     // value. The prune must throw (caller keeps its retry tombstone).
     const duplicateAllowlist = `{
   "toolAllowlist": { "other": ["t2"] },
-  "toolAllowlist": { "plugin:abc:echo": ["t1"] }
+  "toolAllowlist": { "plugin:0123456789abcdef:echo": ["t1"] }
 }
 `;
     await fs.writeFile(filePath, duplicateAllowlist);
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
-    await expect(service.prunePluginOverrideKeys(workspaceId, "plugin:abc:")).rejects.toThrow(
-      /duplicate "toolAllowlist"/
-    );
+    await expect(
+      service.prunePluginOverrideKeys(workspaceId, "plugin:0123456789abcdef:")
+    ).rejects.toThrow(/duplicate "toolAllowlist"/);
     expect(await fs.readFile(filePath, "utf-8")).toBe(duplicateAllowlist);
 
     // Duplicate enabledServers: the same parse/modify disagreement makes the
@@ -580,28 +637,28 @@ describe("WorkspaceMcpOverridesService", () => {
       filePath,
       `{
   "enabledServers": ["other"],
-  "enabledServers": ["plugin:abc:echo"]
+  "enabledServers": ["plugin:0123456789abcdef:echo"]
 }
 `
     );
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
-    await expect(service.prunePluginOverrideKeys(workspaceId, "plugin:abc:")).rejects.toThrow(
-      /duplicate "enabledServers"/
-    );
+    await expect(
+      service.prunePluginOverrideKeys(workspaceId, "plugin:0123456789abcdef:")
+    ).rejects.toThrow(/duplicate "enabledServers"/);
 
     // Duplicate keys INSIDE toolAllowlist: removal by name hits the first,
     // parse exposes the last — the stale key would survive.
     await fs.writeFile(
       filePath,
       `{
-  "toolAllowlist": { "plugin:abc:echo": ["t1"], "plugin:abc:echo": ["t2"] }
+  "toolAllowlist": { "plugin:0123456789abcdef:echo": ["t1"], "plugin:0123456789abcdef:echo": ["t2"] }
 }
 `
     );
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
-    await expect(service.prunePluginOverrideKeys(workspaceId, "plugin:abc:")).rejects.toThrow(
-      /duplicate "plugin:abc:echo"/
-    );
+    await expect(
+      service.prunePluginOverrideKeys(workspaceId, "plugin:0123456789abcdef:")
+    ).rejects.toThrow(/duplicate "plugin:0123456789abcdef:echo"/);
   });
 
   it("removes workspace-local file when overrides are set to empty", async () => {

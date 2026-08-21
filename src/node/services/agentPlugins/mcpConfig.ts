@@ -75,6 +75,18 @@ export function isCanonicalPluginServerKeyPrefix(prefix: string): boolean {
 }
 
 /**
+ * Whether a FULL override key has the canonical managed-plugin shape
+ * `plugin:<16-hex instanceId>:<server>`. MCP server names are otherwise
+ * arbitrary user strings (a user-defined server may legitimately be named
+ * "plugin:custom"), so plugin-key pruning must match only this shape.
+ */
+const CANONICAL_PLUGIN_KEY_PATTERN = /^plugin:[0-9a-f]{16}:/;
+
+export function isCanonicalPluginServerKey(key: string): boolean {
+  return CANONICAL_PLUGIN_KEY_PATTERN.test(key);
+}
+
+/**
  * Plugin keys PER FIELD, not collapsed into one set: a stale key that only
  * survives in toolAllowlist (e.g. a removed unmanaged dir's old tool
  * selection) must not make that key's NEW appearance in enabledServers look

@@ -10,6 +10,7 @@ import { type createRuntime } from "@/node/runtime/runtimeFactory";
 import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
 import { execBuffered, readFileString, writeFileString } from "@/node/utils/runtime/helpers";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
+import { isCanonicalPluginServerKey } from "@/node/services/agentPlugins/mcpConfig";
 import { log } from "@/node/services/log";
 import { getErrorMessage } from "@/common/utils/errors";
 
@@ -651,6 +652,13 @@ export class WorkspaceMcpOverridesService {
             `Workspace MCP overrides file has an unrecognized "${field}" shape (written by a newer version?): ${filePath}`
           );
 
+        // Match only canonical `plugin:<16-hex>:<server>` keys under the
+        // requested prefix: MCP server names are otherwise arbitrary strings
+        // and user configuration may legitimately name a server "plugin:…" —
+        // pruning must never strip such an ordinary server's overrides.
+        const isPrunableKey = (key: unknown): boolean =>
+          typeof key === "string" && key.startsWith(keyPrefix) && isCanonicalPluginServerKey(key);
+
         for (const field of ["enabledServers", "disabledServers"] as const) {
           // Re-parse after each removal: array indices shift as items go.
           for (;;) {
@@ -662,9 +670,7 @@ export class WorkspaceMcpOverridesService {
             if (!Array.isArray(value)) {
               throw opaqueShape(field);
             }
-            const index = value.findIndex(
-              (key) => typeof key === "string" && key.startsWith(keyPrefix)
-            );
+            const index = value.findIndex(isPrunableKey);
             if (index === -1) {
               break;
             }
@@ -678,7 +684,7 @@ export class WorkspaceMcpOverridesService {
             throw opaqueShape("toolAllowlist");
           }
           for (const key of Object.keys(allowlist)) {
-            if (key.startsWith(keyPrefix)) {
+            if (isPrunableKey(key)) {
               removeAt(["toolAllowlist", key]);
             }
           }

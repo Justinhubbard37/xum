@@ -2720,7 +2720,7 @@ export class WorkspaceService extends EventEmitter {
   private workspaceGoalService?: WorkspaceGoalService;
   /** Narrow DevTools cleanup surface; wired by coreServices when a DevToolsService exists. */
   private devToolsService?: { removeWorkspaceData(workspaceId: string): Promise<void> };
-  /** Narrow overrides-cleanup surface; wired by ServiceContainer for plugin-key pruning on removal. */
+  /** Narrow overrides-cleanup surface; wired by ServiceContainer for stale plugin-key sanitization. */
   private workspaceMcpOverridesService?: {
     prunePluginOverrideKeys(workspaceId: string, keyPrefix: string): Promise<void>;
   };
@@ -2741,6 +2741,63 @@ export class WorkspaceService extends EventEmitter {
     prunePluginOverrideKeys(workspaceId: string, keyPrefix: string): Promise<void>;
   }): void {
     this.workspaceMcpOverridesService = service;
+  }
+
+  /**
+   * Registration-time sanitization of stale Agent Plugin override keys.
+   *
+   * A LocalRuntime workspace's `.mux/mcp.local.jsonc` lives in the checkout,
+   * which removal PRESERVES — while a removed workspace is invisible to the
+   * plugin uninstaller's pruning/tombstones. Plugin-server consent must die
+   * with the workspace that granted it: when a directory is REGISTERED as a
+   * new local workspace and no other live workspace resolves to the same
+   * path, canonical `plugin:<16-hex>:` keys are pruned before the workspace
+   * is announced, so a stale enable can never silently re-activate a
+   * same-name reinstall's default-disabled server.
+   *
+   * Deliberately NOT done at removal time: a removal-time prune edits a file
+   * that sibling workspaces (conversation forks share the local checkout) may
+   * still be using, has no durable retry if it fails (the workspace becomes
+   * unresolvable), and races Workspace MCP dialog saves that land between the
+   * prune and the metadata drop. Sanitizing at the moment the NEW workspace
+   * identity is created has none of those windows: siblings force a skip,
+   * a failure aborts creation (nothing announced, no silent activation), and
+   * no dialog can target a workspace that has not been announced yet.
+   *
+   * Returns an error string (creation must abort) or undefined on success.
+   */
+  private async sanitizeStalePluginOverridesForNewWorkspace(
+    workspaceId: string,
+    workspacePath: string
+  ): Promise<string | undefined> {
+    if (!this.workspaceMcpOverridesService) {
+      return undefined;
+    }
+    // A sibling workspace resolving to the same checkout (local-runtime
+    // conversation forks) means the consent context is still ALIVE — its
+    // enables must survive, and the uninstaller can still reach the file
+    // through that sibling.
+    const normalizedPath = stripTrailingSlashes(workspacePath);
+    const config = this.config.loadConfigOrDefault();
+    for (const project of config.projects.values()) {
+      for (const workspace of project.workspaces) {
+        if (
+          workspace.id !== workspaceId &&
+          stripTrailingSlashes(workspace.path) === normalizedPath
+        ) {
+          return undefined;
+        }
+      }
+    }
+    try {
+      await this.workspaceMcpOverridesService.prunePluginOverrideKeys(workspaceId, "plugin:");
+      return undefined;
+    } catch (error) {
+      // Abort creation instead of proceeding with the stale file: continuing
+      // would re-create the silent-activation path this sanitization exists
+      // to close, with no durable record left to retry it.
+      return `The directory's existing MCP overrides file could not be sanitized: ${getErrorMessage(error)}. Fix or remove .mux/mcp.local.jsonc in ${workspacePath} and try again.`;
+    }
   }
 
   setWorkspaceGoalService(service: WorkspaceGoalService): void {
@@ -4355,6 +4412,24 @@ export class WorkspaceService extends EventEmitter {
         return Err("Failed to retrieve workspace metadata");
       }
 
+      // Local runtime registers an EXISTING directory, whose preserved
+      // .mux/mcp.local.jsonc may carry plugin enables consented by a since-
+      // removed workspace. Sanitize before announcing; a failure aborts the
+      // creation (config entry rolled back) so nothing stale ever activates.
+      // Worktree/SSH runtimes create fresh checkouts, so there is no
+      // preserved-file window there.
+      if (finalRuntimeConfig.type === "local") {
+        const sanitizeError = await this.sanitizeStalePluginOverridesForNewWorkspace(
+          workspaceId,
+          createResult!.workspacePath
+        );
+        if (sanitizeError !== undefined) {
+          await this.config.removeWorkspace(workspaceId).catch(() => undefined);
+          initLogger.logComplete(-1);
+          return Err(sanitizeError);
+        }
+      }
+
       session.emitMetadata(this.enrichFrontendMetadata(completeMetadata));
 
       // Background init: run postCreateSetup (if present) then initWorkspace
@@ -5321,26 +5396,6 @@ export class WorkspaceService extends EventEmitter {
       // Stop MCP servers for this workspace
       if (this.mcpServerManager) {
         await this.mcpServerManager.stopServers(workspaceId);
-      }
-
-      // Strip Agent Plugin override keys from the workspace's override files
-      // BEFORE the metadata is dropped (pruning needs it to resolve the
-      // workspace path). LocalRuntime removal preserves the checkout — and
-      // its .mux/mcp.local.jsonc — but a removed workspace is invisible to
-      // the plugin uninstaller's pruning/tombstones, so a surviving
-      // `plugin:` enable could silently re-enable a same-name reinstall's
-      // server when the directory is re-registered later. Best-effort:
-      // removal must never brick on a corrupted overrides file (worktree
-      // removals delete the checkout anyway, and a missing file is a no-op).
-      if (this.workspaceMcpOverridesService) {
-        try {
-          await this.workspaceMcpOverridesService.prunePluginOverrideKeys(workspaceId, "plugin:");
-        } catch (error) {
-          log.warn("Failed to prune plugin override keys during workspace removal", {
-            workspaceId,
-            error: getErrorMessage(error),
-          });
-        }
       }
 
       // Close any terminal sessions for this workspace
