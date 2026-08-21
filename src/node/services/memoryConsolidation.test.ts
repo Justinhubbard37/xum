@@ -4,7 +4,7 @@ import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import type { Tool } from "ai";
 
-import { MEMORY_CONSOLIDATION_OP_BUDGET } from "@/common/constants/memory";
+import { MEMORY_CONSOLIDATION_OP_BUDGET, MEMORY_MAX_FILE_BYTES } from "@/common/constants/memory";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { Config } from "@/node/config";
 import { createConsolidationMemoryTool, type MemoryConsolidationOp } from "./memoryConsolidation";
@@ -335,6 +335,36 @@ describe("consolidation memory tool rails", () => {
       path: "/memories/global/proposed.md",
     });
     expect(overBudget.success).toBe(false);
+  });
+
+  it("dry-run rejects proposals the real write path would reject", async () => {
+    // Codex round 18: the dry-run staging path returned before
+    // executeMemoryCommand, skipping the real service's arg validation and
+    // the memory file cap — an oversized/invalid mutation staged
+    // successfully, was rendered into chat, and /refine apply later rejected
+    // it through the real handler, consuming the staged set as a no-op after
+    // the user approved.
+    using fixture = await createFixture({ dryRun: true });
+
+    // Over the real write cap: must fail staging with the real cap error.
+    const overCap = await execute(fixture.tool, {
+      command: "create",
+      path: "/memories/global/too-big.md",
+      file_text: "x".repeat(MEMORY_MAX_FILE_BYTES + 1),
+    });
+    expect(overCap.success).toBe(false);
+    if (!overCap.success) expect(overCap.error).toContain(`${MEMORY_MAX_FILE_BYTES}`);
+
+    // Missing required args: must fail staging with the real arg error.
+    const missingArgs = await execute(fixture.tool, {
+      command: "create",
+      path: "/memories/global/no-text.md",
+    });
+    expect(missingArgs.success).toBe(false);
+    if (!missingArgs.success) expect(missingArgs.error).toContain("file_text");
+
+    // Both rejections journal as unapplied with the error, never as staged.
+    expect(fixture.journal.every((op) => !op.applied && op.note !== "dry-run")).toBe(true);
   });
 
   it("journals failed dispatches as unapplied with the error note", async () => {

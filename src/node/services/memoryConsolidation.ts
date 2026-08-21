@@ -32,6 +32,7 @@ import assert from "@/common/utils/assert";
 import {
   MEMORY_CONSOLIDATION_MAX_STEPS,
   MEMORY_CONSOLIDATION_OP_BUDGET,
+  MEMORY_MAX_FILE_BYTES,
 } from "@/common/constants/memory";
 import type { MemoryToolResult } from "@/common/types/tools";
 import type { MemoryConsolidationOp } from "@/common/orpc/schemas/memory";
@@ -110,6 +111,40 @@ export function createMutationBudget(limit: number): MutationBudget {
       return true;
     },
   };
+}
+
+/**
+ * Non-mutating validation for staged (dry-run) mutations, mirroring what the
+ * real write path enforces: executeMemoryCommand's required-arg checks (same
+ * error strings) and MemoryService's MEMORY_MAX_FILE_BYTES write cap (same
+ * constant). Content-bearing fields are exact-safe to cap-check without
+ * reading the target file: the written file contains file_text (create) /
+ * insert_text / new_str verbatim, so a field over the cap guarantees the
+ * apply-time write would exceed it.
+ */
+function validateMutationForStaging(input: MemoryCommandInput): string | null {
+  const overCap = (field: string, content: string): string | null => {
+    const bytes = Buffer.byteLength(content, "utf-8");
+    return bytes > MEMORY_MAX_FILE_BYTES
+      ? `Memory files are limited to ${MEMORY_MAX_FILE_BYTES} bytes (${field} is ${bytes} bytes); split the content into smaller files`
+      : null;
+  };
+  switch (input.command) {
+    case "create":
+      if (input.file_text == null) return "create requires 'path' and 'file_text'";
+      return overCap("file_text", input.file_text);
+    case "str_replace":
+      if (input.old_str == null) return "str_replace requires 'path' and 'old_str'";
+      return input.new_str != null ? overCap("new_str", input.new_str) : null;
+    case "insert":
+      if (input.insert_line == null || input.insert_text == null) {
+        return "insert requires 'path', 'insert_line' and 'insert_text'";
+      }
+      return overCap("insert_text", input.insert_text);
+    default:
+      // delete/rename argument shapes are fully validated by classifyMutation.
+      return null;
+  }
 }
 
 /**
@@ -208,6 +243,17 @@ export function createConsolidationMemoryTool(args: {
       }
 
       if (dryRun) {
+        // Validate BEFORE staging: the real write path enforces
+        // command-specific required args (executeMemoryCommand) and the
+        // memory file cap (MemoryService) — skipping them here let an
+        // invalid/oversized proposal be staged, rendered in full into chat,
+        // and only rejected by the real handler at /refine apply AFTER the
+        // user approved, consuming the staged set as a silent no-op.
+        const invalid = validateMutationForStaging(input);
+        if (invalid !== null) {
+          journal.push({ ...target, applied: false, note: invalid });
+          return { success: false, error: invalid };
+        }
         journal.push({ ...target, applied: false, note: "dry-run" });
         args.onStagedMutation?.(input, toolCallId);
         return { success: true, output: `[dry-run] recorded ${target.command} ${target.path}` };
