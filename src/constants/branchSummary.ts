@@ -43,6 +43,16 @@ export const BRANCH_SUMMARY_MAX_OUTPUT_TOKENS = 512;
 export const BRANCH_SUMMARY_TIMEOUT_MS = 6_000;
 
 /**
+ * Hard cap on characters accumulated from the summary stream. Purely
+ * defensive: BRANCH_SUMMARY_MAX_OUTPUT_TOKENS already bounds well-behaved
+ * providers (~4 chars/token ≈ 2k chars), but a pathological provider that
+ * ignores both max_tokens and abort could otherwise grow the buffer without
+ * bound between the consume loop's deadline checks. Generous multiple of the
+ * worst-case legitimate output so it can never clip a real summary.
+ */
+export const BRANCH_SUMMARY_MAX_ACCUMULATED_CHARS = 32_000;
+
+/**
  * Input cap for the thinking-stripped transcript fed to the summarizer.
  * Oldest messages are dropped first: the newest abandoned work carries the
  * most context worth preserving. ~40k tokens at the chars/4 heuristic keeps

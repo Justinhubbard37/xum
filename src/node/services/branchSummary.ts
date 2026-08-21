@@ -25,6 +25,7 @@ import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
 import {
+  BRANCH_SUMMARY_MAX_ACCUMULATED_CHARS,
   BRANCH_SUMMARY_MAX_OUTPUT_TOKENS,
   BRANCH_SUMMARY_MAX_TRANSCRIPT_CHARS,
   BRANCH_SUMMARY_MIN_SEGMENT_TOKENS,
@@ -265,10 +266,28 @@ async function generateAbandonedBranchSummaryText(input: {
       // rejects: abort/stream errors set streamFailed and end the loop.
       let accumulated = "";
       let streamFailed = false;
+      let cappedAtLimit = false;
+      // Explicit reader instead of for-await: the deadline path below must be
+      // able to cancel the consumer from OUTSIDE. A provider that ignores
+      // abortSignal would otherwise keep this loop alive after the race
+      // returns — pinned in read() forever, or growing `accumulated` without
+      // bound — while the finally cleans up the model underneath it.
+      const reader = stream.textStream.getReader();
       const consume = (async () => {
         try {
-          for await (const delta of stream.textStream) {
-            accumulated += delta;
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            // Deadline already won the race: the salvage snapshot was taken,
+            // so stop appending and tear the stream down.
+            if (abortSignal.aborted) break;
+            accumulated += value;
+            // Defensive memory bound: a pathological provider can ignore
+            // max_tokens too; never buffer beyond the hard cap.
+            if (accumulated.length >= BRANCH_SUMMARY_MAX_ACCUMULATED_CHARS) {
+              cappedAtLimit = true;
+              break;
+            }
           }
         } catch (error) {
           streamFailed = true;
@@ -276,11 +295,22 @@ async function generateAbandonedBranchSummaryText(input: {
             modelString,
             error: getErrorMessage(error),
           });
+        } finally {
+          // Cancel (not just release) on ANY exit: an early break above must
+          // stop the underlying stream, not leave it producing into a locked
+          // reader. No-op when the stream already closed; rejects when it
+          // errored, hence the swallow.
+          void reader.cancel().catch(() => undefined);
         }
       })();
       await Promise.race([consume, deadline]);
 
       if (abortSignal.aborted) {
+        // Actively cancel the losing consumer: a wedged provider leaves it
+        // pinned in read() (the loop's aborted check only runs when a delta
+        // arrives), and cancel resolves that pending read so the reader is
+        // released promptly instead of leaking with the raced-away task.
+        void reader.cancel().catch(() => undefined);
         // Deadline hit. Salvage whole sentences already streamed — a missed
         // deadline should still buy a (shorter) summary when tokens flowed.
         const salvaged = trimSummaryToBoundary(accumulated);
@@ -299,8 +329,13 @@ async function generateAbandonedBranchSummaryText(input: {
         // trim back to a whole-statement boundary; a natural stop is complete
         // by definition and kept verbatim. Raced against the deadline
         // defensively (a stream that closes without a finish part must not
-        // hang us); an unknown reason is treated as truncated.
-        const finishReason = await Promise.race([stream.finishReason, deadline]);
+        // hang us); an unknown reason is treated as truncated. A cap-break
+        // must NOT touch finishReason at all: awaiting it makes the SDK keep
+        // draining the runaway stream internally until the deadline, exactly
+        // the unbounded consumption the cap exists to stop.
+        const finishReason = cappedAtLimit
+          ? null
+          : await Promise.race([stream.finishReason, deadline]);
         const text =
           finishReason === "length" || finishReason === null
             ? trimSummaryToBoundary(accumulated)

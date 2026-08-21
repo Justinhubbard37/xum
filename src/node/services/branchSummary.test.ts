@@ -406,6 +406,111 @@ describe("maybeAppendAbandonedBranchSummary", () => {
     }
   });
 
+  test("a provider that ignores abort stops being consumed once the deadline wins", async () => {
+    const { historyService, cleanup } = await createTestHistoryService();
+    try {
+      let pulls = 0;
+      // A runaway provider: streams one complete sentence, then keeps
+      // yielding fragments forever, ignoring abortSignal entirely. Each pull
+      // waits a real timer tick so the deadline can actually fire (a
+      // synchronous enqueue loop would starve the event loop).
+      const runawayModel = new MockLanguageModelV3({
+        doStream: () =>
+          Promise.resolve({
+            stream: new ReadableStream<LanguageModelV3StreamPart>({
+              start: (controller) => {
+                controller.enqueue({ type: "text-start", id: "t1" });
+                controller.enqueue({
+                  type: "text-delta",
+                  id: "t1",
+                  delta: "Salvaged sentence before the deadline.",
+                });
+              },
+              pull: (controller) =>
+                new Promise((resolve) =>
+                  setTimeout(() => {
+                    pulls += 1;
+                    controller.enqueue({ type: "text-delta", id: "t1", delta: " overflow" });
+                    resolve();
+                  }, 1)
+                ),
+            }),
+          }),
+      });
+      const appended = await maybeAppendAbandonedBranchSummary({
+        historyService,
+        aiService: fakeAiService(runawayModel),
+        workspaceId: "ws-runaway",
+        abandonedMessages: meatyExchange("runaway"),
+        experiments: RLM_ON,
+        timeoutMs: 100,
+      });
+      // The salvaged row contains only the pre-deadline complete sentence.
+      expect(appended).not.toBeNull();
+      const text = appended!.parts.find((part) => part.type === "text");
+      expect(
+        text?.type === "text" && text.text.endsWith("Salvaged sentence before the deadline.")
+      ).toBe(true);
+
+      // The losing consumer must be terminated, not left reading: once the
+      // deadline returned the operation, the provider stream stops being
+      // pulled (previously the orphaned consume loop kept reading and
+      // growing its buffer indefinitely).
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const pullsAfterSettle = pulls;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(pulls).toBe(pullsAfterSettle);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("a pathological delta flood is cut off at the hard accumulation cap", async () => {
+    const { historyService, cleanup } = await createTestHistoryService();
+    try {
+      // Floods ~10k chars per pull, ignoring max_tokens and abort alike. The
+      // consumer must stop pulling once BRANCH_SUMMARY_MAX_ACCUMULATED_CHARS
+      // trips — without the cap it keeps buffering until the deadline.
+      const floodDelta = "Filler sentence for the flood. ".repeat(320);
+      let pulls = 0;
+      const floodModel = new MockLanguageModelV3({
+        doStream: () =>
+          Promise.resolve({
+            stream: new ReadableStream<LanguageModelV3StreamPart>({
+              start: (controller) => {
+                controller.enqueue({ type: "text-start", id: "t1" });
+              },
+              // Each pull waits a real timer tick so the deadline stays live
+              // (a synchronous enqueue loop would starve the event loop).
+              pull: (controller) =>
+                new Promise((resolve) =>
+                  setTimeout(() => {
+                    pulls += 1;
+                    controller.enqueue({ type: "text-delta", id: "t1", delta: floodDelta });
+                    resolve();
+                  }, 1)
+                ),
+            }),
+          }),
+      });
+      const appended = await maybeAppendAbandonedBranchSummary({
+        historyService,
+        aiService: fakeAiService(floodModel),
+        workspaceId: "ws-flood",
+        abandonedMessages: meatyExchange("flood"),
+        experiments: RLM_ON,
+        timeoutMs: 300,
+      });
+      // The capped buffer still salvages whole sentences into a row.
+      expect(appended).not.toBeNull();
+      // The cap trips after a handful of 10k-char deltas; an uncapped
+      // consumer would have kept pulling ~1/ms until the 300ms deadline.
+      expect(pulls).toBeLessThan(20);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("a max_tokens (length) stop is trimmed to a statement boundary", async () => {
     const { historyService, cleanup } = await createTestHistoryService();
     try {
