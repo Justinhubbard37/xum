@@ -989,6 +989,90 @@ describe("AgentPluginInstallService", () => {
       service.uninstall({ name: "demo-plugin", deletePluginData: false })
     ).rejects.toThrow(/unfinished recovery/);
     expect(await pathExists(targetPath)).toBe(true);
+
+    // And the unconsumed journal keeps the discovery gate CLOSED: recovery
+    // "succeeding" while a journal is retained would scan the managed
+    // container over the unresolved collision.
+    const suppressed = await discoverAgentPlugins([{ path: pluginsDir(), scope: "global" }]);
+    expect(suppressed.plugins).toEqual([]);
+    expect(
+      suppressed.diagnostics.some((diagnostic) => diagnostic.message.includes("crash recovery"))
+    ).toBe(true);
+  });
+
+  test("uninstall refuses while an uninstall journal awaits recovery", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const targetPath = path.join(pluginsDir(), "demo-plugin");
+
+    // Post-crash state of an UNCOMMITTED uninstall (registry still owns the
+    // plugin, assets staged, journal retained because a restore failed). A
+    // second uninstall would overwrite the journal — the only references to
+    // the original trashDir/dataTrashDir — orphaning the recoverable assets.
+    const trashDir = path.join(stagingDir(), `trash-${Date.now()}-demo-plugin`);
+    await fsPromises.rename(targetPath, trashDir);
+    const journalPath = path.join(stagingDir(), "uninstall-demo-plugin.json");
+    await fsPromises.writeFile(
+      journalPath,
+      JSON.stringify({ name: "demo-plugin", trashDir, stagedAt: Date.now() })
+    );
+
+    await expect(
+      service.uninstall({ name: "demo-plugin", deletePluginData: false })
+    ).rejects.toThrow(/unfinished cleanup/);
+    // The journal still references the original staged tree.
+    expect(
+      (JSON.parse(await fsPromises.readFile(journalPath, "utf8")) as { trashDir: string }).trashDir
+    ).toBe(trashDir);
+
+    // Recovery restores the tree; the uninstall then proceeds normally.
+    await service.list();
+    expect(await pathExists(targetPath)).toBe(true);
+    await service.uninstall({ name: "demo-plugin", deletePluginData: false });
+    expect(await registry()).toEqual([]);
+  });
+
+  test("update recovery keeps the tree marker when the journal cannot be deleted", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const targetPath = path.join(pluginsDir(), "demo-plugin");
+    const markerPath = path.join(targetPath, ".mux-promotion-marker");
+
+    // Promote landed (marker inside), cleanup lost. If deleting the journal
+    // fails transiently, cleanup must ABORT with the marker retained: a
+    // markerless target + surviving journal is exactly the state recovery
+    // misclassifies as a user replacement, deadlocking updates.
+    const trashDir = path.join(stagingDir(), `trash-${Date.now()}-demo-plugin`);
+    await fsPromises.mkdir(trashDir, { recursive: true });
+    await fsPromises.writeFile(markerPath, "swap-nonce");
+    const journalPath = path.join(stagingDir(), "update-demo-plugin.json");
+    await fsPromises.writeFile(
+      journalPath,
+      JSON.stringify({ name: "demo-plugin", trashDir, nonce: "swap-nonce", stagedAt: Date.now() })
+    );
+
+    const realRm = fsPromises.rm;
+    const rmSpy = spyOn(fsPromises, "rm").mockImplementation((target, options) => {
+      if (String(target) === journalPath) {
+        return Promise.reject(new Error("EBUSY: journal locked"));
+      }
+      return realRm(target, options);
+    });
+    try {
+      await service.list();
+      expect(await pathExists(markerPath)).toBe(true);
+      expect(await pathExists(journalPath)).toBe(true);
+      expect(await pathExists(trashDir)).toBe(true);
+    } finally {
+      rmSpy.mockRestore();
+    }
+
+    // Once the journal deletes, cleanup completes and the plugin is intact.
+    const items = await service.list();
+    expect(items.find((item) => item.name === "demo-plugin")?.managed).toBe(true);
+    expect(await pathExists(markerPath)).toBe(false);
+    expect(await pathExists(journalPath)).toBe(false);
+    expect(await pathExists(trashDir)).toBe(false);
   });
 
   test("update recovery finishes cleanup when the promoted tree carries the nonce", async () => {

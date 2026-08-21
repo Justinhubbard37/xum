@@ -415,10 +415,20 @@ export class AgentPluginInstallService {
     );
   }
 
-  /** Run reconcileJournals, mapping the outcome to a never-rejecting health flag. */
+  /**
+   * Run reconcileJournals, mapping the outcome to a never-rejecting health
+   * flag: false when it threw (unreadable registry) OR when any journal was
+   * left unconsumed (failed restore/quarantine, unidentified target tree) —
+   * both mean the managed container may hold unreconciled state.
+   */
   private attemptReconcileJournals(context: string): Promise<boolean> {
     return this.reconcileJournals().then(
-      () => true,
+      (allConsumed) => {
+        if (!allConsumed) {
+          log.warn(`Plugin journal reconciliation left unresolved journals (${context})`);
+        }
+        return allConsumed;
+      },
       (error: unknown) => {
         log.warn(`Plugin journal reconciliation failed (${context})`, {
           error: getErrorMessage(error),
@@ -1640,19 +1650,19 @@ export class AgentPluginInstallService {
    * without ever opening the Plugins section) and again on section open,
    * under the mutation queue so it cannot interleave with a live mutation.
    */
-  private async reconcileJournals(): Promise<void> {
+  private async reconcileJournals(): Promise<boolean> {
     let journalNames: string[];
     try {
       journalNames = (await fsPromises.readdir(this.stagingRoot)).filter(
         (entry) => isJournalName(entry) && entry.endsWith(".json")
       );
     } catch {
-      return; // No staging root: nothing was ever staged.
+      return true; // No staging root: nothing was ever staged.
     }
     if (journalNames.length === 0) {
-      return;
+      return true;
     }
-    await this.runExclusive(async () => {
+    return this.runExclusive(async () => {
       // STRICT read: a temporarily unreadable or corrupted registry must not
       // degrade to an empty entry list here — reconciliation would then treat
       // committed installs as orphans and delete their trees, turning a
@@ -1663,6 +1673,13 @@ export class AgentPluginInstallService {
           .map((rawEntry) => this.rawEntryName(rawEntry))
           .filter((name): name is string => name !== undefined)
       );
+      // Health result: every journal must end CONSUMED (its recovery job
+      // done and the file gone). A retained journal — failed restore or
+      // quarantine, unidentified tree at the target, or even a failed
+      // journal deletion — means unreconciled state may still sit in the
+      // managed container, so the discovery gate must keep suppressing it;
+      // resolving successfully here would open the gate over that state.
+      let allConsumed = true;
       for (const journalName of journalNames) {
         const journalPath = path.join(this.stagingRoot, journalName);
         const prefix = JOURNAL_PREFIXES.find((candidate) => journalName.startsWith(candidate));
@@ -1678,10 +1695,21 @@ export class AgentPluginInstallService {
             : prefix === UPDATE_JOURNAL_PREFIX
               ? await this.recoverInterruptedUpdateSwap(name, journalPath, registryNames)
               : await this.recoverInterruptedUninstall(name, journalPath, registryNames);
-        if (consumed) {
-          await fsPromises.rm(journalPath, { force: true }).catch(() => undefined);
+        if (!consumed) {
+          allConsumed = false;
+          continue;
+        }
+        try {
+          await fsPromises.rm(journalPath, { force: true });
+        } catch (error) {
+          allConsumed = false;
+          log.warn("Failed to delete a consumed plugin journal; will retry", {
+            journalPath,
+            error: getErrorMessage(error),
+          });
         }
       }
+      return allConsumed;
     });
   }
 
@@ -1771,11 +1799,22 @@ export class AgentPluginInstallService {
         .catch(() => undefined);
       if (journalNonce !== undefined && treeNonce === journalNonce) {
         // OUR promoted replacement landed and only the cleanup was lost:
-        // finish it. Journal FIRST (mirrors the update path): a crash after
-        // removing the marker but before the journal would strand a
+        // finish it. Journal FIRST, and ENFORCED (mirrors the update path):
+        // removing the marker while the journal survives would strand a
         // markerless target that the next recovery misclassifies as a user
-        // replacement, deadlocking updates.
-        await fsPromises.rm(journalPath, { force: true }).catch(() => undefined);
+        // replacement, deadlocking updates — so a failed journal deletion
+        // must abort cleanup and keep the marker as the tree's identity.
+        try {
+          await fsPromises.rm(journalPath, { force: true });
+        } catch (error) {
+          log.warn("Failed to delete the update journal; keeping the tree marker for retry", {
+            name,
+            error: getErrorMessage(error),
+          });
+          return false;
+        }
+        // Journal gone: a stray marker or trash dir is harmless if these
+        // best-effort removals fail (nothing references them anymore).
         await fsPromises
           .rm(path.join(targetPath, PROMOTION_MARKER_FILE), { force: true })
           .catch(() => undefined);
@@ -2042,6 +2081,17 @@ export class AgentPluginInstallService {
       if (await pathExists(this.journalPath(UPDATE_JOURNAL_PREFIX, args.name))) {
         throw new Error(
           `A previous update of '${args.name}' has unfinished recovery. Open Settings → Plugins to let recovery complete, then try again.`
+        );
+      }
+      // Same for an unresolved UNINSTALL journal (a previous uninstall's
+      // restore failed while the registry still owns the plugin): the
+      // unconditional journal write below would replace the only references
+      // to the original trashDir/dataTrashDir, orphaning the recoverable
+      // assets for stale reclamation while this retry commits against a
+      // missing or replaced target.
+      if (await pathExists(this.journalPath(UNINSTALL_JOURNAL_PREFIX, args.name))) {
+        throw new Error(
+          `A previous uninstall of '${args.name}' has unfinished cleanup. Open Settings → Plugins to let recovery complete, then try again.`
         );
       }
 
@@ -2821,27 +2871,41 @@ export class AgentPluginInstallService {
           }
           throw error;
         }
-        // The new tree is live. Consume the JOURNAL before the marker: a
-        // crash between marker removal and journal removal would leave a
-        // markerless target with the old tree still staged, which recovery
-        // must treat as an unidentified user replacement — deadlocking future
-        // updates. Journal-first, a crash merely leaves a stray marker in the
-        // live tree (harmless; the next update swap discards it).
+        // The new tree is live. Consume the JOURNAL before the marker, and
+        // ENFORCE that ordering: a markerless target with the journal still
+        // present is exactly the state recovery must treat as an unidentified
+        // user replacement — deadlocking future updates. If the journal
+        // cannot be deleted, keep the marker (it is the tree's identity for
+        // the matching-nonce recovery branch, which retries this cleanup) and
+        // leave the staged old tree pinned by the journal. Journal-first, a
+        // crash merely leaves a stray marker in the live tree (harmless; the
+        // next update swap discards it).
+        let journalConsumed = true;
         if (hadOldTree) {
-          await fsPromises.rm(updateJournalPath, { force: true }).catch(() => undefined);
+          try {
+            await fsPromises.rm(updateJournalPath, { force: true });
+          } catch (error) {
+            journalConsumed = false;
+            log.warn(
+              "Failed to delete the update journal; keeping the tree marker so recovery can finish",
+              { name: entry.name, error: getErrorMessage(error) }
+            );
+          }
         }
-        await fsPromises
-          .rm(path.join(targetPath, PROMOTION_MARKER_FILE), { force: true })
-          .catch(() => undefined);
-        if (hadOldTree) {
-          // Best-effort: the trash dir sits under the staging root, where
-          // stale-dir reclamation cleans up leftovers.
-          await this.removeDir(trashDir).catch((error: unknown) => {
-            log.warn("Failed to delete replaced plugin tree; leaving it for staging reclamation", {
-              trashDir,
-              error: getErrorMessage(error),
+        if (journalConsumed) {
+          await fsPromises
+            .rm(path.join(targetPath, PROMOTION_MARKER_FILE), { force: true })
+            .catch(() => undefined);
+          if (hadOldTree) {
+            // Best-effort: the trash dir sits under the staging root, where
+            // stale-dir reclamation cleans up leftovers.
+            await this.removeDir(trashDir).catch((error: unknown) => {
+              log.warn(
+                "Failed to delete replaced plugin tree; leaving it for staging reclamation",
+                { trashDir, error: getErrorMessage(error) }
+              );
             });
-          });
+          }
         }
 
         const updated: AgentPluginInstallEntry = {
