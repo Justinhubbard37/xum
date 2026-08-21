@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
@@ -286,6 +286,70 @@ describe("RefineService", () => {
     const third = await fixture.service.run(WORKSPACE_ID);
     expect(third.success).toBe(true);
     expect(fixture.modelCalls).toHaveLength(2);
+  });
+
+  it("does not resolve a cancelled pass while a tool write is still settling", async () => {
+    // The deadline fires while the memory write is mid-flight. The pass must
+    // not settle (releasing the run lock and letting removal delete the
+    // session directory) until that write — including its journal append —
+    // has fully settled; a detached late write would recreate the removed
+    // session.
+    let releaseWrite: () => void = () => undefined;
+    const writeGate = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    using fixture = await createFixture({
+      timeoutMs: 150,
+      modelFactory: () =>
+        toolCallModel(
+          [
+            {
+              toolCallId: "refine-slow-write-1",
+              toolName: "memory",
+              input: {
+                command: "create",
+                path: LESSON_PATH,
+                file_text: "A slow write that outlives the deadline.\n",
+              },
+            },
+          ],
+          `${LESSON_PATH}: written slowly.`
+        ),
+    });
+    await fixture.seedTrajectory();
+    const realCreate = fixture.memoryService.create.bind(fixture.memoryService);
+    const createSpy = spyOn(fixture.memoryService, "create").mockImplementation(
+      async (...createArgs) => {
+        await writeGate;
+        return realCreate(...createArgs);
+      }
+    );
+    try {
+      let settled = false;
+      const runPromise = fixture.service.run(WORKSPACE_ID).then((result) => {
+        settled = true;
+        return result;
+      });
+      // Wait for the write to start, then let the 150ms deadline pass well by.
+      const spinDeadline = Date.now() + 5_000;
+      while (createSpy.mock.calls.length === 0 && Date.now() < spinDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(createSpy.mock.calls.length).toBe(1);
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      // The pass is deadline-cancelled but the write has not settled: the run
+      // must still be pending.
+      expect(settled).toBe(false);
+
+      releaseWrite();
+      const result = await runPromise;
+      expect(result.success).toBe(false);
+      // The write settled BEFORE the pass resolved, so its journal row is
+      // already durable by the time removal could delete the session dir.
+      expect(await listRefinements(fixture.sessionDir)).toHaveLength(1);
+    } finally {
+      createSpy.mockRestore();
+    }
   });
 
   it("cancelInFlightRefinePass aborts a running pass so no writes or summary land", async () => {

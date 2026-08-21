@@ -79,6 +79,29 @@ function wrapSkillWriteWithBudget(
   });
 }
 
+/**
+ * Track every tool execution so the pass can await their SETTLEMENT before
+ * resolving. Reader cancellation only stops stream consumption — the SDK's
+ * in-flight execute promise keeps running detached — so a removal/deadline
+ * cancellation could otherwise release the run lock (and let workspace
+ * removal delete the session directory) while a memory/skill write is still
+ * settling; its late journal append would recreate the removed session.
+ */
+function trackToolExecutions(inner: Tool, pending: Set<Promise<unknown>>): Tool {
+  assert(typeof inner.execute === "function", "tracked tool must have execute");
+  const innerExecute = inner.execute.bind(inner);
+  return {
+    ...inner,
+    execute: (input, options) => {
+      const run = Promise.resolve(innerExecute(input, options));
+      pending.add(run);
+      // Self-prune on settle so a long pass never accumulates settled promises.
+      void run.catch(() => undefined).finally(() => pending.delete(run));
+      return run;
+    },
+  };
+}
+
 function buildRefineSystemPrompt(hasSkillTool: boolean): string {
   return [
     "You are Mux's refine agent. You are given a recent trajectory (chat transcript, possibly timeline events) of ONE workspace.",
@@ -138,9 +161,15 @@ export async function runRefinePass(args: {
     budget,
   });
 
-  const tools: Record<string, Tool> = { memory: memoryTool };
+  const pendingToolRuns = new Set<Promise<unknown>>();
+  const tools: Record<string, Tool> = {
+    memory: trackToolExecutions(memoryTool, pendingToolRuns),
+  };
   if (args.skillWriteTool !== undefined) {
-    tools.agent_skill_write = wrapSkillWriteWithBudget(args.skillWriteTool, budget);
+    tools.agent_skill_write = trackToolExecutions(
+      wrapSkillWriteWithBudget(args.skillWriteTool, budget),
+      pendingToolRuns
+    );
   }
 
   const promptSections = [
@@ -196,8 +225,9 @@ export async function runRefinePass(args: {
       // Cancel (not just release) on ANY exit so an early break stops the
       // underlying stream instead of leaving it producing into a locked
       // reader. No-op when already closed; rejects when errored, hence the
-      // swallow.
-      void reader.cancel().catch(() => undefined);
+      // swallow. Awaited so the consume task's settlement includes the
+      // cancellation itself (the pass drains this task before resolving).
+      await reader.cancel().catch(() => undefined);
     }
   })();
   // Deadline promise: resolves when the abort signal fires so the race stays
@@ -218,8 +248,14 @@ export async function runRefinePass(args: {
     // consumer — a wedged provider leaves it pinned in read() — and record
     // the timeout as a stream error so the result awaits below (which would
     // drain a wedged stream indefinitely) are skipped and the caller reports
-    // the failure instead of hanging.
-    void reader.cancel().catch(() => undefined);
+    // the failure instead of hanging. Both awaited: the pass must not resolve
+    // (releasing the run lock and unblocking cancelInFlightRefinePass /
+    // session-dir deletion) while cancellation or the consumer is still
+    // settling. Safe to await: cancel settles promptly even on wedged
+    // streams (a pending pull does not block it), and it resolves the pinned
+    // read so the consumer exits.
+    await reader.cancel().catch(() => undefined);
+    await consume;
     if (streamErrors.length === 0) {
       streamErrors.push("refine pass deadline exceeded before the stream finished");
     }
@@ -243,6 +279,17 @@ export async function runRefinePass(args: {
     } catch {
       usage = undefined;
     }
+  }
+
+  // Drain in-flight tool executions before resolving: a memory/skill write
+  // launched by a step keeps running after reader cancellation, and the
+  // caller's removal flow deletes the session directory as soon as this pass
+  // settles — a write (and its journal append) still in flight would recreate
+  // it. Local FS operations, so this wait is bounded; allSettled because a
+  // failed write must not fail the pass here (its tool result already
+  // reported the error to the model).
+  if (pendingToolRuns.size > 0) {
+    await Promise.allSettled([...pendingToolRuns]);
   }
 
   return {
