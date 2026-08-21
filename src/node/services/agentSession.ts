@@ -2824,6 +2824,15 @@ export class AgentSession {
     // (the "summary lands before the next request" contract). Bounded by the
     // generation deadline; resolves immediately when nothing is pending.
     const pendingBranchSummary = await awaitPendingBranchSummary(this.workspaceId);
+    // Workspace removal disposes the session and cancels the summary writer
+    // while this send is parked on the await above; every append between here
+    // and the late pre-stream disposed check would recreate the session
+    // directory removal is about to delete. Bail exactly like that check
+    // (nothing durable has been persisted for this turn yet, so a plain Ok is
+    // safe — no monitor wake can be past its point of no return here).
+    if (this.disposed) {
+      return Ok(undefined);
+    }
     if (pendingBranchSummary) {
       // The renderer loaded history before the background row landed; surface
       // it without requiring a reload.
