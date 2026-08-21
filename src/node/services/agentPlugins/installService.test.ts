@@ -8,6 +8,7 @@ import { Config } from "@/node/config";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import { execFileAsync } from "@/node/utils/disposableExec";
+import { discoverAgentPlugins } from "./discovery";
 import { AgentPluginInstallService, withDiskQuotaWatchdog } from "./installService";
 import {
   AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
@@ -642,6 +643,21 @@ describe("AgentPluginInstallService", () => {
     expect(items.filter((item) => item.name === "demo-plugin")).toHaveLength(1);
   });
 
+  /** The identity-stamped journal install() writes before the promote rename. */
+  const writePromotionJournal = async (journalPath: string, treePath: string): Promise<void> => {
+    const stat = await fsPromises.stat(treePath, { bigint: true });
+    await fsPromises.mkdir(path.dirname(journalPath), { recursive: true });
+    await fsPromises.writeFile(
+      journalPath,
+      JSON.stringify({
+        name: path.basename(treePath),
+        stagedAt: Date.now(),
+        treeDev: stat.dev.toString(),
+        treeIno: stat.ino.toString(),
+      })
+    );
+  };
+
   test("a promotion orphaned by a crash is cleaned up on section open", async () => {
     // Simulate the post-crash state of an install that died between the
     // promote rename and the registry write: a promoted tree with no
@@ -653,11 +669,7 @@ describe("AgentPluginInstallService", () => {
       JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "demo-plugin", version: "1" })
     );
     const journalPath = path.join(stagingDir(), "promotion-demo-plugin.json");
-    await fsPromises.mkdir(stagingDir(), { recursive: true });
-    await fsPromises.writeFile(
-      journalPath,
-      JSON.stringify({ name: "demo-plugin", stagedAt: Date.now() })
-    );
+    await writePromotionJournal(journalPath, targetPath);
 
     // Section open reconciles: the orphan never renders (not even as
     // unmanaged), the tree is gone, and the journal is consumed.
@@ -673,17 +685,14 @@ describe("AgentPluginInstallService", () => {
 
     // A journal WITH a registry entry means the install committed and only
     // the journal deletion was lost — the tree must survive.
-    await fsPromises.writeFile(
-      journalPath,
-      JSON.stringify({ name: "demo-plugin", stagedAt: Date.now() })
-    );
+    await writePromotionJournal(journalPath, targetPath);
     const itemsAfter = await service.list();
     expect(itemsAfter.find((item) => item.name === "demo-plugin")?.managed).toBe(true);
     expect(await pathExists(targetPath)).toBe(true);
     expect(await pathExists(journalPath)).toBe(false);
   });
 
-  test("crash recovery runs at service startup, before any section open", async () => {
+  test("crash recovery runs at service startup and gates global discovery", async () => {
     // An orphaned promotion must not wait for list(): a session can serve
     // agent requests — whose global plugin discovery loads the container's
     // hooks and MCP servers — without ever opening Settings → Plugins.
@@ -693,19 +702,118 @@ describe("AgentPluginInstallService", () => {
       path.join(targetPath, "plugin.json"),
       JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "demo-plugin", version: "1" })
     );
-    await fsPromises.mkdir(stagingDir(), { recursive: true });
     const journalPath = path.join(stagingDir(), "promotion-demo-plugin.json");
-    await fsPromises.writeFile(
-      journalPath,
-      JSON.stringify({ name: "demo-plugin", stagedAt: Date.now() })
-    );
+    await writePromotionJournal(journalPath, targetPath);
 
-    const freshService = new AgentPluginInstallService(config, { isEnabled: () => true });
-    await (freshService as unknown as { startupReconciliation: Promise<void> })
-      .startupReconciliation;
+    void new AgentPluginInstallService(config, { isEnabled: () => true });
+    // The barrier makes a discovery scan issued IMMEDIATELY after
+    // construction wait for the recovery pass, so the orphan can never
+    // surface — its hooks/servers would otherwise load on the next request.
+    const { plugins } = await discoverAgentPlugins([{ path: pluginsDir(), scope: "global" }]);
+    expect(plugins.find((plugin) => plugin.dirName === "demo-plugin")).toBeUndefined();
 
     expect(await pathExists(targetPath)).toBe(false);
     expect(await pathExists(journalPath)).toBe(false);
+  });
+
+  test("promotion recovery leaves a user-replaced tree at the same path alone", async () => {
+    // The user deleted the orphan while the app was stopped and placed their
+    // OWN unmanaged plugin at the same path — a supported use of the global
+    // container. The journal's dev/ino stamp no longer matches, so recovery
+    // must not delete their directory; the journal is spent (our orphan is
+    // gone).
+    const targetPath = path.join(pluginsDir(), "demo-plugin");
+    await fsPromises.mkdir(targetPath, { recursive: true });
+    await fsPromises.writeFile(
+      path.join(targetPath, "plugin.json"),
+      JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "demo-plugin", version: "1" })
+    );
+    // Stamp the journal with a DIFFERENT directory's identity (stands in for
+    // the promoted tree that no longer exists).
+    await fsPromises.mkdir(stagingDir(), { recursive: true });
+    const otherStat = await fsPromises.stat(stagingDir(), { bigint: true });
+    const journalPath = path.join(stagingDir(), "promotion-demo-plugin.json");
+    await fsPromises.writeFile(
+      journalPath,
+      JSON.stringify({
+        name: "demo-plugin",
+        stagedAt: Date.now(),
+        treeDev: otherStat.dev.toString(),
+        treeIno: otherStat.ino.toString(),
+      })
+    );
+
+    const items = await service.list();
+    // The user's tree survives and lists as unmanaged; the journal is consumed.
+    expect(items.find((item) => item.name === "demo-plugin")?.managed).toBe(false);
+    expect(await pathExists(targetPath)).toBe(true);
+    expect(await pathExists(journalPath)).toBe(false);
+  });
+
+  test("reinstalling is blocked while an uninstall journal awaits recovery", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const targetPath = path.join(pluginsDir(), "demo-plugin");
+
+    // Post-crash state of a COMMITTED uninstall whose journal was retained
+    // (e.g. the trash deletion kept failing): entry gone, staged tree left.
+    // A reinstall now would make recovery unable to tell this journal from
+    // an uncommitted uninstall of the NEW install — it must be blocked until
+    // recovery finalizes the journal.
+    const trashDir = path.join(stagingDir(), `trash-${Date.now()}-demo-plugin`);
+    await fsPromises.rename(targetPath, trashDir);
+    const seeded = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as Record<
+      string,
+      unknown
+    >;
+    await fsPromises.writeFile(registryFile(), JSON.stringify({ ...seeded, plugins: [] }));
+    const journalPath = path.join(stagingDir(), "uninstall-demo-plugin.json");
+    await fsPromises.writeFile(
+      journalPath,
+      JSON.stringify({ name: "demo-plugin", trashDir, stagedAt: Date.now() })
+    );
+
+    await expect(
+      service.install({ source: preview.source, expectedSha: preview.lockedSha })
+    ).rejects.toThrow(/unfinished cleanup/);
+
+    // Recovery finalizes the journal (committed → trash deleted); the
+    // reinstall then proceeds.
+    await service.list();
+    expect(await pathExists(journalPath)).toBe(false);
+    const entry = await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    expect(entry.name).toBe("demo-plugin");
+  });
+
+  test("a committed uninstall journal is retained until its staged assets delete", async () => {
+    // The user explicitly requested the data deletion: if recovery's cleanup
+    // fails (e.g. a Windows file lock), the journal must survive as the
+    // durable retry record instead of reporting success — stale-staging
+    // reclamation may never run again.
+    await fsPromises.mkdir(stagingDir(), { recursive: true });
+    const dataTrashDir = path.join(stagingDir(), `trash-data-${Date.now()}-demo-plugin`);
+    await fsPromises.mkdir(dataTrashDir, { recursive: true });
+    const journalPath = path.join(stagingDir(), "uninstall-demo-plugin.json");
+    await fsPromises.writeFile(
+      journalPath,
+      JSON.stringify({ name: "demo-plugin", dataTrashDir, stagedAt: Date.now() })
+    );
+
+    const internals = service as unknown as { removeDir: (dirPath: string) => Promise<void> };
+    const removeDirSpy = spyOn(internals, "removeDir").mockImplementation(() =>
+      Promise.reject(new Error("EBUSY: locked"))
+    );
+    try {
+      await service.list();
+      expect(await pathExists(journalPath)).toBe(true);
+    } finally {
+      removeDirSpy.mockRestore();
+    }
+
+    // Once deletion succeeds, the journal is consumed and the data is gone.
+    await service.list();
+    expect(await pathExists(journalPath)).toBe(false);
+    expect(await pathExists(dataTrashDir)).toBe(false);
   });
 
   test("an update swap interrupted between rename and promote is restored", async () => {
@@ -1021,12 +1129,19 @@ describe("AgentPluginInstallService", () => {
     }
 
     // Uninstall completed: registry entry + container dir gone; the staged
-    // tree remains under staging for stale-dir reclamation.
+    // tree remains under staging with the journal as the durable retry
+    // record (stale reclamation may never run again).
     expect(await registry()).toEqual([]);
     expect(await pathExists(path.join(pluginsDir(), "demo-plugin"))).toBe(false);
     expect((await stagingLeftovers()).some((name) => name.startsWith("trash-"))).toBe(true);
+    const journalPath = path.join(stagingDir(), "uninstall-demo-plugin.json");
+    expect(await pathExists(journalPath)).toBe(true);
 
-    // And reinstall is not blocked by leftover state.
+    // Recovery (section open) retries the deletion and finalizes the
+    // journal; reinstall then proceeds unblocked.
+    await service.list();
+    expect(await pathExists(journalPath)).toBe(false);
+    expect((await stagingLeftovers()).some((name) => name.startsWith("trash-"))).toBe(false);
     const preview2 = await service.preview({ input: remoteDir });
     const entry = await service.install({
       source: preview2.source,

@@ -361,6 +361,23 @@ export async function discoverAgentPluginAt(args: {
 }
 
 /**
+ * Crash-recovery gate for container scans. AgentPluginInstallService installs
+ * its startup journal reconciliation here so no discovery path (MCP config,
+ * hooks, skills, workflows, agents — they all funnel through
+ * discoverAgentPlugins) can scan the managed container while recovery is
+ * still restoring or removing trees: an agent request arriving right after a
+ * crash would otherwise load an orphaned promotion — hook included — before
+ * cleanup ran. The barrier must never reject (the service catches); it
+ * defaults to resolved so tests and contexts without the install service are
+ * unaffected.
+ */
+let discoveryBarrier: Promise<void> = Promise.resolve();
+
+export function setAgentPluginDiscoveryBarrier(barrier: Promise<void>): void {
+  discoveryBarrier = barrier;
+}
+
+/**
  * Discover Agent Plugins in the given container directories.
  *
  * Containers are scanned in the given order; plugins within a container are
@@ -371,6 +388,7 @@ export async function discoverAgentPluginAt(args: {
 export async function discoverAgentPlugins(
   containers: AgentPluginContainer[]
 ): Promise<DiscoverAgentPluginsResult> {
+  await discoveryBarrier;
   const plugins: AgentPluginInfo[] = [];
   const diagnostics: AgentPluginDiagnostic[] = [];
 

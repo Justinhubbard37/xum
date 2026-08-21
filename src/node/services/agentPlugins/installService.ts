@@ -34,6 +34,7 @@ import { execFileAsync } from "@/node/utils/disposableExec";
 import {
   discoverAgentPluginAt,
   discoverAgentPlugins,
+  setAgentPluginDiscoveryBarrier,
   type AgentPluginContainer,
   type AgentPluginInfo,
 } from "./discovery";
@@ -392,6 +393,11 @@ export class AgentPluginInstallService {
         error: getErrorMessage(error),
       });
     });
+    // Every global discovery consumer (MCP config, hooks, skills, workflows,
+    // agents) funnels through discoverAgentPlugins; gate those scans on the
+    // startup pass so an agent request cannot load an orphaned tree while
+    // recovery is still running. The promise never rejects (caught above).
+    setAgentPluginDiscoveryBarrier(this.startupReconciliation);
   }
 
   /**
@@ -1383,6 +1389,18 @@ export class AgentPluginInstallService {
         const name = plugin.name;
         await this.assertNoCollision(name);
         await this.assertNoPendingOverridePrune(name);
+        // A retained uninstall journal means a previous uninstall of this
+        // name still has unfinished recovery (staged assets to restore or
+        // delete). Block the reinstall until it resolves: with a fresh
+        // registry entry present, recoverInterruptedUninstall could no longer
+        // tell that old journal from an uncommitted uninstall of THIS install
+        // and would restore the old data over it. Recovery runs at startup
+        // and on section open, so this self-heals.
+        if (await pathExists(this.journalPath(UNINSTALL_JOURNAL_PREFIX, name))) {
+          throw new Error(
+            `A previous uninstall of '${name}' has unfinished cleanup. Open Settings → Plugins to let recovery complete, then try again.`
+          );
+        }
         const targetPath = this.targetPathFor(name);
 
         // The installed tree is a plain content snapshot: the registry holds
@@ -1394,9 +1412,22 @@ export class AgentPluginInstallService {
         // the rename and the registry write would otherwise strand a tree
         // that discovery lists as unmanaged, assertNoCollision blocks, and
         // uninstall refuses — reconcileJournals uses this record to clean it
-        // up on startup or the next section open.
+        // up on startup or the next section open. The staged dir's filesystem
+        // identity (preserved by the rename) proves the tree recovery finds
+        // at the target is the one WE promoted: a user could delete the
+        // orphan while the app is stopped and place their own unmanaged
+        // plugin at the same path, which cleanup must never delete.
+        const stagedStat = await fsPromises.stat(stagedDir, { bigint: true });
         const journalPath = this.journalPath(PROMOTION_JOURNAL_PREFIX, name);
-        await fsPromises.writeFile(journalPath, JSON.stringify({ name, stagedAt: Date.now() }));
+        await fsPromises.writeFile(
+          journalPath,
+          JSON.stringify({
+            name,
+            stagedAt: Date.now(),
+            treeDev: stagedStat.dev.toString(),
+            treeIno: stagedStat.ino.toString(),
+          })
+        );
 
         await fsPromises.mkdir(this.containerDir, { recursive: true });
         await fsPromises.rename(stagedDir, targetPath);
@@ -1504,6 +1535,20 @@ export class AgentPluginInstallService {
     return path.join(this.stagingRoot, `${prefix}${name}.json`);
   }
 
+  /** A string field from a journal, or undefined when absent/unreadable. */
+  private async readJournalField(journalPath: string, field: string): Promise<string | undefined> {
+    try {
+      const parsed = JSON.parse(await fsPromises.readFile(journalPath, "utf-8")) as unknown;
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return undefined;
+      }
+      const value = (parsed as Record<string, unknown>)[field];
+      return typeof value === "string" ? value : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   /**
    * A staged path recorded in a journal, or undefined when absent/invalid.
    * Defensive: recovery renames/deletes these paths, so a corrupted journal
@@ -1513,22 +1558,14 @@ export class AgentPluginInstallService {
     journalPath: string,
     field: string
   ): Promise<string | undefined> {
-    try {
-      const parsed = JSON.parse(await fsPromises.readFile(journalPath, "utf-8")) as unknown;
-      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-        return undefined;
-      }
-      const value = (parsed as Record<string, unknown>)[field];
-      if (typeof value !== "string") {
-        return undefined;
-      }
-      if (path.dirname(value) !== this.stagingRoot || !path.basename(value).startsWith("trash-")) {
-        return undefined;
-      }
-      return value;
-    } catch {
+    const value = await this.readJournalField(journalPath, field);
+    if (value === undefined) {
       return undefined;
     }
+    if (path.dirname(value) !== this.stagingRoot || !path.basename(value).startsWith("trash-")) {
+      return undefined;
+    }
+    return value;
   }
 
   /**
@@ -1574,7 +1611,7 @@ export class AgentPluginInstallService {
         }
         const consumed =
           prefix === PROMOTION_JOURNAL_PREFIX
-            ? await this.recoverOrphanedPromotion(name, registryNames)
+            ? await this.recoverOrphanedPromotion(name, journalPath, registryNames)
             : prefix === UPDATE_JOURNAL_PREFIX
               ? await this.recoverInterruptedUpdateSwap(name, journalPath, registryNames)
               : await this.recoverInterruptedUninstall(name, journalPath, registryNames);
@@ -1593,12 +1630,38 @@ export class AgentPluginInstallService {
    */
   private async recoverOrphanedPromotion(
     name: string,
+    journalPath: string,
     registryNames: Set<string>
   ): Promise<boolean> {
     const targetPath = this.targetPathFor(name);
     // Only an ORPHAN (tree without registry entry) needs cleanup; a registry
     // entry means the install committed and only the journal deletion was lost.
     if (!registryNames.has(name) && (await pathExists(targetPath))) {
+      // Verify the tree is the one WE promoted before deleting anything: the
+      // user can delete the orphan while the app is stopped and place their
+      // own unmanaged plugin at the same path (a supported use of the
+      // globally scanned container). The journal's dev/ino stamp survives the
+      // promote rename; a mismatch (or an unverifiable stamp) means our
+      // orphan is already gone, so consume the journal WITHOUT touching the
+      // replacement.
+      const journalDev = await this.readJournalField(journalPath, "treeDev");
+      const journalIno = await this.readJournalField(journalPath, "treeIno");
+      const currentStat = await fsPromises
+        .stat(targetPath, { bigint: true })
+        .catch(() => undefined);
+      const isPromotedTree =
+        journalDev !== undefined &&
+        journalIno !== undefined &&
+        currentStat !== undefined &&
+        currentStat.dev.toString() === journalDev &&
+        currentStat.ino.toString() === journalIno;
+      if (!isPromotedTree) {
+        log.warn(
+          "Skipping orphaned-promotion cleanup: the tree at the plugin path is not the promoted one",
+          { name }
+        );
+        return true;
+      }
       log.warn("Cleaning up plugin promotion orphaned by a crash", { name });
       const serverKeyPrefix = buildPluginServerKey(this.instanceIdFor(name), "");
       await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
@@ -1678,14 +1741,25 @@ export class AgentPluginInstallService {
     if (!registryNames.has(name)) {
       // Committed: the staged assets are trash. Delete them now — the user
       // may have explicitly requested the data deletion, and stale-staging
-      // reclamation only runs during a later staging operation.
-      if (trashDir !== undefined) {
-        await this.removeDir(trashDir).catch(() => undefined);
+      // reclamation only runs during a later staging operation. A failed
+      // deletion (e.g. a Windows file lock) RETAINS the journal as the
+      // durable retry record; that also keeps same-name reinstalls blocked
+      // (install()'s journal gate), so this branch stays the only reachable
+      // one for this journal.
+      let cleaned = true;
+      for (const staged of [trashDir, dataTrashDir]) {
+        if (staged === undefined) {
+          continue;
+        }
+        await this.removeDir(staged).catch((error: unknown) => {
+          cleaned = false;
+          log.warn("Failed to delete staged assets of a committed uninstall; will retry", {
+            staged,
+            error: getErrorMessage(error),
+          });
+        });
       }
-      if (dataTrashDir !== undefined) {
-        await this.removeDir(dataTrashDir).catch(() => undefined);
-      }
-      return true;
+      return cleaned;
     }
     log.warn("Restoring plugin assets after an uninstall interrupted by a crash", { name });
     let restored = true;
@@ -2035,9 +2109,11 @@ export class AgentPluginInstallService {
 
       // The uninstall is committed; everything below is best-effort cleanup
       // that must not abort the remaining steps.
+      let trashCleaned = true;
       if (stagedTree) {
         await this.removeDir(trashDir).catch((error: unknown) => {
-          log.warn("Failed to delete uninstalled plugin tree; leaving it for staging reclamation", {
+          trashCleaned = false;
+          log.warn("Failed to delete uninstalled plugin tree; recovery will retry", {
             trashDir,
             error: getErrorMessage(error),
           });
@@ -2050,18 +2126,23 @@ export class AgentPluginInstallService {
         // stale-staging reclamation only runs during a later staging
         // operation, which may never happen.
         await this.removeDir(dataTrashDir).catch((error: unknown) => {
+          trashCleaned = false;
           dataDeletionFailure = `The plugin was uninstalled, but deleting its stored data failed (${getErrorMessage(error)}). The data was moved to ${shortenHome(dataTrashDir)} — delete it manually.`;
-          log.warn("Failed to delete plugin data; leaving it for staging reclamation", {
+          log.warn("Failed to delete plugin data; recovery will retry", {
             dataTrashDir,
             error: getErrorMessage(error),
           });
         });
       }
-      // Consume the journal even when a trash removal failed above: the
-      // commit landed, so recovery must never restore these assets — a kept
-      // journal could resurrect the old data over a later REINSTALL of the
-      // same name. Undeletable leftovers surface below / go to reclamation.
-      await consumeJournal();
+      // Consume the journal only once every staged asset is gone: a retained
+      // committed journal is the durable retry record for the failed cleanup
+      // (recoverInterruptedUninstall's committed branch finishes it), and it
+      // blocks same-name reinstalls until then — with the entry gone,
+      // recovery can never misread this journal as an uncommitted uninstall
+      // and restore the assets.
+      if (trashCleaned) {
+        await consumeJournal();
+      }
 
       // Re-invalidate AFTER the tree is gone: a getToolsForWorkspace call
       // that started right after the pre-rename stop snapshots the new epoch,
