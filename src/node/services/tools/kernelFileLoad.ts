@@ -24,7 +24,16 @@ export interface KernelLoadedFile {
 }
 
 /** Host closure resolving + reading a file with the workspace's cwd/runtime. */
-export type KernelFileLoader = (args: { path: string }) => Promise<KernelLoadedFile>;
+export type KernelFileLoader = (args: {
+  path: string;
+  /**
+   * Kernel cancellation must reach the underlying I/O: a stalled remote read
+   * would otherwise ride RemoteRuntime's 300s `cat` timeout, keeping the
+   * persistent-mount lease occupied long past the execution deadline or a
+   * workspace removal.
+   */
+  abortSignal?: AbortSignal;
+}) => Promise<KernelLoadedFile>;
 
 /**
  * Build the loader from the same cwd/runtime pair the file tools use, so
@@ -36,10 +45,10 @@ export function createKernelFileLoader(config: {
   cwd: string;
   runtime: Runtime;
 }): KernelFileLoader {
-  return async ({ path }) => {
+  return async ({ path, abortSignal }) => {
     const { resolvedPath } = resolvePathWithinCwd(path, config.cwd, config.runtime);
     // stat throws a RuntimeError with a clear message for missing paths.
-    const stat = await config.runtime.stat(resolvedPath);
+    const stat = await config.runtime.stat(resolvedPath, abortSignal);
     if (stat.isDirectory) {
       throw new Error(`Path is a directory, not a file: ${resolvedPath}`);
     }
@@ -52,7 +61,7 @@ export function createKernelFileLoader(config: {
     if (sizeValidation) {
       throw new Error(sizeValidation.error);
     }
-    const content = await readFileString(config.runtime, resolvedPath);
+    const content = await readFileString(config.runtime, resolvedPath, abortSignal);
     const bytes = Buffer.byteLength(content, "utf8");
     // Count newline-delimited records, not split segments: a conventional
     // newline-terminated file yields a trailing empty segment that would

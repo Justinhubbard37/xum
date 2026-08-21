@@ -27,3 +27,43 @@ describe("createKernelFileLoader line counting", () => {
     expect((await load({ path: "blank-line.txt" })).lines).toBe(3);
   });
 });
+
+describe("createKernelFileLoader cancellation", () => {
+  it("threads the abort signal into runtime.stat and runtime.readFile", async () => {
+    // Kernel cancellation must reach the underlying I/O: on RemoteRuntime a
+    // read without a signal falls back to the 300s cat timeout, holding the
+    // persistent-mount lease long past the execution deadline or a removal.
+    using tmp = new DisposableTempDir("kernel-load-signal");
+    await fs.writeFile(nodePath.join(tmp.path, "a.txt"), "hello\n", "utf8");
+
+    const inner = new LocalRuntime(tmp.path);
+    const seenStatSignals: Array<AbortSignal | undefined> = [];
+    const seenReadSignals: Array<AbortSignal | undefined> = [];
+    // Recording proxy: forward everything, capture the signals the loader
+    // passes to the two I/O entry points.
+    const recording = new Proxy(inner, {
+      get(target, prop, receiver) {
+        if (prop === "stat") {
+          return (path: string, signal?: AbortSignal) => {
+            seenStatSignals.push(signal);
+            return target.stat(path, signal);
+          };
+        }
+        if (prop === "readFile") {
+          return (path: string, signal?: AbortSignal) => {
+            seenReadSignals.push(signal);
+            return target.readFile(path, signal);
+          };
+        }
+        return Reflect.get(target, prop, receiver) as unknown;
+      },
+    });
+
+    const controller = new AbortController();
+    const load = createKernelFileLoader({ cwd: tmp.path, runtime: recording });
+    await load({ path: "a.txt", abortSignal: controller.signal });
+
+    expect(seenStatSignals).toEqual([controller.signal]);
+    expect(seenReadSignals).toEqual([controller.signal]);
+  });
+});

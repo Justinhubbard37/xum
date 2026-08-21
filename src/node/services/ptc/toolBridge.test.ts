@@ -483,6 +483,38 @@ describe("ToolBridge", () => {
         expect(summary).toEqual({ key: "data", bytes: 11, lines: 2, preview: "line1\nline2" });
       });
 
+      it("passes the kernel abort signal to the loader and refuses to mutate vars after abort", async () => {
+        // Without propagation, a stalled remote read rides RemoteRuntime's
+        // 300s cat timeout regardless of the execution deadline; and an abort
+        // landing mid-read must not write the loaded content into vars.
+        const controller = new AbortController();
+        const setVarsProperty = mock((_key: string, _value: string) => undefined);
+        let loaderSignal: AbortSignal | undefined;
+        const bridge = new ToolBridge({ file_read: fileReadTool() });
+        const captured = registerCapturing(
+          bridge,
+          {
+            drainHostEvents: () => [],
+            loadFile: (args: { path: string; abortSignal?: AbortSignal }) => {
+              loaderSignal = args.abortSignal;
+              // Abort lands while the read is in flight.
+              controller.abort();
+              return Promise.resolve(loaded);
+            },
+          },
+          { setVarsProperty, getAbortSignal: () => controller.signal }
+        );
+        const load = captured.mux.load as (...args: unknown[]) => Promise<unknown>;
+        try {
+          await load({ path: "a.txt", key: "data" });
+          expect.unreachable("Should have thrown");
+        } catch (e) {
+          expect(String(e)).toContain("Execution aborted");
+        }
+        expect(loaderSignal).toBe(controller.signal);
+        expect(setVarsProperty).not.toHaveBeenCalled();
+      });
+
       it("is absent without a loader, and absent when file_read is not bridged", () => {
         const noLoader = registerCapturing(new ToolBridge({ file_read: fileReadTool() }), {
           drainHostEvents: () => [],

@@ -331,7 +331,16 @@ export class ToolBridge {
             throw new Error("Execution aborted");
           }
           const { path, key } = parseLoadArgs(args);
-          const loaded = await loadFile({ path });
+          // Propagate kernel cancellation into the underlying I/O — without
+          // it a stalled remote read rides RemoteRuntime's 300s cat timeout
+          // even when code_execution's deadline is much shorter.
+          const loaded = await loadFile({ path, abortSignal });
+          // Re-check after the read: an abort that landed mid-read must not
+          // mutate vars (the snapshot would persist a load the caller
+          // believes was cancelled).
+          if (abortSignal?.aborted) {
+            throw new Error("Execution aborted");
+          }
           // Host-side write into the guest heap: the content reaches
           // vars[key] without passing through the return value below (which
           // is all the record, the events, and the model ever see).
