@@ -895,16 +895,20 @@ describe("AgentPluginInstallService", () => {
     const serverKey = `plugin:${instanceId}:echo`;
     let storedOverrides: { enabledServers: string[] } = { enabledServers: [serverKey] };
     const overridesStub = {
-      prunePluginOverrideKeys: (_id: string, keyPrefix: string) => {
+      // Mirrors the real service's contract: publish runs with the pruned
+      // persisted overrides inside the same (stubbed) write step.
+      prunePluginOverrideKeys: async (
+        _id: string,
+        keyPrefix: string,
+        options?: { publish?: (persisted: unknown) => Promise<void> }
+      ) => {
         storedOverrides = {
           enabledServers: storedOverrides.enabledServers.filter(
             (key) => !key.startsWith(keyPrefix)
           ),
         };
-        return Promise.resolve();
+        await options?.publish?.(storedOverrides);
       },
-      getOverridesForWorkspace: () =>
-        Promise.resolve({ overrides: storedOverrides, revision: "r" }),
     };
     const applied: Array<{ workspaceId: string; overrides: unknown }> = [];
     const mcpStub = {
@@ -977,6 +981,14 @@ describe("AgentPluginInstallService", () => {
     await writePluginFixture(remoteDir, { version: "2.0.0" });
     await commitAll(remoteDir, "new upstream");
     await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(/unfinished recovery/);
+
+    // Uninstall refuses too: the occupied target may be the USER'S tree, and
+    // uninstalling would delete it and orphan the staged original (the next
+    // reconciliation would discard it once the registry entry is gone).
+    await expect(
+      service.uninstall({ name: "demo-plugin", deletePluginData: false })
+    ).rejects.toThrow(/unfinished recovery/);
+    expect(await pathExists(targetPath)).toBe(true);
   });
 
   test("update recovery finishes cleanup when the promoted tree carries the nonce", async () => {
@@ -1009,6 +1021,36 @@ describe("AgentPluginInstallService", () => {
     await fsPromises.writeFile(path.join(remoteDir, ".mux-promotion-marker"), "shipped");
     await commitAll(remoteDir, "reserved marker name");
     await expect(service.preview({ input: remoteDir })).rejects.toThrow(/reserved file name/);
+
+    // A DANGLING symlink at the same path must be rejected too: access-style
+    // existence checks follow it and report "absent", and the nonce write
+    // would then follow the attacker-controlled target OUTSIDE the staged
+    // tree (e.g. creating ../../plugins.json with nonce content).
+    await fsPromises.rm(path.join(remoteDir, ".mux-promotion-marker"));
+    await fsPromises.symlink("../../plugins.json", path.join(remoteDir, ".mux-promotion-marker"));
+    await commitAll(remoteDir, "dangling symlink at reserved marker path");
+    await expect(service.preview({ input: remoteDir })).rejects.toThrow(/reserved file name/);
+  });
+
+  test("update refuses subpath installs recorded by a newer build", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    // A newer build recorded a monorepo subpath source (the schema preserves
+    // it for upgrade↔downgrade). This build clones only the repository ROOT,
+    // so updating would swap the installed subpath snapshot for an unrelated
+    // root tree while the registry keeps claiming the subpath source.
+    const doc = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<{ source: Record<string, unknown> }>;
+    };
+    doc.plugins[0].source.subpath = "packages/inner-plugin";
+    await fsPromises.writeFile(registryFile(), JSON.stringify(doc));
+
+    await writePluginFixture(remoteDir, { version: "2.0.0" });
+    await commitAll(remoteDir, "upstream moved");
+    await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(
+      /installed from a repository subpath/
+    );
   });
 
   test("an update swap interrupted between rename and promote is restored", async () => {

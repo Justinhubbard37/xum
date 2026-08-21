@@ -503,6 +503,14 @@ export class WorkspaceMcpOverridesService {
         current: WorkspaceMCPOverrides,
         incoming: WorkspaceMCPOverrides
       ) => Promise<void>;
+      /**
+       * Called INSIDE the exclusive write queue after a successful write,
+       * with the normalized persisted overrides. Callers that mirror
+       * overrides into in-memory caches (MCPServerManager) must publish here:
+       * publishing after this method returns can interleave with a concurrent
+       * writer's publication and leave the cache holding the older snapshot.
+       */
+      publish?: (persisted: WorkspaceMCPOverrides) => Promise<void>;
     }
   ): Promise<void> {
     assert(overrides && typeof overrides === "object", "overrides must be an object");
@@ -530,12 +538,14 @@ export class WorkspaceMcpOverridesService {
 
       if (isEmptyOverrides(normalized)) {
         await this.removeOverridesFile(runtime, workspacePath);
+        await options?.publish?.(normalized);
         return;
       }
 
       await this.ensureOverridesDir(runtime, workspacePath, metadata.runtimeConfig);
       await writeFileString(runtime, jsoncPath, JSON.stringify(normalized, null, 2) + "\n");
       await this.ensureOverridesGitignored(runtime, workspacePath, metadata.runtimeConfig);
+      await options?.publish?.(normalized);
     });
   }
 
@@ -554,7 +564,21 @@ export class WorkspaceMcpOverridesService {
    * only ever written to workspace-local files (legacy config.json storage
    * predates Agent Plugins).
    */
-  async prunePluginOverrideKeys(workspaceId: string, keyPrefix: string): Promise<void> {
+  async prunePluginOverrideKeys(
+    workspaceId: string,
+    keyPrefix: string,
+    options?: {
+      /**
+       * Called INSIDE the exclusive write queue after the prune, with the
+       * pruned normalized overrides re-read from disk. Same ordering contract
+       * as setOverridesForWorkspace's publish: in-memory caches must be
+       * updated here, not after this method returns, or a concurrent dialog
+       * save's publication can be overwritten by the stale pre-save snapshot
+       * (in either direction).
+       */
+      publish?: (persisted: WorkspaceMCPOverrides) => Promise<void>;
+    }
+  ): Promise<void> {
     assert(keyPrefix.length > 0, "prunePluginOverrideKeys: keyPrefix must be non-empty");
 
     return this.runExclusive(async () => {
@@ -663,6 +687,12 @@ export class WorkspaceMcpOverridesService {
         if (text !== original) {
           await writeFileString(runtime, filePath, text);
         }
+      }
+      if (options?.publish) {
+        // Strict re-read: the prune above already threw on anything
+        // unreadable, so a failure here is a real regression and must keep
+        // the caller's retry tombstone rather than publish a guess.
+        await options.publish(await this.loadOverrides(workspaceId, "strict"));
       }
     });
   }

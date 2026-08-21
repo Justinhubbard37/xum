@@ -348,6 +348,73 @@ describe("WorkspaceMcpOverridesService", () => {
     await service.prunePluginOverrideKeys(workspaceId, "plugin:abc:");
   });
 
+  it("publish hooks run in write order with the persisted overrides", async () => {
+    const projectPath = "/fake/project";
+    const workspaceId = "ws-id";
+    const workspaceName = "branch";
+
+    const workspacePath = getWorkspacePath({
+      srcDir: config.srcDir,
+      projectName: "project",
+      workspaceName,
+    });
+    const filePath = path.join(workspacePath, ".mux", "mcp.local.jsonc");
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.writeFile(
+      filePath,
+      JSON.stringify({ enabledServers: ["plugin:abc:echo", "other-server"] })
+    );
+    await config.editConfig((cfg) => {
+      cfg.projects.set(projectPath, {
+        workspaces: [
+          {
+            path: workspacePath,
+            id: workspaceId,
+            name: workspaceName,
+            runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+          },
+        ],
+      });
+      return cfg;
+    });
+    const service = new WorkspaceMcpOverridesService(config);
+
+    // In-memory caches (MCPServerManager) mirror these publications: they
+    // must observe the same order as the disk writes, or a plugin-uninstall
+    // prune racing a dialog save can leave the cache holding the older
+    // snapshot (in either direction). Both writers publish INSIDE the
+    // exclusive write queue, so concurrent launches publish in write order.
+    const published: Array<{ via: string; enabled: unknown }> = [];
+    await Promise.all([
+      service.prunePluginOverrideKeys(workspaceId, "plugin:abc:", {
+        publish: (persisted) => {
+          published.push({ via: "prune", enabled: persisted.enabledServers });
+          return Promise.resolve();
+        },
+      }),
+      service.setOverridesForWorkspace(
+        workspaceId,
+        { enabledServers: ["other-server", "third-server"] },
+        {
+          publish: (persisted) => {
+            published.push({ via: "set", enabled: persisted.enabledServers });
+            return Promise.resolve();
+          },
+        }
+      ),
+    ]);
+
+    // Queue order: prune first (pruned snapshot), then the save (its own
+    // normalized payload). Each publication carries the state its write
+    // persisted, and the LAST publication matches the final disk state.
+    expect(published).toEqual([
+      { via: "prune", enabled: ["other-server"] },
+      { via: "set", enabled: ["other-server", "third-server"] },
+    ]);
+    const finalState = JSON.parse(await fs.readFile(filePath, "utf-8")) as Record<string, unknown>;
+    expect(finalState.enabledServers).toEqual(["other-server", "third-server"]);
+  });
+
   it("prunePluginOverrideKeys preserves JSONC comments and formatting", async () => {
     const projectPath = "/fake/project";
     const workspaceId = "ws-id";

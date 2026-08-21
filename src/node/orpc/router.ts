@@ -5824,13 +5824,14 @@ export const router = (authToken?: string) => {
                     );
                     return new Set(Object.keys(servers).filter((key) => key.startsWith("plugin:")));
                   }),
+                  // Prompt invocation can hit cached servers before the next
+                  // stream recomputes enablement, so sync the manager's view —
+                  // INSIDE the write queue, so a concurrent plugin-uninstall
+                  // prune cannot interleave its own publication and leave the
+                  // cache holding the older snapshot (in either direction).
+                  publish: (persisted) =>
+                    context.mcpServerManager.applyWorkspaceOverrides(input.workspaceId, persisted),
                 }
-              );
-              // Prompt invocation can hit cached servers before the next stream
-              // recomputes enablement, so sync the manager's view immediately.
-              await context.mcpServerManager.applyWorkspaceOverrides(
-                input.workspaceId,
-                input.overrides
               );
               return { success: true, data: undefined };
             } catch (error) {

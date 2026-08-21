@@ -1006,8 +1006,20 @@ export class AgentPluginInstallService {
     // nonce file at this path just before their promote rename, which would
     // silently replace repository-shipped content (and the commit path then
     // deletes it), leaving the installed tree different from the consented
-    // commit. Reject up front instead of corrupting the plugin.
-    if (await pathExists(path.join(stagedDir, PROMOTION_MARKER_FILE))) {
+    // commit. Reject up front instead of corrupting the plugin. lstat, not
+    // access: a DANGLING symlink at this path reads as "absent" to
+    // access-style checks, and the later nonce writeFile would then follow
+    // the attacker-controlled target OUTSIDE the staged tree (e.g. creating
+    // ../../plugins.json with nonce content).
+    const markerEntry = await fsPromises
+      .lstat(path.join(stagedDir, PROMOTION_MARKER_FILE))
+      .catch((error: unknown) => {
+        if (hasErrorCode(error, "ENOENT")) {
+          return undefined;
+        }
+        throw error;
+      });
+    if (markerEntry !== undefined) {
       throw new Error(
         `The repository contains a reserved file name (${PROMOTION_MARKER_FILE}) used by the installer's crash recovery. Remove or rename it upstream to install this plugin.`
       );
@@ -1759,7 +1771,11 @@ export class AgentPluginInstallService {
         .catch(() => undefined);
       if (journalNonce !== undefined && treeNonce === journalNonce) {
         // OUR promoted replacement landed and only the cleanup was lost:
-        // finish it (marker off the live tree, staged old tree is trash).
+        // finish it. Journal FIRST (mirrors the update path): a crash after
+        // removing the marker but before the journal would strand a
+        // markerless target that the next recovery misclassifies as a user
+        // replacement, deadlocking updates.
+        await fsPromises.rm(journalPath, { force: true }).catch(() => undefined);
         await fsPromises
           .rm(path.join(targetPath, PROMOTION_MARKER_FILE), { force: true })
           .catch(() => undefined);
@@ -2016,6 +2032,17 @@ export class AgentPluginInstallService {
       const entry = registry.find((e) => e.name === args.name);
       if (!entry) {
         throw new Error(`'${args.name}' is not a managed plugin install.`);
+      }
+
+      // An unresolved update journal means the tree at the target may be a
+      // USER-PLACED replacement (recovery refused to identify it), not the
+      // managed install: uninstalling would stage and delete the user's tree,
+      // and the next reconciliation would discard the recoverable original
+      // because its registry entry is gone. Refuse until recovery resolves.
+      if (await pathExists(this.journalPath(UPDATE_JOURNAL_PREFIX, args.name))) {
+        throw new Error(
+          `A previous update of '${args.name}' has unfinished recovery. Open Settings → Plugins to let recovery complete, then try again.`
+        );
       }
 
       const targetPath = this.targetPathFor(entry.name);
@@ -2325,20 +2352,27 @@ export class AgentPluginInstallService {
         // Raw in-queue patch: preserves unknown fields written by newer
         // builds, throws on unreadable files (tombstone retry), and cannot
         // interleave with a dialog save (shared exclusive write queue).
-        await overridesService.prunePluginOverrideKeys(workspaceId, serverKeyPrefix);
-        // Propagate the pruned state into MCPServerManager's in-memory
-        // override cache, in the same disk-then-memory order as dialog
-        // saves: latestWorkspaceOverrides wins over freshly read files, so a
-        // workspace that once enabled this plugin's server would otherwise
-        // keep serving the stale enable — and a same-name reinstall's
-        // default-disabled server could start without a fresh user action.
-        // A failure keeps the tombstone so cache repair is retried too.
-        if (this.deps.mcpServerManager) {
-          const { overrides } = await overridesService.getOverridesForWorkspace(workspaceId, {
-            mode: "strict",
-          });
-          await this.deps.mcpServerManager.applyWorkspaceOverrides(workspaceId, overrides);
-        }
+        //
+        // The publish hook repairs MCPServerManager's in-memory override
+        // cache INSIDE that same write queue: latestWorkspaceOverrides wins
+        // over freshly read overrides, so a workspace that once enabled this
+        // plugin's server would otherwise keep serving the stale enable — and
+        // a same-name reinstall's default-disabled server could start without
+        // a fresh user action. In-queue publication also keeps the ordering
+        // consistent with concurrent dialog saves (whichever writes disk last
+        // publishes last). A failure keeps the tombstone so cache repair is
+        // retried too.
+        const mcpServerManager = this.deps.mcpServerManager;
+        await overridesService.prunePluginOverrideKeys(
+          workspaceId,
+          serverKeyPrefix,
+          mcpServerManager
+            ? {
+                publish: (persisted) =>
+                  mcpServerManager.applyWorkspaceOverrides(workspaceId, persisted),
+              }
+            : undefined
+        );
       } catch (error) {
         failedWorkspaceIds.push(workspaceId);
         log.warn("Failed to prune plugin MCP overrides for workspace", {
@@ -2669,6 +2703,16 @@ export class AgentPluginInstallService {
           `'${entry.name}' is pinned to commit ${entry.lockedSha.slice(0, 12)}; uninstall and reinstall to change it.`
         );
       }
+      if (entry.source.subpath !== undefined) {
+        // The registry schema deliberately preserves subpath entries written
+        // by newer builds (upgrade↔downgrade), but this build clones and
+        // validates only the repository ROOT: updating would swap the
+        // installed subpath snapshot for an unrelated root tree while the
+        // registry keeps claiming the subpath source.
+        throw new Error(
+          `'${entry.name}' was installed from a repository subpath by a newer version of Mux; update it with that version.`
+        );
+      }
       // A retained journal means a previous swap's recovery is unfinished
       // (e.g. the target was occupied by an unidentifiable tree). Refuse
       // BEFORE cloning and comparing capabilities: a new journal would
@@ -2777,14 +2821,19 @@ export class AgentPluginInstallService {
           }
           throw error;
         }
-        // The new tree is live: the marker did its crash-recovery job.
+        // The new tree is live. Consume the JOURNAL before the marker: a
+        // crash between marker removal and journal removal would leave a
+        // markerless target with the old tree still staged, which recovery
+        // must treat as an unidentified user replacement — deadlocking future
+        // updates. Journal-first, a crash merely leaves a stray marker in the
+        // live tree (harmless; the next update swap discards it).
+        if (hadOldTree) {
+          await fsPromises.rm(updateJournalPath, { force: true }).catch(() => undefined);
+        }
         await fsPromises
           .rm(path.join(targetPath, PROMOTION_MARKER_FILE), { force: true })
           .catch(() => undefined);
         if (hadOldTree) {
-          // The journal's recovery job is done (the staged old tree is plain
-          // trash now).
-          await fsPromises.rm(updateJournalPath, { force: true }).catch(() => undefined);
           // Best-effort: the trash dir sits under the staging root, where
           // stale-dir reclamation cleans up leftovers.
           await this.removeDir(trashDir).catch((error: unknown) => {
