@@ -290,6 +290,10 @@ export class ServiceContainer {
           this.workspaceService.emitChatEvent(workspaceId, { ...message, type: "message" }),
       }
     );
+    // Removal must be able to abort + drain a running /refine pass before it
+    // deletes the session directory (post-construction wiring: RefineService
+    // is built after WorkspaceService).
+    this.workspaceService.setRefinePassCanceller(this.refineService);
     this.workspaceService.setTimelineRecorder(this.timelineService);
     this.taskService.setTimelineRecorder(this.timelineService);
     this.heartbeatService.setTimelineRecorder(this.timelineService);

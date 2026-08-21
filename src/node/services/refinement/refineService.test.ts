@@ -288,6 +288,55 @@ describe("RefineService", () => {
     expect(fixture.modelCalls).toHaveLength(2);
   });
 
+  it("cancelInFlightRefinePass aborts a running pass so no writes or summary land", async () => {
+    // Removal races a pass that WOULD apply a memory edit and post a summary
+    // row. Gate model creation to hold the race window open deterministically;
+    // cancellation must then stop the pass before any write.
+    let releaseGate: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    using fixture = await createFixture({
+      modelGate: gate,
+      modelFactory: () =>
+        toolCallModel(
+          [
+            {
+              toolCallId: "refine-cancelled-1",
+              toolName: "memory",
+              input: {
+                command: "create",
+                path: LESSON_PATH,
+                file_text: "A lesson that must never land after removal.\n",
+              },
+            },
+          ],
+          `${LESSON_PATH}: must never be written.`
+        ),
+    });
+    await fixture.seedTrajectory();
+    const chatBefore = await fixture.readChat();
+
+    const runPromise = fixture.service.run(WORKSPACE_ID);
+    // Removal races in while the pass is gated; both waiters must settle once
+    // the gate opens.
+    const cancelPromise = fixture.service.cancelInFlightRefinePass(WORKSPACE_ID);
+    releaseGate();
+    await cancelPromise;
+
+    const result = await runPromise;
+    expect(result.success).toBe(false);
+
+    // No tool-driven writes, no journal rows, no summary row, no emission.
+    expect(await listRefinements(fixture.sessionDir)).toHaveLength(0);
+    expect(await fixture.readChat()).toHaveLength(chatBefore.length);
+    expect(fixture.emittedMessages).toHaveLength(0);
+
+    // The lock is cleared: a later invocation is not rejected as running.
+    const second = await fixture.service.run(WORKSPACE_ID);
+    if (!second.success) expect(second.error).not.toContain("already running");
+  });
+
   it("releases the run lock at the deadline even when the provider ignores abort", async () => {
     // A wedged stream: never yields, never closes, ignores the abort signal
     // entirely. The pass must still settle at the deadline and release the

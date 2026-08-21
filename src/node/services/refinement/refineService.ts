@@ -138,13 +138,21 @@ export function createRefineSummaryMessage(record: RefineRecord): MuxMessage {
   });
 }
 
+interface InFlightRefinePass {
+  promise: Promise<Result<RefineRecord, string>>;
+  /** Invalidates the running pass (see cancelInFlightRefinePass). */
+  controller: AbortController;
+}
+
 export class RefineService {
   /**
    * Per-workspace run lock. Reserved SYNCHRONOUSLY in run() before any await
    * so two near-simultaneous invocations can never both start; the loser is
-   * rejected outright (see module doc).
+   * rejected outright (see module doc). Entries carry a cancellation handle
+   * so workspace removal can abort and drain a running pass before deleting
+   * the session directory (same posture as pendingBranchSummaries).
    */
-  private readonly inFlight = new Map<string, Promise<Result<RefineRecord, string>>>();
+  private readonly inFlight = new Map<string, InFlightRefinePass>();
 
   constructor(
     private readonly config: Config,
@@ -172,16 +180,43 @@ export class RefineService {
     }
     // runLocked executes synchronously up to its first await, so the map is
     // populated before any other caller can observe it.
-    const run = this.runLocked(workspaceId);
-    this.inFlight.set(workspaceId, run);
+    const controller = new AbortController();
+    const run = this.runLocked(workspaceId, controller.signal);
+    const entry: InFlightRefinePass = { promise: run, controller };
+    this.inFlight.set(workspaceId, entry);
     try {
       return await run;
     } finally {
-      this.inFlight.delete(workspaceId);
+      // Identity-guarded: a cancel + immediate re-run must not sweep the
+      // newer registration.
+      if (this.inFlight.get(workspaceId) === entry) {
+        this.inFlight.delete(workspaceId);
+      }
     }
   }
 
-  private async runLocked(workspaceId: string): Promise<Result<RefineRecord, string>> {
+  /**
+   * Abort and drain any running /refine pass for a removed workspace. Removal
+   * MUST await this before deleting the session directory: the abort stops
+   * the pass's stream (ending tool-driven memory/skill writes) and gates the
+   * summary-row append, and awaiting the settle serializes removal behind
+   * writes already in flight — otherwise a late write could recreate session
+   * state for a workspace that no longer exists. Never rejects.
+   */
+  async cancelInFlightRefinePass(workspaceId: string): Promise<void> {
+    const entry = this.inFlight.get(workspaceId);
+    if (!entry) {
+      return;
+    }
+    entry.controller.abort();
+    // runLocked can throw on unexpected failures; removal must proceed anyway.
+    await entry.promise.catch(() => undefined);
+  }
+
+  private async runLocked(
+    workspaceId: string,
+    cancellationSignal: AbortSignal
+  ): Promise<Result<RefineRecord, string>> {
     const workspace = this.config.findWorkspace(workspaceId);
     if (!workspace) return Err(`workspace not found: ${workspaceId}`);
 
@@ -242,8 +277,13 @@ export class RefineService {
         transcript,
         timelineText,
         skillWriteTool,
-        // Hard timeout: a wedged provider stream must not hold the run lock forever.
-        abortSignal: AbortSignal.timeout(this.options.timeoutMs ?? REFINE_TIMEOUT_MS),
+        // Hard timeout: a wedged provider stream must not hold the run lock
+        // forever. Workspace-removal cancellation is folded into the same
+        // signal so it stops the stream (and its tool-driven writes) promptly.
+        abortSignal: AbortSignal.any([
+          AbortSignal.timeout(this.options.timeoutMs ?? REFINE_TIMEOUT_MS),
+          cancellationSignal,
+        ]),
         recordUsage: async (usage, providerMetadata) => {
           await this.options.sessionUsageService?.recordHeadlessUsage(
             workspaceId,
@@ -285,6 +325,15 @@ export class RefineService {
         budgetExhausted: result.budgetExhausted,
         usage: result.usage,
       });
+
+      // Cancellation gate before the chat write: removal aborts and drains
+      // in-flight passes before deleting the session directory, and a summary
+      // append past this point would recreate it. (A stream that drained
+      // cleanly just before the abort still reaches here, so the mid-stream
+      // abort alone is not enough.)
+      if (cancellationSignal.aborted) {
+        return Err("refine pass cancelled (workspace removed)");
+      }
 
       // Completion UX: post the labeled summary row ONLY when edits were
       // applied — a no-op stays out of chat (the invoking toast reports it).

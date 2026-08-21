@@ -2686,6 +2686,8 @@ export class WorkspaceService extends EventEmitter {
   private workspaceGoalService?: WorkspaceGoalService;
   /** Narrow DevTools cleanup surface; wired by coreServices when a DevToolsService exists. */
   private devToolsService?: { removeWorkspaceData(workspaceId: string): Promise<void> };
+  /** Cancels running /refine passes before removal deletes the session dir; wired post-construction (RefineService is built later). */
+  private refinePassCanceller?: { cancelInFlightRefinePass(workspaceId: string): Promise<void> };
 
   setTimelineRecorder(recorder: TimelineRecorder): void {
     this.timelineRecorder = recorder;
@@ -2754,6 +2756,13 @@ export class WorkspaceService extends EventEmitter {
   /** DevTools debug-log cleanup on archive/remove; wired by coreServices. */
   setDevToolsService(service: { removeWorkspaceData(workspaceId: string): Promise<void> }): void {
     this.devToolsService = service;
+  }
+
+  /** Refine-pass cancellation on remove; wired by the service container. */
+  setRefinePassCanceller(service: {
+    cancelInFlightRefinePass(workspaceId: string): Promise<void>;
+  }): void {
+    this.refinePassCanceller = service;
   }
 
   private getWorktreeArchiveBehavior(): "keep" | "delete" | "snapshot" {
@@ -5220,6 +5229,11 @@ export class WorkspaceService extends EventEmitter {
       // the directory after removal, leaving an orphaned session. This also
       // drops the retained registration a fork that never sent would leak.
       await clearPendingBranchSummary(workspaceId);
+
+      // Same posture for a running /refine pass: abort + drain so its
+      // tool-driven memory/skill writes and summary-row append cannot land
+      // after the session directory is deleted.
+      await this.refinePassCanceller?.cancelInFlightRefinePass(workspaceId);
 
       // Drop any persistent sandbox mount BEFORE deleting the session
       // directory: dropScope disposes the runtime without disk writes and
