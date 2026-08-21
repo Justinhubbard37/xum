@@ -506,8 +506,23 @@ export async function maybeAppendAbandonedBranchSummary(
       return null;
     }
 
+    // Compaction artifacts must not reach the summarizer. Forking from a
+    // message that moved into the sealed archive removes BOTH the archived
+    // original turns and their rlmPreservedTailCopy duplicates from the
+    // active epoch, so the copies would displace unique abandoned work under
+    // the transcript's char cap; compaction summary rows likewise condense
+    // history that is already represented (kept prefix or removed originals).
+    // Filtered here — NOT in buildAbandonedBranchTranscript, which /refine
+    // also uses on the active epoch where the preserved copies are the tail's
+    // only representation.
+    const abandonedMessages = input.abandonedMessages.filter(
+      (message) =>
+        message.metadata?.rlmPreservedTailCopy !== true &&
+        (message.metadata?.compacted === undefined || message.metadata.compacted === false)
+    );
+
     // Tiny abandoned segments are not worth a model call.
-    const estimatedTokens = input.abandonedMessages.reduce(
+    const estimatedTokens = abandonedMessages.reduce(
       (sum, message) => sum + estimateMuxMessageTokens(message),
       0
     );
@@ -515,7 +530,7 @@ export async function maybeAppendAbandonedBranchSummary(
       return null;
     }
 
-    const transcript = buildAbandonedBranchTranscript(input.abandonedMessages);
+    const transcript = buildAbandonedBranchTranscript(abandonedMessages);
     if (transcript.length === 0) {
       return null;
     }

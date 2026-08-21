@@ -408,6 +408,50 @@ describe("maybeAppendAbandonedBranchSummary", () => {
     }
   });
 
+  test("preserved-tail copies and compaction rows are excluded from the summarizer input", async () => {
+    const { historyService, cleanup } = await createTestHistoryService();
+    try {
+      // An archived-fork removed tail: the archived original turns PLUS their
+      // rlmPreservedTailCopy duplicates from the active epoch, plus the
+      // compaction summary row. Only the originals may reach the summarizer —
+      // duplicates would displace unique abandoned work under the char cap,
+      // and the compaction row condenses history that is already represented.
+      const originals = meatyExchange("original");
+      const duplicates = meatyExchange("copydup").map((message) => ({
+        ...message,
+        id: `copy-${message.id}`,
+        metadata: { ...message.metadata, synthetic: true, rlmPreservedTailCopy: true },
+      }));
+      const compactionRow = createMuxMessage(
+        "compact-1",
+        "assistant",
+        `Compaction summary condensing kept history ${"x".repeat(4_000)}`,
+        { timestamp: 3, synthetic: true, compacted: "user" }
+      );
+
+      let seenPrompt = "";
+      const appended = await maybeAppendAbandonedBranchSummary({
+        historyService,
+        aiService: fakeAiService(
+          summaryModel("Summarized only the unique abandoned work.", (prompt) => {
+            seenPrompt = prompt;
+          })
+        ),
+        workspaceId: "ws-preserved-copies",
+        abandonedMessages: [...originals, compactionRow, ...duplicates],
+        experiments: RLM_ON,
+      });
+      expect(appended).not.toBeNull();
+      // The unique abandoned turns reached the summarizer...
+      expect(seenPrompt).toContain("investigated the flaky original test");
+      // ...but the preserved-tail duplicates and the compaction row did not.
+      expect(seenPrompt).not.toContain("copydup");
+      expect(seenPrompt).not.toContain("Compaction summary condensing");
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("generation failure skips the row and never throws", async () => {
     const { historyService, cleanup } = await createTestHistoryService();
     try {
