@@ -43,7 +43,11 @@ import type { Config } from "@/node/config";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
-import type { MemoryRefinementAction } from "@/common/types/refinement";
+import {
+  REFINEMENT_CAPTURE_MAX_FILES,
+  REFINEMENT_CAPTURE_MAX_TOTAL_BYTES,
+  type MemoryRefinementAction,
+} from "@/common/types/refinement";
 import {
   appendRefinementEvent,
   type RefinementFileCapture,
@@ -124,6 +128,13 @@ interface ParsedMemoryPath {
 
 /** Thrown for expected, recoverable command errors; converted to { success: false }. */
 class MemoryCommandError extends Error {}
+
+/**
+ * Delete-inverse capture cannot represent the subtree faithfully (dotfile,
+ * non-regular entry, empty dir, over-budget): skip journaling, never the
+ * delete itself.
+ */
+class MemoryCaptureSkippedError extends Error {}
 
 // Rejected BEFORE resolution: URL-encoded '.', '/', '\' could smuggle traversal
 // through downstream decoding layers.
@@ -676,9 +687,14 @@ export class MemoryService extends EventEmitter {
 
   /**
    * Capture the restore payload for a delete (file or recursive directory)
-   * BEFORE it is removed. Returns null when capture fails (e.g. an over-cap or
-   * binary file edited outside Mux): the delete then proceeds unjournaled
-   * (log-only) rather than failing the user-facing command.
+   * BEFORE it is removed. Returns null when capture fails or the subtree
+   * cannot be represented faithfully by a files-only text inverse: the delete
+   * then proceeds unjournaled (log-only) rather than failing the user-facing
+   * command. A PARTIAL inverse is worse than none — rollback would
+   * "successfully" restore a subset and permanently lose the rest — so the
+   * directory walk is strict (unlike listFiles, which silently drops
+   * dotfiles, truncates at the scope cap, and lists unreadable dirs as
+   * empty). Same doctrine as agent_skill_delete's capture.
    */
   private async captureDeleteInverse(
     store: MemoryStore,
@@ -686,23 +702,77 @@ export class MemoryService extends EventEmitter {
     kind: MemoryEntryKind
   ): Promise<RefinementInverseDraft | null> {
     try {
-      const capture = async (fileRelPath: string): Promise<RefinementFileCapture> => ({
-        path: store.physicalPath(fileRelPath),
-        content: await this.readBoundedTextFile(store, fileRelPath, fileRelPath),
-      });
+      const capture = async (fileRelPath: string): Promise<RefinementFileCapture> => {
+        const content = await this.readBoundedTextFile(store, fileRelPath, fileRelPath);
+        // Lossy utf-8 decode (externally created binary file): restoring the
+        // decoded text would corrupt it on rollback. Files legitimately
+        // containing U+FFFD are a rare false positive whose only cost is an
+        // unjournaled delete.
+        if (content.includes("\uFFFD")) {
+          throw new MemoryCaptureSkippedError(`'${fileRelPath}' is not valid UTF-8 (binary)`);
+        }
+        return { path: store.physicalPath(fileRelPath), content };
+      };
       if (kind === "file") {
         return { op: "restore-files", files: [await capture(relPath)] };
       }
-      // Directory: every file under the prefix (dotfiles excluded, matching
-      // listFiles — the memory path grammar never addresses dotfiles anyway).
-      const prefix = `${relPath}/`;
-      const files = (await store.listFiles()).filter((file) => file.startsWith(prefix));
+      // Directory: strict complete walk over the PHYSICAL subtree.
+      const fileRelPaths: string[] = [];
+      const walk = async (dirRel: string): Promise<void> => {
+        // An unreadable dir throws here → capture is skipped (never partial).
+        const entries = await fsPromises.readdir(store.physicalPath(dirRel), {
+          withFileTypes: true,
+        });
+        if (entries.length === 0) {
+          // restore-files recreates parent dirs of files only; an empty dir
+          // would silently vanish from a rollback-restored subtree.
+          throw new MemoryCaptureSkippedError(`'${dirRel}' is an empty directory`);
+        }
+        entries.sort((a, b) => (a.name < b.name ? -1 : 1));
+        for (const entry of entries) {
+          const childRel = `${dirRel}/${entry.name}`;
+          if (entry.name.startsWith(".")) {
+            // The memory grammar cannot address dotfiles, so a restored one
+            // could never be managed (or re-deleted) through MemoryService.
+            throw new MemoryCaptureSkippedError(`'${childRel}' is a dotfile`);
+          }
+          if (entry.isDirectory()) {
+            await walk(childRel);
+          } else if (entry.isFile()) {
+            if (fileRelPaths.length >= REFINEMENT_CAPTURE_MAX_FILES) {
+              throw new MemoryCaptureSkippedError(
+                `subtree has more than ${REFINEMENT_CAPTURE_MAX_FILES} files`
+              );
+            }
+            fileRelPaths.push(childRel);
+          } else {
+            // Symlink/socket/fifo: unrepresentable in a restore-files inverse.
+            throw new MemoryCaptureSkippedError(`'${childRel}' is not a regular file`);
+          }
+        }
+      };
+      await walk(relPath);
       const captures: RefinementFileCapture[] = [];
-      for (const file of files) {
-        captures.push(await capture(file));
+      let totalBytes = 0;
+      for (const file of fileRelPaths) {
+        const captured = await capture(file);
+        totalBytes += Buffer.byteLength(captured.content, "utf-8");
+        if (totalBytes > REFINEMENT_CAPTURE_MAX_TOTAL_BYTES) {
+          throw new MemoryCaptureSkippedError(
+            `subtree exceeds ${REFINEMENT_CAPTURE_MAX_TOTAL_BYTES} total bytes`
+          );
+        }
+        captures.push(captured);
       }
       return { op: "restore-files", files: captures };
     } catch (error) {
+      if (error instanceof MemoryCaptureSkippedError) {
+        log.debug("[MemoryService] skipping delete inverse: unrepresentable subtree", {
+          relPath,
+          reason: error.message,
+        });
+        return null;
+      }
       log.debug("[MemoryService] failed to capture delete inverse; delete proceeds unjournaled", {
         relPath,
         error,

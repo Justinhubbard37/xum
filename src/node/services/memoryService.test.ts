@@ -18,6 +18,7 @@ import {
 import { MemoryMetaService } from "./memoryMeta";
 import {
   MemoryRefinementActionSchema,
+  REFINEMENT_CAPTURE_MAX_FILES,
   REFINEMENT_INLINE_MAX_CHARS,
   RefinementEvidenceSchema,
   RefinementInverseSchema,
@@ -1270,6 +1271,68 @@ describe("MemoryService refinement journal", () => {
     await applyRefinementInverse(sessionDirOf(fixture), events[2].data.inverse);
     expect(await fsPromises.readFile(path.join(dir, "a.md"), "utf-8")).toBe("aaa");
     expect(await fsPromises.readFile(path.join(dir, "sub", "b.md"), "utf-8")).toBe("bbb");
+  });
+
+  it("skips journaling a directory delete when the dir contains a dotfile", async () => {
+    using fixture = await createFixture();
+    await fixture.service.create(fixture.ctx, "/memories/global/dir/a.md", "aaa", "agent");
+    // Externally created dotfile: invisible to listFiles/the memory grammar.
+    // A partial inverse would "successfully" restore only a.md on rollback,
+    // permanently losing this state — skip journaling instead.
+    const dir = path.join(fixture.muxHome, "memory", "global", "dir");
+    await fsPromises.writeFile(path.join(dir, ".secret"), "hidden\n", "utf-8");
+
+    const result = await fixture.service.deletePath(fixture.ctx, "/memories/global/dir", "agent");
+    expect(result.success).toBe(true);
+    expect(await pathExists(dir)).toBe(false);
+
+    // Only the create row exists; the delete journaled nothing.
+    const events = await readRefinementEvents(sessionDirOf(fixture));
+    expect(events).toHaveLength(1);
+    expect(MemoryRefinementActionSchema.parse(events[0].data.action).op).toBe("create");
+  });
+
+  it("skips journaling a directory delete containing an empty subdir or symlink", async () => {
+    using fixture = await createFixture();
+    // Empty subdirectory: a files-only inverse cannot recreate it.
+    await fixture.service.create(fixture.ctx, "/memories/global/d1/a.md", "aaa", "agent");
+    const d1 = path.join(fixture.muxHome, "memory", "global", "d1");
+    await fsPromises.mkdir(path.join(d1, "empty"));
+    expect(
+      (await fixture.service.deletePath(fixture.ctx, "/memories/global/d1", "agent")).success
+    ).toBe(true);
+
+    // Symlink: non-regular entries are unrepresentable in a restore inverse.
+    await fixture.service.create(fixture.ctx, "/memories/global/d2/a.md", "aaa", "agent");
+    const d2 = path.join(fixture.muxHome, "memory", "global", "d2");
+    await fsPromises.symlink("a.md", path.join(d2, "alias.md"));
+    expect(
+      (await fixture.service.deletePath(fixture.ctx, "/memories/global/d2", "agent")).success
+    ).toBe(true);
+
+    // Two create rows only; neither delete journaled an inverse.
+    const events = await readRefinementEvents(sessionDirOf(fixture));
+    expect(events).toHaveLength(2);
+    for (const event of events) {
+      expect(MemoryRefinementActionSchema.parse(event.data.action).op).toBe("create");
+    }
+  });
+
+  it("skips journaling a directory delete when the subtree exceeds the capture file cap", async () => {
+    using fixture = await createFixture();
+    await fixture.service.create(fixture.ctx, "/memories/global/dir/a.md", "aaa", "agent");
+    // Externally grown beyond the capture cap: listFiles-style truncation
+    // must not produce a silently partial inverse.
+    const dir = path.join(fixture.muxHome, "memory", "global", "dir");
+    for (let i = 0; i < REFINEMENT_CAPTURE_MAX_FILES; i++) {
+      await fsPromises.writeFile(path.join(dir, `f${i}.md`), "x", "utf-8");
+    }
+
+    const result = await fixture.service.deletePath(fixture.ctx, "/memories/global/dir", "agent");
+    expect(result.success).toBe(true);
+    expect(await pathExists(dir)).toBe(false);
+    const events = await readRefinementEvents(sessionDirOf(fixture));
+    expect(events).toHaveLength(1); // create row only
   });
 
   it("journals rename with an inverse that renames back", async () => {
