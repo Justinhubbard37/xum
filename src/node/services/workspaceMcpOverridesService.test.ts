@@ -408,6 +408,53 @@ describe("WorkspaceMcpOverridesService", () => {
     });
   });
 
+  it("prunePluginOverrideKeys rejects opaque field shapes instead of declaring success", async () => {
+    const projectPath = "/fake/project";
+    const workspaceId = "ws-id";
+    const workspaceName = "branch";
+
+    const workspacePath = getWorkspacePath({
+      srcDir: config.srcDir,
+      projectName: "project",
+      workspaceName,
+    });
+    const filePath = path.join(workspacePath, ".mux", "mcp.local.jsonc");
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await config.editConfig((cfg) => {
+      cfg.projects.set(projectPath, {
+        workspaces: [
+          {
+            path: workspacePath,
+            id: workspaceId,
+            name: workspaceName,
+            runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+          },
+        ],
+      });
+      return cfg;
+    });
+    const service = new WorkspaceMcpOverridesService(config);
+
+    // A newer release may represent an owned field with a shape this build
+    // cannot inspect; "successfully pruning" it would retire the caller's
+    // tombstone while plugin keys embedded in that shape survive.
+    await fs.writeFile(filePath, JSON.stringify({ enabledServers: { v2: ["plugin:abc:echo"] } }));
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(service.prunePluginOverrideKeys(workspaceId, "plugin:abc:")).rejects.toThrow(
+      /unrecognized "enabledServers" shape/
+    );
+
+    await fs.writeFile(filePath, JSON.stringify({ toolAllowlist: ["plugin:abc:echo"] }));
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(service.prunePluginOverrideKeys(workspaceId, "plugin:abc:")).rejects.toThrow(
+      /unrecognized "toolAllowlist" shape/
+    );
+
+    // Absent fields stay fine (nothing to prune).
+    await fs.writeFile(filePath, JSON.stringify({ somethingElse: true }));
+    await service.prunePluginOverrideKeys(workspaceId, "plugin:abc:");
+  });
+
   it("prunePluginOverrideKeys rejects duplicate properties instead of mis-editing", async () => {
     const projectPath = "/fake/project";
     const workspaceId = "ws-id";

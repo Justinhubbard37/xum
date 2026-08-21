@@ -57,7 +57,7 @@ const Badge: React.FC<{
       "rounded px-1.5 py-0.5 text-[10px] font-medium whitespace-nowrap",
       props.tone === "muted" && "bg-foreground/10 text-muted",
       props.tone === "accent" && "bg-accent/15 text-accent",
-      props.tone === "warning" && "bg-yellow-500/15 text-yellow-500",
+      props.tone === "warning" && "bg-warning/15 text-warning",
       props.tone === "error" && "bg-destructive/15 text-destructive"
     )}
   >
@@ -210,9 +210,9 @@ const AddPluginPanel: React.FC<{
           </div>
 
           {preview.warnings.length > 0 && (
-            <div className="space-y-1 rounded-md bg-yellow-500/10 px-3 py-2">
+            <div className="bg-warning/10 space-y-1 rounded-md px-3 py-2">
               {preview.warnings.map((warning) => (
-                <div key={warning} className="flex items-start gap-2 text-xs text-yellow-500">
+                <div key={warning} className="text-warning flex items-start gap-2 text-xs">
                   <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                   <span className="break-words">{warning}</span>
                 </div>
@@ -625,7 +625,7 @@ export const PluginsSettingsSection: React.FC = () => {
           </div>
         )}
         {updateCheckError && (
-          <div className="mb-3 flex items-start gap-2 rounded-md bg-yellow-500/10 px-3 py-2 text-sm text-yellow-500">
+          <div className="bg-warning/10 text-warning mb-3 flex items-start gap-2 rounded-md px-3 py-2 text-sm">
             <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
             <span className="break-words">Update check failed: {updateCheckError}</span>
           </div>
@@ -689,7 +689,7 @@ export const PluginsSettingsSection: React.FC = () => {
                         </p>
                       )}
                       {check?.status === "error" && check.message && (
-                        <p className="mt-0.5 flex items-start gap-1 text-[11px] text-yellow-500">
+                        <p className="text-warning mt-0.5 flex items-start gap-1 text-[11px]">
                           <CircleAlert className="mt-0.5 h-3 w-3 shrink-0" />
                           <span className="break-words">{check.message}</span>
                         </p>

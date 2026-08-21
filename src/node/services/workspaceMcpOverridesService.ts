@@ -611,13 +611,26 @@ export class WorkspaceMcpOverridesService {
           text = next;
         };
 
+        // A newer release may represent an owned field with a shape this
+        // build cannot inspect. Declaring success would retire the caller's
+        // tombstone while plugin keys embedded in that shape survive —
+        // reactivating the server on reinstall. Throw instead: the tombstone
+        // stays retryable (same doctrine as unreadable files).
+        const opaqueShape = (field: string): Error =>
+          new Error(
+            `Workspace MCP overrides file has an unrecognized "${field}" shape (written by a newer version?): ${filePath}`
+          );
+
         for (const field of ["enabledServers", "disabledServers"] as const) {
           // Re-parse after each removal: array indices shift as items go.
           for (;;) {
             const current = jsonc.parse(text) as Record<string, unknown>;
             const value = current[field];
-            if (!Array.isArray(value)) {
+            if (value === undefined) {
               break;
+            }
+            if (!Array.isArray(value)) {
+              throw opaqueShape(field);
             }
             const index = value.findIndex(
               (key) => typeof key === "string" && key.startsWith(keyPrefix)
@@ -630,7 +643,10 @@ export class WorkspaceMcpOverridesService {
         }
 
         const allowlist = (jsonc.parse(text) as Record<string, unknown>).toolAllowlist;
-        if (allowlist !== null && typeof allowlist === "object" && !Array.isArray(allowlist)) {
+        if (allowlist !== undefined) {
+          if (allowlist === null || typeof allowlist !== "object" || Array.isArray(allowlist)) {
+            throw opaqueShape("toolAllowlist");
+          }
           for (const key of Object.keys(allowlist)) {
             if (key.startsWith(keyPrefix)) {
               removeAt(["toolAllowlist", key]);

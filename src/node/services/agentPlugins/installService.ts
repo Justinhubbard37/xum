@@ -28,6 +28,7 @@ import { log } from "@/node/services/log";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
+import { shellQuote } from "@/common/utils/shell";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import {
   discoverAgentPluginAt,
@@ -117,9 +118,43 @@ async function runGit(args: string[], opts?: { timeoutMs?: number }): Promise<st
     // stalled helper would otherwise keep the promise pending past the
     // timeout because only the direct child gets killed.
     killTreeOnTermination: true,
+    // These remotes are untrusted: a malicious or noisy repository can emit
+    // unbounded progress/sideband output, and unbounded buffering would
+    // exhaust the main process before the timeout fires. 10 MiB is far above
+    // anything the plugin-sized clones/ls-remotes here legitimately produce.
+    maxOutputBytes: 10 * 1024 * 1024,
   });
   const { stdout } = await proc.result;
   return stdout;
+}
+
+/** Max simultaneous `git ls-remote` processes during an update check. */
+const UPDATE_CHECK_CONCURRENCY = 4;
+
+/**
+ * Map with a bounded worker pool, preserving input order. Rejections
+ * propagate; callers needing per-item error isolation catch inside `fn`
+ * (checkUpdates does).
+ */
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<R>
+): Promise<R[]> {
+  assert(limit > 0, "mapWithConcurrency: limit must be positive");
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const index = nextIndex++;
+      if (index >= items.length) {
+        return;
+      }
+      results[index] = await fn(items[index]);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 async function pathExists(candidate: string): Promise<boolean> {
@@ -612,6 +647,102 @@ export class AgentPluginInstallService {
   }
 
   /**
+   * Security-relevant capability surface of a plugin tree: the auto-loading
+   * hook (entry path + tool grants) and MCP servers (transport + exact
+   * argv/env/url, root-path-normalized so staged and installed trees compare
+   * equal). Skills, agents, workflows, and slash commands are excluded: they
+   * stay inert until the user explicitly invokes them and are listed in
+   * Settings, whereas a hook auto-executes on requests and an enabled MCP
+   * server's command changes silently behind its stable server key.
+   */
+  private async capabilitySurface(
+    plugin: AgentPluginInfo,
+    instanceId: string
+  ): Promise<{ hook: AgentPluginPreviewHook | undefined; servers: Map<string, string> }> {
+    const hook = this.collectHook(plugin);
+    const servers = new Map<string, string>();
+    if (plugin.mcpConfigPath !== undefined) {
+      const { servers: infos } = await loadPluginMcpServers(plugin, {
+        muxHome: this.config.rootDir,
+        instanceId,
+      });
+      const normalize = (value: string): string => value.split(plugin.rootPath).join("<plugin>");
+      for (const info of Object.values(infos)) {
+        assert(info.plugin !== undefined, "plugin server info must carry provenance");
+        const fingerprint =
+          info.transport === "stdio"
+            ? JSON.stringify({
+                transport: "stdio",
+                argv: [info.command, ...(info.args ?? [])].map(normalize),
+                env: Object.fromEntries(
+                  Object.entries(info.env ?? {}).map(([key, value]) => [key, normalize(value)])
+                ),
+              })
+            : JSON.stringify({ transport: info.transport, url: info.url });
+        servers.set(info.plugin.serverName, fingerprint);
+      }
+    }
+    return { hook, servers };
+  }
+
+  /**
+   * Update gate: reject capability increases/changes between the installed
+   * tree and the staged new tree. A missing or invalid installed tree yields
+   * an empty surface, so everything staged counts as an addition
+   * (conservative: nothing inspectable was consented to at this path).
+   * Capability REMOVALS and grant reductions apply without re-consent.
+   */
+  private async assertNoCapabilityIncrease(
+    name: string,
+    installedPath: string,
+    stagedPlugin: AgentPluginInfo
+  ): Promise<void> {
+    const instanceId = this.instanceIdFor(name);
+    const { plugin: currentPlugin } = await discoverAgentPluginAt({
+      pluginDir: installedPath,
+      scope: "global",
+    });
+    const staged = await this.capabilitySurface(stagedPlugin, instanceId);
+    const current =
+      currentPlugin === null ? undefined : await this.capabilitySurface(currentPlugin, instanceId);
+
+    const changes: string[] = [];
+    if (staged.hook !== undefined) {
+      const currentHook = current?.hook;
+      if (currentHook === undefined) {
+        const grantSuffix =
+          staged.hook.toolGrants.length > 0
+            ? ` with tool grants: ${staged.hook.toolGrants.join(", ")}`
+            : "";
+        changes.push(`adds executable hooks (${staged.hook.path}${grantSuffix})`);
+      } else {
+        if (staged.hook.path !== currentHook.path) {
+          changes.push(`moves its hook entry (${currentHook.path} → ${staged.hook.path})`);
+        }
+        const newGrants = staged.hook.toolGrants.filter(
+          (grant) => !currentHook.toolGrants.includes(grant)
+        );
+        if (newGrants.length > 0) {
+          changes.push(`expands hook tool grants: ${newGrants.join(", ")}`);
+        }
+      }
+    }
+    for (const [serverName, fingerprint] of staged.servers) {
+      const currentFingerprint = current?.servers.get(serverName);
+      if (currentFingerprint === undefined) {
+        changes.push(`adds MCP server '${serverName}'`);
+      } else if (currentFingerprint !== fingerprint) {
+        changes.push(`changes MCP server '${serverName}'`);
+      }
+    }
+    if (changes.length > 0) {
+      throw new Error(
+        `The update to '${name}' ${changes.join("; ")}. Updates cannot expand a plugin's capabilities without review — uninstall it and reinstall to see the full consent preview.`
+      );
+    }
+  }
+
+  /**
    * Agent definition files (agents/*.md) and executable workflow scripts
    * (workflows/*.js) for the consent preview, mirroring the runtime listers
    * (agentDefinitionsService / workflowScriptDiscovery: top-level files and
@@ -731,7 +862,14 @@ export class AgentPluginInstallService {
     for (const info of Object.values(servers)) {
       assert(info.plugin !== undefined, "plugin server info must carry provenance");
       if (info.transport === "stdio") {
-        const commandLine = [info.command, ...(info.args ?? [])].map(rewrite).join(" ");
+        // Mirror the runtime's rendering (MCPServerManager shell-quotes every
+        // token): the consent preview must show the exact argument boundaries
+        // that will run — an arg containing whitespace/quotes could otherwise
+        // masquerade as several args or hide a boundary.
+        const commandLine =
+          info.args !== undefined
+            ? [info.command, ...info.args].map(rewrite).map(shellQuote).join(" ")
+            : rewrite(info.command);
         const envKeys = Object.keys(info.env ?? {}).filter(
           (key) => key !== "PLUGIN_ROOT" && key !== "PLUGIN_DATA"
         );
@@ -1542,9 +1680,17 @@ export class AgentPluginInstallService {
   async checkUpdates(): Promise<AgentPluginUpdateCheck[]> {
     this.assertEnabled();
 
-    const registry = await this.readRegistry("lenient");
-    return Promise.all(
-      registry.map(async (entry): Promise<AgentPluginUpdateCheck> => {
+    // STRICT: a lenient read would degrade an unreadable/corrupted registry
+    // to an empty list and report a false "everything is up to date". The
+    // thrown error surfaces nonfatally in the UI as the update-check error
+    // state instead.
+    const registry = await this.readRegistry("strict");
+    // Bounded concurrency: one ls-remote process per entry at once would let
+    // a large registry exhaust sockets/file descriptors on section open.
+    return mapWithConcurrency(
+      registry,
+      UPDATE_CHECK_CONCURRENCY,
+      async (entry): Promise<AgentPluginUpdateCheck> => {
         if (entry.source.refType === "commit") {
           return { name: entry.name, status: "pinned" };
         }
@@ -1570,7 +1716,7 @@ export class AgentPluginInstallService {
         } catch (error) {
           return { name: entry.name, status: "error", message: getErrorMessage(error) };
         }
-      })
+      }
     );
   }
 
@@ -1621,9 +1767,19 @@ export class AgentPluginInstallService {
             `The plugin renamed itself upstream ('${entry.name}' → '${plugin.name}'). Uninstall and reinstall to adopt the new name.`
           );
         }
-        await this.removeDir(path.join(stagedDir, ".git"));
 
         const targetPath = this.targetPathFor(entry.name);
+        // Security: an update must not silently expand what the plugin can
+        // do — a compromised upstream could add hooks.js plus a bash grant
+        // and auto-load it on the next request. Compare the staged tree's
+        // capability surface against the installed tree and reject
+        // increases/changes; uninstall + reinstall routes through the full
+        // install consent preview. (In-place re-consent UX for updates is
+        // a v2 item.)
+        await this.assertNoCapabilityIncrease(entry.name, targetPath, plugin);
+
+        await this.removeDir(path.join(stagedDir, ".git"));
+
         const serverKeyPrefix = buildPluginServerKey(this.instanceIdFor(entry.name), "");
         const trashDir = path.join(this.stagingRoot, `trash-${Date.now()}-${entry.name}`);
         const hadOldTree = await pathExists(targetPath);

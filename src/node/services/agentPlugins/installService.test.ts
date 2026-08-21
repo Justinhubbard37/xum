@@ -202,9 +202,11 @@ describe("AgentPluginInstallService", () => {
     expect(preview.mcpServers).toHaveLength(1);
     expect(preview.mcpServers[0].serverName).toBe("echo");
     expect(preview.mcpServers[0].transport).toBe("stdio");
-    // Command line shows the FINAL install path, not the staging clone path.
+    // Command line shows the FINAL install path, not the staging clone path,
+    // shell-quoted per token exactly like the runtime renders it (argument
+    // boundaries in the consent preview must match what will run).
     expect(preview.mcpServers[0].summary).toBe(
-      `node ${path.join(pluginsDir(), "demo-plugin", "server.js")}`
+      `'node' '${path.join(pluginsDir(), "demo-plugin", "server.js")}'`
     );
 
     // Cancelling after preview = nothing written anywhere.
@@ -279,6 +281,134 @@ describe("AgentPluginInstallService", () => {
     expect(await pathExists(path.join(installedDir, "local-edit.txt"))).toBe(false);
     expect(((await registry())[0] as { lockedSha: string }).lockedSha).toBe(newHead);
     expect(await stagingLeftovers()).toEqual([]);
+  });
+
+  test("update rejects capability increases (new hook, expanded grants, new/changed MCP servers)", async () => {
+    // Security gate: a compromised upstream must not auto-load new executable
+    // capabilities through a routine update click. Additions/changes are
+    // rejected; the user re-consents via uninstall + reinstall.
+    const preview = await service.preview({ input: remoteDir });
+    const installedSha = preview.lockedSha;
+    await service.install({ source: preview.source, expectedSha: installedSha });
+    const installedDir = path.join(pluginsDir(), "demo-plugin");
+
+    // Upstream adds hooks.js with a bash grant and a NEW MCP server.
+    await writePluginFixture(remoteDir, { version: "2.0.0" });
+    await fsPromises.writeFile(path.join(remoteDir, "hooks.js"), "export default {};\n");
+    await fsPromises.writeFile(
+      path.join(remoteDir, "plugin.json"),
+      JSON.stringify({
+        $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+        name: "demo-plugin",
+        version: "2.0.0",
+        description: "Demo plugin",
+        extensions: { mux: { hooks: { tools: ["bash"] } } },
+      })
+    );
+    await fsPromises.writeFile(
+      path.join(remoteDir, "mcp.json"),
+      JSON.stringify({
+        $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+        mcpServers: {
+          echo: { type: "stdio", command: "node", args: ["${PLUGIN_ROOT}/server.js"] },
+          exfil: { type: "stdio", command: "node", args: ["${PLUGIN_ROOT}/exfil.js"] },
+        },
+      })
+    );
+    await commitAll(remoteDir, "v2 adds hook + server");
+
+    await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(
+      /adds executable hooks \(hooks\.js with tool grants: bash\).*adds MCP server 'exfil'.*uninstall/s
+    );
+    // Rejected update leaves the install untouched.
+    expect(((await registry())[0] as { lockedSha: string }).lockedSha).toBe(installedSha);
+    expect(await pathExists(path.join(installedDir, "hooks.js"))).toBe(false);
+    expect(await stagingLeftovers()).toEqual([]);
+
+    // Changing an EXISTING server's command line is likewise rejected.
+    await writePluginFixture(remoteDir, { version: "2.0.1" });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "mcp.json"),
+      JSON.stringify({
+        $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+        mcpServers: {
+          echo: { type: "stdio", command: "node", args: ["${PLUGIN_ROOT}/other.js"] },
+        },
+      })
+    );
+    await commitAll(remoteDir, "v2.0.1 changes echo argv");
+    await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(
+      /changes MCP server 'echo'/
+    );
+
+    // A capability-neutral update (same hook-less, same servers) applies.
+    await writePluginFixture(remoteDir, { version: "3.0.0" });
+    await fsPromises.rm(path.join(remoteDir, "hooks.js"));
+    const cleanHead = await commitAll(remoteDir, "v3 capability-neutral");
+    const updated = await service.update({ name: "demo-plugin" });
+    expect(updated.lockedSha).toBe(cleanHead);
+  });
+
+  test("checkUpdates surfaces a corrupted registry instead of a false all-clear", async () => {
+    await fsPromises.writeFile(registryFile(), "{ not json");
+
+    await expect(service.checkUpdates()).rejects.toThrow(/corrupted/);
+  });
+
+  test("checkUpdates bounds concurrent remote lookups", async () => {
+    // Seed a registry with many entries; a gate inside resolveRemoteRef
+    // measures how many lookups run simultaneously.
+    const entries = Array.from({ length: 9 }, (_, i) => ({
+      name: `plugin-${i}`,
+      scope: "global",
+      source: { type: "git", url: remoteDir, ref: "main", refType: "branch" },
+      lockedSha: "a".repeat(40),
+      installedAt: "2026-08-01T00:00:00.000Z",
+    }));
+    await fsPromises.writeFile(registryFile(), JSON.stringify({ plugins: entries }));
+
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const internals = service as unknown as {
+      resolveRemoteRef: (url: string, ref: string) => Promise<unknown>;
+    };
+    const resolveSpy = spyOn(internals, "resolveRemoteRef").mockImplementation(async () => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      inFlight -= 1;
+      return { refType: "branch", ref: "main", sha: "a".repeat(40) };
+    });
+    try {
+      const checks = await service.checkUpdates();
+      expect(checks).toHaveLength(9);
+      expect(checks.every((check) => check.status === "up-to-date")).toBe(true);
+      expect(maxInFlight).toBeGreaterThan(1);
+      expect(maxInFlight).toBeLessThanOrEqual(4);
+    } finally {
+      resolveSpy.mockRestore();
+    }
+  });
+
+  test("Windows-reserved plugin names are rejected at consent time", async () => {
+    // `con` (with or without extension) is a reserved device name on
+    // Windows: promotion into ~/.mux/plugins/<name> would fail there, so
+    // consent must reject it up front on every platform.
+    await fsPromises.writeFile(
+      path.join(remoteDir, "plugin.json"),
+      JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "con", version: "1.0.0" })
+    );
+    await commitAll(remoteDir, "reserved name");
+
+    await expect(service.preview({ input: remoteDir })).rejects.toThrow(/name/);
+
+    await fsPromises.writeFile(
+      path.join(remoteDir, "plugin.json"),
+      JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "com1.tools", version: "1" })
+    );
+    await commitAll(remoteDir, "reserved name with extension");
+
+    await expect(service.preview({ input: remoteDir })).rejects.toThrow(/name/);
   });
 
   test("tag refs pin; a moved tag reports tag-moved; commit refs report pinned", async () => {

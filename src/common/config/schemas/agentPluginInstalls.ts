@@ -3,6 +3,7 @@ import { z } from "zod";
 import {
   AGENT_PLUGIN_NAME_MAX_LENGTH,
   AGENT_PLUGIN_NAME_PATTERN,
+  isValidAgentPluginName,
 } from "@/common/utils/agentPluginName";
 
 /**
@@ -62,7 +63,13 @@ export const AgentPluginInstallEntrySchema = z.object({
    * Pattern-enforced because it is joined into filesystem paths that
    * uninstall deletes recursively — `.`/`..`/separators must never validate.
    */
-  name: z.string().max(AGENT_PLUGIN_NAME_MAX_LENGTH).regex(AGENT_PLUGIN_NAME_PATTERN),
+  name: z
+    .string()
+    .max(AGENT_PLUGIN_NAME_MAX_LENGTH)
+    .regex(AGENT_PLUGIN_NAME_PATTERN)
+    // Full validator on top of the grammar: also rejects Windows-reserved
+    // device names, which pattern+length alone admit.
+    .refine(isValidAgentPluginName, { message: "reserved or invalid plugin name" }),
   /** v1 installs are global-only; the installer never writes into project checkouts. */
   scope: z.literal("global"),
   source: AgentPluginInstallSourceSchema,
