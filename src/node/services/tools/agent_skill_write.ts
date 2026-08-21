@@ -18,9 +18,9 @@ import { readFileString, writeFileString } from "@/node/utils/runtime/helpers";
 import { generateDiff } from "@/node/services/tools/fileCommon";
 import {
   hasErrorCode,
-  isAbsolutePathAny,
   isSkillMarkdownRootFile,
   resolveContainedSkillFilePath,
+  resolveSkillFilePath,
   SKILL_FILENAME,
   validateLocalSkillDirectory,
 } from "./skillFileUtils";
@@ -111,6 +111,7 @@ function injectSkillNameIntoFrontmatter(content: string, skillName: string): str
  * reject (invalid name, traversal-shaped filePath, invalid SKILL.md
  * frontmatter, the parser's size cap) BEFORE they are staged, rendered, and
  * approved. Built from the same primitives execute uses (SkillNameSchema,
+ * resolveSkillFilePath — the write path's lexical resolver —
  * injectSkillNameIntoFrontmatter, parseSkillMarkdown, isSkillMarkdownRootFile)
  * so it cannot drift. Deliberately excludes state/filesystem checks
  * (symlink/realpath containment, workspace bounds): staging validation is
@@ -126,21 +127,21 @@ export function validateSkillWriteProposal(args: {
     return { ok: false, error: parsedName.error.message };
   }
   const relativeFilePath = args.filePath ?? SKILL_FILENAME;
-  // Same string-level shape checks both execute branches run inside their
-  // path resolvers (before any filesystem access).
-  if (!relativeFilePath) {
-    return { ok: false, error: "filePath is required" };
+  // NORMALIZE FIRST with the write path's own lexical resolver (against a
+  // synthetic root — no filesystem access): a prefix-only ".." check missed
+  // interior traversal like "nested/../../escape.md", and checking SKILL.md
+  // against the unnormalized input let "docs/../SKILL.md" bypass
+  // frontmatter validation at staging.
+  let normalizedRelativePath: string;
+  try {
+    normalizedRelativePath = resolveSkillFilePath(
+      path.resolve(path.sep, "staged-skill-validation"),
+      relativeFilePath
+    ).normalizedRelativePath;
+  } catch (error) {
+    return { ok: false, error: getErrorMessage(error) };
   }
-  if (isAbsolutePathAny(relativeFilePath) || relativeFilePath.startsWith("~")) {
-    return {
-      ok: false,
-      error: `Invalid filePath (must be relative to the skill directory): ${relativeFilePath}`,
-    };
-  }
-  if (relativeFilePath.startsWith("..")) {
-    return { ok: false, error: `Invalid filePath (path traversal): ${relativeFilePath}` };
-  }
-  if (isSkillMarkdownRootFile(relativeFilePath.replace(/\\/g, "/"))) {
+  if (isSkillMarkdownRootFile(normalizedRelativePath)) {
     const contentToWrite = injectSkillNameIntoFrontmatter(args.content, parsedName.data);
     try {
       parseSkillMarkdown({

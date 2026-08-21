@@ -1219,6 +1219,50 @@ describe("RefineService", () => {
     if (!applyAfter.success) expect(applyAfter.error).toContain("no staged refine edits");
   });
 
+  it("normalizes staged skill paths before validating (interior traversal, SKILL.md aliases)", async () => {
+    // Codex round 20: the round-19 validator only rejected paths BEGINNING
+    // with ".." and checked SKILL.md against the unnormalized input —
+    // "nested/../../escape.md" staged then failed at apply, and
+    // "docs/../SKILL.md" bypassed staging-time frontmatter validation.
+    using fixture = await createFixture({
+      withSkillTool: true,
+      modelFactory: () =>
+        toolCallModel(
+          [
+            {
+              toolCallId: "refine-interior-escape",
+              toolName: "agent_skill_write",
+              input: {
+                name: "escapey",
+                filePath: "nested/../../escape.md",
+                content: "must never stage\n",
+              },
+            },
+            {
+              toolCallId: "refine-skillmd-alias",
+              toolName: "agent_skill_write",
+              input: {
+                name: "aliased",
+                filePath: "docs/../SKILL.md",
+                // Normalizes to SKILL.md, so frontmatter is REQUIRED — this
+                // body has none and must fail staging validation.
+                content: "no frontmatter here\n",
+              },
+            },
+          ],
+          "attempted normalization bypasses"
+        ),
+    });
+    await fixture.seedTrajectory();
+
+    const result = await fixture.service.run(WORKSPACE_ID);
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    // Neither proposal staged: interior traversal refused, alias frontmatter-validated.
+    expect(result.data.noOp).toBe(true);
+    expect(result.data.staged).toBeUndefined();
+  });
+
   it("includes timeline events in the prompt only when the Timeline experiment is on", async () => {
     const prompts: string[] = [];
     const timelineEvents = [{ kind: "milestone", description: "shipped the fix" }];
