@@ -287,6 +287,29 @@ describe("QuickJSRuntime", () => {
       expect(String(marker.args[0])).toMatch(/2\d\d record\(s\) dropped/);
     });
 
+    it("treats unserializable console records as over budget (BigInt bypass)", async () => {
+      // r17: a BARE BigInt arg survives dump as a real BigInt (objects
+      // containing one stringify to "[object Object]"), so JSON.stringify of
+      // the args array throws — charging such records zero bytes would
+      // retain the sibling payload arg for free, letting a guest grow host
+      // memory unbounded past the capture budget by pairing every large
+      // payload with one BigInt arg.
+      const result = await runtime.eval(`
+        for (let i = 0; i < 300; i++) { console.log(1n, "x".repeat(100000)); }
+        return "done";
+      `);
+      expect(result.success).toBe(true);
+      expect(result.result).toBe("done");
+
+      // Unserializable records must be dropped, not retained: total retained
+      // record count stays O(1) (the marker plus at most a few pre-trip
+      // records), never the 300 the guest logged.
+      expect(result.consoleOutput.length).toBeLessThanOrEqual(2);
+      const marker = result.consoleOutput[result.consoleOutput.length - 1];
+      expect(String(marker.args[0])).toContain("console output truncated at capture");
+      expect(String(marker.args[0])).toMatch(/(299|300) record\(s\) dropped/);
+    });
+
     it("events for dropped console records are not emitted (bounded capture, bounded stream)", async () => {
       const events: PTCEvent[] = [];
       runtime.onEvent((event) => events.push(event));

@@ -1183,14 +1183,16 @@ export class QuickJSRuntime implements IJSRuntime {
 
         const args: unknown[] = argHandles.map((h) => this.ctx.dump(h) as unknown);
         // Same measurement as the post-eval kernel cap: the JSON serialization
-        // of the args (unserializable → 0, matching that cap's fallback; such
-        // values come from guest cycles and are rare enough not to matter for
-        // a memory bound).
-        let size = 0;
+        // of the args. UNLIKE that cap's zero fallback, an unserializable
+        // record (e.g. BigInt — preserved by dump, throws in JSON.stringify)
+        // is treated as OVERFLOW: charging it zero would retain it for free,
+        // so a guest pairing every large payload with one BigInt could grow
+        // host memory unbounded past the budget (r17).
+        let size: number;
         try {
           size = Buffer.byteLength(JSON.stringify(args) ?? "", "utf8");
         } catch {
-          size = 0;
+          size = Number.POSITIVE_INFINITY;
         }
 
         if (budget.retainedBytes + size > CONSOLE_CAPTURE_BUDGET_BYTES) {
