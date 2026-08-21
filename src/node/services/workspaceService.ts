@@ -26,7 +26,11 @@ import { eventSpine } from "@/node/services/events/eventSpine";
 import { agentPluginHookService } from "@/node/services/agentPlugins/hookService";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import { isPathInsideDir } from "@/node/utils/pathUtils";
-import { AgentSession, type StreamErrorRecoveryOutcome } from "@/node/services/agentSession";
+import {
+  AgentSession,
+  clearProviderConfigFixableAbandonMarkers,
+  type StreamErrorRecoveryOutcome,
+} from "@/node/services/agentSession";
 import type { HistoryService } from "@/node/services/historyService";
 import type { AIService } from "@/node/services/aiService";
 import type { InitStateManager } from "@/node/services/initStateManager";
@@ -1728,6 +1732,35 @@ function extractUserPromptText(message: MuxMessage): string {
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
 export class WorkspaceService extends EventEmitter {
   private readonly sessions = new Map<string, AgentSession>();
+  private readonly providerConfigChangedListener = (): void => {
+    const liveSessions = new Map([
+      ...this.sessions.entries(),
+      ...this.transientStartupRecoverySessions.entries(),
+    ]);
+
+    // Clearing persisted credential failures restores the manual retry path only. The config
+    // change itself must never schedule or resume a stream (PR #2317 was rejected).
+    for (const [workspaceId, session] of liveSessions) {
+      void session.handleProviderConfigChanged().catch((error: unknown) => {
+        log.warn("Failed to clear provider-fixable auto-retry abandon state", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      });
+    }
+
+    // Closed chats have no session to clear their persisted marker, so sweep their
+    // preference files directly; otherwise reopening after a credential fix would
+    // resurrect the stale abandoned state from disk.
+    void clearProviderConfigFixableAbandonMarkers(
+      this.config.sessionsDir,
+      new Set(liveSessions.keys())
+    ).catch((error: unknown) => {
+      log.warn("Failed to sweep persisted auto-retry abandon markers", {
+        error: getErrorMessage(error),
+      });
+    });
+  };
   // Startup recovery may need a short-lived session even before the workspace is opened.
   // Promote only sessions that keep retry/stream activity alive after the initial check.
   private readonly transientStartupRecoverySessions = new Map<string, AgentSession>();
@@ -2006,6 +2039,7 @@ export class WorkspaceService extends EventEmitter {
     this.telemetryService = telemetryService;
     this.experimentsService = experimentsService;
     this.sessionTimingService = sessionTimingService;
+    this.aiService.on("providers-config-changed", this.providerConfigChangedListener);
     this.setupMetadataListeners();
     this.setupInitMetadataListeners();
   }
