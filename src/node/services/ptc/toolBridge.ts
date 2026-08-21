@@ -6,6 +6,7 @@
  * Zod schemas and result serialization.
  */
 
+import { randomUUID } from "node:crypto";
 import type { Tool } from "ai";
 import type { z } from "zod";
 import type { IJSRuntime } from "./runtime";
@@ -66,6 +67,18 @@ function extractAdmissionHandle(result: unknown): TaskSpawnAdmissionHandle {
   // Impossible by construction: the task tool's background result always
   // carries taskId(s). Crash-fast so a contract drift surfaces immediately.
   throw new Error("task_spawn: task admission returned no taskId");
+}
+
+/**
+ * Collision-free synthetic toolCallId for bridged executions. Millisecond
+ * timestamps are NOT unique: two concurrent guest calls (e.g. Promise.all of
+ * grouped task_spawns) landing in the same ms would share an ID, and the task
+ * tool derives its best-of group ID from toolCallId — colliding IDs merge
+ * independent launches into one cohort, mixing completion/winner selection
+ * across prompts.
+ */
+function syntheticToolCallId(toolName: string): string {
+  return `ptc-${toolName}-${randomUUID()}`;
 }
 
 /**
@@ -228,7 +241,7 @@ export class ToolBridge {
         // but not used by most tools - generate synthetic values for sandbox context)
         const result: unknown = await boundTool.execute!(validatedArgs, {
           abortSignal,
-          toolCallId: `ptc-${toolName}-${Date.now()}`,
+          toolCallId: syntheticToolCallId(toolName),
           messages: [],
           context: undefined,
         });
@@ -283,7 +296,7 @@ export class ToolBridge {
         });
         const result: unknown = await taskTool.execute!(validatedArgs, {
           abortSignal,
-          toolCallId: `ptc-task_spawn-${Date.now()}`,
+          toolCallId: syntheticToolCallId("task_spawn"),
           messages: [],
           context: undefined,
         });

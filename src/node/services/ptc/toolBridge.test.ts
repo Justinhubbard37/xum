@@ -392,6 +392,33 @@ describe("ToolBridge", () => {
       });
     });
 
+    it("concurrent task_spawn calls receive distinct toolCallIds", async () => {
+      // The task tool derives its best-of group ID from toolCallId, so two
+      // grouped spawns launched in the same millisecond (Promise.all) must
+      // not share an ID — colliding IDs merge independent launches into one
+      // cohort and mix completion/winner selection across prompts.
+      const seenToolCallIds: string[] = [];
+      const taskTool: Tool = {
+        description: "Mock task tool",
+        inputSchema: taskSchema,
+        execute: (_args, options) => {
+          seenToolCallIds.push(options.toolCallId);
+          return Promise.resolve({ status: "queued", taskId: `child-${seenToolCallIds.length}` });
+        },
+      };
+      const bridge = new ToolBridge({ task: taskTool });
+      const captured = registerCapturing(bridge, { drainHostEvents: () => [] });
+
+      const taskSpawn = captured.mux.task_spawn as (...args: unknown[]) => Promise<unknown>;
+      // 20 concurrent launches: with millisecond-timestamp IDs these land in
+      // the same ms and collide; collision-free IDs must all be unique.
+      await Promise.all(
+        Array.from({ length: 20 }, (_v, i) => taskSpawn({ prompt: `p${i}`, title: "T" }))
+      );
+      expect(seenToolCallIds).toHaveLength(20);
+      expect(new Set(seenToolCallIds).size).toBe(20);
+    });
+
     it("task_spawn is denied by the same grant as task", async () => {
       const executed = mock(() => ({ status: "queued", taskId: "never" }));
       const bridge = new ToolBridge(
