@@ -610,6 +610,12 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
         // stays in the message text; this marker identifies the row for
         // UI/tests.
         type: "refine-summary";
+        /**
+         * Staged-mode proposals only: sha256 over the canonical staged-edit
+         * set rendered in this row. /refine apply verifies refine-staged.json
+         * still hashes to this value, binding approval to the displayed bytes.
+         */
+        stagedSetHash?: string;
       }
     | {
         // Child-controlled family-message payload (task_message_parent),

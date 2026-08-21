@@ -16,6 +16,7 @@
  * Self-healing: a corrupt or unreadable staged file is treated as "nothing
  * staged" rather than failing the workspace.
  */
+import { createHash } from "node:crypto";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import { z } from "zod";
@@ -78,4 +79,32 @@ export async function loadStagedRefineSet(sessionDir: string): Promise<StagedRef
 
 export async function clearStagedRefineSet(sessionDir: string): Promise<void> {
   await fsPromises.rm(stagedFilePath(sessionDir), { force: true });
+}
+
+/** Canonical JSON (recursively sorted object keys) so hashing is stable across save/parse round-trips. */
+function canonicalJsonStringify(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJsonStringify).join(",")}]`;
+  }
+  if (typeof value === "object" && value !== null) {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([k, v]) => `${JSON.stringify(k)}:${canonicalJsonStringify(v)}`);
+    return `{${entries.join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+/**
+ * SECURITY: content hash binding approval to the staged bytes. The staged
+ * proposal row renders the exact edits and records this hash; `/refine apply`
+ * recomputes it over refine-staged.json and refuses on mismatch, so what the
+ * user approved is provably what gets applied (a tampered file or a newer
+ * stage landing between display and apply cannot be applied silently).
+ * Canonical serialization keeps the hash stable across the JSON + zod parse
+ * round-trip regardless of key order.
+ */
+export function hashStagedRefineSet(edits: StagedRefineEdit[]): string {
+  return createHash("sha256").update(canonicalJsonStringify(edits)).digest("hex");
 }

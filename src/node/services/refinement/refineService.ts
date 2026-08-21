@@ -66,8 +66,10 @@ import {
 } from "@/node/services/refinement/refinementRollback";
 import {
   clearStagedRefineSet,
+  hashStagedRefineSet,
   loadStagedRefineSet,
   saveStagedRefineSet,
+  type StagedRefineEdit,
 } from "@/node/services/refinement/refineStaging";
 import { runRefinePass } from "@/node/services/refinement/refineRunner";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
@@ -128,16 +130,41 @@ export function describeRefinementRow(row: RefinementEvent): string {
 
 /**
  * Build the durable, clearly-labeled summary row for a refine pass. "staged"
- * mode announces the proposal and how to approve it; "applied" mode reports
- * the executed edits with their rollback addresses.
+ * mode announces the proposal — rendering the EXACT staged payloads so
+ * approval is informed — and how to approve it; "applied" mode reports the
+ * executed edits with their rollback addresses.
  */
 export function createRefineSummaryMessage(
   record: RefineRecord,
-  mode: "staged" | "applied"
+  mode:
+    | { mode: "applied" }
+    | {
+        mode: "staged";
+        /** The exact staged edits; their full inputs are rendered below. */
+        edits: StagedRefineEdit[];
+        /** Canonical hash binding /refine apply to the rendered bytes. */
+        stagedSetHash: string;
+      }
 ): MuxMessage {
   const lines = [REFINE_SUMMARY_LABEL, ""];
-  if (mode === "staged") {
-    lines.push(...(record.staged ?? []).map((edit) => `- [staged] ${edit.description}`));
+  if (mode.mode === "staged") {
+    // SECURITY: render the exact staged inputs (full file_text / skill
+    // content), never just the model's one-line descriptions — a
+    // prompt-injected refine model could otherwise present a benign
+    // rationale while apply persists different content. Sizes are bounded
+    // by the per-run mutation budget and the tools' own input caps, so full
+    // rendering stays feasible; approval is bound to these bytes via
+    // stagedSetHash.
+    for (const [index, edit] of mode.edits.entries()) {
+      lines.push(
+        `- [staged ${index + 1}/${mode.edits.length}] ${edit.description}`,
+        "",
+        "```json",
+        JSON.stringify(edit.input, null, 2),
+        "```",
+        ""
+      );
+    }
   } else {
     lines.push(
       ...record.applied.map((edit) => `- ${edit.description} (refinement ${edit.refinementId})`)
@@ -153,7 +180,7 @@ export function createRefineSummaryMessage(
   if (record.summary.length > 0) {
     lines.push("", record.summary);
   }
-  if (mode === "staged") {
+  if (mode.mode === "staged") {
     // SECURITY: nothing has been written yet — the approval affordance is
     // this instruction (see refineStaging.ts for the rationale).
     lines.push(
@@ -183,7 +210,10 @@ export function createRefineSummaryMessage(
     // request-time injection), uiVisible so users see what was self-applied.
     synthetic: true,
     uiVisible: true,
-    muxMetadata: { type: "refine-summary" },
+    muxMetadata: {
+      type: "refine-summary",
+      ...(mode.mode === "staged" ? { stagedSetHash: mode.stagedSetHash } : {}),
+    },
   });
 }
 
@@ -301,6 +331,26 @@ export class RefineService {
     const staged = await loadStagedRefineSet(sessionDir);
     if (staged === null) {
       return Err("no staged refine edits (run /refine first)");
+    }
+
+    // SECURITY: bind approval to the rendered bytes. The staged proposal row
+    // displayed the exact edit payloads and recorded their canonical hash;
+    // apply refuses unless refine-staged.json still hashes to the NEWEST
+    // proposal the user could have audited in chat. This catches a tampered
+    // staged file and a file/row desync — approving unseen content is never
+    // possible. Fail closed when no hashed proposal row is found (e.g.
+    // pre-hash proposals from an older binary): rerun /refine to restage.
+    const approvedHash = await this.findNewestStagedProposalHash(workspaceId);
+    if (approvedHash === null) {
+      return Err(
+        "no staged refine proposal found in chat to verify against; run /refine again to restage"
+      );
+    }
+    const actualHash = hashStagedRefineSet(staged.edits);
+    if (actualHash !== approvedHash) {
+      return Err(
+        "staged refine edits no longer match the proposal shown in chat (the staged file changed after it was displayed); run /refine again and re-approve"
+      );
     }
 
     // Baseline BEFORE applying: rows appended by this apply have seq >
@@ -424,9 +474,35 @@ export class RefineService {
     // even when removal is racing. Removal awaits this promise before
     // deleting the session directory, so the append still precedes teardown.
     if (!record.noOp) {
-      await this.appendSummaryMessage(workspaceId, record, "applied");
+      await this.appendSummaryMessage(workspaceId, record, { mode: "applied" });
     }
     return Ok(record);
+  }
+
+  /**
+   * Newest staged-proposal hash from the chat transcript (see applyLocked).
+   * Searches recent history for the latest refine-summary row carrying a
+   * stagedSetHash; returns null when none exists in the window.
+   */
+  private async findNewestStagedProposalHash(workspaceId: string): Promise<string | null> {
+    const messagesResult = await this.historyService.getLastMessages(
+      workspaceId,
+      REFINE_MAX_MESSAGES
+    );
+    if (!messagesResult.success) {
+      return null;
+    }
+    for (let i = messagesResult.data.length - 1; i >= 0; i--) {
+      const muxMetadata = messagesResult.data[i].metadata?.muxMetadata;
+      if (
+        muxMetadata?.type === "refine-summary" &&
+        typeof muxMetadata.stagedSetHash === "string" &&
+        muxMetadata.stagedSetHash.length > 0
+      ) {
+        return muxMetadata.stagedSetHash;
+      }
+    }
+    return null;
   }
 
   private async runLocked(
@@ -563,8 +639,14 @@ export class RefineService {
 
       // Completion UX: post the labeled proposal row ONLY when edits were
       // staged — a no-op stays out of chat (the invoking toast reports it).
+      // The row renders the exact staged payloads and carries their hash so
+      // apply can bind approval to these bytes.
       if (!record.noOp) {
-        await this.appendSummaryMessage(workspaceId, record, "staged");
+        await this.appendSummaryMessage(workspaceId, record, {
+          mode: "staged",
+          edits: result.stagedEdits,
+          stagedSetHash: hashStagedRefineSet(result.stagedEdits),
+        });
       }
       return Ok(record);
     } finally {
@@ -686,7 +768,7 @@ export class RefineService {
   private async appendSummaryMessage(
     workspaceId: string,
     record: RefineRecord,
-    mode: "staged" | "applied"
+    mode: Parameters<typeof createRefineSummaryMessage>[1]
   ): Promise<void> {
     try {
       const message = createRefineSummaryMessage(record, mode);
