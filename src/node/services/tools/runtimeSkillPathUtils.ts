@@ -1,8 +1,10 @@
+import type { SkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import type { Runtime } from "@/node/runtime/Runtime";
-import { execBuffered } from "@/node/utils/runtime/helpers";
+import { execBuffered, readFileString } from "@/node/utils/runtime/helpers";
+import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
 
 import { quoteRuntimeProbePath } from "./runtimePathShellQuote";
-import { isAbsolutePathAny } from "./skillFileUtils";
+import { isAbsolutePathAny, SKILL_FILENAME } from "./skillFileUtils";
 
 function normalizePathSeparators(pathValue: string): string {
   return pathValue.replaceAll("\\", "/");
@@ -25,17 +27,10 @@ export function resolveSkillFilePathForRuntime(
   resolvedPath: string;
   normalizedRelativePath: string;
 } {
-  if (!filePath) {
-    throw new Error("filePath is required");
-  }
-
-  if (isAbsolutePathAny(filePath) || filePath.startsWith("~")) {
+  if (!filePath) throw new Error("filePath is required");
+  if (isAbsolutePathAny(filePath) || filePath.startsWith("~"))
     throw new Error(`Invalid filePath (must be relative to the skill directory): ${filePath}`);
-  }
-
-  if (filePath.startsWith("..")) {
-    throw new Error(`Invalid filePath (path traversal): ${filePath}`);
-  }
+  if (filePath.startsWith("..")) throw new Error(`Invalid filePath (path traversal): ${filePath}`);
 
   const resolvedPath = runtime.normalizePath(filePath, skillDir);
   const normalizedSkillDir = trimTrailingSeparators(skillDir);
@@ -72,6 +67,64 @@ export function resolveSkillFilePathForRuntime(
     resolvedPath,
     normalizedRelativePath,
   };
+}
+
+export function getProjectSkillDirs(
+  context: SkillStorageContext,
+  skillName: string
+): readonly [string, string] | null {
+  const [canonicalRoot, legacyRoot] = context.roots?.projectRoots ?? [];
+  if (context.kind === "global-local" || canonicalRoot == null || legacyRoot == null) return null;
+  return [canonicalRoot, legacyRoot].map((root) =>
+    context.runtime.normalizePath(skillName, root)
+  ) as [string, string];
+}
+
+export async function validateProjectSkillDirs(
+  context: SkillStorageContext,
+  skillDirs: readonly [string, string]
+): Promise<string> {
+  const boundary =
+    context.containment.kind === "none" ? context.workspacePath : context.containment.root;
+  for (const skillDir of skillDirs) {
+    await ensureRuntimePathWithinWorkspace(context.runtime, boundary, skillDir, "Skill directory");
+  }
+  return boundary;
+}
+
+export async function migrateLegacyProjectSkill(
+  context: SkillStorageContext,
+  skillName: string
+): Promise<readonly [string, string] | null> {
+  const skillDirs = getProjectSkillDirs(context, skillName);
+  if (skillDirs == null) return null;
+  const { runtime } = context;
+  const legacyStat = await runtime.stat(skillDirs[1]).catch(() => null);
+  if (!legacyStat?.isDirectory) return skillDirs;
+
+  const boundary = await validateProjectSkillDirs(context, skillDirs);
+  const canonicalManifest = runtime.normalizePath(SKILL_FILENAME, skillDirs[0]);
+  try {
+    await ensureRuntimePathWithinWorkspace(runtime, boundary, canonicalManifest, "Skill manifest");
+    const content = await readFileString(runtime, canonicalManifest);
+    parseSkillMarkdown({ content, byteSize: Buffer.byteLength(content), directoryName: skillName });
+    return skillDirs;
+  } catch {
+    // Discovery uses the valid legacy manifest until canonical metadata becomes usable.
+  }
+  const [root, canonical, legacy, containedRoot] = [
+    runtime.normalizePath("..", skillDirs[0]),
+    ...skillDirs,
+    boundary,
+  ].map(quoteRuntimeProbePath);
+  const result = await execBuffered(
+    runtime,
+    `overlay() ( SRC_DIR=$1; DST_DIR=$2; SKIP=$3; for SRC in "$SRC_DIR"/.[!.]* "$SRC_DIR"/..?* "$SRC_DIR"/*; do { [ -e "$SRC" ] || [ -L "$SRC" ]; } || continue; NAME=\${SRC##*/}; [ "$NAME" = "$SKIP" ] && continue; DST=$DST_DIR/$NAME; if [ -d "$SRC" ] && [ ! -L "$SRC" ]; then if [ -L "$DST" ] || { [ -e "$DST" ] && [ ! -d "$DST" ]; }; then rm -rf "$DST" || exit 1; fi; mkdir -p "$DST" && overlay "$SRC" "$DST" || exit 1; else { [ -f "$SRC" ] || [ -L "$SRC" ]; } || exit 1; rm -rf "$DST" && cp -P "$SRC" "$DST" || exit 1; fi; done ); ROOT=${root}; CAN=${canonical}; LEG=${legacy}; BOUNDARY=${containedRoot}; BACKUP=; KEEP_BACKUP=; mkdir -p "$ROOT" && TMP=$(mktemp -d "$CAN.migrate.XXXXXX") && trap 'rm -rf "$TMP"; if [ -n "$BACKUP" ] && [ -z "$KEEP_BACKUP" ]; then rm -rf "$BACKUP"; fi' EXIT && [ ! -L "$TMP" ] && REAL_BOUNDARY=$(cd "$BOUNDARY" && pwd -P) && REAL_TMP=$(cd "$TMP" && pwd -P) && { case "$REAL_TMP" in "$REAL_BOUNDARY"/*) true ;; *) false ;; esac; } && overlay "$LEG" "$TMP" && { [ ! -e "$CAN" ] || overlay "$CAN" "$TMP" SKILL.md; } && if [ -e "$CAN" ]; then BACKUP=$(mktemp -d "$CAN.backup.XXXXXX") && [ ! -L "$BACKUP" ] && REAL_BACKUP=$(cd "$BACKUP" && pwd -P) && { case "$REAL_BACKUP" in "$REAL_BOUNDARY"/*) true ;; *) false ;; esac; } && mv "$CAN" "$BACKUP/original" && if mv "$TMP" "$CAN"; then rm -rf "$BACKUP" && BACKUP=; else mv "$BACKUP/original" "$CAN" || KEEP_BACKUP=1; false; fi; else mv "$TMP" "$CAN"; fi`,
+    { cwd: boundary, timeout: 10 }
+  );
+  if (result.exitCode !== 0)
+    throw new Error(result.stderr.trim() || "Legacy skill migration failed");
+  return skillDirs;
 }
 
 export async function inspectContainmentOnRuntime(
