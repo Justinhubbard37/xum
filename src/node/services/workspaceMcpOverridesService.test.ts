@@ -453,6 +453,14 @@ describe("WorkspaceMcpOverridesService", () => {
     // Absent fields stay fine (nothing to prune).
     await fs.writeFile(filePath, JSON.stringify({ somethingElse: true }));
     await service.prunePluginOverrideKeys(workspaceId, "plugin:abc:");
+
+    // A non-object ROOT is equally opaque: a newer build may store the whole
+    // document in a different shape with plugin keys embedded inside it.
+    await fs.writeFile(filePath, JSON.stringify([{ enabledServers: ["plugin:abc:echo"] }]));
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(service.prunePluginOverrideKeys(workspaceId, "plugin:abc:")).rejects.toThrow(
+      /unrecognized root shape/
+    );
   });
 
   it("prunePluginOverrideKeys rejects duplicate properties instead of mis-editing", async () => {

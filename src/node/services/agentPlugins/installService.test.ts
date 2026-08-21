@@ -1594,10 +1594,13 @@ describe("AgentPluginInstallService", () => {
     expect(await registry()).toHaveLength(1);
   });
 
-  test("install rollback invalidates servers even when deleting the promoted tree fails", async () => {
+  test("install rollback invalidates servers and quarantines the tree when deletion fails", async () => {
     // A locked file (e.g. on Windows) can make the rollback deletion reject;
-    // the prefix invalidation must still run, or a server started from the
-    // briefly-visible tree survives an install that reported failure.
+    // the prefix invalidation must still run (a running server can be exactly
+    // what holds the lock), and the undeletable tree must be QUARANTINED into
+    // the staging root — leaving it in the globally scanned plugins container
+    // would let discovery load it as an unmanaged plugin even though the
+    // install reported failure.
     const stoppedPrefixes: string[] = [];
     const mcpStub = {
       stopServersWithKeyPrefix: (prefix: string) => {
@@ -1624,10 +1627,9 @@ describe("AgentPluginInstallService", () => {
       dir === targetPath ? Promise.reject(new Error("EBUSY: resource busy")) : realRemoveDir(dir)
     );
     try {
-      // Both failures surface in one error; the invalidation still ran.
       await expect(
         serviceWithMcp.install({ source: preview.source, expectedSha: preview.lockedSha })
-      ).rejects.toThrow(/persist the plugin registry.*could not be removed/s);
+      ).rejects.toThrow(/persist the plugin registry/);
     } finally {
       writeSpy.mockRestore();
       removeSpy.mockRestore();
@@ -1635,6 +1637,10 @@ describe("AgentPluginInstallService", () => {
     const instanceId = computePluginInstanceId(targetPath);
     expect(stoppedPrefixes).toEqual([`plugin:${instanceId}:`]);
     expect(await registry()).toEqual([]);
+    // The tree left the discovery container via the quarantine rename (the
+    // staged-dir mock only rejects the container path), so no unmanaged
+    // ghost plugin can appear.
+    expect(await pathExists(targetPath)).toBe(false);
   });
 
   test("install rejects a source URL with embedded credentials", async () => {

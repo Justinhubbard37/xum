@@ -578,7 +578,13 @@ export class WorkspaceMcpOverridesService {
           throw new Error(`Workspace MCP overrides file has JSONC parse errors: ${filePath}`);
         }
         if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-          continue;
+          // A newer build may store the whole document in a non-object shape
+          // this build cannot inspect; "successfully pruning" it would retire
+          // the caller's tombstone while plugin keys embedded in that shape
+          // survive. Same doctrine as opaque owned-field shapes below.
+          throw new Error(
+            `Workspace MCP overrides file has an unrecognized root shape (written by a newer version?): ${filePath}`
+          );
         }
 
         // Duplicate properties make jsonc.parse (last value wins) and

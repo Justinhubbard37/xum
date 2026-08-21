@@ -1074,12 +1074,13 @@ export class AgentPluginInstallService {
           // isolated so a failure (e.g. a locked file on Windows) cannot
           // skip the others or mask the registry error.
           const cleanupNotes: string[] = [];
+          let treeRemoved = false;
           try {
             await this.removeDir(targetPath);
-          } catch (cleanupError) {
-            cleanupNotes.push(
-              `the promoted plugin tree could not be removed — delete ${shortenHome(targetPath)} manually (${getErrorMessage(cleanupError)})`
-            );
+            treeRemoved = true;
+          } catch {
+            // Retried below after the plugin's processes are stopped — a
+            // running server can be exactly what holds the lock.
           }
           // A getToolsForWorkspace running during the promote↔rollback window
           // can have discovered the briefly-visible tree and be starting a
@@ -1094,6 +1095,26 @@ export class AgentPluginInstallService {
             cleanupNotes.push(
               `the plugin's MCP servers could not be stopped (${getErrorMessage(cleanupError)})`
             );
+          }
+          if (!treeRemoved) {
+            // Retry now that the lock-holding processes are gone; if the tree
+            // still cannot be deleted, QUARANTINE it into the staging root so
+            // the globally scanned plugins container cannot rediscover and
+            // load it as an unmanaged plugin (stale-dir reclamation cleans
+            // staging leftovers).
+            try {
+              await this.removeDir(targetPath);
+            } catch {
+              const quarantineDir = path.join(this.stagingRoot, `trash-${Date.now()}-${name}`);
+              try {
+                await fsPromises.rename(targetPath, quarantineDir);
+                await this.removeDir(quarantineDir).catch(() => undefined);
+              } catch (cleanupError) {
+                cleanupNotes.push(
+                  `the promoted plugin tree could not be removed — delete ${shortenHome(targetPath)} manually (${getErrorMessage(cleanupError)})`
+                );
+              }
+            }
           }
           const notes = cleanupNotes.length > 0 ? ` Additionally, ${cleanupNotes.join("; ")}.` : "";
           throw new Error(
