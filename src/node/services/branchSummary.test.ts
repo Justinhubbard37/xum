@@ -20,6 +20,7 @@ import {
   awaitPendingBranchSummary,
   buildAbandonedBranchSummaryPrompt,
   buildAbandonedBranchTranscript,
+  clearPendingBranchSummary,
   isRlmModeEnabled,
   maybeAppendAbandonedBranchSummary,
   startAbandonedBranchSummaryInBackground,
@@ -518,6 +519,73 @@ describe("branch summary placement on fork/truncate flows", () => {
       // The source workspace keeps its full history untouched.
       const sourceHistory = await historyService.getHistoryFromLatestBoundary(source);
       expect(sourceHistory.success && sourceHistory.data.length).toBe(4);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("summary that settles before the first send stays consumable", async () => {
+    const { historyService, cleanup } = await createTestHistoryService();
+    try {
+      const ws = "ws-settled-before-send";
+      const branchPoint = createMuxMessage("sb-1", "assistant", "branch point", { timestamp: 1 });
+      expect((await historyService.appendToHistory(ws, branchPoint)).success).toBe(true);
+
+      startAbandonedBranchSummaryInBackground({
+        historyService,
+        aiService: fakeAiService(summaryModel("The abandoned attempt found the root cause.")),
+        workspaceId: ws,
+        abandonedMessages: meatyExchange("settled"),
+        experiments: RLM_ON,
+        guardTailMessageId: "sb-1",
+      });
+
+      // Let background generation FINISH before the first send awaits it:
+      // poll until the row is on disk, then yield so any settle-time cleanup
+      // runs. A settle-time delete here previously made the first send get
+      // null, leaving the appended row invisible until a reload.
+      const deadline = Date.now() + 5_000;
+      let rowLanded = false;
+      while (!rowLanded && Date.now() < deadline) {
+        const history = await historyService.getHistoryFromLatestBoundary(ws);
+        rowLanded =
+          history.success &&
+          history.data.some((m) => m.metadata?.muxMetadata?.type === "branch-summary");
+        if (!rowLanded) await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(rowLanded).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      const appended = await awaitPendingBranchSummary(ws);
+      expect(appended).not.toBeNull();
+      expect(appended!.metadata?.muxMetadata?.type).toBe("branch-summary");
+      // Consumption removes the registration; later sends see nothing.
+      expect(await awaitPendingBranchSummary(ws)).toBeNull();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("clearPendingBranchSummary drops a registration a removed workspace never consumed", async () => {
+    const { historyService, cleanup } = await createTestHistoryService();
+    try {
+      const ws = "ws-cleared";
+      const branchPoint = createMuxMessage("cl-1", "assistant", "branch point", { timestamp: 1 });
+      expect((await historyService.appendToHistory(ws, branchPoint)).success).toBe(true);
+
+      startAbandonedBranchSummaryInBackground({
+        historyService,
+        aiService: fakeAiService(summaryModel("A summary nobody ever consumes.")),
+        workspaceId: ws,
+        abandonedMessages: meatyExchange("cleared"),
+        experiments: RLM_ON,
+        guardTailMessageId: "cl-1",
+      });
+
+      // Workspace removal must disconnect the retained registration so it
+      // cannot leak (results are otherwise kept until the first send).
+      clearPendingBranchSummary(ws);
+      expect(await awaitPendingBranchSummary(ws)).toBeNull();
     } finally {
       await cleanup();
     }

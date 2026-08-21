@@ -475,6 +475,13 @@ export async function maybeAppendAbandonedBranchSummary(
  * new workspace's first send can await the row before building its request
  * (keeping the "summary lands before the next request" contract) without the
  * fork operation itself stalling on generation.
+ *
+ * A registration that produced a row is retained even after it settles: the
+ * renderer may have loaded history before the background append landed, so
+ * the first send must still be able to consume the row and emit it (deleting
+ * at settle time left the row invisible until a reload). Cleanup happens on
+ * consumption (awaitPendingBranchSummary) or workspace removal
+ * (clearPendingBranchSummary), so retained results cannot accumulate.
  */
 const pendingBranchSummaries = new Map<string, Promise<MuxMessage | null>>();
 
@@ -493,10 +500,15 @@ export function startAbandonedBranchSummaryInBackground(
 ): void {
   const promise = maybeAppendAbandonedBranchSummary(input);
   pendingBranchSummaries.set(input.workspaceId, promise);
-  void promise.finally(() => {
-    // Only clear our own registration (a re-fork of the same workspace id
-    // cannot happen, but stay defensive about overwrites).
-    if (pendingBranchSummaries.get(input.workspaceId) === promise) {
+  void promise.then((appended) => {
+    // A null result has nothing left for the first send to consume, so drop
+    // the registration eagerly. A produced row must STAY registered: deleting
+    // it here would make a summary that settles before the first send return
+    // null from awaitPendingBranchSummary, leaving the appended row invisible
+    // in the open chat until a reload. Only clear our own registration (a
+    // re-fork of the same workspace id cannot happen, but stay defensive
+    // about overwrites).
+    if (appended === null && pendingBranchSummaries.get(input.workspaceId) === promise) {
       pendingBranchSummaries.delete(input.workspaceId);
     }
   });
@@ -514,5 +526,18 @@ export async function awaitPendingBranchSummary(workspaceId: string): Promise<Mu
   if (!pending) {
     return null;
   }
+  // Consume up front so exactly one send observes (and emits) the row;
+  // subsequent sends resolve null immediately.
+  pendingBranchSummaries.delete(workspaceId);
   return pending;
+}
+
+/**
+ * Drop any pending/retained registration for a removed workspace. Settled
+ * results are kept consumable until the first send (see the map doc above),
+ * so a fork that never sends must be cleaned up here or its registration
+ * would leak forever.
+ */
+export function clearPendingBranchSummary(workspaceId: string): void {
+  pendingBranchSummaries.delete(workspaceId);
 }

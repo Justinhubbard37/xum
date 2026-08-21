@@ -82,7 +82,10 @@ import { isNonNegativeInteger, isPositiveInteger } from "@/common/utils/numbers"
 import { deriveTodoStatus } from "@/common/utils/todoList";
 import { createContextResetBoundaryMessageId } from "@/node/services/utils/messageIds";
 import { fileExists } from "@/node/utils/runtime/fileExists";
-import { startAbandonedBranchSummaryInBackground } from "@/node/services/branchSummary";
+import {
+  clearPendingBranchSummary,
+  startAbandonedBranchSummaryInBackground,
+} from "@/node/services/branchSummary";
 import { orchestrateFork } from "@/node/services/utils/forkOrchestrator";
 import {
   ADDITIONAL_SYSTEM_CONTEXT_DISABLED_FILENAME,
@@ -5284,6 +5287,10 @@ export class WorkspaceService extends EventEmitter {
       await this.config.removeWorkspace(workspaceId);
       removedFromConfig = true;
       this.autoTitlingWorkspaces.delete(workspaceId);
+      // Branch-summary registrations are retained until the first send
+      // consumes them; a fork removed before ever sending must drop its
+      // registration here or it leaks.
+      clearPendingBranchSummary(workspaceId);
 
       this.emit("metadata", {
         workspaceId,
