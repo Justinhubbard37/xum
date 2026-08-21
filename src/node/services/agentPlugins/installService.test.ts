@@ -505,12 +505,39 @@ describe("AgentPluginInstallService", () => {
     const dir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "quota-watchdog-"));
     try {
       await expect(
-        withDiskQuotaWatchdog({ dir, maxBytes: 1024, pollMs: 10 }, async (signal) => {
-          await fsPromises.writeFile(path.join(dir, "pack"), "x".repeat(8192));
-          await new Promise((_resolve, reject) => {
-            signal.addEventListener("abort", () => reject(new Error("killed")), { once: true });
-          });
-        })
+        withDiskQuotaWatchdog(
+          { dir, maxBytes: 1024, maxFiles: 10_000, pollMs: 10 },
+          async (signal) => {
+            await fsPromises.writeFile(path.join(dir, "pack"), "x".repeat(8192));
+            await new Promise((_resolve, reject) => {
+              signal.addEventListener("abort", () => reject(new Error("killed")), { once: true });
+            });
+          }
+        )
+      ).rejects.toThrow(/too large to install/);
+    } finally {
+      await fsPromises.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("withDiskQuotaWatchdog aborts on file count independently of bytes", async () => {
+    // Many empty files consume inodes and allocation metadata without moving
+    // the byte total, so the in-flight watchdog must enforce maxFiles DURING
+    // checkout too — the post-clone count only runs after git returns.
+    const dir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "quota-watchdog-files-"));
+    try {
+      await expect(
+        withDiskQuotaWatchdog(
+          { dir, maxBytes: 1024 * 1024, maxFiles: 8, pollMs: 10 },
+          async (signal) => {
+            for (let i = 0; i < 20; i += 1) {
+              await fsPromises.writeFile(path.join(dir, `empty-${i}`), "");
+            }
+            await new Promise((_resolve, reject) => {
+              signal.addEventListener("abort", () => reject(new Error("killed")), { once: true });
+            });
+          }
+        )
       ).rejects.toThrow(/too large to install/);
     } finally {
       await fsPromises.rm(dir, { recursive: true, force: true });
@@ -532,6 +559,17 @@ describe("AgentPluginInstallService", () => {
     const oldStamped = path.join(staging, `trash-${twoHoursAgo.getTime()}-old`);
     await fsPromises.mkdir(oldStamped);
 
+    // An old-stamped trash dir still referenced by an uninstall journal is a
+    // pending rollback copy, not garbage — reclaiming it before
+    // reconcileJournals runs would turn a restorable interrupted uninstall
+    // into data loss.
+    const journaled = path.join(staging, `trash-${twoHoursAgo.getTime()}-journaled`);
+    await fsPromises.mkdir(journaled);
+    await fsPromises.writeFile(
+      path.join(staging, "uninstall-journaled-plugin.json"),
+      JSON.stringify({ name: "journaled-plugin", trashDir: journaled, stagedAt: Date.now() })
+    );
+
     const internals = service as unknown as {
       createStagingDir: () => Promise<string>;
       purgeStaleStaging: () => Promise<void>;
@@ -545,6 +583,7 @@ describe("AgentPluginInstallService", () => {
 
     expect(await pathExists(freshStamped)).toBe(true);
     expect(await pathExists(oldStamped)).toBe(false);
+    expect(await pathExists(journaled)).toBe(true);
     expect(await pathExists(active)).toBe(true);
   });
 
@@ -640,6 +679,155 @@ describe("AgentPluginInstallService", () => {
     );
     const itemsAfter = await service.list();
     expect(itemsAfter.find((item) => item.name === "demo-plugin")?.managed).toBe(true);
+    expect(await pathExists(targetPath)).toBe(true);
+    expect(await pathExists(journalPath)).toBe(false);
+  });
+
+  test("crash recovery runs at service startup, before any section open", async () => {
+    // An orphaned promotion must not wait for list(): a session can serve
+    // agent requests — whose global plugin discovery loads the container's
+    // hooks and MCP servers — without ever opening Settings → Plugins.
+    const targetPath = path.join(pluginsDir(), "demo-plugin");
+    await fsPromises.mkdir(targetPath, { recursive: true });
+    await fsPromises.writeFile(
+      path.join(targetPath, "plugin.json"),
+      JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "demo-plugin", version: "1" })
+    );
+    await fsPromises.mkdir(stagingDir(), { recursive: true });
+    const journalPath = path.join(stagingDir(), "promotion-demo-plugin.json");
+    await fsPromises.writeFile(
+      journalPath,
+      JSON.stringify({ name: "demo-plugin", stagedAt: Date.now() })
+    );
+
+    const freshService = new AgentPluginInstallService(config, { isEnabled: () => true });
+    await (freshService as unknown as { startupReconciliation: Promise<void> })
+      .startupReconciliation;
+
+    expect(await pathExists(targetPath)).toBe(false);
+    expect(await pathExists(journalPath)).toBe(false);
+  });
+
+  test("an update swap interrupted between rename and promote is restored", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const targetPath = path.join(pluginsDir(), "demo-plugin");
+
+    // Simulate the post-crash state: the old live tree renamed into staging,
+    // the staged replacement never promoted, the registry still recording the
+    // install. Without recovery, retrying Update self-rejects — the missing
+    // tree reads as an empty capability surface, so even the UNCHANGED MCP
+    // server in the new tree looks like a consent-relevant addition.
+    const trashDir = path.join(stagingDir(), `trash-${Date.now()}-demo-plugin`);
+    await fsPromises.rename(targetPath, trashDir);
+    const journalPath = path.join(stagingDir(), "update-demo-plugin.json");
+    await fsPromises.writeFile(
+      journalPath,
+      JSON.stringify({ name: "demo-plugin", trashDir, stagedAt: Date.now() })
+    );
+
+    const items = await service.list();
+    expect(items.find((item) => item.name === "demo-plugin")?.managed).toBe(true);
+    expect(await pathExists(targetPath)).toBe(true);
+    expect(await pathExists(journalPath)).toBe(false);
+
+    // The restored tree makes the retried update succeed.
+    await writePluginFixture(remoteDir, { version: "2.0.0" });
+    const newHead = await commitAll(remoteDir, "v2 after interrupted swap");
+    const updated = await service.update({ name: "demo-plugin" });
+    expect(updated.lockedSha).toBe(newHead);
+  });
+
+  test("an uninstall interrupted before the registry commit restores tree and data", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const targetPath = path.join(pluginsDir(), "demo-plugin");
+    const instanceId = computePluginInstanceId(targetPath);
+    const dataPath = getPluginDataPath(muxRoot, instanceId);
+    await fsPromises.mkdir(dataPath, { recursive: true });
+    await fsPromises.writeFile(path.join(dataPath, "state.txt"), "original");
+
+    // Post-crash state: both assets staged into trash, journal present, the
+    // registry still owning the plugin — and a server launch since restart
+    // recreated a fresh dataPath (prepareStdioLaunch mkdirs it), which must
+    // not block restoring the ORIGINAL data.
+    const trashDir = path.join(stagingDir(), `trash-${Date.now()}-demo-plugin`);
+    const dataTrashDir = path.join(stagingDir(), `trash-data-${Date.now()}-demo-plugin`);
+    await fsPromises.rename(targetPath, trashDir);
+    await fsPromises.rename(dataPath, dataTrashDir);
+    await fsPromises.mkdir(dataPath, { recursive: true });
+    const journalPath = path.join(stagingDir(), "uninstall-demo-plugin.json");
+    await fsPromises.writeFile(
+      journalPath,
+      JSON.stringify({ name: "demo-plugin", trashDir, dataTrashDir, stagedAt: Date.now() })
+    );
+
+    const items = await service.list();
+    expect(items.find((item) => item.name === "demo-plugin")?.managed).toBe(true);
+    expect(await pathExists(targetPath)).toBe(true);
+    expect(await fsPromises.readFile(path.join(dataPath, "state.txt"), "utf8")).toBe("original");
+    expect(await pathExists(journalPath)).toBe(false);
+
+    // A retried uninstall then completes cleanly.
+    await service.uninstall({ name: "demo-plugin", deletePluginData: true });
+    expect(await registry()).toEqual([]);
+    expect(await pathExists(dataPath)).toBe(false);
+  });
+
+  test("an uninstall interrupted after the registry commit finishes deleting the trash", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const targetPath = path.join(pluginsDir(), "demo-plugin");
+
+    // Post-crash state: the commit landed (entry gone) but the staged assets
+    // and the journal survived. The user may have requested the data
+    // deletion, so recovery must finish it — stale-staging reclamation only
+    // runs during a later staging operation, which may never happen.
+    const trashDir = path.join(stagingDir(), `trash-${Date.now()}-demo-plugin`);
+    await fsPromises.rename(targetPath, trashDir);
+    const seeded = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as Record<
+      string,
+      unknown
+    >;
+    await fsPromises.writeFile(registryFile(), JSON.stringify({ ...seeded, plugins: [] }));
+    const journalPath = path.join(stagingDir(), "uninstall-demo-plugin.json");
+    await fsPromises.writeFile(
+      journalPath,
+      JSON.stringify({ name: "demo-plugin", trashDir, stagedAt: Date.now() })
+    );
+
+    const items = await service.list();
+    expect(items.find((item) => item.name === "demo-plugin")).toBeUndefined();
+    expect(await pathExists(trashDir)).toBe(false);
+    expect(await pathExists(journalPath)).toBe(false);
+  });
+
+  test("journal recovery refuses to treat an unreadable registry as empty", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const targetPath = path.join(pluginsDir(), "demo-plugin");
+
+    // A leftover promotion journal plus a temporarily corrupted registry: a
+    // lenient read would degrade to an empty entry list and reconciliation
+    // would delete the COMMITTED install's tree while its entry survives on
+    // disk — a recoverable read problem turned into data loss.
+    const journalPath = path.join(stagingDir(), "promotion-demo-plugin.json");
+    await fsPromises.writeFile(
+      journalPath,
+      JSON.stringify({ name: "demo-plugin", stagedAt: Date.now() })
+    );
+    const goodRegistry = await fsPromises.readFile(registryFile(), "utf8");
+    await fsPromises.writeFile(registryFile(), "{ not json");
+
+    await service.list(); // Reconciliation failure is logged; list degrades gracefully.
+    expect(await pathExists(targetPath)).toBe(true);
+    expect(await pathExists(journalPath)).toBe(true);
+
+    // Once the registry reads again, the journal resolves: the entry exists,
+    // so the install committed and the tree survives.
+    await fsPromises.writeFile(registryFile(), goodRegistry);
+    const items = await service.list();
+    expect(items.find((item) => item.name === "demo-plugin")?.managed).toBe(true);
     expect(await pathExists(targetPath)).toBe(true);
     expect(await pathExists(journalPath)).toBe(false);
   });
@@ -1908,7 +2096,11 @@ describe("AgentPluginInstallService", () => {
       removeSpy.mockRestore();
     }
     const instanceId = computePluginInstanceId(targetPath);
-    expect(stoppedPrefixes).toEqual([`plugin:${instanceId}:`]);
+    // Two stops: one so the retry can delete what a running server locked,
+    // and one AFTER the retry/quarantine — a startup that began after the
+    // first stop can have discovered the still-visible tree and would
+    // otherwise publish after it disappears.
+    expect(stoppedPrefixes).toEqual([`plugin:${instanceId}:`, `plugin:${instanceId}:`]);
     expect(await registry()).toEqual([]);
     // The tree left the discovery container via the quarantine rename (the
     // staged-dir mock only rejects the container path), so no unmanaged

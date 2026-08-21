@@ -92,9 +92,39 @@ const STAGING_DIR_NAME = "plugin-staging";
  * that window would otherwise strand an orphaned tree that discovery lists as
  * unmanaged, assertNoCollision blocks from reinstalling, and uninstall
  * refuses (not managed) — recoverable only by manual deletion.
- * reconcileOrphanedPromotions cleans such trees up on the next section open.
+ * reconcileJournals cleans such trees up on startup and on section open.
  */
 const PROMOTION_JOURNAL_PREFIX = "promotion-";
+
+/**
+ * Journal recording an update swap that has renamed the OLD live tree into
+ * staging but not yet promoted the staged replacement. A crash in that window
+ * leaves the registry recording an install whose path is missing — and
+ * retrying Update cannot self-heal because assertNoCapabilityIncrease treats
+ * the missing tree as an empty surface and rejects the staged capabilities as
+ * additions. reconcileJournals restores the old tree from staging.
+ */
+const UPDATE_JOURNAL_PREFIX = "update-";
+
+/**
+ * Journal recording an uninstall that has staged the plugin tree (and
+ * optionally its data dir) into staging but not yet committed the registry
+ * write. A crash in that window hides the assets under plugin-staging while
+ * the registry still owns the plugin. reconcileJournals restores the staged
+ * assets when the registry entry still exists, and finishes the trash cleanup
+ * when the commit landed.
+ */
+const UNINSTALL_JOURNAL_PREFIX = "uninstall-";
+
+const JOURNAL_PREFIXES = [
+  PROMOTION_JOURNAL_PREFIX,
+  UPDATE_JOURNAL_PREFIX,
+  UNINSTALL_JOURNAL_PREFIX,
+] as const;
+
+function isJournalName(entry: string): boolean {
+  return JOURNAL_PREFIXES.some((prefix) => entry.startsWith(prefix));
+}
 
 /** Staging dirs left behind by crashes are reclaimed after this age. */
 const STALE_STAGING_MAX_AGE_MS = 60 * 60 * 1000;
@@ -122,16 +152,23 @@ function gitEnv(): Record<string, string> {
 }
 
 /**
- * True when the aggregate file bytes under `dir` exceed `maxBytes`. Walks
- * with early exit; entries vanishing mid-walk (git renames temp files) are
- * skipped.
+ * True when the aggregate file bytes OR the non-directory entry count under
+ * `dir` exceed the quota. Counts every non-directory entry (empty files,
+ * symlinks) like assertStagedTreeWithinQuota: a repo of tens of thousands of
+ * empty files consumes inodes and allocation metadata without moving the byte
+ * total. Walks with early exit; entries vanishing mid-walk (git renames temp
+ * files) are skipped.
  */
-async function directorySizeExceeds(dir: string, maxBytes: number): Promise<boolean> {
+async function directoryQuotaExceeded(
+  dir: string,
+  quota: { maxBytes: number; maxFiles: number }
+): Promise<boolean> {
   let bytes = 0;
+  let files = 0;
   const pending: string[] = [dir];
   while (pending.length > 0) {
     const current = pending.pop();
-    assert(current !== undefined, "directorySizeExceeds: queue underflow");
+    assert(current !== undefined, "directoryQuotaExceeded: queue underflow");
     let entries: Dirent[];
     try {
       entries = await fsPromises.readdir(current, { withFileTypes: true });
@@ -144,15 +181,16 @@ async function directorySizeExceeds(dir: string, maxBytes: number): Promise<bool
         pending.push(entryPath);
         continue;
       }
+      files += 1;
       if (entry.isFile()) {
         try {
           bytes += (await fsPromises.lstat(entryPath)).size;
         } catch {
           continue;
         }
-        if (bytes > maxBytes) {
-          return true;
-        }
+      }
+      if (bytes > quota.maxBytes || files > quota.maxFiles) {
+        return true;
       }
     }
   }
@@ -161,12 +199,13 @@ async function directorySizeExceeds(dir: string, maxBytes: number): Promise<bool
 
 /**
  * Run `fn` with an AbortSignal that fires when `dir` grows past `maxBytes`
- * while fn is pending. Bounds git DURING clone/fetch/checkout: the post-clone
- * quota can only reject a tree git already materialized, so a huge remote
- * would otherwise fill the disk before that check runs. Exported for tests.
+ * or `maxFiles` while fn is pending. Bounds git DURING clone/fetch/checkout:
+ * the post-clone quota can only reject a tree git already materialized, so a
+ * huge remote would otherwise fill the disk — or exhaust inodes via many
+ * empty files — before that check runs. Exported for tests.
  */
 export async function withDiskQuotaWatchdog<T>(
-  quota: { dir: string; maxBytes: number; pollMs?: number },
+  quota: { dir: string; maxBytes: number; maxFiles: number; pollMs?: number },
   fn: (signal: AbortSignal) => Promise<T>
 ): Promise<T> {
   const controller = new AbortController();
@@ -177,7 +216,7 @@ export async function withDiskQuotaWatchdog<T>(
       return;
     }
     checking = true;
-    directorySizeExceeds(quota.dir, quota.maxBytes).then(
+    directoryQuotaExceeded(quota.dir, quota).then(
       (over) => {
         checking = false;
         if (over) {
@@ -195,7 +234,7 @@ export async function withDiskQuotaWatchdog<T>(
   } catch (error) {
     if (exceeded) {
       throw new Error(
-        `The repository is too large to install as a plugin (exceeded ${Math.floor(quota.maxBytes / (1024 * 1024))} MiB during clone).`
+        `The repository is too large to install as a plugin (exceeded ${Math.floor(quota.maxBytes / (1024 * 1024))} MiB or ${quota.maxFiles} files during clone).`
       );
     }
     throw error;
@@ -206,7 +245,10 @@ export async function withDiskQuotaWatchdog<T>(
 
 async function runGit(
   args: string[],
-  opts?: { timeoutMs?: number; diskQuota?: { dir: string; maxBytes: number; pollMs?: number } }
+  opts?: {
+    timeoutMs?: number;
+    diskQuota?: { dir: string; maxBytes: number; maxFiles: number; pollMs?: number };
+  }
 ): Promise<string> {
   const run = async (signal?: AbortSignal): Promise<string> => {
     using proc = execFileAsync("git", args, {
@@ -314,6 +356,17 @@ export class AgentPluginInstallService {
    */
   private readonly activeStagingPaths = new Set<string>();
 
+  /**
+   * Startup crash-recovery pass. Kicked off at construction because a
+   * session can serve agent requests (whose global plugin discovery, MCP
+   * config, and hook loading scan the container) without ever opening the
+   * Plugins section — an orphaned promotion would load as an unmanaged
+   * plugin, hooks included, before list()'s reconciliation ever ran. Errors
+   * are logged, never thrown (startup must not crash the app); list() awaits
+   * this so section open cannot race it.
+   */
+  private readonly startupReconciliation: Promise<void>;
+
   constructor(
     private readonly config: Config,
     private readonly deps: {
@@ -330,6 +383,15 @@ export class AgentPluginInstallService {
     this.containerDir = path.join(config.rootDir, "plugins");
     this.stagingRoot = path.join(config.rootDir, STAGING_DIR_NAME);
     this.registryFile = path.join(config.rootDir, REGISTRY_FILE_NAME);
+    // Not gated on isEnabled(): journals only exist if the feature staged
+    // something, and cleaning up our own crash leftovers is correct even if
+    // the experiment was disabled afterwards (a missing staging root makes
+    // this a single readdir). Failures retry on the next section open.
+    this.startupReconciliation = this.reconcileJournals().catch((error: unknown) => {
+      log.warn("Startup plugin journal reconciliation failed", {
+        error: getErrorMessage(error),
+      });
+    });
   }
 
   /**
@@ -586,11 +648,35 @@ export class AgentPluginInstallService {
   private async purgeStaleStaging(): Promise<void> {
     try {
       const now = Date.now();
-      for (const entry of await fsPromises.readdir(this.stagingRoot)) {
+      const entries = await fsPromises.readdir(this.stagingRoot);
+      // Journals pin the staged trash dirs they reference: reclaiming a
+      // journaled rollback copy by age before reconcileJournals runs would
+      // turn a restorable interrupted uninstall/update into data loss.
+      const journalProtected = new Set<string>();
+      for (const entry of entries) {
+        if (!isJournalName(entry)) {
+          continue;
+        }
+        for (const field of ["trashDir", "dataTrashDir"]) {
+          const staged = await this.readJournalStagedPath(
+            path.join(this.stagingRoot, entry),
+            field
+          );
+          if (staged !== undefined) {
+            journalProtected.add(staged);
+          }
+        }
+      }
+      for (const entry of entries) {
         const entryPath = path.join(this.stagingRoot, entry);
-        // Never touch paths an in-process operation still owns, or promotion
-        // journals (their lifecycle belongs to reconcileOrphanedPromotions).
-        if (this.activeStagingPaths.has(entryPath) || entry.startsWith(PROMOTION_JOURNAL_PREFIX)) {
+        // Never touch paths an in-process operation still owns, journals
+        // (their lifecycle belongs to reconcileJournals), or trash dirs a
+        // journal still references.
+        if (
+          this.activeStagingPaths.has(entryPath) ||
+          isJournalName(entry) ||
+          journalProtected.has(entryPath)
+        ) {
           continue;
         }
         try {
@@ -710,12 +796,14 @@ export class AgentPluginInstallService {
 
   /**
    * During-clone disk bound for a staging dir: checkout + pack live in it, so
-   * allow twice the checkout quota. The watchdog aborts git mid-transfer —
+   * allow twice the checkout quota (bytes AND file count — loose objects can
+   * mirror the checkout's file count). The watchdog aborts git mid-transfer —
    * the post-clone assertStagedTreeWithinQuota can only reject a tree git
    * already fully materialized on disk.
    */
-  private cloneDiskQuota(dir: string): { dir: string; maxBytes: number } {
-    return { dir, maxBytes: this.stagingQuota().maxBytes * 2 };
+  private cloneDiskQuota(dir: string): { dir: string; maxBytes: number; maxFiles: number } {
+    const quota = this.stagingQuota();
+    return { dir, maxBytes: quota.maxBytes * 2, maxFiles: quota.maxFiles * 2 };
   }
 
   /**
@@ -1305,9 +1393,9 @@ export class AgentPluginInstallService {
         // Journal the promotion BEFORE the rename: a process crash between
         // the rename and the registry write would otherwise strand a tree
         // that discovery lists as unmanaged, assertNoCollision blocks, and
-        // uninstall refuses — reconcileOrphanedPromotions uses this record
-        // to clean it up on the next section open.
-        const journalPath = this.promotionJournalPath(name);
+        // uninstall refuses — reconcileJournals uses this record to clean it
+        // up on startup or the next section open.
+        const journalPath = this.journalPath(PROMOTION_JOURNAL_PREFIX, name);
         await fsPromises.writeFile(journalPath, JSON.stringify({ name, stagedAt: Date.now() }));
 
         await fsPromises.mkdir(this.containerDir, { recursive: true });
@@ -1379,6 +1467,20 @@ export class AgentPluginInstallService {
                 );
               }
             }
+            // Re-invalidate AFTER the retry/quarantine: a workspace startup
+            // that began after the stop above snapshots the newer epoch, can
+            // still have discovered the then-visible tree, and would publish
+            // after it disappears with no later invalidation covering it
+            // (update/uninstall do the same second post-removal stop).
+            try {
+              await this.deps.mcpServerManager?.stopServersWithKeyPrefix(
+                `plugin:${this.instanceIdFor(name)}:`
+              );
+            } catch (cleanupError) {
+              cleanupNotes.push(
+                `the plugin's MCP servers could not be re-stopped after removal (${getErrorMessage(cleanupError)})`
+              );
+            }
           }
           const notes = cleanupNotes.length > 0 ? ` Additionally, ${cleanupNotes.join("; ")}.` : "";
           throw new Error(
@@ -1397,80 +1499,255 @@ export class AgentPluginInstallService {
     });
   }
 
-  private promotionJournalPath(name: string): string {
+  private journalPath(prefix: string, name: string): string {
     // Names are grammar-validated (no separators/traversal), so this join is safe.
-    return path.join(this.stagingRoot, `${PROMOTION_JOURNAL_PREFIX}${name}.json`);
+    return path.join(this.stagingRoot, `${prefix}${name}.json`);
   }
 
   /**
-   * Crash recovery for installs that died between the promote rename and the
-   * registry write: the journal proves WE created the container tree from a
-   * staged clone (it is not user-authored work), so it is safe to clear.
-   * Without this, the orphan is listed as unmanaged, blocks reinstalling the
-   * same name, and cannot be uninstalled (not managed). Runs on section open
-   * under the mutation queue so it cannot interleave with a live install.
+   * A staged path recorded in a journal, or undefined when absent/invalid.
+   * Defensive: recovery renames/deletes these paths, so a corrupted journal
+   * must never aim them anywhere but a direct trash child of the staging root.
    */
-  private async reconcileOrphanedPromotions(): Promise<void> {
+  private async readJournalStagedPath(
+    journalPath: string,
+    field: string
+  ): Promise<string | undefined> {
+    try {
+      const parsed = JSON.parse(await fsPromises.readFile(journalPath, "utf-8")) as unknown;
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return undefined;
+      }
+      const value = (parsed as Record<string, unknown>)[field];
+      if (typeof value !== "string") {
+        return undefined;
+      }
+      if (path.dirname(value) !== this.stagingRoot || !path.basename(value).startsWith("trash-")) {
+        return undefined;
+      }
+      return value;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Crash recovery for mutations that died between their directory moves and
+   * the registry write. Each journal proves WE created the referenced state
+   * from a registry-owned tree or a staged clone (it is not user-authored
+   * work), so it is safe to restore or clear. Runs at service startup (a
+   * session can serve agent requests — global discovery, MCP config, hooks —
+   * without ever opening the Plugins section) and again on section open,
+   * under the mutation queue so it cannot interleave with a live mutation.
+   */
+  private async reconcileJournals(): Promise<void> {
     let journalNames: string[];
     try {
       journalNames = (await fsPromises.readdir(this.stagingRoot)).filter(
-        (entry) => entry.startsWith(PROMOTION_JOURNAL_PREFIX) && entry.endsWith(".json")
+        (entry) => isJournalName(entry) && entry.endsWith(".json")
       );
     } catch {
-      return; // No staging root: nothing was ever promoted.
+      return; // No staging root: nothing was ever staged.
     }
     if (journalNames.length === 0) {
       return;
     }
     await this.runExclusive(async () => {
+      // STRICT read: a temporarily unreadable or corrupted registry must not
+      // degrade to an empty entry list here — reconciliation would then treat
+      // committed installs as orphans and delete their trees, turning a
+      // recoverable read problem into data loss. Throwing retains every
+      // journal for a later retry; callers log and continue.
       const registryNames = new Set(
-        (await this.readRegistryDocument("lenient")).rawEntries
+        (await this.readRegistryDocument("strict")).rawEntries
           .map((rawEntry) => this.rawEntryName(rawEntry))
           .filter((name): name is string => name !== undefined)
       );
       for (const journalName of journalNames) {
         const journalPath = path.join(this.stagingRoot, journalName);
-        const name = journalName.slice(PROMOTION_JOURNAL_PREFIX.length, -".json".length);
+        const prefix = JOURNAL_PREFIXES.find((candidate) => journalName.startsWith(candidate));
+        assert(prefix !== undefined, "reconcileJournals: filtered journal lost its prefix");
+        const name = journalName.slice(prefix.length, -".json".length);
         if (!isValidAgentPluginName(name)) {
           await fsPromises.rm(journalPath, { force: true }).catch(() => undefined);
           continue;
         }
-        const targetPath = this.targetPathFor(name);
-        // Only an ORPHAN (tree without registry entry) needs cleanup; a
-        // registry entry means the install committed and only the journal
-        // deletion was lost.
-        if (!registryNames.has(name) && (await pathExists(targetPath))) {
-          log.warn("Cleaning up plugin promotion orphaned by a crash", { name });
-          await this.deps.mcpServerManager?.stopServersWithKeyPrefix(
-            buildPluginServerKey(this.instanceIdFor(name), "")
-          );
-          const quarantineDir = path.join(this.stagingRoot, `trash-${Date.now()}-${name}`);
-          try {
-            await this.renameIntoStaging(targetPath, quarantineDir);
-            await this.removeDir(quarantineDir).catch(() => undefined);
-          } catch (error) {
-            // Keep the journal so the next section open retries.
-            log.warn("Failed to clean up orphaned plugin promotion", {
-              name,
-              error: getErrorMessage(error),
-            });
-            continue;
-          }
+        const consumed =
+          prefix === PROMOTION_JOURNAL_PREFIX
+            ? await this.recoverOrphanedPromotion(name, registryNames)
+            : prefix === UPDATE_JOURNAL_PREFIX
+              ? await this.recoverInterruptedUpdateSwap(name, journalPath, registryNames)
+              : await this.recoverInterruptedUninstall(name, journalPath, registryNames);
+        if (consumed) {
+          await fsPromises.rm(journalPath, { force: true }).catch(() => undefined);
         }
-        await fsPromises.rm(journalPath, { force: true }).catch(() => undefined);
       }
     });
+  }
+
+  /**
+   * Install crashed between the promote rename and the registry write: the
+   * orphan would be listed as unmanaged, block reinstalling the same name,
+   * and refuse uninstall (not managed). Returns true when the journal's
+   * recovery job is done.
+   */
+  private async recoverOrphanedPromotion(
+    name: string,
+    registryNames: Set<string>
+  ): Promise<boolean> {
+    const targetPath = this.targetPathFor(name);
+    // Only an ORPHAN (tree without registry entry) needs cleanup; a registry
+    // entry means the install committed and only the journal deletion was lost.
+    if (!registryNames.has(name) && (await pathExists(targetPath))) {
+      log.warn("Cleaning up plugin promotion orphaned by a crash", { name });
+      const serverKeyPrefix = buildPluginServerKey(this.instanceIdFor(name), "");
+      await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
+      const quarantineDir = path.join(this.stagingRoot, `trash-${Date.now()}-${name}`);
+      try {
+        await this.renameIntoStaging(targetPath, quarantineDir);
+        await this.removeDir(quarantineDir).catch(() => undefined);
+      } catch (error) {
+        // Keep the journal so the next reconciliation retries.
+        log.warn("Failed to clean up orphaned plugin promotion", {
+          name,
+          error: getErrorMessage(error),
+        });
+        return false;
+      }
+      // Re-invalidate AFTER the tree left the container: a workspace startup
+      // that began after the stop above can have discovered the then-visible
+      // tree and would otherwise publish a server from the removed tree.
+      await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
+    }
+    return true;
+  }
+
+  /**
+   * Update crashed between renaming the OLD live tree into staging and
+   * promoting the staged replacement: the registry records an install whose
+   * path is missing, and retrying Update self-rejects (the missing tree reads
+   * as an empty capability surface). Restore the old tree from staging.
+   */
+  private async recoverInterruptedUpdateSwap(
+    name: string,
+    journalPath: string,
+    registryNames: Set<string>
+  ): Promise<boolean> {
+    if (await pathExists(this.targetPathFor(name))) {
+      // A live tree (old or new) means the swap never started or completed;
+      // a still-staged old tree is plain trash for reclamation.
+      return true;
+    }
+    const trashDir = await this.readJournalStagedPath(journalPath, "trashDir");
+    if (trashDir === undefined || !(await pathExists(trashDir))) {
+      log.warn("Update swap journal has no recoverable tree", { name });
+      return true;
+    }
+    if (!registryNames.has(name)) {
+      // The entry was since removed (e.g. a registry-only uninstall while
+      // recovery kept failing): restoring would recreate an unmanaged orphan.
+      await this.removeDir(trashDir).catch(() => undefined);
+      return true;
+    }
+    log.warn("Restoring plugin tree after an update swap interrupted by a crash", { name });
+    try {
+      await fsPromises.mkdir(this.containerDir, { recursive: true });
+      await fsPromises.rename(trashDir, this.targetPathFor(name));
+    } catch (error) {
+      log.warn("Failed to restore plugin tree from an interrupted update swap", {
+        name,
+        error: getErrorMessage(error),
+      });
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Uninstall crashed between staging the plugin's assets into trash and the
+   * registry commit (registry still owns the plugin → restore everything), or
+   * between the commit and the trash cleanup (entry gone → finish deleting).
+   */
+  private async recoverInterruptedUninstall(
+    name: string,
+    journalPath: string,
+    registryNames: Set<string>
+  ): Promise<boolean> {
+    const trashDir = await this.readJournalStagedPath(journalPath, "trashDir");
+    const dataTrashDir = await this.readJournalStagedPath(journalPath, "dataTrashDir");
+    if (!registryNames.has(name)) {
+      // Committed: the staged assets are trash. Delete them now — the user
+      // may have explicitly requested the data deletion, and stale-staging
+      // reclamation only runs during a later staging operation.
+      if (trashDir !== undefined) {
+        await this.removeDir(trashDir).catch(() => undefined);
+      }
+      if (dataTrashDir !== undefined) {
+        await this.removeDir(dataTrashDir).catch(() => undefined);
+      }
+      return true;
+    }
+    log.warn("Restoring plugin assets after an uninstall interrupted by a crash", { name });
+    let restored = true;
+    const targetPath = this.targetPathFor(name);
+    if (trashDir !== undefined && (await pathExists(trashDir))) {
+      if (await pathExists(targetPath)) {
+        // The container path is occupied (e.g. the user manually recreated
+        // it): renaming over it would clobber that tree. Leave the staged
+        // copy and the journal for manual/later resolution.
+        log.warn("Uninstall recovery found the plugin path occupied; keeping the staged tree", {
+          name,
+        });
+        restored = false;
+      } else {
+        try {
+          await fsPromises.mkdir(this.containerDir, { recursive: true });
+          await fsPromises.rename(trashDir, targetPath);
+        } catch (error) {
+          log.warn("Failed to restore plugin tree from an interrupted uninstall", {
+            name,
+            error: getErrorMessage(error),
+          });
+          restored = false;
+        }
+      }
+    }
+    if (dataTrashDir !== undefined && (await pathExists(dataTrashDir))) {
+      const dataPath = getPluginDataPath(this.config.rootDir, this.instanceIdFor(name));
+      // A server launch since restart can have recreated a fresh dataPath
+      // (prepareStdioLaunch mkdirs it): stop the plugin's servers and clear
+      // it so the ORIGINAL data slides back (mirrors the inline rollback).
+      await this.deps.mcpServerManager?.stopServersWithKeyPrefix(
+        buildPluginServerKey(this.instanceIdFor(name), "")
+      );
+      if (await pathExists(dataPath)) {
+        await this.removeDir(dataPath).catch(() => undefined);
+      }
+      try {
+        await fsPromises.mkdir(path.dirname(dataPath), { recursive: true });
+        await fsPromises.rename(dataTrashDir, dataPath);
+      } catch (error) {
+        log.warn("Failed to restore plugin data from an interrupted uninstall", {
+          name,
+          error: getErrorMessage(error),
+        });
+        restored = false;
+      }
+    }
+    return restored;
   }
 
   /** Managed registry entries merged with unmanaged plugins found by global discovery. */
   async list(): Promise<AgentPluginListItem[]> {
     this.assertEnabled();
 
-    // Section open is the natural recovery moment: clear promotions orphaned
-    // by a crash between promote and registry write BEFORE discovery scans
-    // the container, so the orphan never renders as an unmanaged row.
-    await this.reconcileOrphanedPromotions().catch((error: unknown) => {
-      log.warn("Failed to reconcile orphaned plugin promotions", {
+    // Section open re-runs crash recovery (the startup pass may have failed
+    // or predates recent journals) BEFORE discovery scans the container, so
+    // an orphaned promotion never renders as an unmanaged row and interrupted
+    // update/uninstall swaps are restored before their rows would look wrong.
+    await this.startupReconciliation;
+    await this.reconcileJournals().catch((error: unknown) => {
+      log.warn("Failed to reconcile plugin journals", {
         error: getErrorMessage(error),
       });
     });
@@ -1615,34 +1892,60 @@ export class AgentPluginInstallService {
       // the Settings row is gone but their requested cleanup never happens.
       await fsPromises.mkdir(this.stagingRoot, { recursive: true });
       const trashDir = path.join(this.stagingRoot, `trash-${Date.now()}-${entry.name}`);
+      const dataTrashDir = path.join(this.stagingRoot, `trash-data-${Date.now()}-${entry.name}`);
+
+      // Journal the transaction BEFORE anything moves: a crash between the
+      // renames below and the registry commit would otherwise leave the
+      // registry owning a plugin whose tree (and optionally its data) is
+      // hidden under plugin-staging with nothing to restore it — the next
+      // list shows a missing install and a retried uninstall commits on
+      // ENOENT while the staged assets linger. reconcileJournals restores
+      // them while the registry entry still exists, and finishes the trash
+      // cleanup once the commit landed.
+      const uninstallJournalPath = this.journalPath(UNINSTALL_JOURNAL_PREFIX, entry.name);
+      await fsPromises.writeFile(
+        uninstallJournalPath,
+        JSON.stringify({ name: entry.name, trashDir, dataTrashDir, stagedAt: Date.now() })
+      );
+      const consumeJournal = async (): Promise<void> => {
+        await fsPromises.rm(uninstallJournalPath, { force: true }).catch(() => undefined);
+      };
+
       let stagedTree = false;
       try {
         await this.renameIntoStaging(targetPath, trashDir);
         stagedTree = true;
       } catch (error) {
         if (!hasErrorCode(error, "ENOENT")) {
+          await consumeJournal(); // Nothing moved: no recovery needed.
           throw new Error(`Failed to remove the plugin directory: ${getErrorMessage(error)}`);
         }
         // Missing tree (present:false row): registry-only uninstall.
       }
 
-      const restoreTree = async (context: string): Promise<void> => {
+      /** Returns true when nothing remained staged (safe to consume the journal). */
+      const restoreTree = async (context: string): Promise<boolean> => {
         if (!stagedTree) {
-          return;
+          return true;
         }
-        await fsPromises.rename(trashDir, targetPath).then(
-          () => this.activeStagingPaths.delete(trashDir),
+        return fsPromises.rename(trashDir, targetPath).then(
+          () => {
+            this.activeStagingPaths.delete(trashDir);
+            return true;
+          },
           (rollbackError: unknown) => {
+            // Keep the journal: reconcileJournals restores the staged tree
+            // on the next startup/section open.
             log.error(`Failed to restore plugin dir after ${context}`, {
               targetPath,
               rollbackError,
             });
+            return false;
           }
         );
       };
 
       const dataPath = getPluginDataPath(this.config.rootDir, instanceId);
-      const dataTrashDir = path.join(this.stagingRoot, `trash-data-${Date.now()}-${entry.name}`);
       let stagedData = false;
       if (args.deletePluginData) {
         try {
@@ -1652,7 +1955,9 @@ export class AgentPluginInstallService {
           if (!hasErrorCode(error, "ENOENT")) {
             // Fail BEFORE the registry commit so the row stays and the user
             // can retry the requested cleanup.
-            await restoreTree("failed plugin-data staging");
+            if (await restoreTree("failed plugin-data staging")) {
+              await consumeJournal();
+            }
             throw new Error(`Failed to remove the plugin data: ${getErrorMessage(error)}`);
           }
           // No data dir: nothing to delete.
@@ -1685,7 +1990,8 @@ export class AgentPluginInstallService {
           rawRegistry.filter((rawEntry) => this.rawEntryName(rawEntry) !== entry.name)
         );
       } catch (error) {
-        await restoreTree("failed registry write");
+        const treeRestored = await restoreTree("failed registry write");
+        let dataRestored = true;
         if (stagedData) {
           // A getToolsForWorkspace startup that began after the pre-stage
           // invalidation can have recreated dataPath (prepareStdioLaunch
@@ -1705,15 +2011,24 @@ export class AgentPluginInstallService {
           if (await pathExists(dataPath)) {
             await this.removeDir(dataPath).catch(() => undefined);
           }
-          await fsPromises.rename(dataTrashDir, dataPath).then(
-            () => this.activeStagingPaths.delete(dataTrashDir),
+          dataRestored = await fsPromises.rename(dataTrashDir, dataPath).then(
+            () => {
+              this.activeStagingPaths.delete(dataTrashDir);
+              return true;
+            },
             (rollbackError: unknown) => {
+              // Keep the journal: reconcileJournals restores the staged data
+              // on the next startup/section open.
               log.error("Failed to restore plugin data after failed registry write", {
                 dataPath,
                 rollbackError,
               });
+              return false;
             }
           );
+        }
+        if (treeRestored && dataRestored) {
+          await consumeJournal();
         }
         throw new Error(`Failed to persist the plugin registry: ${getErrorMessage(error)}`);
       }
@@ -1742,6 +2057,11 @@ export class AgentPluginInstallService {
           });
         });
       }
+      // Consume the journal even when a trash removal failed above: the
+      // commit landed, so recovery must never restore these assets — a kept
+      // journal could resurrect the old data over a later REINSTALL of the
+      // same name. Undeletable leftovers surface below / go to reclamation.
+      await consumeJournal();
 
       // Re-invalidate AFTER the tree is gone: a getToolsForWorkspace call
       // that started right after the pre-rename stop snapshots the new epoch,
@@ -2223,8 +2543,25 @@ export class AgentPluginInstallService {
         // handles can make the rename itself fail on Windows.
         await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
 
+        const updateJournalPath = this.journalPath(UPDATE_JOURNAL_PREFIX, entry.name);
         if (hadOldTree) {
-          await this.renameIntoStaging(targetPath, trashDir);
+          // Journal the swap BEFORE the live tree moves: a crash between the
+          // rename below and the promote would leave the registry recording
+          // an install whose path is missing — and retrying Update cannot
+          // self-heal because assertNoCapabilityIncrease treats the missing
+          // tree as an empty surface and rejects the staged capabilities as
+          // additions. reconcileJournals restores the old tree on recovery.
+          await fsPromises.writeFile(
+            updateJournalPath,
+            JSON.stringify({ name: entry.name, trashDir, stagedAt: Date.now() })
+          );
+          try {
+            await this.renameIntoStaging(targetPath, trashDir);
+          } catch (error) {
+            // Nothing moved: no recovery needed.
+            await fsPromises.rm(updateJournalPath, { force: true }).catch(() => undefined);
+            throw error;
+          }
         }
         try {
           await fsPromises.mkdir(this.containerDir, { recursive: true });
@@ -2232,19 +2569,25 @@ export class AgentPluginInstallService {
         } catch (error) {
           if (hadOldTree) {
             // Roll the old tree back so a failed swap never leaves the plugin missing.
-            await fsPromises.rename(trashDir, targetPath).then(
-              () => this.activeStagingPaths.delete(trashDir),
-              (rollbackError: unknown) => {
-                log.error("Failed to roll back plugin dir after failed update swap", {
-                  targetPath,
-                  rollbackError,
-                });
-              }
-            );
+            try {
+              await fsPromises.rename(trashDir, targetPath);
+              this.activeStagingPaths.delete(trashDir);
+              await fsPromises.rm(updateJournalPath, { force: true }).catch(() => undefined);
+            } catch (rollbackError) {
+              // Keep the journal: reconcileJournals restores the tree on the
+              // next startup/section open.
+              log.error("Failed to roll back plugin dir after failed update swap", {
+                targetPath,
+                rollbackError,
+              });
+            }
           }
           throw error;
         }
         if (hadOldTree) {
+          // The new tree is live: the journal's recovery job is done (the
+          // staged old tree is plain trash now).
+          await fsPromises.rm(updateJournalPath, { force: true }).catch(() => undefined);
           // Best-effort: the trash dir sits under the staging root, where
           // stale-dir reclamation cleans up leftovers.
           await this.removeDir(trashDir).catch((error: unknown) => {
