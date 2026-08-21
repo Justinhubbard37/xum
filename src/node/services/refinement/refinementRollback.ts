@@ -24,6 +24,7 @@
  * translated here (same v1 scope as the r2 emitters' cross-workspace caveat).
  */
 
+import { randomUUID } from "node:crypto";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import writeFileAtomic from "write-file-atomic";
@@ -120,30 +121,53 @@ function errnoCode(error: unknown): string | undefined {
  * the debug CLI (a standalone Bun process, src/cli/debug/refinements.ts)
  * against the Electron backend: both processes could pass the
  * already-rolled-back check, double-apply the inverse, and append duplicate
- * `rollbackOf` rows. An O_EXCL lockfile carrying the owner PID provides the
- * cross-process claim. A leftover lock is reclaimed ONLY when its owner is
- * provably dead (ESRCH); every ambiguous state — unreadable PID, EPERM, a
- * live owner — fails the rollback instead of risking a double apply.
+ * `rollbackOf` rows. An O_EXCL lockfile provides the cross-process claim.
+ *
+ * Ownership: each acquisition writes a unique `pid:uuid` token. A leftover
+ * lock is reclaimed ONLY when its owner PID is provably dead (ESRCH); every
+ * ambiguous state — unreadable token, EPERM, a live owner — fails the
+ * rollback instead of risking a double apply. Both destructive steps are
+ * ownership-verified so a pathname-level unlink can never remove another
+ * acquisition's live lock:
+ * - release unlinks only while the file still carries this token;
+ * - reclamation renames the observed-stale file aside atomically and deletes
+ *   it only after re-verifying the dead owner's token (see
+ *   reclaimStaleRollbackLock for the race this prevents).
+ *
+ * Exported for tests (concurrency scenarios need the raw lock, not a full
+ * rollback); production callers go through rollbackRefinement.
  */
-async function acquireRollbackFileLock(sessionDir: string): Promise<AsyncDisposable> {
+export async function acquireRollbackFileLock(sessionDir: string): Promise<AsyncDisposable> {
   const lockPath = path.join(path.resolve(sessionDir), ROLLBACK_LOCKFILE);
   // A session dir may not exist yet (e.g. unknown-id refusals before any row
   // was journaled); the claim must still succeed so the ordinary "No
   // refinement row" refusal is reached instead of a lockfile ENOENT.
   await fsPromises.mkdir(path.resolve(sessionDir), { recursive: true });
+  const myToken = `${process.pid}:${randomUUID()}`;
   // Two attempts: the initial claim plus one retry after reclaiming a stale
   // (dead-owner) lock. Losing the retry means live contention — fail.
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const handle = await fsPromises.open(lockPath, "wx");
       try {
-        await handle.writeFile(String(process.pid), "utf-8");
+        await handle.writeFile(myToken, "utf-8");
       } finally {
         await handle.close();
       }
       return {
         async [Symbol.asyncDispose]() {
           try {
+            // Ownership-verified release: a mismatched token means this lock
+            // was reclaimed out from under us (e.g. this PID was wrongly
+            // judged dead) and the path now belongs to another acquisition —
+            // unlinking it would unlock that rollback mid-flight.
+            const current = await fsPromises.readFile(lockPath, "utf-8");
+            if (current !== myToken) {
+              log.warn("[refinement] rollback lockfile changed owners before release; leaving it", {
+                lockPath,
+              });
+              return;
+            }
             await fsPromises.unlink(lockPath);
           } catch (error) {
             log.debug("[refinement] failed to release rollback lockfile", { lockPath, error });
@@ -156,17 +180,17 @@ async function acquireRollbackFileLock(sessionDir: string): Promise<AsyncDisposa
       }
     }
 
-    // Contended: decide liveness from the recorded owner PID.
-    let rawPid: string;
+    // Contended: decide liveness from the owner token's PID prefix.
+    let ownerToken: string;
     try {
-      rawPid = await fsPromises.readFile(lockPath, "utf-8");
+      ownerToken = await fsPromises.readFile(lockPath, "utf-8");
     } catch (error) {
       if (errnoCode(error) === "ENOENT") {
         continue; // Owner released between our open and read; retry the claim.
       }
       throw error;
     }
-    const ownerPid = Number.parseInt(rawPid.trim(), 10);
+    const ownerPid = Number.parseInt(ownerToken.trim().split(":")[0] ?? "", 10);
     if (!Number.isInteger(ownerPid) || ownerPid <= 0) {
       // Unreadable owner (torn write, foreign file): ambiguous — never break.
       throw new RollbackError(
@@ -188,16 +212,71 @@ async function acquireRollbackFileLock(sessionDir: string): Promise<AsyncDisposa
         `Another rollback is in progress for this session (lockfile '${lockPath}' held by pid ${ownerPid}). Retry once it finishes.`
       );
     }
-    try {
-      await fsPromises.unlink(lockPath);
-    } catch (error) {
-      if (errnoCode(error) !== "ENOENT") {
-        throw error;
-      }
-    }
+    await reclaimStaleRollbackLock(lockPath, ownerToken);
   }
   throw new RollbackError(
     `Another rollback is in progress for this session (lost the claim on '${lockPath}' twice). Retry once it finishes.`
+  );
+}
+
+/**
+ * Remove a lockfile whose recorded owner was judged dead. An unconditional
+ * pathname unlink here would race a competing reclaimer: after it unlinks
+ * and re-creates, our unlink would silently remove the competitor's fresh
+ * LIVE lock and let two rollbacks enter the critical section. rename(2) is
+ * atomic and moves exactly one directory entry: losing the race surfaces as
+ * ENOENT instead, and the post-rename token check catches the other
+ * interleaving — the dead owner's file replaced by a live lock between our
+ * read and rename — which is restored via link(2) (fails with EEXIST rather
+ * than clobbering an even newer competitor's lock).
+ *
+ * Returns when the pathname is free to re-claim; throws RollbackError when
+ * the lock turned out to be live. Exported for tests.
+ */
+export async function reclaimStaleRollbackLock(
+  lockPath: string,
+  staleToken: string
+): Promise<void> {
+  const reclaimPath = `${lockPath}.reclaim-${randomUUID()}`;
+  try {
+    await fsPromises.rename(lockPath, reclaimPath);
+  } catch (error) {
+    if (errnoCode(error) === "ENOENT") {
+      return; // Another reclaimer (or a releasing owner) removed it first.
+    }
+    throw error;
+  }
+  let renamedToken: string | null = null;
+  try {
+    renamedToken = await fsPromises.readFile(reclaimPath, "utf-8");
+  } catch (error) {
+    log.debug("[refinement] failed to read renamed rollback lockfile", { reclaimPath, error });
+  }
+  if (renamedToken === staleToken) {
+    // Verified: we moved the dead owner's file. Deleting it by its unique
+    // temp name cannot touch any competitor's lock at the canonical path.
+    await fsPromises.rm(reclaimPath, { force: true });
+    return;
+  }
+  // We renamed someone ELSE's lock: the stale file was released and a live
+  // lock created at the pathname between our read and rename. Put it back
+  // without clobbering — link(2) fails with EEXIST when a competitor already
+  // re-claimed the pathname (that owner's release is token-verified, so the
+  // displaced lock staying gone is handled there).
+  try {
+    await fsPromises.link(reclaimPath, lockPath);
+  } catch (error) {
+    if (errnoCode(error) !== "EEXIST") {
+      log.error("[refinement] failed to restore a mistakenly renamed rollback lock", {
+        lockPath,
+        reclaimPath,
+        error,
+      });
+    }
+  }
+  await fsPromises.rm(reclaimPath, { force: true });
+  throw new RollbackError(
+    `Another rollback is in progress for this session (lock '${lockPath}' changed owners mid-reclaim). Retry once it finishes.`
   );
 }
 

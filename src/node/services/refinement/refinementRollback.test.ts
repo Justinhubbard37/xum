@@ -11,7 +11,13 @@ import { MemoryService, type MemoryScopeContext } from "@/node/services/memorySe
 import { TestTempDir } from "@/node/services/tools/testHelpers";
 import { sharedDurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { appendRefinementEvent } from "./refinementJournal";
-import { listRefinements, rollbackRefinement, type RefinementEvent } from "./refinementRollback";
+import {
+  acquireRollbackFileLock,
+  listRefinements,
+  reclaimStaleRollbackLock,
+  rollbackRefinement,
+  type RefinementEvent,
+} from "./refinementRollback";
 
 function pathExists(target: string): Promise<boolean> {
   return fsPromises.access(target).then(
@@ -324,6 +330,73 @@ describe("refinementRollback", () => {
     });
     expect(result.success).toBe(true);
     // The reclaimed lock was released after the rollback.
+    expect(await pathExists(lockPath)).toBe(false);
+  });
+
+  it("reclaim cannot unlink a live lock created after the stale read (double-reclaim race)", async () => {
+    using fixture = await createFixture();
+    await fixture.service.create(fixture.ctx, "/memories/global/race2.md", "v1\n", "agent");
+    await fixture.service.strReplace(fixture.ctx, "/memories/global/race2.md", "v1", "v2", "agent");
+    const editRow = await lastRow(fixture.sessionDir);
+    const lockPath = path.join(fixture.sessionDir, "refinement-rollback.lock");
+
+    // Reclaimer A observed a stale (dead-owner) lock...
+    const child = spawnSync(process.execPath, ["--version"]);
+    const deadToken = `${child.pid}:dead-owner-uuid`;
+    // ...but before A's reclaim executes, a competitor finished its own
+    // reclaim and acquired a fresh LIVE lock at the same pathname (the
+    // interleaving that made unconditional unlink destroy the live lock).
+    const liveToken = `${process.pid}:live-owner-uuid`;
+    await fsPromises.writeFile(lockPath, liveToken, { encoding: "utf-8", flag: "wx" });
+
+    // A's reclaim renames the file aside, detects the token mismatch, and
+    // must restore the live lock instead of deleting it.
+    let threw: unknown = null;
+    try {
+      await reclaimStaleRollbackLock(lockPath, deadToken);
+    } catch (error) {
+      threw = error;
+    }
+    expect(String(threw)).toContain("changed owners mid-reclaim");
+    // The live lock is back at the canonical pathname, byte-identical...
+    expect(await fsPromises.readFile(lockPath, "utf-8")).toBe(liveToken);
+    // ...with no renamed-aside residue left behind.
+    const residue = (await fsPromises.readdir(fixture.sessionDir)).filter((name) =>
+      name.includes(".reclaim-")
+    );
+    expect(residue).toEqual([]);
+
+    // The restored live lock (live PID) still refuses a full rollback.
+    const refused = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: editRow.id,
+      evidence: EVIDENCE,
+    });
+    expect(refused.success).toBe(false);
+    if (refused.success) throw new Error("unreachable");
+    expect(refused.error).toContain("Another rollback is in progress");
+  });
+
+  it("release leaves the lockfile alone when its token no longer matches", async () => {
+    using fixture = await createFixture();
+    // Materialize the session dir (acquire creates it, but be explicit).
+    await fsPromises.mkdir(fixture.sessionDir, { recursive: true });
+    const lockPath = path.join(fixture.sessionDir, "refinement-rollback.lock");
+
+    const lock = await acquireRollbackFileLock(fixture.sessionDir);
+    // Simulate a wrongful reclaim while we hold the lock: the pathname now
+    // carries another acquisition's token.
+    const foreignToken = `${process.pid}:foreign-uuid`;
+    await fsPromises.writeFile(lockPath, foreignToken, "utf-8");
+
+    await lock[Symbol.asyncDispose]();
+    // Ownership-verified release must not unlink the new owner's lock.
+    expect(await fsPromises.readFile(lockPath, "utf-8")).toBe(foreignToken);
+
+    // Sanity: a matching token still releases (same acquire/dispose path).
+    await fsPromises.unlink(lockPath);
+    const lock2 = await acquireRollbackFileLock(fixture.sessionDir);
+    await lock2[Symbol.asyncDispose]();
     expect(await pathExists(lockPath)).toBe(false);
   });
 
