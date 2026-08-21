@@ -691,25 +691,49 @@ export async function rollbackRefinement(
     // Capture the pre-rollback state (the new row's inverse) BEFORE mutating.
     const newInverse = await capturePreRollbackInverse(inverse);
 
-    // Apply the target's inverse to disk.
+    // Apply the target's inverse to disk. Multi-file ops are two-phase: a
+    // failure after the first mutation would otherwise leave an unjournaled
+    // partial rollback behind (no rollbackOf row, and a retry refuses on the
+    // resulting divergence).
     const applied: RollbackApplied = { rollbackRowId: null, restored: [], deleted: [] };
     switch (inverse.op) {
       case "delete-files":
-        for (const p of inverse.paths) {
-          await fsPromises.rm(p, { force: true });
-          applied.deleted.push(p);
+        try {
+          for (const p of inverse.paths) {
+            await fsPromises.rm(p, { force: true });
+            applied.deleted.push(p);
+          }
+        } catch (error) {
+          await compensatePartialApply(applied.deleted, newInverse);
+          throw error;
         }
         break;
-      case "restore-files":
+      case "restore-files": {
+        // Phase 1 — resolve every payload before any mutation, so a missing
+        // or corrupt blob aborts with the tree untouched. All contents fit in
+        // memory: inverses are bounded by the capture budgets at write time.
+        const staged: RefinementFileCapture[] = [];
         for (const file of inverse.files) {
-          const content = await readContent.read(file);
-          await fsPromises.mkdir(path.dirname(file.path), { recursive: true });
-          // Same atomic-write discipline as LocalMemoryStore.writeFile.
-          await writeFileAtomic(file.path, content, { encoding: "utf-8" });
-          applied.restored.push(file.path);
+          staged.push({ path: file.path, content: await readContent.read(file) });
+        }
+        // Phase 2 — write. A mid-apply failure (e.g. an unwritable
+        // destination) is compensated from the pre-rollback capture so the
+        // tree returns to its pre-rollback state.
+        try {
+          for (const file of staged) {
+            await fsPromises.mkdir(path.dirname(file.path), { recursive: true });
+            // Same atomic-write discipline as LocalMemoryStore.writeFile.
+            await writeFileAtomic(file.path, file.content, { encoding: "utf-8" });
+            applied.restored.push(file.path);
+          }
+        } catch (error) {
+          await compensatePartialApply(applied.restored, newInverse);
+          throw error;
         }
         break;
+      }
       case "rename":
+        // Single filesystem op: no partial state to compensate.
         await fsPromises.mkdir(path.dirname(inverse.to), { recursive: true });
         await fsPromises.rename(inverse.from, inverse.to);
         applied.renamed = { from: inverse.from, to: inverse.to };
@@ -757,6 +781,41 @@ export async function rollbackRefinement(
       return { success: false, error: error.message };
     }
     return { success: false, error: `Rollback failed: ${getErrorMessage(error)}` };
+  }
+}
+
+/**
+ * Best-effort compensation for a mid-apply failure: put every already-mutated
+ * path back to its pre-rollback state captured in `preState` (a path with
+ * captured content is rewritten; a path without one did not exist and is
+ * removed). Failures are logged, not thrown — the original apply error is the
+ * actionable one, and any residue is at least reported instead of silently
+ * masquerading as divergence on the next attempt.
+ */
+async function compensatePartialApply(
+  mutatedPaths: string[],
+  preState: RefinementInverseDraft
+): Promise<void> {
+  // capturePreRollbackInverse never produces a rename (renames are single-op).
+  assert(preState.op !== "rename", "pre-rollback capture cannot be a rename");
+  for (const p of mutatedPaths) {
+    try {
+      const prior =
+        preState.op === "restore-files"
+          ? preState.files.find((file) => file.path === p)
+          : undefined;
+      if (prior !== undefined) {
+        await fsPromises.mkdir(path.dirname(p), { recursive: true });
+        await writeFileAtomic(p, prior.content, { encoding: "utf-8" });
+      } else {
+        await fsPromises.rm(p, { force: true });
+      }
+    } catch (error) {
+      log.error("[refinement] failed to compensate a partially applied rollback", {
+        path: p,
+        error,
+      });
+    }
   }
 }
 

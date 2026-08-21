@@ -115,6 +115,70 @@ describe("refinementRollback", () => {
     expect(result.data.rollbackRowId).toBe(rollbackRow.id);
   });
 
+  it("aborts a multi-file restore before any write when a blob is missing", async () => {
+    using fixture = await createFixture();
+    // Two files under one memory dir; the big one's captured content is
+    // blob-backed in the delete row's inverse. Sorted capture order puts
+    // a-small.md first, so a sequential apply would restore it before the
+    // blob failure.
+    await fixture.service.create(fixture.ctx, "/memories/global/notes/a-small.md", "sm\n", "agent");
+    const big = "x".repeat(REFINEMENT_INLINE_MAX_CHARS + 100);
+    await fixture.service.create(fixture.ctx, "/memories/global/notes/z-big.md", big, "agent");
+    await fixture.service.deletePath(fixture.ctx, "/memories/global/notes", "agent");
+    const deleteRow = await lastRow(fixture.sessionDir);
+    const inverse = deleteRow.data.inverse as {
+      op: string;
+      files: Array<{ path: string; blobRef?: string }>;
+    };
+    const blobbed = inverse.files.find((file) => file.blobRef !== undefined);
+    expect(blobbed?.blobRef).toBeDefined();
+    // Corrupt the journal: drop the blob payload backing z-big.md
+    // (blobs live at blobs/<hash[0:2]>/<hash> with the ref's sha256: prefix stripped).
+    const hash = blobbed!.blobRef!.slice("sha256:".length);
+    await fsPromises.rm(path.join(fixture.sessionDir, "blobs", hash.slice(0, 2), hash));
+
+    const result = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: deleteRow.id,
+      evidence: EVIDENCE,
+    });
+    expect(result.success).toBe(false);
+    if (result.success) throw new Error("unreachable");
+    expect(result.error).toContain("Blob");
+    // Phase 1 failed before any write: the small file must NOT be restored...
+    const smallPath = path.join(fixture.muxHome, "memory", "global", "notes", "a-small.md");
+    expect(await pathExists(smallPath)).toBe(false);
+    // ...and no rollback row was appended.
+    const rows = await listRefinements(fixture.sessionDir);
+    expect(rows.some((row) => row.data.rollbackOf === deleteRow.id)).toBe(false);
+  });
+
+  it("compensates already-written files when a multi-file restore fails midway", async () => {
+    using fixture = await createFixture();
+    await fixture.service.create(fixture.ctx, "/memories/global/notes/a/first.md", "1\n", "agent");
+    await fixture.service.create(fixture.ctx, "/memories/global/notes/z/second.md", "2\n", "agent");
+    await fixture.service.deletePath(fixture.ctx, "/memories/global/notes", "agent");
+    const deleteRow = await lastRow(fixture.sessionDir);
+
+    // Sabotage the SECOND destination: a regular file where its parent dir
+    // must be created makes phase 2 fail after the first file was written.
+    const notesDir = path.join(fixture.muxHome, "memory", "global", "notes");
+    await fsPromises.mkdir(notesDir, { recursive: true });
+    await fsPromises.writeFile(path.join(notesDir, "z"), "not a dir\n", "utf-8");
+
+    const result = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: deleteRow.id,
+      evidence: EVIDENCE,
+    });
+    expect(result.success).toBe(false);
+    // Compensation removed the already-restored first file (it was absent
+    // pre-rollback), so a later retry sees no divergence from this failure.
+    expect(await pathExists(path.join(notesDir, "a", "first.md"))).toBe(false);
+    const rows = await listRefinements(fixture.sessionDir);
+    expect(rows.some((row) => row.data.rollbackOf === deleteRow.id)).toBe(false);
+  });
+
   it("refuses a double rollback of the same id, but allows rolling back the rollback", async () => {
     using fixture = await createFixture();
     await fixture.service.create(fixture.ctx, "/memories/global/a.md", "v1\n", "agent");
