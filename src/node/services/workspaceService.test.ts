@@ -8676,9 +8676,13 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
       workspaceId: string,
       workspacePath: string
     ): Promise<string | undefined>;
+    pendingPluginSanitizations: Set<string>;
+    rollbackUnsanitizedWorkspaceRegistration(workspaceId: string): Promise<boolean>;
   }
 
-  function makeService(existingWorkspaces: Array<{ id: string; path: string }>): WorkspaceService {
+  function makeService(
+    existingWorkspaces: Array<{ id: string; path: string; runtimeConfig?: unknown }>
+  ): WorkspaceService {
     return createWorkspaceServiceForTest({
       config: {
         srcDir: "/tmp/src",
@@ -8737,6 +8741,99 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
     ).sanitizeStalePluginOverridesForNewWorkspace("ws-new", "/tmp/proj");
     expect(error).toContain("could not be sanitized");
     expect(error).toContain("mcp.local.jsonc");
+  });
+
+  test("an off-host workspace with an equal path string is not a sibling", async () => {
+    // SSH/container paths occupy a different filesystem namespace: an equal
+    // STRING proves nothing about the local overrides file, and skipping
+    // would leave a stale enable to activate on the next local request.
+    const service = makeService([
+      { id: "ws-ssh", path: "/tmp/proj", runtimeConfig: { type: "ssh", host: "box" } },
+      { id: "ws-new", path: "/tmp/proj" },
+    ]);
+    const pruned: string[] = [];
+    service.setWorkspaceMcpOverridesService({
+      prunePluginOverrideKeys: (workspaceId, keyPrefix) => {
+        pruned.push(`${workspaceId}:${keyPrefix}`);
+        return Promise.resolve();
+      },
+    });
+    const error = await (
+      service as unknown as SanitizeAccess
+    ).sanitizeStalePluginOverridesForNewWorkspace("ws-new", "/tmp/proj");
+    expect(error).toBeUndefined();
+    expect(pruned).toEqual(["ws-new:plugin:"]);
+  });
+
+  test("a sibling registered through a symlinked spelling still forces a skip", async () => {
+    // Canonical (realpath) identity, not just spelling: pruning here would
+    // strip the live symlink-spelled sibling's enables from the shared file.
+    const realDir = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-sanitize-real-"));
+    const linkPath = `${realDir}-link`;
+    await fsPromises.symlink(realDir, linkPath);
+    try {
+      const service = makeService([
+        { id: "ws-symlink-sibling", path: linkPath },
+        { id: "ws-new", path: realDir },
+      ]);
+      const pruned: string[] = [];
+      service.setWorkspaceMcpOverridesService({
+        prunePluginOverrideKeys: (workspaceId, keyPrefix) => {
+          pruned.push(`${workspaceId}:${keyPrefix}`);
+          return Promise.resolve();
+        },
+      });
+      const error = await (
+        service as unknown as SanitizeAccess
+      ).sanitizeStalePluginOverridesForNewWorkspace("ws-new", realDir);
+      expect(error).toBeUndefined();
+      expect(pruned).toEqual([]);
+    } finally {
+      await fsPromises.rm(linkPath, { force: true });
+      await fsPromises.rm(realDir, { recursive: true, force: true });
+    }
+  });
+
+  test("an overlapping registration pending its own sanitization is not a sibling", async () => {
+    // Two creations for the same checkout can both persist config entries
+    // before either sanitizes; a not-yet-sanitized entry is no proof of live
+    // consent, so the scan must ignore it or BOTH creations skip pruning.
+    const service = makeService([
+      { id: "ws-concurrent", path: "/tmp/proj" },
+      { id: "ws-new", path: "/tmp/proj" },
+    ]);
+    (service as unknown as SanitizeAccess).pendingPluginSanitizations.add("ws-concurrent");
+    const pruned: string[] = [];
+    service.setWorkspaceMcpOverridesService({
+      prunePluginOverrideKeys: (workspaceId, keyPrefix) => {
+        pruned.push(`${workspaceId}:${keyPrefix}`);
+        return Promise.resolve();
+      },
+    });
+    const error = await (
+      service as unknown as SanitizeAccess
+    ).sanitizeStalePluginOverridesForNewWorkspace("ws-new", "/tmp/proj");
+    expect(error).toBeUndefined();
+    expect(pruned).toEqual(["ws-new:plugin:"]);
+  });
+
+  test("rollback verification detects a swallowed config write failure", async () => {
+    // Config.saveConfig logs and swallows write errors, so removeWorkspace
+    // can resolve while the entry survives on disk; the rollback must verify
+    // absence rather than trust the resolved promise.
+    const stuckWorkspaces = [{ id: "ws-stuck", path: "/tmp/proj" }];
+    const service = createWorkspaceServiceForTest({
+      config: {
+        removeWorkspace: mock(() => Promise.resolve()),
+        loadConfigOrDefault: mock(() => ({
+          projects: new Map([["/tmp/proj", { workspaces: stuckWorkspaces }]]),
+        })),
+      } as unknown as Config,
+    });
+    const access = service as unknown as SanitizeAccess;
+    expect(await access.rollbackUnsanitizedWorkspaceRegistration("ws-stuck")).toBe(false);
+    // A rollback that actually lands verifies clean.
+    expect(await access.rollbackUnsanitizedWorkspaceRegistration("ws-gone")).toBe(true);
   });
 });
 
