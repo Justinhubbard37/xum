@@ -12,6 +12,10 @@
 import type { Tool } from "ai";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
+import type { SendMessageOptions } from "@/common/orpc/types";
+
+/** Renderer-sent experiment flags (SendMessageOptions.experiments). */
+type SendMessageExperiments = SendMessageOptions["experiments"];
 
 import { applyToolPolicy, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { applyCapabilityGrants } from "@/common/utils/tools/capabilityGrants";
@@ -169,12 +173,10 @@ export function persistentSandboxMountsEnabled(): boolean {
  * silently streams with the non-persistent flat/PTC toolset. Explicit
  * renderer values (true or false) always win over the backend fallback.
  */
-export function resolveBackendGatedPtcExperiments<
-  T extends NonNullable<ApplyToolPolicyAndExperimentsOptions["experiments"]>,
->(experiments: T | undefined, isExperimentEnabled: (experimentId: ExperimentId) => boolean): T {
-  // Targeted cast: TypeScript cannot type a spread-with-override against a
-  // generic T, but the override only fills the three optional boolean PTC
-  // fields T declares, so the result is structurally a T.
+export function resolveBackendGatedPtcExperiments(
+  experiments: SendMessageExperiments | undefined,
+  isExperimentEnabled: (experimentId: ExperimentId) => boolean
+): NonNullable<SendMessageExperiments> {
   return {
     ...experiments,
     programmaticToolCalling:
@@ -184,7 +186,7 @@ export function resolveBackendGatedPtcExperiments<
       experiments?.programmaticToolCallingExclusive ??
       isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE),
     rlm: experiments?.rlm ?? isExperimentEnabled(EXPERIMENT_IDS.RLM),
-  } as T;
+  };
 }
 
 /**

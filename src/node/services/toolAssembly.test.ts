@@ -501,14 +501,10 @@ describe("resolveBackendGatedPtcExperiments", () => {
   });
 
   test("explicit renderer values (true or false) win over the backend", () => {
-    // Widened annotation: literal inference would freeze T's fields to the
-    // exact literals and defeat the assertions below.
-    const flags: {
-      programmaticToolCalling?: boolean;
-      programmaticToolCallingExclusive?: boolean;
-      rlm?: boolean;
-    } = { rlm: false, programmaticToolCallingExclusive: true };
-    const resolved = resolveBackendGatedPtcExperiments(flags, isEnabled);
+    const resolved = resolveBackendGatedPtcExperiments(
+      { rlm: false, programmaticToolCallingExclusive: true },
+      isEnabled
+    );
     // Explicit false is NOT backfilled to the backend's true.
     expect(resolved.rlm).toBe(false);
     expect(resolved.programmaticToolCallingExclusive).toBe(true);
@@ -517,7 +513,7 @@ describe("resolveBackendGatedPtcExperiments", () => {
   });
 
   test("preserves unrelated experiment flags untouched", () => {
-    const resolved = resolveBackendGatedPtcExperiments({ memory: true } as never, isEnabled);
-    expect((resolved as { memory?: boolean }).memory).toBe(true);
+    const resolved = resolveBackendGatedPtcExperiments({ memory: true }, isEnabled);
+    expect(resolved.memory).toBe(true);
   });
 });
