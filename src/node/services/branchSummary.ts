@@ -422,10 +422,16 @@ export function createBranchSummaryMessage(summaryText: string): MuxMessage {
   assert(summaryText.trim().length > 0, "branch summary text must be non-empty");
   return createMuxMessage(
     createBranchSummaryMessageId(),
-    // A synthetic user row: provider-visible like other synthetic notices
-    // (restart/wake messages), never mistaken for a streamed assistant turn
-    // (no turn envelope/usage), and uiVisible so users see what was preserved.
-    "user",
+    // SECURITY: assistant role, never user. The text is MODEL OUTPUT over an
+    // attacker-influenceable transcript (the abandoned branch); storing it as
+    // a user row would grant prompt-injected summarizer output user-priority
+    // trust in every later tool-capable request, surviving the very rewind
+    // the user performed. As an assistant row the provider reads it as prior
+    // generated context, not user instructions — same posture as compaction
+    // summary rows, the other synthetic assistant precedent. Provenance is
+    // durable via synthetic + muxMetadata; no turn envelope/usage marks it as
+    // a streamed turn.
+    "assistant",
     `${BRANCH_SUMMARY_LABEL}\n\n${summaryText.trim()}`,
     {
       timestamp: Date.now(),

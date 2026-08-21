@@ -305,7 +305,10 @@ describe("maybeAppendAbandonedBranchSummary", () => {
       if (!history.success) return;
       expect(history.data.length).toBe(1);
       const row = history.data[0];
-      expect(row.role).toBe("user");
+      // SECURITY: generated provenance — the summary is model output over an
+      // attacker-influenceable transcript and must never gain user-role
+      // authority in later tool-capable requests.
+      expect(row.role).toBe("assistant");
       const text = row.parts.find((part) => part.type === "text");
       expect(text?.type === "text" && text.text.startsWith(BRANCH_SUMMARY_LABEL)).toBe(true);
       expect(text?.type === "text" && text.text).toContain("root cause was a race in setup");

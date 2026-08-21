@@ -1005,6 +1005,65 @@ function mergeConsecutiveUserMessages(messages: ModelMessage[]): ModelMessage[] 
   return merged;
 }
 
+type AssistantContentArray = Exclude<AssistantModelMessage["content"], string>;
+
+/** True when the content is plain text: a string, or an array of only text parts. */
+function isTextOnlyAssistantContent(content: AssistantModelMessage["content"]): boolean {
+  if (typeof content === "string") return true;
+  return content.every((part) => part.type === "text");
+}
+
+/**
+ * Merge a text-only assistant message into a directly preceding assistant
+ * message. Synthetic assistant rows (branch summaries; potentially other
+ * generated notices) can land right after a streamed assistant turn, and
+ * Anthropic requires alternating user/assistant roles. Deliberately narrow:
+ * the INCOMING message must be text-only, and the previous message must not
+ * end in tool calls (their tool-result adjacency must stay intact — a
+ * tool-call assistant message is followed by a tool message, so those pairs
+ * never reach this merge anyway). Reasoning parts already in the previous
+ * message are preserved ahead of the appended text.
+ */
+function mergeConsecutiveAssistantTextMessages(messages: ModelMessage[]): ModelMessage[] {
+  const merged: ModelMessage[] = [];
+
+  for (const msg of messages) {
+    const prev = merged[merged.length - 1];
+    if (
+      msg.role === "assistant" &&
+      prev?.role === "assistant" &&
+      isTextOnlyAssistantContent(msg.content) &&
+      (typeof prev.content === "string" || !prev.content.some((part) => part.type === "tool-call"))
+    ) {
+      const currentText =
+        typeof msg.content === "string"
+          ? msg.content
+          : msg.content
+              .map((part) => (part.type === "text" ? part.text : ""))
+              .filter((text) => text.length > 0)
+              .join("\n");
+      const prevContent: AssistantContentArray =
+        typeof prev.content === "string"
+          ? [{ type: "text", text: prev.content }]
+          : [...prev.content];
+      const lastPart = prevContent[prevContent.length - 1];
+      if (lastPart?.type === "text") {
+        prevContent[prevContent.length - 1] = {
+          ...lastPart,
+          text: `${lastPart.text}\n\n${currentText}`,
+        };
+      } else {
+        prevContent.push({ type: "text", text: currentText });
+      }
+      merged[merged.length - 1] = { ...prev, content: prevContent };
+      continue;
+    }
+    merged.push(msg);
+  }
+
+  return merged;
+}
+
 function ensureAnthropicThinkingBeforeToolCalls(messages: ModelMessage[]): ModelMessage[] {
   const result: ModelMessage[] = [];
 
@@ -1168,7 +1227,10 @@ export function transformModelMessages(
   // Pass 5: Merge consecutive user messages (applies to all providers)
   const merged = mergeConsecutiveUserMessages(reasoningHandled);
 
-  return merged;
+  // Pass 6: Merge text-only synthetic assistant rows (branch summaries) into
+  // a preceding assistant turn — Anthropic rejects consecutive assistant
+  // messages just as it rejects consecutive user messages.
+  return mergeConsecutiveAssistantTextMessages(merged);
 }
 
 /**

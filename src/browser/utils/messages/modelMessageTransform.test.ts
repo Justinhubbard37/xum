@@ -178,7 +178,10 @@ describe("modelMessageTransform", () => {
         expect(lastAssistant.content[0]).toEqual({ type: "reasoning", text: "..." });
       }
     });
-    it("should keep text-only messages unchanged", () => {
+    it("merges consecutive text-only assistant messages (Anthropic alternation)", () => {
+      // Previously passed through unchanged; since synthetic assistant rows
+      // (branch summaries) can follow a streamed assistant turn, consecutive
+      // text-only assistant messages now merge like consecutive user messages.
       const assistantMsg1: AssistantModelMessage = {
         role: "assistant",
         content: [{ type: "text", text: "Let me help you with that." }],
@@ -190,7 +193,12 @@ describe("modelMessageTransform", () => {
       const messages: ModelMessage[] = [assistantMsg1, assistantMsg2];
 
       const result = transformModelMessages(messages, "anthropic");
-      expect(result).toEqual(messages);
+      expect(result).toEqual([
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "Let me help you with that.\n\nHere's the result." }],
+        },
+      ]);
     });
 
     it("coalesces 3 consecutive identical no-progress task_await pairs into 1 (keep last pair)", () => {
@@ -629,6 +637,67 @@ describe("modelMessageTransform", () => {
       expect((result[2].content as Array<{ type: string; text: string }>)[0].text).toBe(
         "How are you?"
       );
+    });
+  });
+
+  describe("consecutive assistant messages", () => {
+    it("merges a text-only synthetic assistant row into the preceding assistant turn", () => {
+      // Branch summaries are assistant-role synthetic rows that can land
+      // directly after a streamed assistant turn; Anthropic rejects
+      // consecutive assistant messages just like consecutive user messages.
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "question" }] },
+        { role: "assistant", content: [{ type: "text", text: "branch point answer" }] },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "Summary of the abandoned branch: explored a race." }],
+        },
+        { role: "user", content: [{ type: "text", text: "first send on the fork" }] },
+      ];
+      const result = transformModelMessages(messages, "anthropic");
+      expect(result).toHaveLength(3);
+      expect(result[1].role).toBe("assistant");
+      const content = result[1].content;
+      expect(Array.isArray(content) && content[0].type === "text" && content[0].text).toBe(
+        "branch point answer\n\nSummary of the abandoned branch: explored a race."
+      );
+      // Alternation restored for Anthropic.
+      expect(result.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
+    });
+
+    it("keeps a summary row standalone after a tool-call/tool-result pair", () => {
+      // Tool-call/tool-result adjacency must stay intact: when the branch
+      // point turn ended in tool calls, the summary follows the TOOL message
+      // and must not be folded backwards across it.
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "question" }] },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "calling" },
+            { type: "tool-call", toolCallId: "t1", toolName: "bash", input: {} },
+          ],
+        },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: "t1",
+              toolName: "bash",
+              output: { type: "text", value: "ok" },
+            },
+          ],
+        },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "Summary of the abandoned branch: stalled." }],
+        },
+      ];
+      const result = transformModelMessages(messages, "anthropic");
+      expect(result.map((m) => m.role)).toEqual(["user", "assistant", "tool", "assistant"]);
+      const validation = validateAnthropicCompliance(result);
+      expect(validation.valid).toBe(true);
     });
   });
 
