@@ -45,14 +45,16 @@ export function LeftSidebar(props: LeftSidebarProps) {
 
   return (
     <>
-      {/* Overlay backdrop - only visible on mobile when sidebar is open */}
-      <div
-        className={cn(
-          "hidden mobile-overlay fixed inset-0 bg-black/50 z-40 backdrop-blur-sm",
-          collapsed && "!hidden"
-        )}
-        onClick={onToggleCollapsed}
-      />
+      {/* Overlay backdrop - only visible on mobile when sidebar is open. Unmounted (not
+          hidden via opacity/!hidden) when collapsed: iOS/iPadOS 26 WebKit samples any
+          mounted fixed element's backdrop-filter to synthesize a Liquid Glass blur over
+          the status bar, even when the element is visually hidden. */}
+      {!collapsed && (
+        <div
+          className="mobile-overlay fixed inset-0 z-40 hidden bg-black/50 backdrop-blur-sm"
+          onClick={onToggleCollapsed}
+        />
+      )}
 
       {/* Sidebar */}
       <div

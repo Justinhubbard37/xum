@@ -1180,6 +1180,21 @@ body,
     min-height: 44px !important;
     height: auto !important;
     flex-wrap: wrap !important;
+    /* iOS/iPadOS 26 WebKit samples background-color/backdrop-filter on fixed elements
+       near the viewport edges to synthesize a native Liquid Glass blur over the status
+       bar. Keep the fixed container transparent and paint the surface on a pseudo
+       element instead; the sampler ignores pseudo-elements and absolute children. */
+    background-color: transparent !important;
+  }
+
+  .mobile-sticky-header::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    /* Matches the bg-sidebar utility that these headers use outside this media query. */
+    background-color: var(--color-sidebar);
   }
 
   /* Add padding to content below fixed header so it's not hidden underneath.
@@ -1236,6 +1251,23 @@ body,
     padding-top: env(safe-area-inset-top, 0px) !important;
     padding-bottom: env(safe-area-inset-bottom, 0px) !important;
     padding-left: env(safe-area-inset-left, 0px) !important;
+
+    /* The collapsed drawer stays mounted (translateX(-100%) preserves the slide
+       transition), so iOS/iPadOS 26 WebKit still samples its background-color to
+       synthesize a Liquid Glass blur over the status bar. Keep the fixed container
+       transparent and paint the surface on a pseudo-element, which the sampler
+       ignores (same pattern as .mobile-sticky-header). */
+    background-color: transparent !important;
+  }
+
+  .mobile-sidebar::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    /* Matches the bg-sidebar utility on the sidebar container. */
+    background-color: var(--color-sidebar);
   }
 
   .mobile-sidebar-collapsed {
