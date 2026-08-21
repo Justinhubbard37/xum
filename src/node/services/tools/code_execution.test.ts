@@ -1108,6 +1108,36 @@ describe("createCodeExecutionTool", () => {
       await host.disposeScope("ws-overcap");
     });
 
+    it("truncates handle-tier returns when the guest made vars unusable (store failure)", async () => {
+      // r14: with `vars = null`, storeResultHandle fails for every value in
+      // the offloadable tier (16KB..4MB). Keeping the FULL value inline on
+      // that failure path would let a prompt-influenced program push
+      // megabytes into durable history/provider context; the record must be
+      // the same bounded truncated shape as the over-cap tier.
+      using tmp = new DisposableTempDir("code-exec-offload");
+      const host = new SandboxHostService();
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge({}),
+        undefined,
+        persistentRunner(host, "ws-store-fail", tmp.path)
+      );
+
+      const size = 100_000; // well over the threshold, far under the cap
+      const result = (await tool.execute!(
+        { code: `vars = null; return "z".repeat(${size});` },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+
+      const record = result.result as { truncated?: boolean; handle?: string; preview?: string };
+      expect(record.truncated).toBe(true);
+      expect(record.handle).toBeUndefined();
+      // Bounded: nothing model-visible carries the full payload.
+      expect(JSON.stringify(result).length).toBeLessThan(16 * 1024);
+      await host.disposeScope("ws-store-fail");
+    });
+
     it("rewrites an advertised handle to a truncated record when the snapshot budget rejects it", async () => {
       // Pre-existing unmanaged guest vars can push the FULL snapshot over
       // budget even when the new handle itself is under the retention cap;

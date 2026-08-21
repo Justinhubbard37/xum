@@ -128,22 +128,25 @@ export interface TruncatedValueRecord {
 }
 
 /** Build the model-visible record for a value the kernel could not retain. */
-function buildTruncatedRecord(preview: string, size: number): TruncatedValueRecord {
+function buildTruncatedRecord(preview: string, size: number, note?: string): TruncatedValueRecord {
   return {
     truncated: true,
     preview,
     size,
     note:
+      note ??
       `Return value (${size} bytes) exceeded the kernel retention budget and was NOT stored — ` +
-      `only this preview remains. Re-derive the data in a follow-up call, returning a smaller ` +
-      `slice or aggregate (keep working data in vars).`,
+        `only this preview remains. Re-derive the data in a follow-up call, returning a smaller ` +
+        `slice or aggregate (keep working data in vars).`,
   };
 }
 
 /**
  * Offload one oversized value to the persistent kernel. Returns the
- * model-visible replacement record, or null when the value is sub-threshold
- * or could not be offloaded (in which case it must stay inline).
+ * model-visible replacement record, or null only when the value is
+ * sub-threshold or non-JSON (in which case it stays inline). Over-threshold
+ * JSON values NEVER stay inline: store failures and over-cap sizes both
+ * degrade to a bounded truncated record.
  */
 async function offloadValue(
   mount: SandboxMount,
@@ -175,16 +178,28 @@ async function offloadValue(
     return buildTruncatedRecord(buildHandlePreview(serialized, size), size);
   }
 
-  // Store in vars FIRST: if the guest assignment fails, the model record must
-  // keep the full inline value — never point the model at a missing handle.
+  // Store in vars FIRST so the model is never pointed at a missing handle.
+  // On failure the value must NOT stay inline either (r14): the guest can
+  // force this path deliberately (`vars = null`) and a handle-tier value kept
+  // inline would push megabytes into durable history and provider context —
+  // truncate to the same bounded record as the over-cap tier. The error
+  // detail is deliberately not echoed into the note: guest-influenced eval
+  // errors can be arbitrarily large, and the log line above suffices.
   let handleKey: string;
   try {
     handleKey = await mount.storeResultHandle(serialized, RESULT_HANDLE_VARS_CAP_BYTES);
   } catch (error) {
-    log.warn("code_execution: result-handle vars assignment failed; keeping full value inline", {
-      error,
-    });
-    return null;
+    log.warn(
+      "code_execution: result-handle vars assignment failed; truncating to a bounded preview",
+      { error }
+    );
+    return buildTruncatedRecord(
+      buildHandlePreview(serialized, size),
+      size,
+      `Return value (${size} bytes) could NOT be stored in the kernel (the vars namespace is ` +
+        `unusable) — only this preview remains. Restore vars to a plain object, then re-derive ` +
+        `the data in a follow-up call.`
+    );
   }
   const handle = `vars.${handleKey}`;
   const preview = buildHandlePreview(serialized, size);
