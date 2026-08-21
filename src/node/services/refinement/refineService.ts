@@ -164,7 +164,9 @@ export function createRefineSummaryMessage(
     // The rollback pointer only applies to journaled rows.
     lines.push(
       "",
-      "Rollback with: /debug refinements (bun run debug refinements <workspace-id> --rollback <id>) or the refinement_rollback tool."
+      // Only real affordances: the debug CLI and the refinement_rollback
+      // tool ("/debug refinements" is not a registered slash command).
+      "Rollback with: bun run debug refinements <workspace-id> --rollback <id>, or the refinement_rollback tool."
     );
   }
   return createMuxMessage(createRefineSummaryMessageId(), "user", lines.join("\n"), {
