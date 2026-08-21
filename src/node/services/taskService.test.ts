@@ -13291,6 +13291,74 @@ describe("TaskService", () => {
     expect(sendMessage).toHaveBeenCalledTimes(maxSizeSends);
   });
 
+  test("wake failures retain the budget charge for persisted payload rows", async () => {
+    // Codex round 18: refunding on wake failure let a child that catches the
+    // tool error retry unlimited max-size payload rows while the wake path
+    // was down — each retry durably appended another row into parent history
+    // (and the next provider request) without ever consuming budget. Once
+    // the payload row is persisted, the charge must stay.
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-wake-fail-budget";
+    const childTaskId = "child-wake-fail-budget";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId, {
+          aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
+        }),
+        projectWorkspace(projectPath, "child", childTaskId, {
+          parentWorkspaceId,
+          taskStatus: "running",
+          taskExperiments: { rlm: true },
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    // Wake path is down: every trigger send fails after the payload append.
+    const sendMessage = mock(() =>
+      Promise.resolve(Err({ type: "unknown", raw: "wake path down" }))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    const { taskService, historyService } = createTaskServiceHarness(config, {
+      workspaceService,
+    });
+
+    const maxSizeSends = TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS / TASK_FAMILY_MESSAGE_MAX_CHARS;
+    for (let i = 0; i < maxSizeSends; i++) {
+      const sent = await taskService.sendMessageToParentFromAgentTask(
+        childTaskId,
+        "x".repeat(TASK_FAMILY_MESSAGE_MAX_CHARS),
+        "tool-end"
+      );
+      // Each attempt fails (wake down) but persisted a payload row, so it
+      // must consume budget.
+      expect(sent.success).toBe(false);
+    }
+
+    // The budget is exhausted: the next retry is refused WITHOUT appending
+    // another payload row.
+    const exhausted = await taskService.sendMessageToParentFromAgentTask(
+      childTaskId,
+      "one more",
+      "tool-end"
+    );
+    expect(exhausted.success).toBe(false);
+    if (!exhausted.success) {
+      expect("message" in exhausted.error && exhausted.error.message).toContain("budget");
+    }
+    const history = await historyService.getHistoryFromLatestBoundary(parentWorkspaceId);
+    expect(history.success).toBe(true);
+    if (!history.success) return;
+    const payloadRows = history.data.filter(
+      (m) => m.metadata?.muxMetadata?.type === "family-message"
+    );
+    expect(payloadRows).toHaveLength(maxSizeSends);
+  });
+
   test("the receiver-side ceiling bounds many senders targeting one parent", async () => {
     // Pair budgets alone let every child spend a full allowance on the same
     // busy parent; the target ceiling bounds the aggregate across senders.

@@ -7554,11 +7554,16 @@ export class TaskService {
       queueDispatchMode,
     });
     if (!wakeResult.success) {
-      refundBudget();
-      // The already-appended payload row stays behind as a stray attributed
-      // context row: it is durably labeled untrusted, harmless without its
-      // trigger, and removing durable history rows is not a supported
-      // operation (append-only log).
+      // NO refund: the payload row is durably appended and enters the next
+      // provider request, so the budget charge stays with it. Refunding here
+      // let a child that catches the tool error retry unlimited max-size
+      // payload rows while the wake path was down — bypassing the budget
+      // entirely. The stray attributed context row is durably labeled
+      // untrusted, harmless without its trigger, and removing durable
+      // history rows is not a supported operation (append-only log); its
+      // charge is the cost of the bytes that actually landed in the parent
+      // transcript. Refunds remain only for the append-failure path above,
+      // where nothing was persisted.
       return Err({ code: "send_failed" as const, message: wakeResult.error });
     }
     return Ok({ parentWorkspaceId });
