@@ -34,6 +34,7 @@ import { log } from "@/node/services/log";
 import { TASK_TERMINAL_EVENT_TYPE } from "@/constants/sandboxEvents";
 import {
   buildHandlePreview,
+  RESULT_HANDLE_BLOB_QUOTA_BYTES,
   RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES,
   RESULT_HANDLE_VARS_CAP_BYTES,
   VARS_SNAPSHOT_MAX_BYTES,
@@ -96,6 +97,49 @@ async function reclaimSupersededSnapshotBlobs(
   }
 
   for (const hash of superseded) {
+    await journal.blobs.delete(hash);
+  }
+}
+
+/**
+ * Enforce the per-session quota on retained result-handle blob bytes.
+ * Newest-first: recent handles keep their durable payloads (they may still be
+ * recoverable from vars or wanted for a follow-up read); once the cumulative
+ * size crosses the quota, older payloads are deleted. Same reference-safety
+ * rule as snapshot reclamation: a hash referenced by any retained event or
+ * any other event kind survives (content addressing can share payloads).
+ *
+ * Exported for tests (quota interleavings need synthetic event sizes).
+ */
+export async function reclaimExcessResultHandleBlobs(journal: DurableEventJournal): Promise<void> {
+  const events = await journal.read();
+  const handleEvents = events.filter((event) => event.kind === "result-handle");
+  const retained = new Set<BlobRef>();
+  const evictable = new Set<BlobRef>();
+  let retainedBytes = 0;
+  for (let i = handleEvents.length - 1; i >= 0; i--) {
+    const { blobHash, size } = handleEvents[i].data;
+    if (retained.has(blobHash)) continue;
+    if (retainedBytes + size <= RESULT_HANDLE_BLOB_QUOTA_BYTES) {
+      retainedBytes += size;
+      retained.add(blobHash);
+      evictable.delete(blobHash);
+    } else {
+      evictable.add(blobHash);
+    }
+  }
+  if (evictable.size === 0) return;
+
+  for (const event of events) {
+    if (evictable.size === 0) break;
+    if (event.kind === "result-handle") continue;
+    const serialized = JSON.stringify(event);
+    for (const hash of evictable) {
+      if (serialized.includes(hash)) evictable.delete(hash);
+    }
+  }
+
+  for (const hash of evictable) {
     await journal.blobs.delete(hash);
   }
 }
@@ -600,6 +644,15 @@ export class SandboxHostService {
           kind: "result-handle",
           data: { handle, preview, blobHash: ref, size },
         });
+        // Bound retained handle payloads per session (best-effort — failure
+        // must never fail the persist, mirroring snapshot reclamation).
+        try {
+          await reclaimExcessResultHandleBlobs(journal);
+        } catch (error) {
+          log.debug("SandboxHostService: result-handle blob reclamation failed; continuing", {
+            error,
+          });
+        }
       }
     );
 

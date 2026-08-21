@@ -12,8 +12,12 @@ import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { ToolBridge } from "@/node/services/ptc/toolBridge";
 import { FULL_GRANTS, LEAST_PRIVILEGE_GRANTS } from "@/common/types/capabilityGrants";
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
-import { SandboxHostService, VarsSnapshotBudgetError } from "./sandboxHostService";
-import { VARS_SNAPSHOT_MAX_BYTES } from "@/constants/resultHandles";
+import {
+  reclaimExcessResultHandleBlobs,
+  SandboxHostService,
+  VarsSnapshotBudgetError,
+} from "./sandboxHostService";
+import { RESULT_HANDLE_BLOB_QUOTA_BYTES, VARS_SNAPSHOT_MAX_BYTES } from "@/constants/resultHandles";
 
 const runtimeFactory = new QuickJSRuntimeFactory();
 
@@ -132,6 +136,40 @@ describe("SandboxHostService", () => {
     const events = await journal.read();
     expect(events.filter((e) => e.kind === "sandbox-vars-snapshot")).toHaveLength(0);
     await host.dropScope("ws-budget");
+  });
+
+  test("result-handle blobs beyond the session quota are reclaimed newest-first", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const journal = new DurableEventJournal(tmp.path);
+
+    // Three handles whose RECORDED sizes force the two oldest over the
+    // quota (payload bytes are tiny; the quota math uses event sizes).
+    const bigSize = Math.ceil((RESULT_HANDLE_BLOB_QUOTA_BYTES * 2) / 3);
+    const refs: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      const { ref } = await journal.blobs.put(`handle-payload-${i}`);
+      refs.push(ref);
+      await journal.append({
+        workspaceId: "ws-quota",
+        kind: "result-handle",
+        data: { handle: `vars.__h${i + 1}`, preview: "p", blobHash: ref, size: bigSize },
+      });
+    }
+    // Reference the OLDEST handle's hash from another event kind: content
+    // addressing can share payloads, so it must survive reclamation.
+    await journal.append({
+      workspaceId: "ws-quota",
+      kind: "sandbox-vars-snapshot",
+      data: { scopeKey: "ws-quota", blobHash: refs[0], size: 10 },
+    });
+
+    await reclaimExcessResultHandleBlobs(journal);
+
+    // Newest (h3) fits the quota; h2 is over it and unreferenced → deleted;
+    // h1 is over it but referenced by the snapshot event → survives.
+    expect(await journal.blobs.has(refs[2] as never)).toBe(true);
+    expect(await journal.blobs.has(refs[1] as never)).toBe(false);
+    expect(await journal.blobs.has(refs[0] as never)).toBe(true);
   });
 
   test("superseded snapshot blobs are reclaimed; referenced blobs survive", async () => {

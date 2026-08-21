@@ -35,6 +35,7 @@ import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataServi
 import { SessionUsageService } from "@/node/services/sessionUsageService";
 import { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import { IdleDispatcher } from "@/node/services/idleDispatcher";
+import { TASK_FAMILY_MESSAGE_MAX_CHARS } from "@/constants/taskMessages";
 import {
   TerminalAttentionStore,
   type TerminalAttentionOutcome,
@@ -13151,6 +13152,56 @@ describe("TaskService", () => {
         skipAutoResumeReset: true,
       })
     );
+  });
+
+  test("sendMessageToParentFromAgentTask refuses oversized messages without delivering", async () => {
+    // A kernel guest can synthesize huge strings cheaply; an unbounded family
+    // message would be persisted into the parent transcript and sent to its
+    // provider. The service boundary refuses independently of the tool schema.
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-msg-cap";
+    const childTaskId = "child-msg-cap";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId, {
+          aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
+        }),
+        projectWorkspace(projectPath, "child", childTaskId, {
+          parentWorkspaceId,
+          taskStatus: "running",
+          taskExperiments: { rlm: true },
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const oversized = "x".repeat(TASK_FAMILY_MESSAGE_MAX_CHARS + 1);
+    const result = await taskService.sendMessageToParentFromAgentTask(
+      childTaskId,
+      oversized,
+      "tool-end"
+    );
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.code).toBe("send_failed");
+      expect("message" in result.error && result.error.message).toContain("limit");
+    }
+    expect(sendMessage).not.toHaveBeenCalled();
+
+    // At the limit exactly: accepted.
+    const atLimit = await taskService.sendMessageToParentFromAgentTask(
+      childTaskId,
+      "y".repeat(TASK_FAMILY_MESSAGE_MAX_CHARS),
+      "tool-end"
+    );
+    expect(atLimit.success).toBe(true);
   });
 
   test("sendMessageToParentFromAgentTask refuses non-child and workflow-owned callers", async () => {

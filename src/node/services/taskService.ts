@@ -27,6 +27,7 @@ import {
 } from "@/common/utils/subagentReportEnvelope";
 import { BACKGROUND_WORK_WAKE_OPENINGS } from "@/common/utils/machineTurnPrompts";
 import { WORKSPACE_TURN_TASK_TAGS } from "@/constants/workspaceTags";
+import { TASK_FAMILY_MESSAGE_MAX_CHARS } from "@/constants/taskMessages";
 import { log } from "@/node/services/log";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
@@ -7384,6 +7385,16 @@ export class TaskService {
       trimmedMessage.length > 0,
       "sendMessageToParentFromAgentTask: message must be non-empty"
     );
+    // Defense in depth behind the schema cap: the tool schema already rejects
+    // oversized messages, but this service is also reachable from other
+    // callers, and an unbounded message would be persisted into the parent
+    // transcript and sent to its provider.
+    if (trimmedMessage.length > TASK_FAMILY_MESSAGE_MAX_CHARS) {
+      return Err({
+        code: "send_failed" as const,
+        message: `Message exceeds the ${TASK_FAMILY_MESSAGE_MAX_CHARS}-character family-message limit; send a summary instead.`,
+      });
+    }
 
     const cfg = this.config.loadConfigOrDefault();
     const childEntry = findWorkspaceEntry(cfg, childWorkspaceId);
@@ -7456,6 +7467,13 @@ export class TaskService {
       "sendMessageToSiblingAgentTask: targetTaskId must be non-empty"
     );
     assert(message.trim().length > 0, "sendMessageToSiblingAgentTask: message must be non-empty");
+    // Same bound + rationale as sendMessageToParentFromAgentTask above.
+    if (message.trim().length > TASK_FAMILY_MESSAGE_MAX_CHARS) {
+      return Err({
+        code: "send_failed" as const,
+        message: `Message exceeds the ${TASK_FAMILY_MESSAGE_MAX_CHARS}-character family-message limit; send a summary instead.`,
+      });
+    }
 
     const cfg = this.config.loadConfigOrDefault();
     const senderEntry = findWorkspaceEntry(cfg, senderWorkspaceId);

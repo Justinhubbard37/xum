@@ -46,3 +46,15 @@ export const RESULT_HANDLE_VARS_CAP_BYTES = 4 * 1024 * 1024;
  * leaves ample room for legitimate working state.
  */
 export const VARS_SNAPSHOT_MAX_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Per-session quota on TOTAL retained result-handle blob bytes. Every
+ * offloaded value writes a unique blob; guest retention evicts old handle
+ * VARS but deliberately left the durable blob copies, so repeated unique
+ * handle-sized returns could grow the session's disk without any file/bash
+ * grant. Newest handles keep their durable copies up to this quota; older
+ * blob payloads are deleted (their result-handle event rows remain as a
+ * record that the value existed, minus the payload). 8x the retention cap
+ * comfortably outlives any handle still recoverable from vars.
+ */
+export const RESULT_HANDLE_BLOB_QUOTA_BYTES = 32 * 1024 * 1024;

@@ -72,6 +72,7 @@ import {
   HEARTBEAT_TRIGGER_VALUES,
   HEARTBEAT_WHEN_BUSY_VALUES,
 } from "@/constants/heartbeat";
+import { TASK_FAMILY_MESSAGE_MAX_CHARS } from "@/constants/taskMessages";
 
 // -----------------------------------------------------------------------------
 // ask_user_question (plan-mode interactive questions)
@@ -1039,7 +1040,14 @@ export const TaskSendMessageToolResultSchema = z.discriminatedUnion("status", [
 
 export const TaskMessageParentToolArgsSchema = z
   .object({
-    message: z.string().trim().min(1).describe("Message to queue for your parent workspace."),
+    message: z
+      .string()
+      .trim()
+      .min(1)
+      // Bounded: a kernel guest can synthesize huge strings cheaply; family
+      // messages land in another workspace's transcript and provider requests.
+      .max(TASK_FAMILY_MESSAGE_MAX_CHARS)
+      .describe("Message to queue for your parent workspace."),
   })
   .strict();
 
@@ -1055,7 +1063,13 @@ export const TaskMessageSiblingToolArgsSchema = z
       .string()
       .min(1)
       .describe("Sibling task ID; it must share your direct parent workspace."),
-    message: z.string().trim().min(1).describe("Message to deliver to the sibling task."),
+    message: z
+      .string()
+      .trim()
+      .min(1)
+      // Same bound as task_message_parent (see that schema's rationale).
+      .max(TASK_FAMILY_MESSAGE_MAX_CHARS)
+      .describe("Message to deliver to the sibling task."),
   })
   .strict();
 
