@@ -12,6 +12,7 @@ import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools"
 import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { appendRefinementEventFromTool } from "@/node/services/refinement/refinementJournal";
+import { targetMutationLocks } from "@/node/services/refinement/targetMutationLocks";
 import { log } from "@/node/services/log";
 import { readFileString, writeFileString } from "@/node/utils/runtime/helpers";
 import { generateDiff } from "@/node/services/tools/fileCommon";
@@ -357,62 +358,78 @@ export const createAgentSkillWriteTool: ToolFactory = (config: ToolConfiguration
           }
         }
 
-        let originalContent = "";
-        let fileExisted = false;
-        try {
-          const existingStat = await fsPromises.lstat(resolvedTarget.resolvedPath);
-          if (existingStat.isSymbolicLink()) {
-            return {
-              success: false,
-              error: "Refusing to write a symlinked skill file target",
-            };
-          }
+        // Prior read → write → journal run under the per-root mutation lock
+        // shared with the rollback engine (targetMutationLocks.ts), so a
+        // rollback's verify+apply window can never interleave with this write.
+        const outcome = await targetMutationLocks.withLock(
+          path.resolve(skillsRoot),
+          async (): Promise<AgentSkillWriteToolResult | { ok: true; originalContent: string }> => {
+            let originalContent = "";
+            let fileExisted = false;
+            try {
+              const existingStat = await fsPromises.lstat(resolvedTarget.resolvedPath);
+              if (existingStat.isSymbolicLink()) {
+                return {
+                  success: false,
+                  error: "Refusing to write a symlinked skill file target",
+                };
+              }
 
-          if (existingStat.isDirectory()) {
-            return {
-              success: false,
-              error: `Path is a directory, not a file: ${relativeFilePath}`,
-            };
-          }
+              if (existingStat.isDirectory()) {
+                return {
+                  success: false,
+                  error: `Path is a directory, not a file: ${relativeFilePath}`,
+                };
+              }
 
-          originalContent = await fsPromises.readFile(resolvedTarget.resolvedPath, "utf-8");
-          fileExisted = true;
-        } catch (error) {
-          if (!hasErrorCode(error, "ENOENT")) {
-            throw error;
+              originalContent = await fsPromises.readFile(resolvedTarget.resolvedPath, "utf-8");
+              fileExisted = true;
+            } catch (error) {
+              if (!hasErrorCode(error, "ENOENT")) {
+                throw error;
+              }
+            }
+
+            await fsPromises.mkdir(path.dirname(resolvedTarget.resolvedPath), { recursive: true });
+            await fsPromises.writeFile(resolvedTarget.resolvedPath, contentToWrite, "utf-8");
+
+            // Refinement journal (RLM r2): row is appended before the write is
+            // acknowledged; failures never fail the tool (self-healing). An
+            // unjournalable prior capture skips the row entirely — a delete
+            // inverse in its place would destroy the prior file on rollback.
+            if (
+              !fileExisted ||
+              isJournalablePriorContent(resolvedTarget.resolvedPath, originalContent)
+            ) {
+              await appendRefinementEventFromTool(config, {
+                kind: "skill",
+                action: {
+                  op: "write",
+                  skillName: parsedName.data,
+                  filePath: resolvedTarget.normalizedRelativePath,
+                },
+                inverse: fileExisted
+                  ? {
+                      op: "restore-files",
+                      files: [{ path: resolvedTarget.resolvedPath, content: originalContent }],
+                    }
+                  : { op: "delete-files", paths: [resolvedTarget.resolvedPath] },
+                evidence: { toolName: "agent_skill_write", toolCallId },
+                postFiles: [{ path: resolvedTarget.resolvedPath, content: contentToWrite }],
+              });
+            }
+            return { ok: true, originalContent };
           }
+        );
+        if ("success" in outcome) {
+          return outcome;
         }
 
-        await fsPromises.mkdir(path.dirname(resolvedTarget.resolvedPath), { recursive: true });
-        await fsPromises.writeFile(resolvedTarget.resolvedPath, contentToWrite, "utf-8");
-
-        // Refinement journal (RLM r2): row is appended before the write is
-        // acknowledged; failures never fail the tool (self-healing). An
-        // unjournalable prior capture skips the row entirely — a delete
-        // inverse in its place would destroy the prior file on rollback.
-        if (
-          !fileExisted ||
-          isJournalablePriorContent(resolvedTarget.resolvedPath, originalContent)
-        ) {
-          await appendRefinementEventFromTool(config, {
-            kind: "skill",
-            action: {
-              op: "write",
-              skillName: parsedName.data,
-              filePath: resolvedTarget.normalizedRelativePath,
-            },
-            inverse: fileExisted
-              ? {
-                  op: "restore-files",
-                  files: [{ path: resolvedTarget.resolvedPath, content: originalContent }],
-                }
-              : { op: "delete-files", paths: [resolvedTarget.resolvedPath] },
-            evidence: { toolName: "agent_skill_write", toolCallId },
-            postFiles: [{ path: resolvedTarget.resolvedPath, content: contentToWrite }],
-          });
-        }
-
-        const diff = generateDiff(resolvedTarget.resolvedPath, originalContent, contentToWrite);
+        const diff = generateDiff(
+          resolvedTarget.resolvedPath,
+          outcome.originalContent,
+          contentToWrite
+        );
 
         return {
           success: true,

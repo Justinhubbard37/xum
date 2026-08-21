@@ -592,6 +592,43 @@ describe("refinementRollback", () => {
     expect(await fsPromises.readFile(physicalPath, "utf-8")).toBe("v1\n");
   });
 
+  it("refuses when an ordinary write lands between the divergence check and the apply", async () => {
+    using fixture = await createFixture();
+    await fixture.service.create(fixture.ctx, "/memories/global/live.md", "v1\n", "agent");
+    await fixture.service.strReplace(fixture.ctx, "/memories/global/live.md", "v1", "v2", "agent");
+    const editRow = await lastRow(fixture.sessionDir);
+    const physicalPath = path.join(fixture.muxHome, "memory", "global", "live.md");
+
+    // An ORDINARY MemoryService write (not another rollback) interleaves
+    // after the plan-time divergence check but before the apply. Pre-fix the
+    // rollback silently overwrote it with v1; post-fix the writer serializes
+    // through the shared target lock and the in-lock re-verify surfaces it
+    // as divergence.
+    const result = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: editRow.id,
+      evidence: EVIDENCE,
+      testOnlyBeforeTargetLock: async () => {
+        const write = await fixture.service.strReplace(
+          fixture.ctx,
+          "/memories/global/live.md",
+          "v2",
+          "v3",
+          "agent"
+        );
+        expect(write.success).toBe(true);
+      },
+    });
+    expect(result.success).toBe(false);
+    if (result.success) throw new Error("unreachable");
+    expect(result.error).toContain("concurrent mutation");
+    // The newer legitimate mutation is preserved, not silently overwritten.
+    expect(await fsPromises.readFile(physicalPath, "utf-8")).toBe("v3\n");
+    // No rollbackOf row was committed.
+    const rows = await listRefinements(fixture.sessionDir);
+    expect(rows.some((row) => row.data.rollbackOf === editRow.id)).toBe(false);
+  });
+
   it("serializes concurrent rollbacks of the same row: one succeeds, one rollbackOf row", async () => {
     using fixture = await createFixture();
     await fixture.service.create(fixture.ctx, "/memories/global/race.md", "v1\n", "agent");

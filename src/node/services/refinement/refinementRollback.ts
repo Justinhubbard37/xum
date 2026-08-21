@@ -51,6 +51,7 @@ import {
   type RefinementFileCapture,
   type RefinementInverseDraft,
 } from "./refinementJournal";
+import { withTargetMutationLocks } from "./targetMutationLocks";
 
 export type RefinementEvent = Extract<DurableEvent, { kind: "refinement" }>;
 
@@ -78,6 +79,13 @@ export interface RollbackRefinementOptions {
    * paused between our mutation and our journal append).
    */
   testOnlyBeforeCommit?: () => Promise<void>;
+  /**
+   * Test seam: runs after the plan-time divergence check, immediately before
+   * the per-target mutation locks are acquired — the only way to
+   * deterministically interleave an ordinary writer into the check→apply
+   * window (a real writer cannot be paused there).
+   */
+  testOnlyBeforeTargetLock?: () => Promise<void>;
 }
 
 export interface RollbackApplied {
@@ -973,87 +981,121 @@ export async function rollbackRefinement(
       );
     }
 
-    // Capture the pre-rollback state (the new row's inverse) BEFORE mutating.
-    const newInverse = await capturePreRollbackInverse(inverse);
-
-    // Ownership re-verification before any filesystem mutation: guards +
-    // reclamation make cross-process double-entry improbable; this check (and
-    // the commit-point one below) makes it harmless. Losing ownership here
-    // aborts with nothing mutated.
-    await fileLock.assertStillOwned();
-
-    // Sink recheck: the divergence + pre-rollback capture reads above take
-    // long enough for a link substitution race; nothing has been mutated yet,
-    // so a swapped root still aborts cleanly here (delete-files and rename
-    // mutate immediately after this; restore-files rechecks again post-stage).
-    await assertConfinement();
-
-    // Apply the target's inverse to disk. Multi-file ops are two-phase: a
-    // failure after the first mutation would otherwise leave an unjournaled
-    // partial rollback behind (no rollbackOf row, and a retry refuses on the
-    // resulting divergence).
-    const applied: RollbackApplied = { rollbackRowId: null, restored: [], deleted: [] };
-    switch (inverse.op) {
-      case "delete-files":
-        try {
-          for (const p of inverse.paths) {
-            await fsPromises.rm(p, { force: true });
-            applied.deleted.push(p);
-          }
-        } catch (error) {
-          await compensatePartialApply(applied.deleted, newInverse);
-          throw error;
-        }
-        break;
-      case "restore-files": {
-        // Phase 1 — resolve every payload before any mutation, so a missing
-        // or corrupt blob aborts with the tree untouched. All contents fit in
-        // memory: inverses are bounded by the capture budgets at write time.
-        const staged: RefinementFileCapture[] = [];
-        for (const file of inverse.files) {
-          staged.push({ path: file.path, content: await readContent.read(file) });
-        }
-        // Sink recheck after staging: blob reads are the slowest window
-        // between plan-time confinement and the writes below.
-        await assertConfinement();
-        // Phase 2 — write. A mid-apply failure (e.g. an unwritable
-        // destination) is compensated from the pre-rollback capture so the
-        // tree returns to its pre-rollback state.
-        try {
-          for (const file of staged) {
-            await fsPromises.mkdir(path.dirname(file.path), { recursive: true });
-            // Same atomic-write discipline as LocalMemoryStore.writeFile.
-            await writeFileAtomic(file.path, file.content, { encoding: "utf-8" });
-            applied.restored.push(file.path);
-          }
-        } catch (error) {
-          await compensatePartialApply(applied.restored, newInverse);
-          throw error;
-        }
-        break;
-      }
-      case "rename":
-        // Single filesystem op: no partial state to compensate.
-        await fsPromises.mkdir(path.dirname(inverse.to), { recursive: true });
-        await fsPromises.rename(inverse.from, inverse.to);
-        applied.renamed = { from: inverse.from, to: inverse.to };
-        break;
+    if (opts.testOnlyBeforeTargetLock !== undefined) {
+      await opts.testOnlyBeforeTargetLock();
     }
 
-    // Commit point: even if two processes double-entered the critical section
-    // (theoretically possible — plain POSIX files cannot make the guard's
-    // delete-if-content-matches atomic), only the entrant still owning the
-    // canonical lock may journal. The loser undoes its mutations, so no
-    // duplicate rollbackOf rows and no unjournaled divergence can result.
-    try {
-      if (opts.testOnlyBeforeCommit !== undefined) {
-        await opts.testOnlyBeforeCommit();
+    // Verify + apply run under the per-target mutation locks shared with
+    // ORDINARY writers (MemoryService commands, local agent_skill_write/
+    // delete — see targetMutationLocks.ts): the rollback session mutex +
+    // lockfile only serialize other rollbacks, so without this a normal write
+    // landing between the divergence check above and the apply below would be
+    // silently overwritten. Ordering: session mutex → rollback lockfile →
+    // target locks (writers take only a target lock; no cycle).
+    const lockKeys = [...roots.values()];
+    const { applied, newInverse } = await withTargetMutationLocks(lockKeys, async () => {
+      // Re-verify INSIDE the lock, immediately before mutating: a writer that
+      // won the lock first has already landed, and its change must surface as
+      // divergence rather than be overwritten. `rows` is intentionally the
+      // pre-lock read — the fs-level checks (postState hashes, presence) are
+      // what detect concurrent mutations; force skips this exactly like the
+      // plan-time check. Cross-process residual: a writer in ANOTHER process
+      // (live app vs. debug CLI) does not contend on this in-process lock, so
+      // this re-verify narrows but cannot fully close that window.
+      if (opts.force !== true) {
+        const raced = await collectDivergence(rows, target, inverse, readContent);
+        if (raced.length > 0) {
+          throw new RollbackError(
+            `Refusing rollback of '${opts.id}': a concurrent mutation landed before the apply:\n` +
+              raced.map((line) => `  - ${line}`).join("\n") +
+              `\nRe-run with force to apply anyway.`
+          );
+        }
       }
+
+      // Capture the pre-rollback state (the new row's inverse) BEFORE mutating.
+      const newInverse = await capturePreRollbackInverse(inverse);
+
+      // Ownership re-verification before any filesystem mutation: guards +
+      // reclamation make cross-process double-entry improbable; this check (and
+      // the commit-point one below) makes it harmless. Losing ownership here
+      // aborts with nothing mutated.
       await fileLock.assertStillOwned();
-    } catch (error) {
-      await compensateApplied(applied, newInverse);
-      throw error;
-    }
+
+      // Sink recheck: the divergence + pre-rollback capture reads above take
+      // long enough for a link substitution race; nothing has been mutated yet,
+      // so a swapped root still aborts cleanly here (delete-files and rename
+      // mutate immediately after this; restore-files rechecks again post-stage).
+      await assertConfinement();
+
+      // Apply the target's inverse to disk. Multi-file ops are two-phase: a
+      // failure after the first mutation would otherwise leave an unjournaled
+      // partial rollback behind (no rollbackOf row, and a retry refuses on the
+      // resulting divergence).
+      const applied: RollbackApplied = { rollbackRowId: null, restored: [], deleted: [] };
+      switch (inverse.op) {
+        case "delete-files":
+          try {
+            for (const p of inverse.paths) {
+              await fsPromises.rm(p, { force: true });
+              applied.deleted.push(p);
+            }
+          } catch (error) {
+            await compensatePartialApply(applied.deleted, newInverse);
+            throw error;
+          }
+          break;
+        case "restore-files": {
+          // Phase 1 — resolve every payload before any mutation, so a missing
+          // or corrupt blob aborts with the tree untouched. All contents fit in
+          // memory: inverses are bounded by the capture budgets at write time.
+          const staged: RefinementFileCapture[] = [];
+          for (const file of inverse.files) {
+            staged.push({ path: file.path, content: await readContent.read(file) });
+          }
+          // Sink recheck after staging: blob reads are the slowest window
+          // between plan-time confinement and the writes below.
+          await assertConfinement();
+          // Phase 2 — write. A mid-apply failure (e.g. an unwritable
+          // destination) is compensated from the pre-rollback capture so the
+          // tree returns to its pre-rollback state.
+          try {
+            for (const file of staged) {
+              await fsPromises.mkdir(path.dirname(file.path), { recursive: true });
+              // Same atomic-write discipline as LocalMemoryStore.writeFile.
+              await writeFileAtomic(file.path, file.content, { encoding: "utf-8" });
+              applied.restored.push(file.path);
+            }
+          } catch (error) {
+            await compensatePartialApply(applied.restored, newInverse);
+            throw error;
+          }
+          break;
+        }
+        case "rename":
+          // Single filesystem op: no partial state to compensate.
+          await fsPromises.mkdir(path.dirname(inverse.to), { recursive: true });
+          await fsPromises.rename(inverse.from, inverse.to);
+          applied.renamed = { from: inverse.from, to: inverse.to };
+          break;
+      }
+
+      // Commit point: even if two processes double-entered the critical section
+      // (theoretically possible — plain POSIX files cannot make the guard's
+      // delete-if-content-matches atomic), only the entrant still owning the
+      // canonical lock may journal. The loser undoes its mutations, so no
+      // duplicate rollbackOf rows and no unjournaled divergence can result.
+      try {
+        if (opts.testOnlyBeforeCommit !== undefined) {
+          await opts.testOnlyBeforeCommit();
+        }
+        await fileLock.assertStillOwned();
+      } catch (error) {
+        await compensateApplied(applied, newInverse);
+        throw error;
+      }
+      return { applied, newInverse };
+    });
 
     // Journal the rollback row. The filesystem is already restored at this
     // point, so a journaling failure must not fail the operation (self-healing

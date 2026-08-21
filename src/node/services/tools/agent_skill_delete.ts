@@ -18,6 +18,7 @@ import {
   appendRefinementEventFromTool,
   type RefinementFileCapture,
 } from "@/node/services/refinement/refinementJournal";
+import { targetMutationLocks } from "@/node/services/refinement/targetMutationLocks";
 import { log } from "@/node/services/log";
 import { execBuffered, readFileString } from "@/node/utils/runtime/helpers";
 import { quoteRuntimeProbePath } from "./runtimePathShellQuote";
@@ -507,21 +508,27 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
 
         const targetMode = target ?? "file";
         if (targetMode === "skill") {
-          // Prior contents must be captured before removal (refinement inverse).
-          const skillCaptures = await captureLocalSkillFiles(skillDir);
-          await fsPromises.rm(skillDir, { recursive: true });
-          if (skillCaptures !== null) {
-            await appendRefinementEventFromTool(config, {
-              kind: "skill",
-              action: { op: "delete-skill", skillName: parsedName.data },
-              inverse: { op: "restore-files", files: skillCaptures },
-              evidence: { toolName: "agent_skill_delete", toolCallId },
-            });
-          }
-          return {
-            success: true,
-            deleted: "skill",
-          };
+          // Capture → delete → journal run under the per-root mutation lock
+          // shared with the rollback engine (targetMutationLocks.ts), so a
+          // rollback's verify+apply window can never interleave with this
+          // delete.
+          return await targetMutationLocks.withLock(path.resolve(skillsRoot), async () => {
+            // Prior contents must be captured before removal (refinement inverse).
+            const skillCaptures = await captureLocalSkillFiles(skillDir);
+            await fsPromises.rm(skillDir, { recursive: true });
+            if (skillCaptures !== null) {
+              await appendRefinementEventFromTool(config, {
+                kind: "skill",
+                action: { op: "delete-skill", skillName: parsedName.data },
+                inverse: { op: "restore-files", files: skillCaptures },
+                evidence: { toolName: "agent_skill_delete", toolCallId },
+              });
+            }
+            return {
+              success: true,
+              deleted: "skill",
+            } satisfies AgentSkillDeleteToolResult;
+          });
         }
 
         if (filePath == null) {
@@ -543,79 +550,84 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
           };
         }
 
-        let targetStat;
-        try {
-          targetStat = await fsPromises.lstat(targetPath);
-        } catch (error) {
-          if (hasErrorCode(error, "ENOENT")) {
+        // Stat → capture → unlink → journal run under the per-root mutation
+        // lock shared with the rollback engine (targetMutationLocks.ts), so a
+        // rollback's verify+apply window can never interleave with this delete.
+        return await targetMutationLocks.withLock(path.resolve(skillsRoot), async () => {
+          let targetStat;
+          try {
+            targetStat = await fsPromises.lstat(targetPath);
+          } catch (error) {
+            if (hasErrorCode(error, "ENOENT")) {
+              return {
+                success: false,
+                error: `File not found in skill '${parsedName.data}': ${filePath}`,
+              };
+            }
+            throw error;
+          }
+
+          if (targetStat.isSymbolicLink()) {
             return {
               success: false,
-              error: `File not found in skill '${parsedName.data}': ${filePath}`,
+              error: "Refusing to delete a symlinked skill file target",
             };
           }
-          throw error;
-        }
 
-        if (targetStat.isSymbolicLink()) {
-          return {
-            success: false,
-            error: "Refusing to delete a symlinked skill file target",
-          };
-        }
-
-        if (targetStat.isDirectory()) {
-          return {
-            success: false,
-            error: `Path is a directory, not a file: ${filePath}`,
-          };
-        }
-
-        // Prior content must be captured before removal (refinement inverse).
-        // Null capture (e.g. unreadable or over-budget file) skips journaling,
-        // never the delete. lstat size is checked before reading so an
-        // attacker-sized file is never buffered.
-        let localFileCapture: RefinementFileCapture | null = null;
-        if (targetStat.size > REFINEMENT_CAPTURE_MAX_FILE_BYTES) {
-          log.debug("[agent_skill_delete] skipping refinement inverse: capture budget exceeded", {
-            targetPath,
-            size: targetStat.size,
-          });
-        } else {
-          try {
-            localFileCapture = {
-              path: targetPath,
-              content: assertLosslessUtf8(targetPath, await fsPromises.readFile(targetPath)),
+          if (targetStat.isDirectory()) {
+            return {
+              success: false,
+              error: `Path is a directory, not a file: ${filePath}`,
             };
-          } catch (error) {
-            if (error instanceof CaptureSkippedError) {
-              log.debug("[agent_skill_delete] skipping refinement inverse", {
-                targetPath,
-                reason: error.message,
-              });
-            } else {
-              log.debug("[agent_skill_delete] failed to capture file for refinement inverse", {
-                targetPath,
-                error,
-              });
+          }
+
+          // Prior content must be captured before removal (refinement inverse).
+          // Null capture (e.g. unreadable or over-budget file) skips journaling,
+          // never the delete. lstat size is checked before reading so an
+          // attacker-sized file is never buffered.
+          let localFileCapture: RefinementFileCapture | null = null;
+          if (targetStat.size > REFINEMENT_CAPTURE_MAX_FILE_BYTES) {
+            log.debug("[agent_skill_delete] skipping refinement inverse: capture budget exceeded", {
+              targetPath,
+              size: targetStat.size,
+            });
+          } else {
+            try {
+              localFileCapture = {
+                path: targetPath,
+                content: assertLosslessUtf8(targetPath, await fsPromises.readFile(targetPath)),
+              };
+            } catch (error) {
+              if (error instanceof CaptureSkippedError) {
+                log.debug("[agent_skill_delete] skipping refinement inverse", {
+                  targetPath,
+                  reason: error.message,
+                });
+              } else {
+                log.debug("[agent_skill_delete] failed to capture file for refinement inverse", {
+                  targetPath,
+                  error,
+                });
+              }
             }
           }
-        }
 
-        await fsPromises.unlink(targetPath);
+          await fsPromises.unlink(targetPath);
 
-        if (localFileCapture !== null) {
-          await appendRefinementEventFromTool(config, {
-            kind: "skill",
-            action: { op: "delete-file", skillName: parsedName.data, filePath },
-            inverse: { op: "restore-files", files: [localFileCapture] },
-            evidence: { toolName: "agent_skill_delete", toolCallId },
-          });
-        }
+          if (localFileCapture !== null) {
+            await appendRefinementEventFromTool(config, {
+              kind: "skill",
+              action: { op: "delete-file", skillName: parsedName.data, filePath },
+              inverse: { op: "restore-files", files: [localFileCapture] },
+              evidence: { toolName: "agent_skill_delete", toolCallId },
+            });
+          }
 
-        return {
-          success: true,
-          deleted: "file",
-        };
+          return {
+            success: true,
+            deleted: "file",
+          } satisfies AgentSkillDeleteToolResult;
+        });
       } catch (error) {
         return {
           success: false,
