@@ -668,6 +668,54 @@ describe("refinementRollback", () => {
     expect(await fsPromises.readFile(skillFile, "utf-8")).toBe(content);
   });
 
+  it("rolls back a GLOBAL skill write (path under <muxHome>/skills)", async () => {
+    using fixture = await createFixture();
+    // Global-scope skills live at <muxHome>/skills (agent_skill_write/delete
+    // resolve path.join(muxScope.muxHome, "skills")), NOT under a .mux/skills
+    // segment — confinement must accept this root.
+    const skillFile = path.join(fixture.muxHome, "skills", "my-skill", "SKILL.md");
+    const content = "---\nname: my-skill\n---\n\nbody\n";
+    await fsPromises.mkdir(path.dirname(skillFile), { recursive: true });
+    await fsPromises.writeFile(skillFile, content, "utf-8");
+    await appendRefinementEvent({
+      sessionDir: fixture.sessionDir,
+      workspaceId: WORKSPACE_ID,
+      kind: "skill",
+      action: { op: "write", skillName: "my-skill", filePath: "SKILL.md" },
+      inverse: { op: "delete-files", paths: [skillFile] },
+      evidence: { toolName: "agent_skill_write" },
+    });
+    const writeRow = await lastRow(fixture.sessionDir);
+
+    const result = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: writeRow.id,
+      evidence: EVIDENCE,
+    });
+    expect(result.success).toBe(true);
+    expect(await pathExists(skillFile)).toBe(false);
+
+    // The global skills ROOT itself is still not a legal target.
+    await appendRefinementEvent({
+      sessionDir: fixture.sessionDir,
+      workspaceId: WORKSPACE_ID,
+      kind: "skill",
+      action: { op: "write", skillName: "x", filePath: "SKILL.md" },
+      inverse: { op: "delete-files", paths: [path.join(fixture.muxHome, "skills", "loose-file")] },
+      evidence: { toolName: "agent_skill_write" },
+    });
+    const rootRow = await lastRow(fixture.sessionDir);
+    const refused = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: rootRow.id,
+      force: true,
+      evidence: EVIDENCE,
+    });
+    expect(refused.success).toBe(false);
+    if (refused.success) throw new Error("unreachable");
+    expect(refused.error).toContain("global skills root");
+  });
+
   it("undoes a memory rename via the mirrored rename inverse", async () => {
     using fixture = await createFixture();
     await fixture.service.create(fixture.ctx, "/memories/global/old.md", "v1\n", "agent");

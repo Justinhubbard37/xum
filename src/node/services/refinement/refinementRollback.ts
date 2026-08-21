@@ -429,17 +429,35 @@ function resolveConfinementRoot(
   const segments = resolved.split(path.sep);
 
   if (kind === "skill") {
-    // Skill files live under a `.mux/skills` or `.agents/skills` directory
-    // (project checkout or home). Require at least <skill>/<file> below the
-    // skills root so the roots themselves can never be a rollback target.
+    // Project skill files live under a `.mux/skills` or `.agents/skills`
+    // directory (project checkout or home). Require at least <skill>/<file>
+    // below the skills root so the roots themselves can never be a rollback
+    // target.
     for (let i = 0; i + 1 < segments.length; i++) {
       const pair = `${segments[i]}/${segments[i + 1]}`;
       if ((pair === ".mux/skills" || pair === ".agents/skills") && segments.length >= i + 4) {
         return segments.slice(0, i + 2).join(path.sep);
       }
     }
+    // Global skill files live at <muxRoot>/skills/<skill>/<file> — the same
+    // root the producers resolve (agent_skill_write/delete use
+    // path.join(muxScope.muxHome, "skills") for global scope), derived here
+    // from the session dir layout like the memory roots below.
+    const layout = inferMemoryLayout(sessionDir);
+    if (layout !== null) {
+      const globalSkillsRoot = path.join(layout.muxRoot, "skills");
+      const relToGlobal = path.relative(globalSkillsRoot, resolved);
+      if (!relToGlobal.startsWith("..") && !path.isAbsolute(relToGlobal)) {
+        if (relToGlobal.split(path.sep).length >= 2) {
+          return globalSkillsRoot;
+        }
+        throw new RollbackError(
+          `Refusing rollback: path targets the global skills root, not a file inside it: '${filePath}'`
+        );
+      }
+    }
     throw new RollbackError(
-      `Refusing rollback: path is outside every skills root (.mux/skills, .agents/skills): '${filePath}'`
+      `Refusing rollback: path is outside every skills root (.mux/skills, .agents/skills, <muxHome>/skills): '${filePath}'`
     );
   }
 
