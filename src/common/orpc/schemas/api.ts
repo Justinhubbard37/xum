@@ -1022,6 +1022,11 @@ export const agentPlugins = {
     input: z.void(),
     output: ResultSchema(z.array(AgentPluginListItemSchema), z.string()),
   },
+  /** Display path of the ACTIVE managed plugin container (config-derived root; never hardcode it in UI). */
+  containerLocation: {
+    input: z.void(),
+    output: z.string(),
+  },
   uninstall: {
     input: z.object({
       name: z.string(),

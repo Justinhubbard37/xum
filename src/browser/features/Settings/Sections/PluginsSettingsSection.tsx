@@ -417,6 +417,9 @@ export const PluginsSettingsSection: React.FC = () => {
     () => new Map()
   );
   const [checkingUpdates, setCheckingUpdates] = useState(false);
+  // Backend-provided container path: the root is config-derived (canonically
+  // ~/.shux, possibly custom/legacy), so this copy must never hardcode it.
+  const [containerLocation, setContainerLocation] = useState<string | null>(null);
   // Palette intents (keyboard rule: install/uninstall/update need keyboard
   // paths). The initializer covers palette → fresh mount; the subscription
   // below covers commands invoked while this section is already on screen
@@ -492,6 +495,7 @@ export const PluginsSettingsSection: React.FC = () => {
   useEffect(() => {
     void refresh();
     void checkForUpdates();
+    void api?.agentPlugins.containerLocation().then(setContainerLocation, () => undefined);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- fetch on mount / API reconnect only; refresh/checkForUpdates are plain handlers (compiler-memoized), not inputs
   }, [api]);
 
@@ -573,9 +577,14 @@ export const PluginsSettingsSection: React.FC = () => {
       <div>
         <p className="text-muted mb-4 text-xs">
           Install Agent Plugins from git repositories into{" "}
-          <code className="text-accent">~/.mux/plugins</code>. Plugins contribute skills and
-          default-disabled MCP servers. Installs are global (shared by all projects); updates are
-          manual, and updating discards any local edits to the plugin directory.
+          {containerLocation !== null ? (
+            <code className="text-accent">{containerLocation}</code>
+          ) : (
+            "the managed plugins directory"
+          )}
+          . Plugins contribute skills and default-disabled MCP servers. Installs are global (shared
+          by all projects); updates are manual, and updating discards any local edits to the plugin
+          directory.
         </p>
       </div>
 

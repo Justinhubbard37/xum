@@ -100,6 +100,7 @@ export const CommandIds = {
   pluginsUninstall: () => "plugins:uninstall" as const,
   pluginsCheckUpdates: () => "plugins:check-updates" as const,
   pluginsUpdateAll: () => "plugins:update-all" as const,
+  pluginsUpdateOne: () => "plugins:update-one" as const,
 
   // Help commands
   helpKeybinds: () => "help:keybinds" as const,

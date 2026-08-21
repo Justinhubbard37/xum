@@ -3229,6 +3229,10 @@ export const router = (authToken?: string) => {
             return { success: false, error: getErrorMessage(error) };
           }
         }),
+      containerLocation: t
+        .input(schemas.agentPlugins.containerLocation.input)
+        .output(schemas.agentPlugins.containerLocation.output)
+        .handler(({ context }) => context.agentPluginInstallService.containerLocation()),
       uninstall: t
         .input(schemas.agentPlugins.uninstall.input)
         .output(schemas.agentPlugins.uninstall.output)

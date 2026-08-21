@@ -209,6 +209,15 @@ export class AgentPluginInstallService {
     this.registryFile = path.join(config.rootDir, REGISTRY_FILE_NAME);
   }
 
+  /**
+   * Display path of the ACTIVE managed plugin container for UI copy. The
+   * root is config-derived (canonically ~/.shux, possibly a custom or
+   * legacy-compat root), so the UI must never hardcode it.
+   */
+  containerLocation(): string {
+    return shortenHome(this.containerDir);
+  }
+
   // ---------------------------------------------------------------------
   // Registry persistence (~/.mux/plugins.json)
   // ---------------------------------------------------------------------
@@ -320,8 +329,21 @@ export class AgentPluginInstallService {
     return entries;
   }
 
+  /**
+   * In strict mode, an entry this build cannot parse (a newer version's
+   * source kind, or corruption) is an error: callers like checkUpdates would
+   * otherwise silently skip that managed install and report a false
+   * "everything is up to date".
+   */
   private async readRegistry(mode: "lenient" | "strict"): Promise<AgentPluginInstallEntry[]> {
-    return this.parseRegistryEntries((await this.readRegistryDocument(mode)).rawEntries);
+    const { rawEntries } = await this.readRegistryDocument(mode);
+    const entries = this.parseRegistryEntries(rawEntries);
+    if (mode === "strict" && entries.length !== rawEntries.length) {
+      throw new Error(
+        `The plugin registry (${shortenHome(this.registryFile)}) contains ${rawEntries.length - entries.length} entr${rawEntries.length - entries.length === 1 ? "y" : "ies"} this version cannot read (written by a newer version of Mux, or corrupted).`
+      );
+    }
+    return entries;
   }
 
   /** `name` of a raw registry entry, for identity matching during raw rewrites. */
@@ -677,6 +699,9 @@ export class AgentPluginInstallService {
                 env: Object.fromEntries(
                   Object.entries(info.env ?? {}).map(([key, value]) => [key, normalize(value)])
                 ),
+                // cwd changes relative module/config resolution (e.g. plugin
+                // root → writable PLUGIN_DATA), so it is consent-relevant.
+                ...(info.cwd !== undefined ? { cwd: normalize(info.cwd) } : {}),
               })
             : JSON.stringify({ transport: info.transport, url: info.url });
         servers.set(info.plugin.serverName, fingerprint);
@@ -1316,8 +1341,14 @@ export class AgentPluginInstallService {
           });
         });
       }
+      let dataDeletionFailure: string | undefined;
       if (stagedData) {
+        // The user EXPLICITLY requested this deletion, so a failure (e.g. a
+        // locked file on Windows) must surface rather than report success:
+        // stale-staging reclamation only runs during a later staging
+        // operation, which may never happen.
         await this.removeDir(dataTrashDir).catch((error: unknown) => {
+          dataDeletionFailure = `The plugin was uninstalled, but deleting its stored data failed (${getErrorMessage(error)}). The data was moved to ${shortenHome(dataTrashDir)} — delete it manually.`;
           log.warn("Failed to delete plugin data; leaving it for staging reclamation", {
             dataTrashDir,
             error: getErrorMessage(error),
@@ -1368,6 +1399,12 @@ export class AgentPluginInstallService {
       }
 
       log.info(`Uninstalled agent plugin '${entry.name}'`);
+      // Thrown LAST so the remaining cleanup above (invalidation, override
+      // pruning) still ran; the uninstall itself is committed and the message
+      // says so.
+      if (dataDeletionFailure !== undefined) {
+        throw new Error(dataDeletionFailure);
+      }
     });
   }
 

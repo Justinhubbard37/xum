@@ -1795,6 +1795,61 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                 }
               },
             },
+            {
+              id: CommandIds.pluginsUpdateOne(),
+              title: "Update Agent Plugin…",
+              subtitle: "Apply one plugin's pending update",
+              section: section.settings,
+              keywords: ["plugin", "update", "upgrade", "single", "one"],
+              run: () => undefined,
+              prompt: {
+                title: "Update Agent Plugin",
+                fields: [
+                  {
+                    type: "select",
+                    name: "pluginName",
+                    label: "Plugin with a pending update",
+                    placeholder: "Search updatable plugins…",
+                    getOptions: async () => {
+                      const checks = await p.api?.agentPlugins.checkUpdates();
+                      if (!checks?.success) {
+                        return [];
+                      }
+                      // Moved tags are updatable here BY DESIGN: bulk update
+                      // excludes them so they get per-plugin review, and this
+                      // selector (with its warning label) is that reviewed,
+                      // keyboard-accessible path.
+                      return checks.data
+                        .filter(
+                          (check) =>
+                            check.status === "update-available" || check.status === "tag-moved"
+                        )
+                        .map((check) => ({
+                          id: check.name,
+                          label:
+                            check.status === "tag-moved"
+                              ? `${check.name} — tag moved (review: tags should be immutable)`
+                              : `${check.name} — update available`,
+                          keywords: [check.name, check.status],
+                        }));
+                    },
+                  },
+                ],
+                onSubmit: async (values) => {
+                  const api = p.api;
+                  if (!api) return;
+                  const result = await api.agentPlugins.update({ name: values.pluginName });
+                  // A mounted section keeps its own stale updateChecks map;
+                  // tell it to re-query so badges match the toast.
+                  publishPluginsSectionIntent({ type: "refresh" });
+                  showCommandFeedbackToast(
+                    result.success
+                      ? { type: "success", message: `Updated ${values.pluginName}.` }
+                      : { type: "error", message: result.error }
+                  );
+                },
+              },
+            },
           ] satisfies CommandAction[])
         : []),
     ]);

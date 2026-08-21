@@ -341,6 +341,28 @@ describe("AgentPluginInstallService", () => {
       /changes MCP server 'echo'/
     );
 
+    // Changing ONLY the cwd (same argv/env) is likewise consent-relevant:
+    // relative module/config resolution moves (e.g. to writable PLUGIN_DATA).
+    await writePluginFixture(remoteDir, { version: "2.0.2" });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "mcp.json"),
+      JSON.stringify({
+        $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+        mcpServers: {
+          echo: {
+            type: "stdio",
+            command: "node",
+            args: ["${PLUGIN_ROOT}/server.js"],
+            cwd: "${PLUGIN_DATA}",
+          },
+        },
+      })
+    );
+    await commitAll(remoteDir, "v2.0.2 changes echo cwd only");
+    await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(
+      /changes MCP server 'echo'/
+    );
+
     // A capability-neutral update (same hook-less, same servers) applies.
     await writePluginFixture(remoteDir, { version: "3.0.0" });
     await fsPromises.rm(path.join(remoteDir, "hooks.js"));
@@ -353,6 +375,52 @@ describe("AgentPluginInstallService", () => {
     await fsPromises.writeFile(registryFile(), "{ not json");
 
     await expect(service.checkUpdates()).rejects.toThrow(/corrupted/);
+  });
+
+  test("checkUpdates surfaces unrecognized registry entries instead of skipping them", async () => {
+    // A newer version's entry (e.g. a new source kind) parses as unrecognized
+    // and would be silently dropped by the lenient entry parser — the check
+    // would then report "all up to date" without ever checking that install.
+    await fsPromises.writeFile(
+      registryFile(),
+      JSON.stringify({
+        plugins: [{ name: "future-plugin", scope: "global", source: { type: "registry-v2" } }],
+      })
+    );
+
+    await expect(service.checkUpdates()).rejects.toThrow(/cannot read/);
+  });
+
+  test("uninstall surfaces a failed requested plugin-data deletion", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
+    const dataPath = getPluginDataPath(muxRoot, instanceId);
+    await fsPromises.mkdir(dataPath, { recursive: true });
+    await fsPromises.writeFile(path.join(dataPath, "state.txt"), "data");
+
+    // The staged-data deletion fails post-commit (e.g. a locked file on
+    // Windows). The uninstall itself is committed, but the user explicitly
+    // requested the deletion — reporting success would strand the data under
+    // plugin-staging indefinitely (reclamation only runs during a later
+    // staging operation).
+    const internals = service as unknown as { removeDir: (dir: string) => Promise<void> };
+    const realRemoveDir = internals.removeDir.bind(internals);
+    const removeSpy = spyOn(internals, "removeDir").mockImplementation((dir: string) =>
+      path.basename(dir).startsWith("trash-data-")
+        ? Promise.reject(new Error("EBUSY: resource busy"))
+        : realRemoveDir(dir)
+    );
+    try {
+      await expect(
+        service.uninstall({ name: "demo-plugin", deletePluginData: true })
+      ).rejects.toThrow(/uninstalled, but deleting its stored data failed.*delete it manually/s);
+    } finally {
+      removeSpy.mockRestore();
+    }
+    // The uninstall committed; the staged data remains for manual cleanup.
+    expect(await registry()).toEqual([]);
+    expect((await stagingLeftovers()).some((name) => name.startsWith("trash-data-"))).toBe(true);
   });
 
   test("checkUpdates bounds concurrent remote lookups", async () => {

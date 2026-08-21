@@ -1109,6 +1109,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     },
     agentPlugins: {
       list: () => Promise.resolve({ success: true, data: agentPluginsMock?.items ?? [] }),
+      containerLocation: () => Promise.resolve("~/.mux/plugins"),
       checkUpdates: () =>
         Promise.resolve({ success: true, data: agentPluginsMock?.updateChecks ?? [] }),
       preview: () =>
