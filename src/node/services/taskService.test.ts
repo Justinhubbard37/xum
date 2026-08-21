@@ -59,6 +59,7 @@ import { STRUCTURED_WORKFLOW_REPORT_PLACEHOLDER_MARKDOWN } from "@/common/consta
 import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { defaultModel } from "@/common/utils/ai/models";
 import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
+import type { AgentAiDefaults, AgentAiSubagentProfile } from "@/common/types/agentAiDefaults";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { SendMessageError } from "@/common/types/errors";
@@ -250,12 +251,25 @@ async function saveWorkspaces(
   );
 }
 
+function mergeTestAgentAiDefaults(
+  agentAiDefaults?: AgentAiDefaults,
+  subagentAiDefaults?: Record<string, AgentAiSubagentProfile>
+): AgentAiDefaults | undefined {
+  if (!agentAiDefaults && !subagentAiDefaults) return undefined;
+
+  const merged: AgentAiDefaults = { ...agentAiDefaults };
+  for (const [agentId, subagent] of Object.entries(subagentAiDefaults ?? {})) {
+    merged[agentId] = { ...merged[agentId], subagent: { ...subagent } };
+  }
+  return merged;
+}
+
 async function saveLocalParentWorkspace(
   config: Config,
   rootDir: string,
   options?: {
-    agentAiDefaults?: Record<string, { modelString?: string; thinkingLevel?: ThinkingLevel }>;
-    subagentAiDefaults?: Record<string, { modelString?: string; thinkingLevel?: ThinkingLevel }>;
+    agentAiDefaults?: AgentAiDefaults;
+    subagentAiDefaults?: Record<string, AgentAiSubagentProfile>;
     parentAiSettings?: { model: string; thinkingLevel: ThinkingLevel };
   }
 ): Promise<{ parentId: string; projectPath: string }> {
@@ -279,8 +293,10 @@ async function saveLocalParentWorkspace(
     ],
     {
       taskSettings: { maxParallelAgentTasks: 3, maxTaskNestingDepth: 3 },
-      agentAiDefaults: options?.agentAiDefaults,
-      subagentAiDefaults: options?.subagentAiDefaults,
+      agentAiDefaults: mergeTestAgentAiDefaults(
+        options?.agentAiDefaults,
+        options?.subagentAiDefaults
+      ),
       migrations: { execSubagentDefaultsSplit: true },
     }
   );
@@ -653,7 +669,7 @@ describe("TaskService", () => {
           parentMeta: Record<string, never>;
           agentId: string;
           modelString?: string;
-        }) => { taskModelString: string; canonicalModel: string };
+        }) => Promise<{ taskModelString: string; canonicalModel: string }>;
       }
     ).resolveTaskAISettings.bind(taskService);
 
@@ -661,7 +677,7 @@ describe("TaskService", () => {
     // type anthropic) must stay gateway-scoped in the PERSISTED settings:
     // name canonicalization would rewrite it to openai:<claude>, sending
     // queued follow-ups and plan→exec continuations to direct OpenAI.
-    const gateway = resolver({
+    const gateway = await resolver({
       cfg: config.loadConfigOrDefault(),
       parentMeta: {},
       agentId: "exec",
@@ -670,7 +686,7 @@ describe("TaskService", () => {
     expect(gateway.canonicalModel).toBe("coder:openai/claude-sonnet-4-20250514");
 
     // Non-gateway strings keep canonical normalization.
-    const direct = resolver({
+    const direct = await resolver({
       cfg: config.loadConfigOrDefault(),
       parentMeta: {},
       agentId: "exec",
@@ -1176,7 +1192,9 @@ describe("TaskService", () => {
     });
     expect(second.success).toBe(true);
     const secondSend = sendMessage.mock.calls[1];
-    expect(secondSend[2]).not.toHaveProperty("reasoningMode");
+    // The bucket's absent reasoning resolves to explicit standard; the owner's
+    // pro must not leak through.
+    expect((secondSend[2] as { reasoningMode?: string }).reasoningMode).not.toBe("pro");
   });
 
   test("createWorkspaceTurn rejects multi-project owners instead of dropping secondary repos", async () => {
@@ -9372,6 +9390,49 @@ describe("TaskService", () => {
     });
   }, 20_000);
 
+  test("inherits the exec base's configured pro default when spawning an agent without its own", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["aaaaaaaaaa"], "bbbbbbbbbb");
+
+    const projectPath = await createTestProject(rootDir, "repo", { initGit: false });
+
+    const parentId = "1111111111";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        {
+          path: projectPath,
+          id: parentId,
+          name: "parent",
+          createdAt: new Date().toISOString(),
+          runtimeConfig: { type: "local" },
+          // Parent runs standard; the pro must come from the configured exec
+          // default via Explore's base chain, matching Settings/ACP display.
+          aiSettings: { model: "openai:gpt-5.6-sol", thinkingLevel: "high" },
+        },
+      ],
+      {
+        taskSettings: testTaskSettings(),
+        agentAiDefaults: { exec: { reasoningMode: "pro" } },
+      }
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const created = await createAgentTask(taskService, parentId, "run explore with base pro");
+    expect(created.success).toBe(true);
+    if (!created.success) return;
+
+    expect(sendMessage).toHaveBeenCalledWith(
+      created.data.taskId,
+      "run explore with base pro",
+      expect.objectContaining({ agentId: "explore", reasoningMode: "pro" }),
+      { agentInitiated: true }
+    );
+  }, 20_000);
+
   test("falls back to the parent's active-agent pro mode when spawning another agent type", async () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["aaaaaaaaaa"], "bbbbbbbbbb");
@@ -9593,6 +9654,62 @@ describe("TaskService", () => {
     });
     expect(childEntry?.taskModelString).toBe("anthropic:claude-haiku-4-5");
     expect(childEntry?.taskThinkingLevel).toBe("off");
+  }, 20_000);
+
+  test("follows a custom agent's declared base chain for the reasoning default", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["aaaaaaaaaa"], "bbbbbbbbbb");
+
+    const projectPath = await createTestProject(rootDir, "repo", { initGit: false });
+
+    // Custom agent declaring base: plan; the reasoning default must follow the
+    // DECLARED chain (plan), not the hardcoded exec fallback.
+    const agentsDir = path.join(projectPath, ".mux", "agents");
+    await fsPromises.mkdir(agentsDir, { recursive: true });
+    await fsPromises.writeFile(
+      path.join(agentsDir, "researcher.md"),
+      `---\nname: Researcher\ndescription: Plan-derived custom agent for tests\nbase: plan\nsubagent:\n  runnable: true\n---\n\nTest agent body.\n`,
+      "utf-8"
+    );
+
+    const parentId = "1111111111";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        {
+          path: projectPath,
+          id: parentId,
+          name: "parent",
+          createdAt: new Date().toISOString(),
+          runtimeConfig: { type: "local" },
+          aiSettings: { model: "openai:gpt-5.6-sol", thinkingLevel: "high" },
+        },
+      ],
+      {
+        taskSettings: testTaskSettings(),
+        agentAiDefaults: {
+          plan: { reasoningMode: "pro" },
+          exec: { reasoningMode: "standard" },
+        },
+      }
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const created = await createAgentTask(taskService, parentId, "run researcher with plan pro", {
+      agentType: "researcher",
+    });
+    expect(created.success).toBe(true);
+    if (!created.success) return;
+
+    expect(sendMessage).toHaveBeenCalledWith(
+      created.data.taskId,
+      "run researcher with plan pro",
+      expect.objectContaining({ agentId: "researcher", reasoningMode: "pro" }),
+      { agentInitiated: true }
+    );
   }, 20_000);
 
   test("does not inherit base-chain defaults when target agent has no global defaults", async () => {
@@ -10257,7 +10374,10 @@ describe("TaskService", () => {
       {
         model: "google:gemini-3-pro",
         agentId: "exec",
-        thinkingLevel: "low",
+        // Floor-aware clamp (matching what the send path enforces at request
+        // time): "off" is unsupported and below the model's medium floor, so
+        // it lands on the nearest allowed level.
+        thinkingLevel: "high",
         experiments: undefined,
       },
       { agentInitiated: true }
@@ -10386,8 +10506,12 @@ describe("TaskService", () => {
 
     await config.editConfig((cfg) => ({
       ...cfg,
-      subagentAiDefaults: {
-        exec: { modelString: "openai:gpt-5.2", thinkingLevel: "medium" },
+      agentAiDefaults: {
+        ...cfg.agentAiDefaults,
+        exec: {
+          ...cfg.agentAiDefaults?.exec,
+          subagent: { modelString: "openai:gpt-5.2", thinkingLevel: "medium" },
+        },
       },
     }));
 
@@ -22373,11 +22497,8 @@ describe("TaskService", () => {
     projectName?: string;
     maxTaskNestingDepth?: number;
     parentAiSettingsByAgent?: Record<string, { model: string; thinkingLevel: ThinkingLevel }>;
-    agentAiDefaults?: Record<
-      string,
-      { modelString: string; thinkingLevel: ThinkingLevel; enabled?: boolean }
-    >;
-    subagentAiDefaults?: Record<string, { modelString?: string; thinkingLevel?: ThinkingLevel }>;
+    agentAiDefaults?: AgentAiDefaults;
+    subagentAiDefaults?: Record<string, AgentAiSubagentProfile>;
     sendMessageOverride?: ReturnType<typeof mock>;
     aiServiceOverrides?: Parameters<typeof createAIServiceMocks>[1];
   }) {
@@ -22409,7 +22530,10 @@ describe("TaskService", () => {
       );
     }
 
-    const agentAiDefaults = { ...(options?.agentAiDefaults ?? {}) };
+    const agentAiDefaults = mergeTestAgentAiDefaults(
+      options?.agentAiDefaults,
+      options?.subagentAiDefaults
+    );
 
     await saveWorkspaces(
       config,
@@ -22442,8 +22566,7 @@ describe("TaskService", () => {
           maxParallelAgentTasks: 3,
           maxTaskNestingDepth: options?.maxTaskNestingDepth ?? 3,
         },
-        agentAiDefaults: Object.keys(agentAiDefaults).length > 0 ? agentAiDefaults : undefined,
-        subagentAiDefaults: options?.subagentAiDefaults,
+        agentAiDefaults,
       }
     );
 
@@ -22520,7 +22643,9 @@ describe("TaskService", () => {
       expect.objectContaining({
         agentId: "exec",
         model: "openai:gpt-4o-mini",
-        thinkingLevel: "off",
+        // Thinking inherits field-wise from the plan workspace's persisted
+        // settings ("max"), clamped by the resolved kickoff model's policy.
+        thinkingLevel: "high",
       }),
       expect.objectContaining({ synthetic: true })
     );
@@ -22563,6 +22688,24 @@ describe("TaskService", () => {
       .flatMap((project) => project.workspaces)
       .find((workspace) => workspace.id === childId);
     expect(updatedTask?.aiSettings?.reasoningMode).toBe("pro");
+  });
+
+  test("plan handoff applies a configured exec reasoning default when the plan phase ran standard", async () => {
+    const { childId, sendMessage, internal } = await setupPlanModeStreamEndHarness({
+      subagentAiDefaults: {
+        exec: { reasoningMode: "pro" },
+      },
+    });
+
+    await internal.handleStreamEnd(makeSuccessfulProposePlanStreamEndEvent(childId));
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).toHaveBeenCalledWith(
+      childId,
+      expect.stringContaining("Implement the plan"),
+      expect.objectContaining({ agentId: "exec", reasoningMode: "pro" }),
+      expect.objectContaining({ synthetic: true })
+    );
   });
 
   test("stream-end with propose_plan success uses global exec defaults for handoff", async () => {
@@ -22645,7 +22788,7 @@ describe("TaskService", () => {
     expect(updatedTask?.taskThinkingLevel).toBe("xhigh");
   });
 
-  test("stream-end handoff falls back to default model when inherited task model is whitespace", async () => {
+  test("stream-end handoff ignores a whitespace inherited task model", async () => {
     const { config, childId, sendMessage, internal } = await setupPlanModeStreamEndHarness();
 
     const preCfg = config.loadConfigOrDefault();
@@ -22660,13 +22803,15 @@ describe("TaskService", () => {
 
     await internal.handleStreamEnd(makeSuccessfulProposePlanStreamEndEvent(childId));
 
+    // The whitespace frozen model must not be used verbatim; resolution falls
+    // through to the plan workspace's own persisted settings.
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(sendMessage).toHaveBeenCalledWith(
       childId,
       expect.stringContaining("Implement the plan"),
       expect.objectContaining({
         agentId: "exec",
-        model: defaultModel,
+        model: "anthropic:claude-opus-4-6",
       }),
       expect.objectContaining({ synthetic: true })
     );
@@ -22676,7 +22821,7 @@ describe("TaskService", () => {
       .flatMap((project) => project.workspaces)
       .find((workspace) => workspace.id === childId);
 
-    expect(updatedTask?.taskModelString).toBe(defaultModel);
+    expect(updatedTask?.taskModelString).toBe("anthropic:claude-opus-4-6");
   });
 
   test("stream-end with propose_plan success triggers handoff for custom plan-like agents", async () => {

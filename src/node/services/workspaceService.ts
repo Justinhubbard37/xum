@@ -54,6 +54,13 @@ import {
   resolveWorkspaceExecutionPath,
   resolveWorkspaceRootPath,
 } from "@/node/runtime/runtimeHelpers";
+import {
+  resolveNodeAgentAiSettings,
+  type NodeAgentDefinitionContext,
+} from "@/node/services/agentDefinitions/resolveNodeAgentAiSettings";
+import { targetWorkspaceBucketToLayer } from "@/common/types/agentAiSettings";
+import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
+import { resolveAgentAiSettings } from "@/common/utils/ai/resolveAgentAiSettings";
 import { getWorkspacePathHintForProject } from "@/node/services/workspaceProjectRepos";
 import { validateWorkspaceName } from "@/common/utils/validation/workspaceValidation";
 import { ensurePrivateDir, isErrnoWithCode } from "@/node/utils/fs";
@@ -175,7 +182,6 @@ import {
 // (coder:openai/<claude> with type anthropic) to direct openai:<claude>,
 // bypassing the gateway or failing without direct credentials.
 import { isValidModelFormat, normalizeSelectedModel } from "@/common/utils/ai/models";
-import { DEFAULT_MODEL } from "@/common/constants/knownModels";
 import {
   hasBudgetedResumableGoal,
   modelHasPricingData,
@@ -184,10 +190,8 @@ import {
 import {
   coerceOpenAIReasoningMode,
   coerceThinkingLevel,
-  type OpenAIReasoningMode,
   type ThinkingLevel,
 } from "@/common/types/thinking";
-import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import {
   HEARTBEAT_CONTEXT_MODE_VALUES,
@@ -2367,7 +2371,7 @@ export class WorkspaceService extends EventEmitter {
       return;
     }
 
-    const sendOptions = this.getWorkflowContinuationSendOptions(ownerWorkspaceId);
+    const sendOptions = await this.getWorkflowContinuationSendOptions(ownerWorkspaceId);
     if (sendOptions == null) {
       log.debug("Bash monitor wake has no send options; leaving pending", { ownerWorkspaceId });
       return;
@@ -6313,17 +6317,42 @@ export class WorkspaceService extends EventEmitter {
    * unavailable. Public so AgentStatusService can share the precedence.
    */
   public async getWorkspaceTitleModelCandidates(workspaceId: string): Promise<string[]> {
-    const candidates: string[] = [...NAME_GEN_PREFERRED_MODELS];
+    const candidates: string[] = [];
     const metadataResult = await this.aiService.getWorkspaceMetadata(workspaceId);
-    if (!metadataResult.success) {
+    const metadata = metadataResult.success ? metadataResult.data : undefined;
+
+    // A configured name_workspace model (workspace bucket, then agent
+    // defaults) leads the candidate list. Model-only: this runtime ignores
+    // thinking and reasoning parameters. Defensive config read: tests
+    // construct the service with partial Config mocks.
+    let agentAiDefaults: AgentAiDefaults | undefined;
+    try {
+      agentAiDefaults = this.config.loadConfigOrDefault().agentAiDefaults;
+    } catch {
+      agentAiDefaults = undefined;
+    }
+    const nameBucket = metadata?.aiSettingsByAgent?.name_workspace;
+    const resolved = resolveAgentAiSettings({
+      targetAgentId: "name_workspace",
+      profile: "interactive",
+      agentAiDefaults,
+      targetWorkspaceSettings: nameBucket ? { model: nameBucket.model } : undefined,
+    });
+    if (resolved.sources.model.tier !== "default") {
+      candidates.push(resolved.selected.model);
+    }
+    for (const preferred of NAME_GEN_PREFERRED_MODELS) {
+      if (!candidates.includes(preferred)) {
+        candidates.push(preferred);
+      }
+    }
+    if (!metadata) {
       return candidates;
     }
 
     const fallbackModels = [
-      metadataResult.data.aiSettings?.model,
-      ...Object.values(metadataResult.data.aiSettingsByAgent ?? {}).map(
-        (settings) => settings.model
-      ),
+      metadata.aiSettings?.model,
+      ...Object.values(metadata.aiSettingsByAgent ?? {}).map((settings) => settings.model),
     ];
     for (const model of fallbackModels) {
       if (model && !candidates.includes(model)) {
@@ -10776,11 +10805,46 @@ export class WorkspaceService extends EventEmitter {
     };
   }
 
-  getWorkflowContinuationSendOptions(workspaceId: string): SendMessageOptions | null {
+  getWorkflowContinuationSendOptions(workspaceId: string): Promise<SendMessageOptions | null> {
     return this.getGoalContinuationKickoffSendOptions(workspaceId);
   }
 
-  getGoalContinuationKickoffSendOptions(workspaceId: string): SendMessageOptions | null {
+  /**
+   * Defensive providers-config read: tests construct WorkspaceService with
+   * partial AIService mocks, so a missing method degrades to null instead of
+   * throwing inside internal turns (goal kickoff, heartbeats, compaction).
+   */
+  private getProvidersConfigSafe(): ReturnType<AIService["getProvidersConfig"]> | null {
+    try {
+      return this.aiService.getProvidersConfig() ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Checkout context for reading agent definitions (definition `ai` defaults
+   * and declared base chains). Undefined when the workspace cannot be
+   * resolved; the unified resolver then uses its implicit fallback ancestor.
+   */
+  private async getAgentDefinitionContext(
+    workspaceId: string
+  ): Promise<NodeAgentDefinitionContext | undefined> {
+    try {
+      const metadata = await this.getInfo(workspaceId);
+      if (!metadata) {
+        return undefined;
+      }
+      const runtime = createRuntimeForWorkspace(metadata);
+      return { runtime, workspacePath: resolveWorkspaceRootPath(metadata, runtime), workspaceId };
+    } catch {
+      return undefined;
+    }
+  }
+
+  async getGoalContinuationKickoffSendOptions(
+    workspaceId: string
+  ): Promise<SendMessageOptions | null> {
     assert(
       workspaceId.trim().length > 0,
       "getGoalContinuationKickoffSendOptions requires workspaceId"
@@ -10805,68 +10869,39 @@ export class WorkspaceService extends EventEmitter {
         ? WORKSPACE_DEFAULTS.agentId
         : persistedAgentId;
     const selectedAgentSettings = workspaceEntry?.aiSettingsByAgent?.[agentId];
-    const execAgentSettings =
-      agentId !== WORKSPACE_DEFAULTS.agentId
-        ? workspaceEntry?.aiSettingsByAgent?.[WORKSPACE_DEFAULTS.agentId]
-        : undefined;
 
-    // Each candidate pairs the model with the thinking level persisted alongside
-    // it. Dropping the thinking level here caused goal continuations to stream
-    // with an implicit "off" (aiService defaults undefined -> off), which both
-    // ignored the user's UI selection and sent `thinking: { type: "disabled" }`
-    // to Anthropic models that reject disabled thinking (e.g. Fable/Mythos).
-    const candidates: Array<{
-      model?: string;
-      thinkingLevel?: ThinkingLevel;
-      reasoningMode?: OpenAIReasoningMode;
-    }> = [
-      {
-        model: selectedAgentSettings?.model,
-        thinkingLevel: selectedAgentSettings?.thinkingLevel,
-        reasoningMode: selectedAgentSettings?.reasoningMode,
-      },
-      {
-        model: workspaceEntry?.aiSettings?.model,
-        thinkingLevel: workspaceEntry?.aiSettings?.thinkingLevel,
-        reasoningMode: workspaceEntry?.aiSettings?.reasoningMode,
-      },
-      {
-        model: config.agentAiDefaults?.[agentId]?.modelString,
-        thinkingLevel: config.agentAiDefaults?.[agentId]?.thinkingLevel,
-      },
-      {
-        model: execAgentSettings?.model,
-        thinkingLevel: execAgentSettings?.thinkingLevel,
-        reasoningMode: execAgentSettings?.reasoningMode,
-      },
-      agentId !== WORKSPACE_DEFAULTS.agentId
-        ? {
-            model: config.agentAiDefaults?.[WORKSPACE_DEFAULTS.agentId]?.modelString,
-            thinkingLevel: config.agentAiDefaults?.[WORKSPACE_DEFAULTS.agentId]?.thinkingLevel,
-          }
-        : {},
-      { model: DEFAULT_MODEL },
-    ];
+    // Unified interactive resolution: the workspace's own bucket, then
+    // configured/definition defaults and the declared base chain, then the
+    // legacy workspace settings as a fallback layer.
+    const resolved = await resolveNodeAgentAiSettings({
+      agentId,
+      profile: "interactive",
+      cfg: config,
+      providersConfig: this.getProvidersConfigSafe(),
+      targetWorkspaceSettings: selectedAgentSettings
+        ? targetWorkspaceBucketToLayer(selectedAgentSettings)
+        : undefined,
+      fallbacks: workspaceEntry?.aiSettings
+        ? [
+            {
+              model: workspaceEntry.aiSettings.model,
+              thinkingLevel: coerceThinkingLevel(workspaceEntry.aiSettings.thinkingLevel),
+              reasoningMode: coerceOpenAIReasoningMode(workspaceEntry.aiSettings.reasoningMode),
+            },
+          ]
+        : undefined,
+      definitionContext: await this.getAgentDefinitionContext(workspaceId),
+    });
 
-    for (const candidate of candidates) {
-      const raw = candidate.model;
-      if (typeof raw !== "string" || raw.trim().length === 0) {
-        continue;
-      }
-      const normalized = normalizeSelectedModel(raw.trim());
-      if (isValidModelFormat(normalized)) {
-        const thinkingLevel = coerceThinkingLevel(candidate.thinkingLevel);
-        const reasoningMode = coerceOpenAIReasoningMode(candidate.reasoningMode);
-        return {
-          model: normalized,
-          agentId,
-          ...(thinkingLevel != null ? { thinkingLevel } : {}),
-          ...(reasoningMode != null ? { reasoningMode } : {}),
-        };
-      }
-    }
-
-    return null;
+    // Selected values: the send path persists them and re-clamps at request time.
+    return {
+      model: resolved.selected.model,
+      agentId,
+      thinkingLevel: resolved.selected.thinkingLevel,
+      ...(resolved.selected.reasoningMode != null
+        ? { reasoningMode: resolved.selected.reasoningMode }
+        : {}),
+    };
   }
 
   async executeGoalContinuation(input: {
@@ -11039,69 +11074,47 @@ export class WorkspaceService extends EventEmitter {
     const execAgentSettings =
       workspaceEntry?.aiSettingsByAgent?.[WORKSPACE_DEFAULTS.agentId] ?? workspaceEntry?.aiSettings;
 
-    // Compaction defaults now flow through per-agent defaults.
-    const globalCompactDefaults = config.agentAiDefaults?.compact;
-    const globalCompactDefaultModel = globalCompactDefaults?.modelString;
-    const normalizedGlobalCompactDefaultModel =
-      typeof globalCompactDefaultModel === "string"
-        ? normalizeSelectedModel(globalCompactDefaultModel.trim())
-        : undefined;
-    const validGlobalCompactDefaultModel =
-      normalizedGlobalCompactDefaultModel && isValidModelFormat(normalizedGlobalCompactDefaultModel)
-        ? normalizedGlobalCompactDefaultModel
-        : undefined;
-
-    const globalExecDefaultModel =
-      config.agentAiDefaults?.[WORKSPACE_DEFAULTS.agentId]?.modelString;
-    const normalizedGlobalExecDefaultModel =
-      typeof globalExecDefaultModel === "string"
-        ? normalizeSelectedModel(globalExecDefaultModel.trim())
-        : undefined;
-    const validGlobalExecDefaultModel =
-      normalizedGlobalExecDefaultModel && isValidModelFormat(normalizedGlobalExecDefaultModel)
-        ? normalizedGlobalExecDefaultModel
-        : undefined;
-
-    const fallbackModel =
-      compactAgentSettings?.model ??
-      validGlobalCompactDefaultModel ??
-      execAgentSettings?.model ??
-      validGlobalExecDefaultModel ??
-      activity?.lastModel ??
-      WORKSPACE_DEFAULTS.model;
-
-    let model = normalizeSelectedModel(fallbackModel);
-    if (!isValidModelFormat(model)) {
-      log.warn("Idle compaction resolved invalid model; falling back to workspace default", {
-        workspaceId,
-        model,
-      });
-      model = WORKSPACE_DEFAULTS.model;
-    }
-
-    const globalCompactDefaultThinking = globalCompactDefaults?.thinkingLevel;
-
-    const requestedThinking =
-      compactAgentSettings?.thinkingLevel ??
-      globalCompactDefaultThinking ??
-      execAgentSettings?.thinkingLevel ??
-      activity?.lastThinkingLevel ??
-      WORKSPACE_DEFAULTS.thinkingLevel;
-
-    const normalizedThinkingLevel =
-      coerceThinkingLevel(requestedThinking) ?? WORKSPACE_DEFAULTS.thinkingLevel;
-
-    // Same persisted-settings fallback order as thinkingLevel (global defaults
-    // and activity snapshots do not carry reasoningMode).
-    const reasoningMode = coerceOpenAIReasoningMode(
-      compactAgentSettings?.reasoningMode ?? execAgentSettings?.reasoningMode
-    );
+    // Unified resolution for agent "compact": the compact bucket, configured
+    // compact defaults, then the declared base chain (so a saved Exec pro
+    // default reaches compaction), then the workspace's exec/legacy settings
+    // and activity snapshot as fallback layers.
+    const resolved = await resolveNodeAgentAiSettings({
+      agentId: "compact",
+      profile: "interactive",
+      cfg: config,
+      providersConfig: this.getProvidersConfigSafe(),
+      targetWorkspaceSettings: compactAgentSettings
+        ? targetWorkspaceBucketToLayer(compactAgentSettings)
+        : undefined,
+      fallbacks: [
+        ...(execAgentSettings
+          ? [
+              {
+                model: execAgentSettings.model,
+                thinkingLevel: coerceThinkingLevel(execAgentSettings.thinkingLevel),
+                reasoningMode: coerceOpenAIReasoningMode(execAgentSettings.reasoningMode),
+              },
+            ]
+          : []),
+        // Activity snapshots do not carry reasoningMode.
+        {
+          model: activity?.lastModel ?? undefined,
+          thinkingLevel: coerceThinkingLevel(activity?.lastThinkingLevel),
+        },
+      ],
+      defaultModel: WORKSPACE_DEFAULTS.model,
+      definitionContext: await this.getAgentDefinitionContext(workspaceId),
+    });
 
     return {
-      model,
+      model: resolved.selected.model,
       agentId: "compact",
-      thinkingLevel: enforceThinkingPolicy(model, normalizedThinkingLevel),
-      ...(reasoningMode != null ? { reasoningMode } : {}),
+      // Effective (clamped) thinking: this internal request skips persistence,
+      // so there is no user preference to preserve.
+      thinkingLevel: resolved.effective.thinkingLevel,
+      ...(resolved.selected.reasoningMode != null
+        ? { reasoningMode: resolved.selected.reasoningMode }
+        : {}),
       maxOutputTokens: undefined,
       // Disable all tools during compaction - regex .* matches all tool names.
       toolPolicy: [{ regex_match: ".*", action: "disable" }],
@@ -11432,83 +11445,49 @@ export class WorkspaceService extends EventEmitter {
 
     const rawAgentId = workspaceEntry?.agentId;
     const agentId = normalizeAgentId(rawAgentId, WORKSPACE_DEFAULTS.agentId);
-    const agentSettings =
-      workspaceEntry?.aiSettingsByAgent?.[agentId] ?? workspaceEntry?.aiSettings;
-    const execAgentSettings =
-      agentId !== WORKSPACE_DEFAULTS.agentId
-        ? (workspaceEntry?.aiSettingsByAgent?.[WORKSPACE_DEFAULTS.agentId] ??
-          workspaceEntry?.aiSettings)
-        : undefined;
+    const agentSettings = workspaceEntry?.aiSettingsByAgent?.[agentId];
 
-    const globalAgentDefaults = config.agentAiDefaults?.[agentId];
-    const globalAgentDefaultModel = globalAgentDefaults?.modelString;
-    const normalizedGlobalAgentDefaultModel =
-      typeof globalAgentDefaultModel === "string"
-        ? normalizeSelectedModel(globalAgentDefaultModel.trim())
-        : undefined;
-    const validGlobalAgentDefaultModel =
-      normalizedGlobalAgentDefaultModel && isValidModelFormat(normalizedGlobalAgentDefaultModel)
-        ? normalizedGlobalAgentDefaultModel
-        : undefined;
-
-    const globalExecDefaults =
-      agentId !== WORKSPACE_DEFAULTS.agentId
-        ? config.agentAiDefaults?.[WORKSPACE_DEFAULTS.agentId]
-        : undefined;
-    const globalExecDefaultModel = globalExecDefaults?.modelString;
-    const normalizedGlobalExecDefaultModel =
-      typeof globalExecDefaultModel === "string"
-        ? normalizeSelectedModel(globalExecDefaultModel.trim())
-        : undefined;
-    const validGlobalExecDefaultModel =
-      normalizedGlobalExecDefaultModel && isValidModelFormat(normalizedGlobalExecDefaultModel)
-        ? normalizedGlobalExecDefaultModel
-        : undefined;
-
-    const fallbackModel =
-      agentSettings?.model ??
-      validGlobalAgentDefaultModel ??
-      execAgentSettings?.model ??
-      validGlobalExecDefaultModel ??
-      activity?.lastModel ??
-      WORKSPACE_DEFAULTS.model;
-
-    let model = normalizeSelectedModel(fallbackModel);
-    if (!isValidModelFormat(model)) {
-      log.warn("Heartbeat resolved invalid model; falling back to workspace default", {
-        workspaceId,
-        agentId,
-        model,
-      });
-      model = WORKSPACE_DEFAULTS.model;
-    }
-
-    const globalAgentDefaultThinking = globalAgentDefaults?.thinkingLevel;
-    const globalExecDefaultThinking = globalExecDefaults?.thinkingLevel;
-
-    const requestedThinking =
-      agentSettings?.thinkingLevel ??
-      globalAgentDefaultThinking ??
-      execAgentSettings?.thinkingLevel ??
-      globalExecDefaultThinking ??
-      activity?.lastThinkingLevel ??
-      WORKSPACE_DEFAULTS.thinkingLevel;
-
-    const normalizedThinkingLevel =
-      coerceThinkingLevel(requestedThinking) ?? WORKSPACE_DEFAULTS.thinkingLevel;
-
-    // Same persisted-settings fallback order as thinkingLevel (global defaults
-    // and activity snapshots do not carry reasoningMode).
-    const reasoningMode = coerceOpenAIReasoningMode(
-      agentSettings?.reasoningMode ?? execAgentSettings?.reasoningMode
-    );
+    // Unified interactive resolution for the workspace's selected agent: its
+    // bucket, configured/definition defaults and the declared base chain, then
+    // the legacy workspace settings and activity snapshot as fallback layers.
+    const resolved = await resolveNodeAgentAiSettings({
+      agentId,
+      profile: "interactive",
+      cfg: config,
+      providersConfig: this.getProvidersConfigSafe(),
+      targetWorkspaceSettings: agentSettings
+        ? targetWorkspaceBucketToLayer(agentSettings)
+        : undefined,
+      fallbacks: [
+        ...(workspaceEntry?.aiSettings
+          ? [
+              {
+                model: workspaceEntry.aiSettings.model,
+                thinkingLevel: coerceThinkingLevel(workspaceEntry.aiSettings.thinkingLevel),
+                reasoningMode: coerceOpenAIReasoningMode(workspaceEntry.aiSettings.reasoningMode),
+              },
+            ]
+          : []),
+        // Activity snapshots do not carry reasoningMode.
+        {
+          model: activity?.lastModel ?? undefined,
+          thinkingLevel: coerceThinkingLevel(activity?.lastThinkingLevel),
+        },
+      ],
+      defaultModel: WORKSPACE_DEFAULTS.model,
+      definitionContext: await this.getAgentDefinitionContext(workspaceId),
+    });
 
     return {
       sendOptions: {
-        model,
+        model: resolved.selected.model,
         agentId,
-        thinkingLevel: enforceThinkingPolicy(model, normalizedThinkingLevel),
-        ...(reasoningMode != null ? { reasoningMode } : {}),
+        // Effective (clamped) thinking: this internal request skips
+        // persistence, so there is no user preference to preserve.
+        thinkingLevel: resolved.effective.thinkingLevel,
+        ...(resolved.selected.reasoningMode != null
+          ? { reasoningMode: resolved.selected.reasoningMode }
+          : {}),
         maxOutputTokens: undefined,
         // Heartbeats are idle control loops; their prompt may ask the agent to seed a bounded
         // goal before continuing. AIService still gates set_goal to top-level exec-like agents.
