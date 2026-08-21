@@ -144,6 +144,30 @@ describe("selectKeepRecentTailStartIndex", () => {
     expect(selectKeepRecentTailStartIndex(messages, 1_000)).toBe(-1);
   });
 
+  it("rejects a candidate whose snapshot cluster reaches index 0 (empty head)", () => {
+    // A snapshot at messages[0] belongs to the first turn's cluster; the
+    // cluster scan must inspect index 0 so the empty-head check rejects the
+    // candidate — otherwise the tail starts at the real user row and the
+    // snapshot content the preserved turn depends on is summarized away.
+    const snapshot = createMuxMessage("snap-0", "user", "snapshot: file contents", {
+      historySequence: 0,
+      synthetic: true,
+      fileAtMentionSnapshot: ["src/foo.ts"],
+    });
+    const messages = [
+      snapshot,
+      userMessage("u0", "@src/foo.ts what does this do?", 1),
+      assistantMessage("a0", "it does things", 2),
+      userMessage("u1", "and this?", 3),
+      assistantMessage("a1", "more things", 4),
+    ];
+
+    // With a floor covering everything, the first-turn candidate (u0) must be
+    // rejected (its cluster consumes the whole head); the later turn (u1,
+    // index 3) is the correct boundary.
+    expect(selectKeepRecentTailStartIndex(messages, 20_000)).toBe(3);
+  });
+
   it("requires a provider-eligible head so the summarizer has content", () => {
     const boundary = createMuxMessage("summary-1", "assistant", "prior summary", {
       compacted: "user",

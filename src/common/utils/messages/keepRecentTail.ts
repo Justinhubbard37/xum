@@ -90,9 +90,13 @@ export function selectKeepRecentTailStartIndex(
     // snapshots does not fit. Stop extending at a snapshot row without a
     // valid historySequence — the boundary stamp needs one, so degrade to
     // the nearest stampable row (self-healing on corrupt history).
+    // Scan through index 0: a snapshot at messages[0] belongs to the cluster
+    // too, and pulling it in makes the head slice empty so the empty-head
+    // check below rejects the candidate — otherwise the tail would start at
+    // the real user row while the snapshot it depends on gets summarized away.
     let clusterStart = i;
     let clusterTokens = 0;
-    for (let j = i - 1; j >= 1; j--) {
+    for (let j = i - 1; j >= 0; j--) {
       const candidate = messages[j];
       if (
         !isSyntheticSnapshotUserMessage(candidate) ||

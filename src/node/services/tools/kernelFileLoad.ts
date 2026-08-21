@@ -54,7 +54,15 @@ export function createKernelFileLoader(config: {
     }
     const content = await readFileString(config.runtime, resolvedPath);
     const bytes = Buffer.byteLength(content, "utf8");
-    const lines = content === "" ? 0 : content.split("\n").length;
+    // Count newline-delimited records, not split segments: a conventional
+    // newline-terminated file yields a trailing empty segment that would
+    // report one extra line — and this summary is model-visible, so an
+    // exact-count task would come out wrong without reparsing the value.
+    const segments = content.split("\n");
+    if (segments.length > 1 && segments[segments.length - 1] === "") {
+      segments.pop();
+    }
+    const lines = content === "" ? 0 : segments.length;
     const preview = content.slice(0, KERNEL_LOAD_PREVIEW_CHARS);
     return { content, bytes, lines, preview };
   };
