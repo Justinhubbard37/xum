@@ -108,6 +108,99 @@ function sessionLock(sessionDir: string): AsyncMutex {
   return mutex;
 }
 
+/** Lockfile name inside the session dir for the cross-process rollback claim. */
+const ROLLBACK_LOCKFILE = "refinement-rollback.lock";
+
+function errnoCode(error: unknown): string | undefined {
+  return error instanceof Error && "code" in error ? String(error.code) : undefined;
+}
+
+/**
+ * Cross-process rollback lock. The in-process mutex above cannot serialize
+ * the debug CLI (a standalone Bun process, src/cli/debug/refinements.ts)
+ * against the Electron backend: both processes could pass the
+ * already-rolled-back check, double-apply the inverse, and append duplicate
+ * `rollbackOf` rows. An O_EXCL lockfile carrying the owner PID provides the
+ * cross-process claim. A leftover lock is reclaimed ONLY when its owner is
+ * provably dead (ESRCH); every ambiguous state — unreadable PID, EPERM, a
+ * live owner — fails the rollback instead of risking a double apply.
+ */
+async function acquireRollbackFileLock(sessionDir: string): Promise<AsyncDisposable> {
+  const lockPath = path.join(path.resolve(sessionDir), ROLLBACK_LOCKFILE);
+  // A session dir may not exist yet (e.g. unknown-id refusals before any row
+  // was journaled); the claim must still succeed so the ordinary "No
+  // refinement row" refusal is reached instead of a lockfile ENOENT.
+  await fsPromises.mkdir(path.resolve(sessionDir), { recursive: true });
+  // Two attempts: the initial claim plus one retry after reclaiming a stale
+  // (dead-owner) lock. Losing the retry means live contention — fail.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const handle = await fsPromises.open(lockPath, "wx");
+      try {
+        await handle.writeFile(String(process.pid), "utf-8");
+      } finally {
+        await handle.close();
+      }
+      return {
+        async [Symbol.asyncDispose]() {
+          try {
+            await fsPromises.unlink(lockPath);
+          } catch (error) {
+            log.debug("[refinement] failed to release rollback lockfile", { lockPath, error });
+          }
+        },
+      };
+    } catch (error) {
+      if (errnoCode(error) !== "EEXIST") {
+        throw error;
+      }
+    }
+
+    // Contended: decide liveness from the recorded owner PID.
+    let rawPid: string;
+    try {
+      rawPid = await fsPromises.readFile(lockPath, "utf-8");
+    } catch (error) {
+      if (errnoCode(error) === "ENOENT") {
+        continue; // Owner released between our open and read; retry the claim.
+      }
+      throw error;
+    }
+    const ownerPid = Number.parseInt(rawPid.trim(), 10);
+    if (!Number.isInteger(ownerPid) || ownerPid <= 0) {
+      // Unreadable owner (torn write, foreign file): ambiguous — never break.
+      throw new RollbackError(
+        `Another rollback may be in progress: lockfile '${lockPath}' has no readable owner PID. Remove it manually if no rollback is running.`
+      );
+    }
+    let ownerAlive = true;
+    try {
+      process.kill(ownerPid, 0);
+    } catch (error) {
+      if (errnoCode(error) === "ESRCH") {
+        ownerAlive = false; // Provably dead: safe to reclaim.
+      }
+      // EPERM (or anything else): a process exists but is not ours — treat
+      // as live; breaking it could double-apply a rollback in flight.
+    }
+    if (ownerAlive) {
+      throw new RollbackError(
+        `Another rollback is in progress for this session (lockfile '${lockPath}' held by pid ${ownerPid}). Retry once it finishes.`
+      );
+    }
+    try {
+      await fsPromises.unlink(lockPath);
+    } catch (error) {
+      if (errnoCode(error) !== "ENOENT") {
+        throw error;
+      }
+    }
+  }
+  throw new RollbackError(
+    `Another rollback is in progress for this session (lost the claim on '${lockPath}' twice). Retry once it finishes.`
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Confinement: legal self-modification roots
 // ---------------------------------------------------------------------------
@@ -530,7 +623,11 @@ export async function rollbackRefinement(
     assert(opts.id.length > 0, "rollbackRefinement requires a target row id");
     // Held across read → validate → mutate → append so concurrent calls for
     // the same row cannot both pass validation and double-apply the inverse.
+    // Two layers: the in-process mutex serializes callers inside this process
+    // cheaply; the lockfile serializes the debug CLI (a separate Bun process)
+    // against the backend.
     await using _lock = await sessionLock(opts.sessionDir).acquire();
+    await using _fileLock = await acquireRollbackFileLock(opts.sessionDir);
     const journal = sharedDurableEventJournal(opts.sessionDir);
     const rows = await listRefinements(opts.sessionDir);
 

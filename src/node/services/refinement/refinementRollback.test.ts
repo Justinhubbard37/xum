@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
+import { spawnSync } from "node:child_process";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import { REFINEMENT_INLINE_MAX_CHARS } from "@/common/types/refinement";
@@ -206,6 +207,60 @@ describe("refinementRollback", () => {
     });
     expect(forced.success).toBe(true);
     expect(await fsPromises.readFile(physicalPath, "utf-8")).toBe("v1\n");
+  });
+
+  it("fails while the cross-process lockfile is held by a live process", async () => {
+    using fixture = await createFixture();
+    await fixture.service.create(fixture.ctx, "/memories/global/lock.md", "v1\n", "agent");
+    await fixture.service.strReplace(fixture.ctx, "/memories/global/lock.md", "v1", "v2", "agent");
+    const editRow = await lastRow(fixture.sessionDir);
+
+    // Simulate another process's in-flight rollback: our own PID is live, so
+    // the lock must never be broken and the call must fail with a clear error.
+    const lockPath = path.join(fixture.sessionDir, "refinement-rollback.lock");
+    await fsPromises.writeFile(lockPath, String(process.pid), { encoding: "utf-8", flag: "wx" });
+
+    const refused = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: editRow.id,
+      evidence: EVIDENCE,
+    });
+    expect(refused.success).toBe(false);
+    if (refused.success) throw new Error("unreachable");
+    expect(refused.error).toContain("Another rollback is in progress");
+    // The live owner's lockfile survives the refusal.
+    expect(await fsPromises.readFile(lockPath, "utf-8")).toBe(String(process.pid));
+
+    await fsPromises.unlink(lockPath);
+    const retried = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: editRow.id,
+      evidence: EVIDENCE,
+    });
+    expect(retried.success).toBe(true);
+  });
+
+  it("reclaims a stale lockfile whose owner is provably dead", async () => {
+    using fixture = await createFixture();
+    await fixture.service.create(fixture.ctx, "/memories/global/stale.md", "v1\n", "agent");
+    await fixture.service.strReplace(fixture.ctx, "/memories/global/stale.md", "v1", "v2", "agent");
+    const editRow = await lastRow(fixture.sessionDir);
+
+    // A short-lived child that has already exited gives a provably dead PID
+    // (ESRCH from kill(pid, 0)); crash remnants must not block rollbacks.
+    const child = spawnSync(process.execPath, ["--version"]);
+    expect(child.pid).toBeGreaterThan(0);
+    const lockPath = path.join(fixture.sessionDir, "refinement-rollback.lock");
+    await fsPromises.writeFile(lockPath, String(child.pid), { encoding: "utf-8", flag: "wx" });
+
+    const result = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: editRow.id,
+      evidence: EVIDENCE,
+    });
+    expect(result.success).toBe(true);
+    // The reclaimed lock was released after the rollback.
+    expect(await pathExists(lockPath)).toBe(false);
   });
 
   it("serializes concurrent rollbacks of the same row: one succeeds, one rollbackOf row", async () => {
