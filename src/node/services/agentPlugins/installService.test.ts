@@ -8,7 +8,7 @@ import { Config } from "@/node/config";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import { execFileAsync } from "@/node/utils/disposableExec";
-import { AgentPluginInstallService } from "./installService";
+import { AgentPluginInstallService, withDiskQuotaWatchdog } from "./installService";
 import {
   AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
   buildAddedPluginKeyValidator,
@@ -496,6 +496,152 @@ describe("AgentPluginInstallService", () => {
       "demo-plugin",
     ]);
     expect((await stagingLeftovers()).filter((name) => name.startsWith("trash-data-"))).toEqual([]);
+  });
+
+  test("withDiskQuotaWatchdog aborts a pending git run when the staging dir outgrows the quota", async () => {
+    // The post-clone quota only rejects a tree git already materialized; the
+    // watchdog is what bounds disk DURING clone. Simulate a long transfer:
+    // the wrapped fn writes an oversized file, then only settles on abort.
+    const dir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "quota-watchdog-"));
+    try {
+      await expect(
+        withDiskQuotaWatchdog({ dir, maxBytes: 1024, pollMs: 10 }, async (signal) => {
+          await fsPromises.writeFile(path.join(dir, "pack"), "x".repeat(8192));
+          await new Promise((_resolve, reject) => {
+            signal.addEventListener("abort", () => reject(new Error("killed")), { once: true });
+          });
+        })
+      ).rejects.toThrow(/too large to install/);
+    } finally {
+      await fsPromises.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("stale staging reclamation ages trash by embedded stamp and spares owned dirs", async () => {
+    const staging = stagingDir();
+    await fsPromises.mkdir(staging, { recursive: true });
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+
+    // Freshly staged trash inherits the tree's OLD mtime via rename — the
+    // embedded stamp says it is fresh, so reclamation must keep it.
+    const freshStamped = path.join(staging, `trash-${Date.now()}-fresh`);
+    await fsPromises.mkdir(freshStamped);
+    await fsPromises.utimes(freshStamped, twoHoursAgo, twoHoursAgo);
+
+    // Crash leftover: old stamp, whatever the mtime says — reclaimed.
+    const oldStamped = path.join(staging, `trash-${twoHoursAgo.getTime()}-old`);
+    await fsPromises.mkdir(oldStamped);
+
+    const internals = service as unknown as {
+      createStagingDir: () => Promise<string>;
+      purgeStaleStaging: () => Promise<void>;
+    };
+    // An in-flight stage dir stays owned by the operation even when a slow
+    // clone pushes it past the age threshold.
+    const active = await internals.createStagingDir();
+    await fsPromises.utimes(active, twoHoursAgo, twoHoursAgo);
+
+    await internals.purgeStaleStaging();
+
+    expect(await pathExists(freshStamped)).toBe(true);
+    expect(await pathExists(oldStamped)).toBe(false);
+    expect(await pathExists(active)).toBe(true);
+  });
+
+  test("a same-name branch added later does not break a tracked tag", async () => {
+    await git(remoteDir, "tag", "dual");
+    const preview = await service.preview({ input: remoteDir, ref: "dual" });
+    expect(preview.source.refType).toBe("tag");
+    const tagSha = preview.lockedSha;
+    await service.install({ source: preview.source, expectedSha: tagSha });
+
+    // The remote later gains a BRANCH named 'dual' pointing at new content
+    // while the tag is unchanged. The stored ref kind must win the ambiguity:
+    // branch-first resolution would report the tag "became a branch" and
+    // block updates forever.
+    await writePluginFixture(remoteDir, { version: "2.0.0" });
+    const newHead = await commitAll(remoteDir, "content the branch points at");
+    await git(remoteDir, "branch", "dual");
+
+    expect(await service.checkUpdates()).toEqual([{ name: "demo-plugin", status: "up-to-date" }]);
+
+    // A genuinely moved tag still reports tag-moved (with the TAG's sha, not
+    // the same-name branch's), and the reviewed per-plugin update applies it.
+    await git(remoteDir, "tag", "-f", "dual", newHead);
+    expect(await service.checkUpdates()).toEqual([
+      { name: "demo-plugin", status: "tag-moved", remoteSha: newHead },
+    ]);
+    const updated = await service.update({ name: "demo-plugin" });
+    expect(updated.lockedSha).toBe(newHead);
+  });
+
+  test("duplicate registry names block mutations while views keep the first entry", async () => {
+    const entryFor = (url: string) => ({
+      name: "demo-plugin",
+      scope: "global",
+      source: { type: "git", url, ref: "main", refType: "branch" },
+      lockedSha: "a".repeat(40),
+      installedAt: "2026-08-01T00:00:00.000Z",
+    });
+    // Corrupted/newer-written registry: two schema-valid entries, same name,
+    // different sources. Raw rewrites match by name, so a mutation would
+    // patch BOTH from the first entry's source — refuse instead.
+    await fsPromises.writeFile(
+      registryFile(),
+      JSON.stringify({ plugins: [entryFor(remoteDir), entryFor("https://example.com/o.git")] })
+    );
+
+    await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(/duplicate entries/);
+    await expect(
+      service.uninstall({ name: "demo-plugin", deletePluginData: false })
+    ).rejects.toThrow(/duplicate entries/);
+
+    await expect(service.checkUpdates()).rejects.toThrow(/duplicate entries/);
+
+    // Views degrade gracefully: one row (first entry wins, matching find()).
+    const items = await service.list();
+    expect(items.filter((item) => item.name === "demo-plugin")).toHaveLength(1);
+  });
+
+  test("a promotion orphaned by a crash is cleaned up on section open", async () => {
+    // Simulate the post-crash state of an install that died between the
+    // promote rename and the registry write: a promoted tree with no
+    // registry entry, plus the journal install wrote before renaming.
+    const targetPath = path.join(pluginsDir(), "demo-plugin");
+    await fsPromises.mkdir(targetPath, { recursive: true });
+    await fsPromises.writeFile(
+      path.join(targetPath, "plugin.json"),
+      JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "demo-plugin", version: "1" })
+    );
+    const journalPath = path.join(stagingDir(), "promotion-demo-plugin.json");
+    await fsPromises.mkdir(stagingDir(), { recursive: true });
+    await fsPromises.writeFile(
+      journalPath,
+      JSON.stringify({ name: "demo-plugin", stagedAt: Date.now() })
+    );
+
+    // Section open reconciles: the orphan never renders (not even as
+    // unmanaged), the tree is gone, and the journal is consumed.
+    const items = await service.list();
+    expect(items.find((item) => item.name === "demo-plugin")).toBeUndefined();
+    expect(await pathExists(targetPath)).toBe(false);
+    expect(await pathExists(journalPath)).toBe(false);
+
+    // The name is fully recoverable: reinstalling succeeds (no collision).
+    const preview = await service.preview({ input: remoteDir });
+    const entry = await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    expect(entry.name).toBe("demo-plugin");
+
+    // A journal WITH a registry entry means the install committed and only
+    // the journal deletion was lost — the tree must survive.
+    await fsPromises.writeFile(
+      journalPath,
+      JSON.stringify({ name: "demo-plugin", stagedAt: Date.now() })
+    );
+    const itemsAfter = await service.list();
+    expect(itemsAfter.find((item) => item.name === "demo-plugin")?.managed).toBe(true);
+    expect(await pathExists(targetPath)).toBe(true);
+    expect(await pathExists(journalPath)).toBe(false);
   });
 
   test("checkUpdates surfaces a corrupted registry instead of a false all-clear", async () => {

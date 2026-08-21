@@ -1661,11 +1661,22 @@ export class MCPServerManager {
           // were in retryingServerNames but have no live instance). The merge
           // into the published entry happens inside the stable-clock callback
           // so no invalidation can land between the final scan and the merge.
+          let retryOwnershipLost = false;
           await this.closeInvalidatedInstancesThenPublish(
             retriedInstances,
             startupEpoch,
             workspaceId,
             (invalidatedRetryKeys) => {
+              // Recheck ownership INSIDE the synchronous callback: a
+              // removal-style stopServers (or config-change replacement)
+              // landing while the awaited invalidation scan yielded has
+              // deleted/replaced the cache entry and closed its instances —
+              // merging into the detached `existing` would leave these
+              // clients with no cache owner to ever clean them up.
+              if (this.workspaceServers.get(workspaceId) !== existing) {
+                retryOwnershipLost = true;
+                return;
+              }
               for (const [serverName, instance] of retriedInstances) {
                 existing.instances.set(serverName, instance);
               }
@@ -1682,6 +1693,30 @@ export class MCPServerManager {
               ];
             }
           );
+          if (retryOwnershipLost) {
+            for (const instance of retriedInstances.values()) {
+              try {
+                await instance.close();
+              } catch (error) {
+                log.warn("Failed to stop orphaned retried MCP server", {
+                  error,
+                  name: instance.name,
+                });
+              }
+            }
+            // Removed workspace: return empty instead of recursing, which
+            // would resurrect servers the removal just stopped. A replaced
+            // entry (config change) recomputes against the new entry.
+            if (this.workspaceServers.get(workspaceId) === undefined) {
+              return {
+                tools: {},
+                toolServerNames: {},
+                stats: this.createWorkspaceStats(enabledEntries.length, new Map(), []),
+                promptDescriptors: [],
+              };
+            }
+            return this.getToolsForWorkspace(options);
+          }
 
           const failedServerNames = [
             ...existing.stats.failedServerNames.filter(
@@ -1804,11 +1839,19 @@ export class MCPServerManager {
         // unchanged signature) restarts them on the next call. The merge into
         // the published entry happens inside the stable-clock callback so no
         // invalidation can land between the final scan and the merge.
+        let restartOwnershipLost = false;
         await this.closeInvalidatedInstancesThenPublish(
           restartedInstances,
           startupEpoch,
           workspaceId,
           (invalidatedRestartKeys) => {
+            // Same ownership recheck as the timed-out retry path: a removal
+            // or replacement landing during the awaited scan must not let
+            // this merge revive clients on a detached entry.
+            if (this.workspaceServers.get(workspaceId) !== existing) {
+              restartOwnershipLost = true;
+              return;
+            }
             restartTimedOutNames = [...restartTimedOutNames, ...invalidatedRestartKeys];
 
             for (const [serverName, instance] of restartedInstances) {
@@ -1816,6 +1859,30 @@ export class MCPServerManager {
             }
           }
         );
+        if (restartOwnershipLost) {
+          for (const instance of restartedInstances.values()) {
+            try {
+              await instance.close();
+            } catch (error) {
+              log.warn("Failed to stop orphaned restarted MCP server", {
+                error,
+                name: instance.name,
+              });
+            }
+          }
+          // Removed workspace: return empty instead of recursing, which would
+          // resurrect servers the removal just stopped. A replaced entry
+          // (config change) recomputes against the new entry.
+          if (this.workspaceServers.get(workspaceId) === undefined) {
+            return {
+              tools: {},
+              toolServerNames: {},
+              stats: this.createWorkspaceStats(enabledEntries.length, new Map(), []),
+              promptDescriptors: [],
+            };
+          }
+          return this.getToolsForWorkspace(options);
+        }
       }
 
       log.info("[MCP] Deferring MCP server restart while stream is active", {

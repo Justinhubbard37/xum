@@ -1,3 +1,4 @@
+import type { Dirent } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -85,6 +86,16 @@ const REGISTRY_FILE_NAME = "plugins.json";
 /** Preview/staging clones live here — NOT under ~/.mux/plugins, which discovery scans. */
 const STAGING_DIR_NAME = "plugin-staging";
 
+/**
+ * Journal file recording an install promotion that has renamed the staged
+ * tree into the container but not yet written its registry entry. A crash in
+ * that window would otherwise strand an orphaned tree that discovery lists as
+ * unmanaged, assertNoCollision blocks from reinstalling, and uninstall
+ * refuses (not managed) — recoverable only by manual deletion.
+ * reconcileOrphanedPromotions cleans such trees up on the next section open.
+ */
+const PROMOTION_JOURNAL_PREFIX = "promotion-";
+
 /** Staging dirs left behind by crashes are reclaimed after this age. */
 const STALE_STAGING_MAX_AGE_MS = 60 * 60 * 1000;
 
@@ -110,22 +121,116 @@ function gitEnv(): Record<string, string> {
   return env;
 }
 
-async function runGit(args: string[], opts?: { timeoutMs?: number }): Promise<string> {
-  using proc = execFileAsync("git", args, {
-    env: gitEnv(),
-    timeoutMs: opts?.timeoutMs ?? CLONE_TIMEOUT_MS,
-    // Git spawns SSH/credential-helper children that inherit its pipes; a
-    // stalled helper would otherwise keep the promise pending past the
-    // timeout because only the direct child gets killed.
-    killTreeOnTermination: true,
-    // These remotes are untrusted: a malicious or noisy repository can emit
-    // unbounded progress/sideband output, and unbounded buffering would
-    // exhaust the main process before the timeout fires. 10 MiB is far above
-    // anything the plugin-sized clones/ls-remotes here legitimately produce.
-    maxOutputBytes: 10 * 1024 * 1024,
-  });
-  const { stdout } = await proc.result;
-  return stdout;
+/**
+ * True when the aggregate file bytes under `dir` exceed `maxBytes`. Walks
+ * with early exit; entries vanishing mid-walk (git renames temp files) are
+ * skipped.
+ */
+async function directorySizeExceeds(dir: string, maxBytes: number): Promise<boolean> {
+  let bytes = 0;
+  const pending: string[] = [dir];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    assert(current !== undefined, "directorySizeExceeds: queue underflow");
+    let entries: Dirent[];
+    try {
+      entries = await fsPromises.readdir(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const entryPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        pending.push(entryPath);
+        continue;
+      }
+      if (entry.isFile()) {
+        try {
+          bytes += (await fsPromises.lstat(entryPath)).size;
+        } catch {
+          continue;
+        }
+        if (bytes > maxBytes) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Run `fn` with an AbortSignal that fires when `dir` grows past `maxBytes`
+ * while fn is pending. Bounds git DURING clone/fetch/checkout: the post-clone
+ * quota can only reject a tree git already materialized, so a huge remote
+ * would otherwise fill the disk before that check runs. Exported for tests.
+ */
+export async function withDiskQuotaWatchdog<T>(
+  quota: { dir: string; maxBytes: number; pollMs?: number },
+  fn: (signal: AbortSignal) => Promise<T>
+): Promise<T> {
+  const controller = new AbortController();
+  let exceeded = false;
+  let checking = false;
+  const interval = setInterval(() => {
+    if (checking || exceeded) {
+      return;
+    }
+    checking = true;
+    directorySizeExceeds(quota.dir, quota.maxBytes).then(
+      (over) => {
+        checking = false;
+        if (over) {
+          exceeded = true;
+          controller.abort();
+        }
+      },
+      () => {
+        checking = false;
+      }
+    );
+  }, quota.pollMs ?? 500);
+  try {
+    return await fn(controller.signal);
+  } catch (error) {
+    if (exceeded) {
+      throw new Error(
+        `The repository is too large to install as a plugin (exceeded ${Math.floor(quota.maxBytes / (1024 * 1024))} MiB during clone).`
+      );
+    }
+    throw error;
+  } finally {
+    clearInterval(interval);
+  }
+}
+
+async function runGit(
+  args: string[],
+  opts?: { timeoutMs?: number; diskQuota?: { dir: string; maxBytes: number; pollMs?: number } }
+): Promise<string> {
+  const run = async (signal?: AbortSignal): Promise<string> => {
+    using proc = execFileAsync("git", args, {
+      env: gitEnv(),
+      timeoutMs: opts?.timeoutMs ?? CLONE_TIMEOUT_MS,
+      // Git spawns SSH/credential-helper children that inherit its pipes; a
+      // stalled helper would otherwise keep the promise pending past the
+      // timeout because only the direct child gets killed.
+      killTreeOnTermination: true,
+      // These remotes are untrusted: a malicious or noisy repository can emit
+      // unbounded progress/sideband output, and unbounded buffering would
+      // exhaust the main process before the timeout fires. 10 MiB is far above
+      // anything the plugin-sized clones/ls-remotes here legitimately produce.
+      maxOutputBytes: 10 * 1024 * 1024,
+      ...(signal !== undefined ? { signal } : {}),
+    });
+    const { stdout } = await proc.result;
+    return stdout;
+  };
+  if (opts?.diskQuota !== undefined) {
+    const diskQuota = opts.diskQuota;
+    return withDiskQuotaWatchdog(diskQuota, (signal) => run(signal));
+  }
+  return run();
 }
 
 /** Max simultaneous `git ls-remote` processes during an update check. */
@@ -202,6 +307,12 @@ export class AgentPluginInstallService {
   private readonly registryFile: string;
   /** Serializes mutations (install/update/uninstall) so directory swaps and registry writes cannot interleave. */
   private mutationQueue: Promise<unknown> = Promise.resolve();
+  /**
+   * Staging paths owned by in-process operations. Stale reclamation must
+   * never reap these: a just-renamed trash dir inherits the tree's OLD
+   * mtime, so age alone can misclassify an active rollback copy as stale.
+   */
+  private readonly activeStagingPaths = new Set<string>();
 
   constructor(
     private readonly config: Config,
@@ -325,18 +436,37 @@ export class AgentPluginInstallService {
    * file. Name validation in the schema doubles as a filesystem-safety gate:
    * a traversal name like `..` must never reach targetPathFor.
    */
-  private parseRegistryEntries(rawEntries: unknown[]): AgentPluginInstallEntry[] {
+  private parseRegistryEntries(
+    rawEntries: unknown[],
+    mode: "lenient" | "strict" = "lenient"
+  ): AgentPluginInstallEntry[] {
     const entries: AgentPluginInstallEntry[] = [];
+    const seenNames = new Set<string>();
     for (const rawEntry of rawEntries) {
       const parsed = AgentPluginInstallEntrySchema.safeParse(rawEntry);
-      if (parsed.success) {
-        entries.push(parsed.data);
-      } else {
+      if (!parsed.success) {
         log.debug("Skipping unrecognized managed plugin registry entry (preserved on disk)", {
           entry: rawEntry,
           error: parsed.error.message,
         });
+        continue;
       }
+      // Duplicate names are corrupt identity: entry names map 1:1 to
+      // container directories and instance IDs, and raw rewrites match by
+      // name — a mutation would patch EVERY duplicate from the first entry's
+      // source, silently rewriting the others. Mutations (strict) refuse;
+      // views (lenient) keep the first (matching find()-based lookups).
+      if (seenNames.has(parsed.data.name)) {
+        if (mode === "strict") {
+          throw new Error(
+            `The plugin registry (${shortenHome(this.registryFile)}) contains duplicate entries for '${parsed.data.name}'. Repair the file, then retry.`
+          );
+        }
+        log.warn("Ignoring duplicate managed plugin registry entry", { name: parsed.data.name });
+        continue;
+      }
+      seenNames.add(parsed.data.name);
+      entries.push(parsed.data);
     }
     return entries;
   }
@@ -349,7 +479,7 @@ export class AgentPluginInstallService {
    */
   private async readRegistry(mode: "lenient" | "strict"): Promise<AgentPluginInstallEntry[]> {
     const { rawEntries } = await this.readRegistryDocument(mode);
-    const entries = this.parseRegistryEntries(rawEntries);
+    const entries = this.parseRegistryEntries(rawEntries, mode);
     if (mode === "strict" && entries.length !== rawEntries.length) {
       throw new Error(
         `The plugin registry (${shortenHome(this.registryFile)}) contains ${rawEntries.length - entries.length} entr${rawEntries.length - entries.length === 1 ? "y" : "ies"} this version cannot read (written by a newer version of Mux, or corrupted).`
@@ -429,7 +559,27 @@ export class AgentPluginInstallService {
   private async createStagingDir(): Promise<string> {
     await fsPromises.mkdir(this.stagingRoot, { recursive: true });
     await this.purgeStaleStaging();
-    return fsPromises.mkdtemp(path.join(this.stagingRoot, "stage-"));
+    const dir = await fsPromises.mkdtemp(path.join(this.stagingRoot, "stage-"));
+    this.activeStagingPaths.add(dir);
+    return dir;
+  }
+
+  /**
+   * Rename `sourcePath` into the staging root under in-process ownership so
+   * stale reclamation cannot reap it mid-operation. Trash names embed a
+   * Date.now() stamp because the rename preserves the tree's OLD mtime — an
+   * installed tree older than the stale threshold would otherwise be reaped
+   * as "stale" the moment it lands in staging, deleting an active rollback
+   * copy out from under uninstall/update.
+   */
+  private async renameIntoStaging(sourcePath: string, trashDir: string): Promise<void> {
+    this.activeStagingPaths.add(trashDir);
+    try {
+      await fsPromises.rename(sourcePath, trashDir);
+    } catch (error) {
+      this.activeStagingPaths.delete(trashDir);
+      throw error;
+    }
   }
 
   /** Best-effort reclaim of staging dirs orphaned by crashes. */
@@ -438,9 +588,20 @@ export class AgentPluginInstallService {
       const now = Date.now();
       for (const entry of await fsPromises.readdir(this.stagingRoot)) {
         const entryPath = path.join(this.stagingRoot, entry);
+        // Never touch paths an in-process operation still owns, or promotion
+        // journals (their lifecycle belongs to reconcileOrphanedPromotions).
+        if (this.activeStagingPaths.has(entryPath) || entry.startsWith(PROMOTION_JOURNAL_PREFIX)) {
+          continue;
+        }
         try {
-          const stat = await fsPromises.stat(entryPath);
-          if (now - stat.mtimeMs > STALE_STAGING_MAX_AGE_MS) {
+          // Trash names embed their staging time; renames preserve the
+          // tree's old mtime, which says nothing about staging age.
+          const stampMatch = /^trash(?:-data)?-(\d+)-/.exec(entry);
+          const stagedAt =
+            stampMatch !== null
+              ? Number(stampMatch[1])
+              : (await fsPromises.stat(entryPath)).mtimeMs;
+          if (now - stagedAt > STALE_STAGING_MAX_AGE_MS) {
             await fsPromises.rm(entryPath, { recursive: true, force: true });
           }
         } catch {
@@ -454,14 +615,26 @@ export class AgentPluginInstallService {
 
   private async removeDir(dirPath: string): Promise<void> {
     await fsPromises.rm(dirPath, { recursive: true, force: true });
+    this.activeStagingPaths.delete(dirPath);
   }
 
   // ---------------------------------------------------------------------
   // Git plumbing
   // ---------------------------------------------------------------------
 
-  /** Resolve what a preview/install/update should check out, via `git ls-remote` (no fetch). */
-  private async resolveRemoteRef(url: string, ref: string | undefined): Promise<ResolvedRemoteRef> {
+  /**
+   * Resolve what a preview/install/update should check out, via `git
+   * ls-remote` (no fetch). When a branch and a tag share the ref name,
+   * `preferredRefType` (a tracked entry's stored kind) wins — a remote
+   * ADDING a same-name branch must not make a still-valid tracked tag look
+   * like it changed kind. New previews without a stored kind stay
+   * branch-first.
+   */
+  private async resolveRemoteRef(
+    url: string,
+    ref: string | undefined,
+    preferredRefType?: "branch" | "tag"
+  ): Promise<ResolvedRemoteRef> {
     if (ref !== undefined && isFullCommitSha(ref)) {
       return { ref: ref.toLowerCase(), refType: "commit", sha: ref.toLowerCase() };
     }
@@ -506,12 +679,15 @@ export class AgentPluginInstallService {
       else if (refName === `refs/tags/${ref}`) tagSha = sha;
     }
 
-    if (branchSha !== undefined) {
-      return { ref, refType: "branch", sha: branchSha };
-    }
     // Annotated tags list both the tag object and the peeled commit (^{});
     // lockedSha must be the commit so it can be compared against `rev-parse HEAD`.
     const resolvedTagSha = peeledTagSha ?? tagSha;
+    if (preferredRefType === "tag" && resolvedTagSha !== undefined) {
+      return { ref, refType: "tag", sha: resolvedTagSha };
+    }
+    if (branchSha !== undefined) {
+      return { ref, refType: "branch", sha: branchSha };
+    }
     if (resolvedTagSha !== undefined) {
       return { ref, refType: "tag", sha: resolvedTagSha };
     }
@@ -526,6 +702,22 @@ export class AgentPluginInstallService {
     }
   }
 
+  private stagingQuota(): { maxBytes: number; maxFiles: number } {
+    return (
+      this.deps.stagingQuota ?? { maxBytes: STAGED_TREE_MAX_BYTES, maxFiles: STAGED_TREE_MAX_FILES }
+    );
+  }
+
+  /**
+   * During-clone disk bound for a staging dir: checkout + pack live in it, so
+   * allow twice the checkout quota. The watchdog aborts git mid-transfer —
+   * the post-clone assertStagedTreeWithinQuota can only reject a tree git
+   * already fully materialized on disk.
+   */
+  private cloneDiskQuota(dir: string): { dir: string; maxBytes: number } {
+    return { dir, maxBytes: this.stagingQuota().maxBytes * 2 };
+  }
+
   /**
    * Enforce the staged-checkout quota (bytes + file count, .git excluded,
    * symlinks not followed). Runs immediately after every staged clone so an
@@ -533,10 +725,7 @@ export class AgentPluginInstallService {
    * validation reads it.
    */
   private async assertStagedTreeWithinQuota(dir: string): Promise<void> {
-    const quota = this.deps.stagingQuota ?? {
-      maxBytes: STAGED_TREE_MAX_BYTES,
-      maxFiles: STAGED_TREE_MAX_FILES,
-    };
+    const quota = this.stagingQuota();
     let bytes = 0;
     let files = 0;
     const pending: string[] = [dir];
@@ -576,18 +765,21 @@ export class AgentPluginInstallService {
       if (resolved.refType === "commit") {
         await this.fetchExactSha(url, resolved.sha, dir);
       } else {
-        await runGit([
-          "clone",
-          "--depth",
-          "1",
-          "--single-branch",
-          "--branch",
-          resolved.ref,
-          "-c",
-          "advice.detachedHead=false",
-          url,
-          dir,
-        ]);
+        await runGit(
+          [
+            "clone",
+            "--depth",
+            "1",
+            "--single-branch",
+            "--branch",
+            resolved.ref,
+            "-c",
+            "advice.detachedHead=false",
+            url,
+            dir,
+          ],
+          { diskQuota: this.cloneDiskQuota(dir) }
+        );
       }
       const sha = (await runGit(["-C", dir, "rev-parse", "HEAD"])).trim();
       assert(isFullCommitSha(sha), "cloneResolved: rev-parse HEAD must be a full SHA");
@@ -618,18 +810,22 @@ export class AgentPluginInstallService {
         // non-empty destination, so reset the staging dir before falling back.
         await this.removeDir(dir);
         await fsPromises.mkdir(dir, { recursive: true });
-        await runGit([
-          "clone",
-          "--depth",
-          "1",
-          "--single-branch",
-          "--branch",
-          source.ref,
-          "-c",
-          "advice.detachedHead=false",
-          source.url,
-          dir,
-        ]);
+        this.activeStagingPaths.add(dir);
+        await runGit(
+          [
+            "clone",
+            "--depth",
+            "1",
+            "--single-branch",
+            "--branch",
+            source.ref,
+            "-c",
+            "advice.detachedHead=false",
+            source.url,
+            dir,
+          ],
+          { diskQuota: this.cloneDiskQuota(dir) }
+        );
       }
       const head = (await runGit(["-C", dir, "rev-parse", "HEAD"])).trim();
       if (head !== sha) {
@@ -646,18 +842,14 @@ export class AgentPluginInstallService {
   }
 
   private async fetchExactSha(url: string, sha: string, dir: string): Promise<void> {
+    const diskQuota = this.cloneDiskQuota(dir);
     await runGit(["init", "--quiet", dir]);
     await runGit(["-C", dir, "remote", "add", "origin", url]);
-    await runGit(["-C", dir, "fetch", "--depth", "1", "origin", sha]);
-    await runGit([
-      "-C",
-      dir,
-      "-c",
-      "advice.detachedHead=false",
-      "checkout",
-      "--quiet",
-      "FETCH_HEAD",
-    ]);
+    await runGit(["-C", dir, "fetch", "--depth", "1", "origin", sha], { diskQuota });
+    await runGit(
+      ["-C", dir, "-c", "advice.detachedHead=false", "checkout", "--quiet", "FETCH_HEAD"],
+      { diskQuota }
+    );
   }
 
   // ---------------------------------------------------------------------
@@ -1110,6 +1302,14 @@ export class AgentPluginInstallService {
         // .git dir would only invite in-place edits that updates discard.
         await this.removeDir(path.join(stagedDir, ".git"));
 
+        // Journal the promotion BEFORE the rename: a process crash between
+        // the rename and the registry write would otherwise strand a tree
+        // that discovery lists as unmanaged, assertNoCollision blocks, and
+        // uninstall refuses — reconcileOrphanedPromotions uses this record
+        // to clean it up on the next section open.
+        const journalPath = this.promotionJournalPath(name);
+        await fsPromises.writeFile(journalPath, JSON.stringify({ name, stagedAt: Date.now() }));
+
         await fsPromises.mkdir(this.containerDir, { recursive: true });
         await fsPromises.rename(stagedDir, targetPath);
 
@@ -1171,7 +1371,7 @@ export class AgentPluginInstallService {
             } catch {
               const quarantineDir = path.join(this.stagingRoot, `trash-${Date.now()}-${name}`);
               try {
-                await fsPromises.rename(targetPath, quarantineDir);
+                await this.renameIntoStaging(targetPath, quarantineDir);
                 await this.removeDir(quarantineDir).catch(() => undefined);
               } catch (cleanupError) {
                 cleanupNotes.push(
@@ -1184,6 +1384,10 @@ export class AgentPluginInstallService {
           throw new Error(
             `Failed to persist the plugin registry: ${getErrorMessage(error)}${notes}`
           );
+        } finally {
+          // Registry write settled (entry recorded, or the rollback above
+          // handled the tree): the journal's crash-recovery job is done.
+          await fsPromises.rm(journalPath, { force: true }).catch(() => undefined);
         }
         log.info(`Installed agent plugin '${name}' at ${args.expectedSha.slice(0, 12)}`);
         return entry;
@@ -1193,9 +1397,83 @@ export class AgentPluginInstallService {
     });
   }
 
+  private promotionJournalPath(name: string): string {
+    // Names are grammar-validated (no separators/traversal), so this join is safe.
+    return path.join(this.stagingRoot, `${PROMOTION_JOURNAL_PREFIX}${name}.json`);
+  }
+
+  /**
+   * Crash recovery for installs that died between the promote rename and the
+   * registry write: the journal proves WE created the container tree from a
+   * staged clone (it is not user-authored work), so it is safe to clear.
+   * Without this, the orphan is listed as unmanaged, blocks reinstalling the
+   * same name, and cannot be uninstalled (not managed). Runs on section open
+   * under the mutation queue so it cannot interleave with a live install.
+   */
+  private async reconcileOrphanedPromotions(): Promise<void> {
+    let journalNames: string[];
+    try {
+      journalNames = (await fsPromises.readdir(this.stagingRoot)).filter(
+        (entry) => entry.startsWith(PROMOTION_JOURNAL_PREFIX) && entry.endsWith(".json")
+      );
+    } catch {
+      return; // No staging root: nothing was ever promoted.
+    }
+    if (journalNames.length === 0) {
+      return;
+    }
+    await this.runExclusive(async () => {
+      const registryNames = new Set(
+        (await this.readRegistryDocument("lenient")).rawEntries
+          .map((rawEntry) => this.rawEntryName(rawEntry))
+          .filter((name): name is string => name !== undefined)
+      );
+      for (const journalName of journalNames) {
+        const journalPath = path.join(this.stagingRoot, journalName);
+        const name = journalName.slice(PROMOTION_JOURNAL_PREFIX.length, -".json".length);
+        if (!isValidAgentPluginName(name)) {
+          await fsPromises.rm(journalPath, { force: true }).catch(() => undefined);
+          continue;
+        }
+        const targetPath = this.targetPathFor(name);
+        // Only an ORPHAN (tree without registry entry) needs cleanup; a
+        // registry entry means the install committed and only the journal
+        // deletion was lost.
+        if (!registryNames.has(name) && (await pathExists(targetPath))) {
+          log.warn("Cleaning up plugin promotion orphaned by a crash", { name });
+          await this.deps.mcpServerManager?.stopServersWithKeyPrefix(
+            buildPluginServerKey(this.instanceIdFor(name), "")
+          );
+          const quarantineDir = path.join(this.stagingRoot, `trash-${Date.now()}-${name}`);
+          try {
+            await this.renameIntoStaging(targetPath, quarantineDir);
+            await this.removeDir(quarantineDir).catch(() => undefined);
+          } catch (error) {
+            // Keep the journal so the next section open retries.
+            log.warn("Failed to clean up orphaned plugin promotion", {
+              name,
+              error: getErrorMessage(error),
+            });
+            continue;
+          }
+        }
+        await fsPromises.rm(journalPath, { force: true }).catch(() => undefined);
+      }
+    });
+  }
+
   /** Managed registry entries merged with unmanaged plugins found by global discovery. */
   async list(): Promise<AgentPluginListItem[]> {
     this.assertEnabled();
+
+    // Section open is the natural recovery moment: clear promotions orphaned
+    // by a crash between promote and registry write BEFORE discovery scans
+    // the container, so the orphan never renders as an unmanaged row.
+    await this.reconcileOrphanedPromotions().catch((error: unknown) => {
+      log.warn("Failed to reconcile orphaned plugin promotions", {
+        error: getErrorMessage(error),
+      });
+    });
 
     // Section open is the natural retry moment for override-prune tombstones
     // left by uninstalls whose workspaces were temporarily unreachable.
@@ -1299,7 +1577,7 @@ export class AgentPluginInstallService {
 
     return this.runExclusive(async () => {
       const { envelope, rawEntries: rawRegistry } = await this.readRegistryDocument("strict");
-      const registry = this.parseRegistryEntries(rawRegistry);
+      const registry = this.parseRegistryEntries(rawRegistry, "strict");
       const entry = registry.find((e) => e.name === args.name);
       if (!entry) {
         throw new Error(`'${args.name}' is not a managed plugin install.`);
@@ -1339,7 +1617,7 @@ export class AgentPluginInstallService {
       const trashDir = path.join(this.stagingRoot, `trash-${Date.now()}-${entry.name}`);
       let stagedTree = false;
       try {
-        await fsPromises.rename(targetPath, trashDir);
+        await this.renameIntoStaging(targetPath, trashDir);
         stagedTree = true;
       } catch (error) {
         if (!hasErrorCode(error, "ENOENT")) {
@@ -1352,12 +1630,15 @@ export class AgentPluginInstallService {
         if (!stagedTree) {
           return;
         }
-        await fsPromises.rename(trashDir, targetPath).catch((rollbackError: unknown) => {
-          log.error(`Failed to restore plugin dir after ${context}`, {
-            targetPath,
-            rollbackError,
-          });
-        });
+        await fsPromises.rename(trashDir, targetPath).then(
+          () => this.activeStagingPaths.delete(trashDir),
+          (rollbackError: unknown) => {
+            log.error(`Failed to restore plugin dir after ${context}`, {
+              targetPath,
+              rollbackError,
+            });
+          }
+        );
       };
 
       const dataPath = getPluginDataPath(this.config.rootDir, instanceId);
@@ -1365,7 +1646,7 @@ export class AgentPluginInstallService {
       let stagedData = false;
       if (args.deletePluginData) {
         try {
-          await fsPromises.rename(dataPath, dataTrashDir);
+          await this.renameIntoStaging(dataPath, dataTrashDir);
           stagedData = true;
         } catch (error) {
           if (!hasErrorCode(error, "ENOENT")) {
@@ -1424,12 +1705,15 @@ export class AgentPluginInstallService {
           if (await pathExists(dataPath)) {
             await this.removeDir(dataPath).catch(() => undefined);
           }
-          await fsPromises.rename(dataTrashDir, dataPath).catch((rollbackError: unknown) => {
-            log.error("Failed to restore plugin data after failed registry write", {
-              dataPath,
-              rollbackError,
-            });
-          });
+          await fsPromises.rename(dataTrashDir, dataPath).then(
+            () => this.activeStagingPaths.delete(dataTrashDir),
+            (rollbackError: unknown) => {
+              log.error("Failed to restore plugin data after failed registry write", {
+                dataPath,
+                rollbackError,
+              });
+            }
+          );
         }
         throw new Error(`Failed to persist the plugin registry: ${getErrorMessage(error)}`);
       }
@@ -1835,7 +2119,13 @@ export class AgentPluginInstallService {
           return { name: entry.name, status: "pinned" };
         }
         try {
-          const resolved = await this.resolveRemoteRef(entry.source.url, entry.source.ref);
+          // Pass the stored kind: a remote ADDING a same-name branch must
+          // not make a still-tracked tag read as "now a branch".
+          const resolved = await this.resolveRemoteRef(
+            entry.source.url,
+            entry.source.ref,
+            entry.source.refType
+          );
           if (resolved.refType !== entry.source.refType) {
             // e.g. a tracked branch was deleted and a tag with the same name exists now.
             return {
@@ -1871,7 +2161,7 @@ export class AgentPluginInstallService {
 
     return this.runExclusive(async () => {
       const { envelope, rawEntries: rawRegistry } = await this.readRegistryDocument("strict");
-      const registry = this.parseRegistryEntries(rawRegistry);
+      const registry = this.parseRegistryEntries(rawRegistry, "strict");
       const entry = registry.find((e) => e.name === args.name);
       if (!entry) {
         throw new Error(`'${args.name}' is not a managed plugin install.`);
@@ -1882,7 +2172,11 @@ export class AgentPluginInstallService {
         );
       }
 
-      const resolved = await this.resolveRemoteRef(entry.source.url, entry.source.ref);
+      const resolved = await this.resolveRemoteRef(
+        entry.source.url,
+        entry.source.ref,
+        entry.source.refType
+      );
       if (resolved.refType !== entry.source.refType) {
         // The ref name now resolves to a different kind on the remote (e.g. a
         // tracked branch was deleted and a tag of the same name exists). The
@@ -1930,7 +2224,7 @@ export class AgentPluginInstallService {
         await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
 
         if (hadOldTree) {
-          await fsPromises.rename(targetPath, trashDir);
+          await this.renameIntoStaging(targetPath, trashDir);
         }
         try {
           await fsPromises.mkdir(this.containerDir, { recursive: true });
@@ -1938,12 +2232,15 @@ export class AgentPluginInstallService {
         } catch (error) {
           if (hadOldTree) {
             // Roll the old tree back so a failed swap never leaves the plugin missing.
-            await fsPromises.rename(trashDir, targetPath).catch((rollbackError: unknown) => {
-              log.error("Failed to roll back plugin dir after failed update swap", {
-                targetPath,
-                rollbackError,
-              });
-            });
+            await fsPromises.rename(trashDir, targetPath).then(
+              () => this.activeStagingPaths.delete(trashDir),
+              (rollbackError: unknown) => {
+                log.error("Failed to roll back plugin dir after failed update swap", {
+                  targetPath,
+                  rollbackError,
+                });
+              }
+            );
           }
           throw error;
         }

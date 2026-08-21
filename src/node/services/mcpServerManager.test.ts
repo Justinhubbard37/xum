@@ -307,6 +307,57 @@ describe("MCPServerManager", () => {
     expect(access.workspaceServers.has(workspaceId)).toBe(false);
   });
 
+  test("workspace removal landing during a timed-out retry never merges into the detached entry", async () => {
+    const workspaceId = "ws-retry-removal-race";
+    const pluginKey = "plugin:abc123:echo";
+    configService.listServers.mockImplementation(() =>
+      Promise.resolve({ [pluginKey]: stdioConfig("node server.js") })
+    );
+
+    // First call: the server times out, so the cached entry carries a retry
+    // marker and no live instance.
+    access.startServers = () =>
+      Promise.resolve({
+        instances: new Map(),
+        failedServerNames: [],
+        timedOutServerNames: [pluginKey],
+      });
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(access.workspaceServers.has(workspaceId)).toBe(true);
+
+    // Second call retries the timed-out server. The one-shot iterator hook
+    // queues a removal-style stopServers(workspaceId) during the retry's
+    // invalidation scan: it deletes the cache entry, so the merge callback
+    // must NOT attach these clients to the detached entry (they would have
+    // no owner to ever clean them up).
+    const close = mock(() => Promise.resolve(undefined));
+    let stopPromise: Promise<void> | undefined;
+    const retried = new Map<string, unknown>([[pluginKey, testInstance(pluginKey, { close })]]);
+    let armed = true;
+    const originalIterator = retried[Symbol.iterator].bind(retried);
+    retried[Symbol.iterator] = () => {
+      if (armed) {
+        armed = false;
+        queueMicrotask(() => {
+          stopPromise = manager.stopServers(workspaceId);
+        });
+      }
+      return originalIterator();
+    };
+    access.startServers = () =>
+      Promise.resolve({ instances: retried, failedServerNames: [], timedOutServerNames: [] });
+
+    const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(stopPromise).toBeDefined();
+    await stopPromise;
+
+    // The retried client was closed, nothing was merged into the detached
+    // entry, and the removed workspace stays uncached.
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(Object.keys(result.tools)).toEqual([]);
+    expect(access.workspaceServers.has(workspaceId)).toBe(false);
+  });
+
   test("stopServersWithKeyPrefix closes only matching instances and retries them on next use", async () => {
     const workspaceId = "ws-selective-stop";
     const pluginKey = "plugin:abc123:echo";
