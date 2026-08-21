@@ -111,6 +111,36 @@ export interface OffloadedValueRecord {
 }
 
 /**
+ * Model-visible replacement for a return value that could NOT be retained in
+ * the kernel (over the retention cap, or its persistence failed). Unlike
+ * OffloadedValueRecord there is deliberately no handle: promising kernel
+ * state that does not durably exist would send the model chasing a missing
+ * value. The full value is gone; the bounded preview is all that remains.
+ */
+export interface TruncatedValueRecord {
+  truncated: true;
+  /** Bounded head/tail excerpt of the serialized value. */
+  preview: string;
+  /** Full serialized size in bytes. */
+  size: number;
+  /** Why the value was truncated and how to proceed. */
+  note: string;
+}
+
+/** Build the model-visible record for a value the kernel could not retain. */
+function buildTruncatedRecord(preview: string, size: number): TruncatedValueRecord {
+  return {
+    truncated: true,
+    preview,
+    size,
+    note:
+      `Return value (${size} bytes) exceeded the kernel retention budget and was NOT stored — ` +
+      `only this preview remains. Re-derive the data in a follow-up call, returning a smaller ` +
+      `slice or aggregate (keep working data in vars).`,
+  };
+}
+
+/**
  * Offload one oversized value to the persistent kernel. Returns the
  * model-visible replacement record, or null when the value is sub-threshold
  * or could not be offloaded (in which case it must stay inline).
@@ -118,7 +148,7 @@ export interface OffloadedValueRecord {
 async function offloadValue(
   mount: SandboxMount,
   value: unknown
-): Promise<OffloadedValueRecord | null> {
+): Promise<OffloadedValueRecord | TruncatedValueRecord | null> {
   let serialized: string | undefined;
   try {
     serialized = JSON.stringify(value);
@@ -134,14 +164,15 @@ async function offloadValue(
   // retention pass would protect the fresh handle while it single-handedly
   // exceeds the vars snapshot budget, the snapshot would be rejected, and the
   // mount disposed — the next call would restore a snapshot WITHOUT the
-  // handle the record promised. Keep the value inline instead (bounded by the
-  // provider's own context limits) so the model never chases a missing handle.
+  // handle the record promised. Nor may the value stay inline: a 64MB-sandbox
+  // value would defeat kernel context isolation and can exceed the provider
+  // context on the next request. Truncate to a bounded preview instead.
   if (size > RESULT_HANDLE_VARS_CAP_BYTES) {
     log.warn(
-      "code_execution: return value exceeds the vars retention cap; keeping it inline instead of advertising a handle",
+      "code_execution: return value exceeds the vars retention cap; truncating to a bounded preview",
       { size }
     );
-    return null;
+    return buildTruncatedRecord(buildHandlePreview(serialized, size), size);
   }
 
   // Store in vars FIRST: if the guest assignment fails, the model record must
@@ -184,6 +215,11 @@ async function offloadOversizedReturnValue(
   if (result.result !== undefined) {
     const offloaded = await offloadValue(mount, result.result);
     if (offloaded !== null) {
+      if ("truncated" in offloaded) {
+        // Over the retention cap: bounded preview only, no kernel state.
+        result.result = offloaded;
+        return null;
+      }
       result.result = {
         ...offloaded,
         hint: `Return value exceeded the inline limit; the full value is stored in the kernel — access or slice ${offloaded.handle} in a follow-up code_execution call.`,
@@ -571,8 +607,9 @@ ${xumTypes}
           // RLM return-value offloading BEFORE the vars snapshot below, so the
           // handle vars land in the same durable snapshot the model's
           // {handle, preview, size} record relies on.
+          let returnHandleKey: string | null = null;
           if (mount?.lifetime === "persistent" && mount.grants.vars) {
-            const returnHandleKey = await offloadOversizedReturnValue(mount, result);
+            returnHandleKey = await offloadOversizedReturnValue(mount, result);
 
             // r12: loads count toward the r4 vars retention cap — register
             // this call's loaded keys and evict oldest managed entries
@@ -623,6 +660,21 @@ ${xumTypes}
                   args: [`[kernel] ${persistError.message}`],
                   timestamp: Date.now(),
                 });
+                // A handle advertised THIS call did not survive (the mount is
+                // being disposed and the next call restores the previous
+                // durable snapshot — e.g. pre-existing unmanaged vars alone
+                // exceed the budget, which retention cannot evict). Rewrite
+                // the result so the model is never promised missing state.
+                const advertised = result.result as Partial<OffloadedValueRecord> | undefined;
+                if (
+                  returnHandleKey !== null &&
+                  advertised !== undefined &&
+                  typeof advertised.handle === "string" &&
+                  typeof advertised.preview === "string" &&
+                  typeof advertised.size === "number"
+                ) {
+                  result.result = buildTruncatedRecord(advertised.preview, advertised.size);
+                }
               }
               mount.dispose();
             }

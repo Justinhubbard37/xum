@@ -1858,6 +1858,56 @@ describe("CompactionHandler", () => {
       expect(metadata?.preservedTailMessageCount).toBe(2);
     });
 
+    it("rewrites MCP snapshot invoking IDs to the copy IDs of LATER tail rows", async () => {
+      // MCP snapshot rows precede the user row they expand, so the invoking
+      // row's copy ID must be preassigned before any copy is built — a
+      // forward single-pass map would preserve the archived original ID and
+      // request-time orphan filtering would drop the snapshot.
+      handler = new CompactionHandler({
+        workspaceId,
+        historyService,
+        sessionDir,
+        telemetryService,
+        emitter: mockEmitter,
+      });
+
+      const snapshotRow = createMuxMessage("mcp-snap-1", "user", "prompt body", {
+        synthetic: true,
+        mcpPromptSnapshot: {
+          serverName: "srv",
+          promptName: "p",
+          commandKey: "srv:p",
+          invokingMessageId: "u1",
+        },
+      });
+      await seedHistory(
+        createMuxMessage("u0", "user", "old head question"),
+        createMuxMessage("a0", "assistant", "old head answer"),
+        snapshotRow,
+        createMuxMessage("u1", "user", "/mcp srv p"),
+        createMuxMessage("a1", "assistant", "prompt answer"),
+        // Tail starts at the snapshot row (seq 2).
+        createStampedCompactionRequest("compact-req", 2)
+      );
+
+      const handled = await handler.handleCompletion(createStreamEndEvent("Summary"));
+      expect(handled).toBe(true);
+
+      const epochResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!epochResult.success) throw new Error(epochResult.error);
+      const epoch = epochResult.data;
+
+      // [boundary, copy(snapshot), copy(u1), copy(a1)]
+      expect(epoch).toHaveLength(4);
+      const snapshotCopy = epoch[1];
+      const invokingCopy = epoch[2];
+      expect(snapshotCopy.metadata?.mcpPromptSnapshot).toBeDefined();
+      // The pairing must point at the invoking row's COPY, not the archived
+      // original — this is the forward-reference the preassignment fixes.
+      expect(snapshotCopy.metadata?.mcpPromptSnapshot?.invokingMessageId).toBe(invokingCopy.id);
+      expect(invokingCopy.id.startsWith("rlm-tail-")).toBe(true);
+    });
+
     it("keeps default whole-epoch behavior for unstamped requests (RLM off)", async () => {
       const onCompactionComplete = mock((_metadata: CompactionCompletionMetadata) => undefined);
       handler = new CompactionHandler({

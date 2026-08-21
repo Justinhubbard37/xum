@@ -19,6 +19,7 @@ import { SandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { createKernelFileLoader } from "@/node/services/tools/kernelFileLoad";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { RESULT_HANDLE_VARS_CAP_BYTES, VARS_SNAPSHOT_MAX_BYTES } from "@/constants/resultHandles";
 import * as fs from "node:fs/promises";
 import * as nodePath from "node:path";
 
@@ -1024,6 +1025,82 @@ describe("createCodeExecutionTool", () => {
       const fetchRecord = result.toolCalls.find((r) => r.toolName === "big_fetch");
       expect(fetchRecord!.args).toEqual({});
       await host.disposeScope("ws-args-bound");
+    });
+
+    it("truncates over-cap return values to a bounded preview (no handle, no inline value)", async () => {
+      // A value over the retention cap can be neither a handle (retention
+      // would protect it while it blows the snapshot budget) nor inline (it
+      // would defeat context isolation and can exceed the provider context).
+      using tmp = new DisposableTempDir("code-exec-offload");
+      const host = new SandboxHostService();
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge({}),
+        undefined,
+        persistentRunner(host, "ws-overcap", tmp.path)
+      );
+
+      const overCap = RESULT_HANDLE_VARS_CAP_BYTES + 1024;
+      const result = (await tool.execute!(
+        { code: `return "x".repeat(${overCap});` },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+
+      const record = result.result as {
+        truncated?: boolean;
+        handle?: string;
+        preview?: string;
+        size?: number;
+      };
+      expect(record.truncated).toBe(true);
+      expect(record.handle).toBeUndefined();
+      expect(record.size).toBeGreaterThan(overCap);
+      // Bounded: the preview must be a tiny fraction of the value.
+      expect(record.preview!.length).toBeLessThan(4096);
+      await host.disposeScope("ws-overcap");
+    });
+
+    it("rewrites an advertised handle to a truncated record when the snapshot budget rejects it", async () => {
+      // Pre-existing unmanaged guest vars can push the FULL snapshot over
+      // budget even when the new handle itself is under the retention cap;
+      // retention cannot evict unmanaged vars, the persist fails, and the
+      // mount is disposed — the promised handle would not survive to the next
+      // call, so the model must never see it.
+      using tmp = new DisposableTempDir("code-exec-offload");
+      const host = new SandboxHostService();
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge({}),
+        undefined,
+        persistentRunner(host, "ws-budget-rewrite", tmp.path)
+      );
+
+      // Call 1: fill unmanaged vars close to the snapshot budget (durable).
+      const bigBytes = VARS_SNAPSHOT_MAX_BYTES - 128 * 1024;
+      const first = (await tool.execute!(
+        { code: `vars.big = "x".repeat(${bigBytes}); return true;` },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(first.success).toBe(true);
+
+      // Call 2: a handle-eligible return (>16KB, under the retention cap)
+      // pushes the snapshot over budget.
+      const second = (await tool.execute!(
+        { code: `return "y".repeat(${256 * 1024});` },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(second.success).toBe(true);
+
+      const record = second.result as { truncated?: boolean; handle?: string };
+      expect(record.truncated).toBe(true);
+      expect(record.handle).toBeUndefined();
+      // The model is told why via the kernel console notice.
+      const notice = second.consoleOutput.find(
+        (entry) => typeof entry.args[0] === "string" && entry.args[0].startsWith("[kernel]")
+      );
+      expect(notice).toBeDefined();
+      await host.disposeScope("ws-budget-rewrite");
     });
 
     it("handle vars survive a simulated restart: a later eval after remount can slice vars.__hN", async () => {

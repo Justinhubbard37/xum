@@ -1307,7 +1307,15 @@ export class CompactionHandler {
     }
 
     let appended = 0;
+    // Preassign copy IDs for ALL tail rows before building any copy: MCP
+    // snapshot rows precede the user row they expand, so a build-time map
+    // would not yet contain the invoking row's copy ID when the snapshot row
+    // is copied — the preserved original ID would then be dropped as an
+    // orphan by request-time filtering (filterOrphanedMcpPromptSnapshots).
     const idMap = new Map<string, string>();
+    for (const row of tailRows) {
+      idMap.set(row.id, createPreservedTailCopyMessageId());
+    }
     for (const row of tailRows) {
       const copy = this.buildPreservedTailCopy(row, idMap);
       const appendResult = await this.historyService.appendToHistory(this.workspaceId, copy);
@@ -1337,8 +1345,10 @@ export class CompactionHandler {
    * aggregation from collapsing a hidden copy over its visible original.
    */
   private buildPreservedTailCopy(row: MuxMessage, idMap: Map<string, string>): MuxMessage {
-    const copyId = createPreservedTailCopyMessageId();
-    idMap.set(row.id, copyId);
+    // IDs are preassigned for the whole tail (see caller) so forward-pointing
+    // references (snapshot row → later invoking user row) rewrite correctly.
+    const copyId = idMap.get(row.id);
+    assert(copyId !== undefined, "buildPreservedTailCopy: row is missing a preassigned copy ID");
 
     const source = row.metadata;
     // MCP prompt snapshots pair with their invoking user row by message ID;
