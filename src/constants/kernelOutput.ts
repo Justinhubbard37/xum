@@ -13,6 +13,21 @@
 export const KERNEL_CONSOLE_CAP_BYTES = 16 * 1024;
 
 /**
+ * Capture-time retention budget for console records inside QuickJSRuntime —
+ * applies to EVERY eval (kernel, classic PTC, workflows), not just kernel
+ * mode: the guest pushes dumped console args into a host-side array as it
+ * runs, so without a capture bound a `console.log` loop over large values
+ * retains O(guest output) host memory for the whole eval timeout and can
+ * exhaust the process before any post-eval cap runs (the QuickJS heap limit
+ * does not bound host-side retention). 64x the model-visible kernel cap:
+ * generous slack so the post-eval cap keeps exact byte-level semantics for
+ * everything it can ever surface, and far above any legitimate console use
+ * in the non-kernel paths (which previously had no bound at all), while
+ * keeping per-eval host retention trivially bounded.
+ */
+export const CONSOLE_CAPTURE_BUDGET_BYTES = 64 * KERNEL_CONSOLE_CAP_BYTES;
+
+/**
  * Cap on the serialized args echoed in one compact kernel call record.
  * Without it, passing kernel data to a nested tool (e.g.
  * `xum.file_write({content: vars.large})`) would echo the entire value back

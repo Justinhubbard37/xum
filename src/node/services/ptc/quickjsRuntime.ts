@@ -14,6 +14,16 @@ import { QuickJSAsyncFFI } from "@jitl/quickjs-wasmfile-release-asyncify/ffi";
 import crypto from "crypto";
 import type { IJSRuntime, IJSRuntimeFactory, KernelRecordBounds, RuntimeLimits } from "./runtime";
 import type { PTCEvent, PTCExecutionResult, PTCToolCallRecord, PTCConsoleRecord } from "./types";
+import { CONSOLE_CAPTURE_BUDGET_BYTES } from "@/constants/kernelOutput";
+
+/** Capture-time console retention accounting for one eval (see setupConsole). */
+interface ConsoleCaptureBudget {
+  retainedBytes: number;
+  droppedRecords: number;
+  /** The truncation record installed when the budget tripped; its text is
+   * updated in place as later drops accumulate. Null while under budget. */
+  marker: PTCConsoleRecord | null;
+}
 import { UNAVAILABLE_IDENTIFIERS } from "./staticAnalysis";
 
 // Default limits
@@ -215,6 +225,9 @@ export class QuickJSRuntime implements IJSRuntime {
   // Execution state (reset per eval)
   private toolCalls: PTCToolCallRecord[] = [];
   private consoleOutput: PTCConsoleRecord[] = [];
+  /** Per-eval console capture budgets, keyed by the attribution's console
+   * array (see consoleBudgetFor); WeakMap so budgets die with their eval. */
+  private readonly consoleBudgets = new WeakMap<PTCConsoleRecord[], ConsoleCaptureBudget>();
 
   // In-flight async-capability promises (registerPromiseFunction). eval()'s
   // resolve loop awaits these when the returned value is still pending, so a
@@ -1137,19 +1150,69 @@ export class QuickJSRuntime implements IJSRuntime {
   }
 
   /**
-   * Set up console.log/warn/error to capture output.
+   * Set up console.log/warn/error to capture output, bounded at CAPTURE time
+   * (r15): every dumped record used to be retained host-side as the guest
+   * ran, so a `console.log` loop over large values could exhaust process
+   * memory over the eval timeout before any post-eval cap executed — the
+   * QuickJS heap limit does not bound host-side retention. Each attribution
+   * array gets a byte budget; once exhausted, further records are neither
+   * dumped nor retained nor streamed (a single mutable marker record counts
+   * the drops), so retained memory is O(budget), not O(guest output).
    */
   private setupConsole(): void {
     const consoleObj = this.ctx.newObject();
 
     for (const level of ["log", "warn", "error"] as const) {
       const fn = this.ctx.newFunction(level, (...argHandles) => {
-        const args: unknown[] = argHandles.map((h) => this.ctx.dump(h) as unknown);
         const timestamp = Date.now();
-
         // Route to the eval that registered the enclosing reaction (falls
         // back to the current drain context for untagged code).
         const attribution = this.currentAttribution();
+        const budget = this.consoleBudgetFor(attribution.consoleOutput);
+
+        if (budget.marker !== null) {
+          // Budget exhausted: do NOT dump the handles (dumping materializes
+          // the values host-side — the very retention being bounded). Count
+          // the drop and keep the marker's text accurate in place.
+          budget.droppedRecords += 1;
+          budget.marker.args[0] =
+            `[console output truncated at capture: ${CONSOLE_CAPTURE_BUDGET_BYTES}-byte ` +
+            `retention budget reached; ${budget.droppedRecords} record(s) dropped]`;
+          return;
+        }
+
+        const args: unknown[] = argHandles.map((h) => this.ctx.dump(h) as unknown);
+        // Same measurement as the post-eval kernel cap: the JSON serialization
+        // of the args (unserializable → 0, matching that cap's fallback; such
+        // values come from guest cycles and are rare enough not to matter for
+        // a memory bound).
+        let size = 0;
+        try {
+          size = Buffer.byteLength(JSON.stringify(args) ?? "", "utf8");
+        } catch {
+          size = 0;
+        }
+
+        if (budget.retainedBytes + size > CONSOLE_CAPTURE_BUDGET_BYTES) {
+          // Crossing record: drop it whole and install the marker. No
+          // bounded-head slice here — the post-eval kernel cap already does
+          // head-slicing at its (much smaller) model-visible cap, and capture
+          // only needs the memory bound.
+          const marker: PTCConsoleRecord = {
+            level: "warn",
+            args: [
+              `[console output truncated at capture: ${CONSOLE_CAPTURE_BUDGET_BYTES}-byte ` +
+                `retention budget reached; 1 record(s) dropped]`,
+            ],
+            timestamp,
+          };
+          budget.marker = marker;
+          budget.droppedRecords = 1;
+          attribution.consoleOutput.push(marker);
+          return;
+        }
+
+        budget.retainedBytes += size;
         attribution.consoleOutput.push({ level, args, timestamp });
         attribution.eventHandler?.({
           type: "console",
@@ -1164,6 +1227,18 @@ export class QuickJSRuntime implements IJSRuntime {
 
     this.ctx.setProp(this.ctx.global, "console", consoleObj);
     consoleObj.dispose();
+  }
+
+  /** Get-or-create the capture budget for one attribution's console array.
+   * Keyed by the array itself: each eval creates a fresh array, and late
+   * fire-and-forget continuations share their originating eval's budget. */
+  private consoleBudgetFor(consoleOutput: PTCConsoleRecord[]): ConsoleCaptureBudget {
+    let budget = this.consoleBudgets.get(consoleOutput);
+    if (!budget) {
+      budget = { retainedBytes: 0, droppedRecords: 0, marker: null };
+      this.consoleBudgets.set(consoleOutput, budget);
+    }
+    return budget;
   }
 
   /** Install the promise-reaction tagging patch; see REACTION_TAGGING_SCRIPT. */

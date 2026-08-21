@@ -1,4 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach } from "bun:test";
+import { CONSOLE_CAPTURE_BUDGET_BYTES } from "@/constants/kernelOutput";
 import { QuickJSRuntime, QuickJSRuntimeFactory } from "./quickjsRuntime";
 import type { PTCEvent } from "./types";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
@@ -256,6 +257,53 @@ describe("QuickJSRuntime", () => {
       expect(result.consoleOutput[0].level).toBe("log");
       expect(result.consoleOutput[1].level).toBe("warn");
       expect(result.consoleOutput[2].level).toBe("error");
+    });
+
+    it("bounds retained console output at capture time (host memory O(budget), not O(output))", async () => {
+      // r15: a guest loop console.log-ing large values for the whole timeout
+      // used to retain EVERY dumped record host-side before any post-eval cap
+      // ran, so a prompt-influenced program could exhaust process memory.
+      // ~30MB of guest output; retention must stay bounded by the budget.
+      const result = await runtime.eval(`
+        for (let i = 0; i < 300; i++) { console.log("x".repeat(100000)); }
+        return "done";
+      `);
+      expect(result.success).toBe(true);
+      expect(result.result).toBe("done");
+
+      let retainedBytes = 0;
+      for (const record of result.consoleOutput) {
+        retainedBytes += Buffer.byteLength(JSON.stringify(record.args) ?? "", "utf8");
+      }
+      // Budget + small slack for the marker record itself.
+      expect(retainedBytes).toBeLessThanOrEqual(CONSOLE_CAPTURE_BUDGET_BYTES + 4096);
+      expect(result.consoleOutput.length).toBeLessThan(300);
+
+      // The drop is explicit, never silent: the final record is a marker
+      // carrying an accurate dropped-record count.
+      const marker = result.consoleOutput[result.consoleOutput.length - 1];
+      expect(marker.level).toBe("warn");
+      expect(String(marker.args[0])).toContain("console output truncated at capture");
+      expect(String(marker.args[0])).toMatch(/2\d\d record\(s\) dropped/);
+    });
+
+    it("events for dropped console records are not emitted (bounded capture, bounded stream)", async () => {
+      const events: PTCEvent[] = [];
+      runtime.onEvent((event) => events.push(event));
+      const result = await runtime.eval(`
+        for (let i = 0; i < 50; i++) { console.log("y".repeat(100000)); }
+        return true;
+      `);
+      expect(result.success).toBe(true);
+      const consoleEvents = events.filter((event) => event.type === "console");
+      // 50 * 100KB = 5MB > budget: only the retained records streamed.
+      expect(consoleEvents.length).toBeLessThan(50);
+      expect(consoleEvents.length).toBe(
+        // Marker records are pushed host-side without an event.
+        result.consoleOutput.filter(
+          (record) => !String(record.args[0]).includes("truncated at capture")
+        ).length
+      );
     });
   });
 
