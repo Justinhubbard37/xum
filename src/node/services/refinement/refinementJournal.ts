@@ -102,35 +102,40 @@ export async function appendRefinementEvent(args: RefinementEmitArgs): Promise<v
     assert(args.sessionDir.length > 0, "refinement journal requires a session dir");
     assert(args.workspaceId.length > 0, "refinement journal requires a workspace id");
     const journal = sharedDurableEventJournal(args.sessionDir);
-    const inverse = await resolveRefinementInverse(journal.blobs, args.inverse);
-    // Optional fields are spread conditionally: an explicit `undefined` value
-    // would fail the JsonValue schema validation on append and drop the row.
-    const evidence: RefinementEvidence = {
-      workspaceId: args.workspaceId,
-      toolName: args.evidence.toolName,
-      ...(args.evidence.toolCallId !== undefined ? { toolCallId: args.evidence.toolCallId } : {}),
-      ...(args.evidence.actor !== undefined ? { actor: args.evidence.actor } : {}),
-    };
-    const postState: RefinementPostState | undefined =
-      args.postFiles !== undefined
-        ? {
-            files: args.postFiles.map((file) => ({
-              path: file.path,
-              sha256: sha256Hex(file.content),
-            })),
-          }
-        : undefined;
-    await journal.append({
-      workspaceId: args.workspaceId,
-      kind: "refinement",
-      data: {
-        kind: args.kind,
-        action: args.action,
-        inverse,
-        evidence,
-        ...(postState !== undefined ? { postState } : {}),
-        ...(args.runtime !== undefined ? { runtime: args.runtime } : {}),
-      },
+    // Inverse blob puts and the append referencing them run under the journal
+    // blob lock: a concurrent reclamation pass must never observe the
+    // put→append window (see DurableEventJournal.withBlobLock).
+    await journal.withBlobLock(async () => {
+      const inverse = await resolveRefinementInverse(journal.blobs, args.inverse);
+      // Optional fields are spread conditionally: an explicit `undefined` value
+      // would fail the JsonValue schema validation on append and drop the row.
+      const evidence: RefinementEvidence = {
+        workspaceId: args.workspaceId,
+        toolName: args.evidence.toolName,
+        ...(args.evidence.toolCallId !== undefined ? { toolCallId: args.evidence.toolCallId } : {}),
+        ...(args.evidence.actor !== undefined ? { actor: args.evidence.actor } : {}),
+      };
+      const postState: RefinementPostState | undefined =
+        args.postFiles !== undefined
+          ? {
+              files: args.postFiles.map((file) => ({
+                path: file.path,
+                sha256: sha256Hex(file.content),
+              })),
+            }
+          : undefined;
+      await journal.append({
+        workspaceId: args.workspaceId,
+        kind: "refinement",
+        data: {
+          kind: args.kind,
+          action: args.action,
+          inverse,
+          evidence,
+          ...(postState !== undefined ? { postState } : {}),
+          ...(args.runtime !== undefined ? { runtime: args.runtime } : {}),
+        },
+      });
     });
   } catch (error) {
     log.debug("[refinement] failed to journal refinement event; continuing", {

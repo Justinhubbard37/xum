@@ -992,24 +992,29 @@ export async function rollbackRefinement(
         of: opts.id,
         ...(opts.reason !== undefined ? { reason: opts.reason } : {}),
       };
-      const row = await journal.append({
-        workspaceId: target.workspaceId,
-        kind: "refinement",
-        data: {
-          kind,
-          action,
-          inverse: await resolveRefinementInverse(journal.blobs, newInverse),
-          evidence: {
-            workspaceId: target.workspaceId,
-            toolName: opts.evidence.toolName,
-            ...(opts.evidence.toolCallId !== undefined
-              ? { toolCallId: opts.evidence.toolCallId }
-              : {}),
-            ...(opts.evidence.actor !== undefined ? { actor: opts.evidence.actor } : {}),
+      // Inverse blob puts + the append referencing them run under the journal
+      // blob lock: a concurrent reclamation pass must never observe the
+      // put→append window (see DurableEventJournal.withBlobLock).
+      const row = await journal.withBlobLock(async () =>
+        journal.append({
+          workspaceId: target.workspaceId,
+          kind: "refinement",
+          data: {
+            kind,
+            action,
+            inverse: await resolveRefinementInverse(journal.blobs, newInverse),
+            evidence: {
+              workspaceId: target.workspaceId,
+              toolName: opts.evidence.toolName,
+              ...(opts.evidence.toolCallId !== undefined
+                ? { toolCallId: opts.evidence.toolCallId }
+                : {}),
+              ...(opts.evidence.actor !== undefined ? { actor: opts.evidence.actor } : {}),
+            },
+            rollbackOf: opts.id,
           },
-          rollbackOf: opts.id,
-        },
-      });
+        })
+      );
       applied.rollbackRowId = row.id;
     } catch (error) {
       log.error("[refinement] rollback applied but journaling the rollback row failed", {

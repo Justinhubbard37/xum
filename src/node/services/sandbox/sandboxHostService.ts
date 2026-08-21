@@ -616,12 +616,13 @@ export class SandboxHostService {
       grants,
       scopeKey,
       async (varsJson) => {
-        const { ref, size } = await journal.blobs.put(varsJson);
-        await journal.append({
+        // Blob + event publish as one unit under the journal blob lock, so a
+        // concurrent reclamation pass can never observe the put→append window.
+        const { ref } = await journal.publishWithBlob(varsJson, (blobHash, size) => ({
           workspaceId: scopeKey,
           kind: "sandbox-vars-snapshot",
-          data: { scopeKey, blobHash: ref, size },
-        });
+          data: { scopeKey, blobHash, size },
+        }));
         // Reclaim superseded snapshot blobs: only the LATEST snapshot per
         // scope is ever restored, so older versions are pure disk growth
         // (per-call persistence would otherwise retain every unique vars
@@ -637,13 +638,13 @@ export class SandboxHostService {
       options.bridgeKey,
       async ({ handle, preview, serialized }) => {
         // The blob is the durable copy of the full offloaded value; the event
-        // row carries exactly the model-visible {handle, preview, size}.
-        const { ref, size } = await journal.blobs.put(serialized);
-        await journal.append({
+        // row carries exactly the model-visible {handle, preview, size}. Both
+        // publish as one unit under the journal blob lock (see publishWithBlob).
+        await journal.publishWithBlob(serialized, (blobHash, blobSize) => ({
           workspaceId: scopeKey,
           kind: "result-handle",
-          data: { handle, preview, blobHash: ref, size },
-        });
+          data: { handle, preview, blobHash, size: blobSize },
+        }));
         // Bound retained handle payloads per session (best-effort — failure
         // must never fail the persist, mirroring snapshot reclamation).
         try {
@@ -847,12 +848,11 @@ export class SandboxHostService {
         (event) => event.kind === "sandbox-vars-snapshot" && event.data.scopeKey === scopeKey
       );
       if (!hasSnapshot) return;
-      const { ref, size } = await journal.blobs.put("{}");
-      await journal.append({
+      await journal.publishWithBlob("{}", (blobHash, size) => ({
         workspaceId: scopeKey,
         kind: "sandbox-vars-snapshot",
-        data: { scopeKey, blobHash: ref, size },
-      });
+        data: { scopeKey, blobHash, size },
+      }));
     } catch (error) {
       // Never let discard bookkeeping block a context reset.
       log.warn(`SandboxHostService: vars discard failed for scope ${scopeKey}`, { error });
