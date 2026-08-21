@@ -3,7 +3,22 @@ import { spawnSync } from "node:child_process";
 import * as fs from "fs/promises";
 import * as path from "path";
 import { DisposableTempDir } from "@/node/services/tempDir";
-import { acquireProcessFileLock, getProcessBirth } from "./fileLock";
+import { acquireProcessFileLock, getProcessBirth, type ReclaimSeamPhase } from "./fileLock";
+
+/** A verified-live token for this process (the format acquire writes). */
+function liveToken(nonce: string): string {
+  const birth = getProcessBirth(process.pid);
+  return birth === null
+    ? `${process.pid}:${nonce}`
+    : `${process.pid}:${nonce}:${Buffer.from(birth).toString("hex")}`;
+}
+
+/** A provably dead pid (a short-lived child that has already exited). */
+function deadPid(): number {
+  const child = spawnSync(process.execPath, ["--version"]);
+  expect(child.pid).toBeGreaterThan(0);
+  return child.pid;
+}
 
 async function lockExists(lockPath: string): Promise<boolean> {
   return fs.access(lockPath).then(
@@ -74,6 +89,104 @@ describe("acquireProcessFileLock", () => {
     } catch (error) {
       expect(String(error)).toContain("Timed out");
     }
+  });
+
+  test("a reclaimer acting on a stale read can never displace a fresh owner (B+C double entry)", async () => {
+    using tmp = new DisposableTempDir("file-lock-test");
+    const lockPath = path.join(tmp.path, "x.lock");
+    // Round-11 interleaving: reclaimer R1 judges token X stale; a concurrent
+    // reclaimer R2 removes X and fresh owner B acquires; R1 (still acting on
+    // its pre-removal read) displaces B's live lock, and third process C
+    // claims the emptied path — B and C both inside the protected section.
+    await fs.writeFile(lockPath, `${deadPid()}:deadbeef`, { encoding: "utf-8", flag: "wx" });
+    const bToken = liveToken("bbbb");
+
+    let seamFired = false;
+    let cAcquired = false;
+    const seam = async (phase: ReclaimSeamPhase): Promise<void> => {
+      if (phase === "post-guard" && !seamFired) {
+        seamFired = true;
+        // R2's completed reclaim of X, then B's acquisition — all while R1
+        // sits between its staleness judgment and its displacement.
+        await fs.unlink(lockPath);
+        await fs.writeFile(lockPath, bToken, { encoding: "utf-8", flag: "wx" });
+      }
+      if (phase === "pre-restore") {
+        // C races the canonical path. Reaching this phase at all means B was
+        // wrongfully displaced; C succeeds only if the path was left empty.
+        try {
+          await fs.writeFile(lockPath, liveToken("cccc"), { encoding: "utf-8", flag: "wx" });
+          cAcquired = true;
+        } catch {
+          // canonical still occupied — C correctly excluded
+        }
+      }
+    };
+
+    try {
+      await acquireProcessFileLock({
+        lockPath,
+        timeoutMs: 400,
+        label: "test",
+        testOnlyReclaimSeam: seam,
+      });
+      expect.unreachable("R1 must not acquire while fresh owner B holds the lock");
+    } catch (error) {
+      expect(String(error)).toContain("Timed out");
+    }
+    expect(seamFired).toBe(true);
+    // Invariant: exactly one believed owner. B's canonical record survived
+    // and C never entered the section.
+    expect(await fs.readFile(lockPath, "utf-8")).toBe(bToken);
+    expect(cAcquired).toBe(false);
+  });
+
+  test("a live reclaim guard defers other reclaimers (conservative skip)", async () => {
+    using tmp = new DisposableTempDir("file-lock-test");
+    const lockPath = path.join(tmp.path, "x.lock");
+    // Reclaimable canonical lock, but another live process holds the guard:
+    // reclamation must wait its turn rather than judge/displace concurrently.
+    await fs.writeFile(lockPath, `${deadPid()}:deadbeef`, { encoding: "utf-8", flag: "wx" });
+    await fs.writeFile(`${lockPath}.reclaim`, liveToken("9999"), { encoding: "utf-8", flag: "wx" });
+    try {
+      await acquireProcessFileLock({ lockPath, timeoutMs: 200, label: "test" });
+      expect.unreachable("reclamation must not proceed while a live guard is held");
+    } catch (error) {
+      expect(String(error)).toContain("Timed out");
+    }
+    // Guard released → the stale lock is reclaimed normally.
+    await fs.unlink(`${lockPath}.reclaim`);
+    await using _lock = await acquireProcessFileLock({ lockPath, timeoutMs: 2_000, label: "test" });
+  });
+
+  test("a crash-remnant reclaim guard (dead pid) does not deadlock reclamation", async () => {
+    using tmp = new DisposableTempDir("file-lock-test");
+    const lockPath = path.join(tmp.path, "x.lock");
+    const dead = deadPid();
+    await fs.writeFile(lockPath, `${dead}:deadbeef`, { encoding: "utf-8", flag: "wx" });
+    await fs.writeFile(`${lockPath}.reclaim`, `${dead}:feedface`, {
+      encoding: "utf-8",
+      flag: "wx",
+    });
+    await using _lock = await acquireProcessFileLock({ lockPath, timeoutMs: 2_000, label: "test" });
+  });
+
+  test("assertStillOwned passes for the live owner and throws after displacement", async () => {
+    using tmp = new DisposableTempDir("file-lock-test");
+    const lockPath = path.join(tmp.path, "x.lock");
+    await using lock = await acquireProcessFileLock({ lockPath, timeoutMs: 500, label: "test" });
+    await lock.assertStillOwned(); // owner in place → passes
+
+    const original = await fs.readFile(lockPath, "utf-8");
+    await fs.writeFile(lockPath, liveToken("hijacked"), "utf-8");
+    try {
+      await lock.assertStillOwned();
+      expect.unreachable("a displaced holder must fail its ownership assertion");
+    } catch (error) {
+      expect(String(error)).toContain("no longer owned");
+    }
+    // Restore so the handle's release finds its own token (clean disposal).
+    await fs.writeFile(lockPath, original, "utf-8");
   });
 
   test("never lease-breaks a verified-live holder, no matter how old the lock is", async () => {

@@ -12,14 +12,30 @@
  *   its pid is dead, OR the pid is alive but belongs to a DIFFERENT process
  *   (PID reuse, detected via a process-birth identity recorded in the
  *   token), OR staleness cannot be proven either way and the lock's mtime
- *   exceeds a generous lease. Claim-by-rename makes reclamation atomic (of
- *   two concurrent reclaimers only one rename succeeds), and reading the
- *   claimed file AFTER the rename verifies we claimed the token we judged
- *   stale — a raced fresh lock is restored via link (atomic, loses
- *   gracefully to an even newer lock, whose holder's release tolerates the
- *   loss).
+ *   exceeds a generous lease.
+ * - Reclamation itself is serialized by a guard lockfile and verifies before
+ *   displacing: under the guard the canonical token is re-read and must
+ *   still equal the judged-stale token, so a lock released-and-reacquired
+ *   while a reclaimer was deciding is never displaced (round 11: two
+ *   concurrent reclaimers + a fresh acquirer could otherwise put two
+ *   processes inside the protected section). Claim-by-rename then moves the
+ *   verified-stale token aside; a post-rename mismatch (fresh owner
+ *   displaced despite everything — possible only via the owner's own
+ *   release inside the microsecond re-read→rename window of a lease-judged
+ *   lock) restores it via link, and a failed restoration PRESERVES the
+ *   displaced record instead of destroying the owner's only evidence.
  * - Release is ownership-verified: a mismatched token means the lock was
  *   reclaimed and re-acquired by someone else; leave it alone.
+ *
+ * Invariant: at most one process can believe it owns the lock. On
+ * birth-capable platforms (Linux/macOS) this holds outright: a live holder
+ * is never judged stale, and any canonical-token change between judgment
+ * and displacement aborts the reclaim. On birth-less platforms the
+ * lease-judged residual window (owner releasing exactly between the guarded
+ * re-read and the rename after a >5min hold) remains theoretically possible;
+ * holders therefore expose `assertStillOwned` so critical sections re-verify
+ * ownership immediately before irreversible mutations (mirrors the rollback
+ * lock's commit-point doctrine in refinementRollback.ts).
  */
 
 import assert from "node:assert";
@@ -44,6 +60,9 @@ const FILE_LOCK_RETRY_MS = 10;
  */
 const FILE_LOCK_LEASE_MS = 5 * 60_000;
 
+/** Interleaving points inside reclamation, exposed only for tests. */
+export type ReclaimSeamPhase = "post-guard" | "pre-restore";
+
 export interface ProcessFileLockOptions {
   /** Absolute or relative lockfile path; the parent directory is created. */
   lockPath: string;
@@ -51,6 +70,39 @@ export interface ProcessFileLockOptions {
   timeoutMs: number;
   /** Human label for error/log messages (e.g. "append lock", "blob lock"). */
   label: string;
+  /**
+   * Test seam: awaited at deterministic points inside stale-lock
+   * reclamation — the only way to exercise reclaim/acquire interleavings
+   * (a real competitor cannot be paused between our judgment and our
+   * rename). "post-guard" fires after guard acquisition, before the
+   * verify-before-displace re-read; "pre-restore" fires after a wrongful
+   * displacement is detected, before the restoration link.
+   */
+  testOnlyReclaimSeam?: (phase: ReclaimSeamPhase) => Promise<void>;
+}
+
+export interface ProcessFileLock extends AsyncDisposable {
+  /**
+   * Re-read the lockfile and throw when this acquisition no longer owns it
+   * (wrongfully displaced by a reclaimer, or reclaimed after a wedge).
+   * Critical sections call this immediately before irreversible mutations —
+   * see the module-doc invariant discussion.
+   */
+  assertStillOwned(): Promise<void>;
+}
+
+/** Build a `pid:nonce[:birthHex]` ownership token for lock/guard files. */
+function makeOwnershipToken(): { token: string; nonce: string } {
+  const nonce = crypto.randomBytes(8).toString("hex");
+  // Record our birth identity so a future reclaimer can distinguish "this
+  // pid is alive" from "this pid now belongs to someone else" (hex-encoded:
+  // ps-derived birth strings contain spaces and colons).
+  const ownBirth = getProcessBirth(process.pid);
+  const token =
+    ownBirth === null
+      ? `${process.pid}:${nonce}`
+      : `${process.pid}:${nonce}:${Buffer.from(ownBirth).toString("hex")}`;
+  return { token, nonce };
 }
 
 /** True when a signal-0 probe reaches the pid (EPERM = alive, not ours). */
@@ -138,19 +190,11 @@ function parseLockToken(raw: string): { pid: number | null; birth: string | null
 
 export async function acquireProcessFileLock(
   options: ProcessFileLockOptions
-): Promise<AsyncDisposable> {
+): Promise<ProcessFileLock> {
   const { lockPath, timeoutMs, label } = options;
   assert(lockPath.length > 0, "acquireProcessFileLock requires a lock path");
   assert(timeoutMs > 0, "acquireProcessFileLock timeoutMs must be positive");
-  const nonce = crypto.randomBytes(8).toString("hex");
-  // Record our birth identity so a future reclaimer can distinguish "this
-  // pid is alive" from "this pid now belongs to someone else" (hex-encoded:
-  // ps-derived birth strings contain spaces and colons).
-  const ownBirth = getProcessBirth(process.pid);
-  const token =
-    ownBirth === null
-      ? `${process.pid}:${nonce}`
-      : `${process.pid}:${nonce}:${Buffer.from(ownBirth).toString("hex")}`;
+  const { token, nonce } = makeOwnershipToken();
   const tempPath = `${lockPath}.tmp-${process.pid}-${nonce}`;
   const deadline = Date.now() + timeoutMs;
   await fs.mkdir(path.dirname(lockPath), { recursive: true });
@@ -159,13 +203,16 @@ export async function acquireProcessFileLock(
     for (;;) {
       try {
         await fs.link(tempPath, lockPath);
-        return { [Symbol.asyncDispose]: () => releaseFileLock(lockPath, token, label) };
+        return {
+          assertStillOwned: () => assertLockOwned(lockPath, token, label),
+          [Symbol.asyncDispose]: () => releaseFileLock(lockPath, token, label),
+        };
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
           throw error;
         }
       }
-      await reclaimStaleFileLock(lockPath, label);
+      await reclaimStaleFileLock(lockPath, label, options.testOnlyReclaimSeam);
       if (Date.now() >= deadline) {
         throw new Error(`Timed out acquiring ${label} ${lockPath} after ${timeoutMs}ms`);
       }
@@ -175,6 +222,25 @@ export async function acquireProcessFileLock(
     }
   } finally {
     await fs.unlink(tempPath).catch(() => undefined);
+  }
+}
+
+/** Throw when `token` is no longer the canonical lock content (see handle doc). */
+async function assertLockOwned(lockPath: string, token: string, label: string): Promise<void> {
+  let current: string | null = null;
+  try {
+    current = await fs.readFile(lockPath, "utf-8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
+    // ENOENT = the lock vanished: someone judged us stale and reclaimed.
+  }
+  if (current !== token) {
+    throw new Error(
+      `${label} ${lockPath} is no longer owned by this holder (displaced or reclaimed); ` +
+        `aborting before mutation`
+    );
   }
 }
 
@@ -211,8 +277,58 @@ async function lockLeaseExpired(lockPath: string): Promise<boolean> {
   }
 }
 
+/**
+ * Serialize reclaimers: at most one process may evaluate/displace a stale
+ * lock at a time. The round-11 double entry began with exactly the
+ * forbidden interleaving — reclaimer 1 removes the stale token, a fresh
+ * owner acquires, and reclaimer 2 (still acting on its pre-removal read)
+ * renames the fresh lock aside. When the guard is busy, `fn` is skipped and
+ * the caller's poll loop retries; a crash-remnant guard (stale by the same
+ * pid/birth/lease policy as locks) is unlinked so it cannot deadlock
+ * reclamation. The unconditional unlink of a stale guard has its own
+ * theoretical double-remove window (plain POSIX cannot compare-and-unlink);
+ * the verify-before-displace re-read in reclaimStaleFileLock and holders'
+ * commit-point assertStillOwned make that residual harmless — mirroring the
+ * rollback lock's guard doctrine in refinementRollback.ts.
+ */
+async function withReclaimGuard(
+  lockPath: string,
+  label: string,
+  fn: () => Promise<void>
+): Promise<void> {
+  const guardPath = `${lockPath}.reclaim`;
+  const { token, nonce } = makeOwnershipToken();
+  const tempPath = `${guardPath}.tmp-${process.pid}-${nonce}`;
+  await fs.writeFile(tempPath, token, "utf-8");
+  try {
+    try {
+      await fs.link(tempPath, guardPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw error;
+      }
+      const observed = await fs.readFile(guardPath, "utf-8").catch(() => null);
+      if (observed !== null && (await isLockStale(guardPath, observed))) {
+        await fs.unlink(guardPath).catch(() => undefined);
+      }
+      return; // Guard busy (or just freed): the caller's poll loop retries.
+    }
+    try {
+      await fn();
+    } finally {
+      await releaseFileLock(guardPath, token, `${label} reclaim guard`);
+    }
+  } finally {
+    await fs.unlink(tempPath).catch(() => undefined);
+  }
+}
+
 /** Reclaim the lock if its recorded owner is provably gone (see module doc). */
-async function reclaimStaleFileLock(lockPath: string, label: string): Promise<void> {
+async function reclaimStaleFileLock(
+  lockPath: string,
+  label: string,
+  testOnlySeam?: (phase: ReclaimSeamPhase) => Promise<void>
+): Promise<void> {
   let observed: string;
   try {
     observed = await fs.readFile(lockPath, "utf-8");
@@ -222,18 +338,53 @@ async function reclaimStaleFileLock(lockPath: string, label: string): Promise<vo
   if (!(await isLockStale(lockPath, observed))) {
     return;
   }
-  const graveyard = `${lockPath}.stale-${crypto.randomBytes(4).toString("hex")}`;
-  try {
-    await fs.rename(lockPath, graveyard);
-  } catch {
-    return; // Another reclaimer won the rename; retry acquisition.
-  }
-  const claimed = await fs.readFile(graveyard, "utf-8").catch(() => null);
-  if (claimed !== null && claimed !== observed) {
-    log.warn(`FileLock: reclaim raced a fresh ${label} on ${lockPath}; restoring it`);
-    await fs.link(graveyard, lockPath).catch(() => undefined);
-  }
-  await fs.unlink(graveyard).catch(() => undefined);
+  await withReclaimGuard(lockPath, label, async () => {
+    if (testOnlySeam !== undefined) {
+      await testOnlySeam("post-guard");
+    }
+    // Verify before displacing: with reclaimers serialized by the guard,
+    // only the owner's own release can change the canonical token between
+    // our staleness judgment and here — ANY change means a fresh owner may
+    // hold the lock now, so the reclaim must abort rather than displace it.
+    const current = await fs.readFile(lockPath, "utf-8").catch(() => null);
+    if (current !== observed) {
+      return;
+    }
+    const graveyard = `${lockPath}.stale-${crypto.randomBytes(4).toString("hex")}`;
+    try {
+      await fs.rename(lockPath, graveyard);
+    } catch {
+      return; // Lock vanished (owner released): retry acquisition.
+    }
+    const claimed = await fs.readFile(graveyard, "utf-8").catch(() => null);
+    if (claimed !== null && claimed !== observed) {
+      // Despite the guard and the re-read, a lease-judged owner released and
+      // a fresh holder re-acquired inside the re-read→rename window: restore
+      // the displaced owner's lock.
+      if (testOnlySeam !== undefined) {
+        await testOnlySeam("pre-restore");
+      }
+      try {
+        await fs.link(graveyard, lockPath);
+      } catch (error) {
+        // A third process claimed the emptied path first. PRESERVE the
+        // displaced record (round 11): destroying it would erase the only
+        // evidence of the wrongful displacement while its holder still
+        // believes it owns the section; the holder's commit-point
+        // assertStillOwned aborts it instead.
+        log.error(
+          `FileLock: failed to restore a wrongfully displaced ${label} on ${lockPath}; ` +
+            `preserving the displaced record at ${graveyard}`,
+          { error }
+        );
+        return;
+      }
+      log.warn(`FileLock: reclaim raced a fresh ${label} on ${lockPath}; restored it`);
+      await fs.unlink(graveyard).catch(() => undefined);
+      return;
+    }
+    await fs.unlink(graveyard).catch(() => undefined);
+  });
 }
 
 /** Release only if we still own the lock (a raced reclaim may have replaced it). */
