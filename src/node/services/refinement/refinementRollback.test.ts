@@ -16,7 +16,6 @@ import { memoryMutationLockKey, targetMutationLockFilePath } from "./targetMutat
 import {
   acquireRollbackFileLock,
   listRefinements,
-  reclaimStaleRollbackLock,
   rollbackRefinement,
   type RefinementEvent,
 } from "./refinementRollback";
@@ -410,50 +409,30 @@ describe("refinementRollback", () => {
     expect(await pathExists(lockPath)).toBe(false);
   });
 
-  it("reclaim cannot unlink a live lock created after the stale read (double-reclaim race)", async () => {
+  it("reclaims a lockfile whose recorded owner PID was reused by another process", async () => {
     using fixture = await createFixture();
-    await fixture.service.create(fixture.ctx, "/memories/global/race2.md", "v1\n", "agent");
-    await fixture.service.strReplace(fixture.ctx, "/memories/global/race2.md", "v1", "v2", "agent");
+    await fixture.service.create(fixture.ctx, "/memories/global/reuse.md", "v1\n", "agent");
+    await fixture.service.strReplace(fixture.ctx, "/memories/global/reuse.md", "v1", "v2", "agent");
     const editRow = await lastRow(fixture.sessionDir);
+
+    // r18: a crashed Xum's PID was handed to an unrelated LIVE process — the
+    // recorded birth identity proves the reuse. A PID-only liveness check
+    // treated this lock as live forever, refusing every rollback until
+    // manual cleanup. Simulate with our own (alive) pid + a foreign birth.
     const lockPath = path.join(fixture.sessionDir, "refinement-rollback.lock");
+    const bogusBirth = Buffer.from("crashed-xum-birth").toString("hex");
+    await fsPromises.writeFile(lockPath, `${process.pid}:cafe:${bogusBirth}`, {
+      encoding: "utf-8",
+      flag: "wx",
+    });
 
-    // Reclaimer A observed a stale (dead-owner) lock...
-    const child = spawnSync(process.execPath, ["--version"]);
-    const deadToken = `${child.pid}:dead-owner-uuid`;
-    // ...but before A's reclaim executes, a competitor finished its own
-    // reclaim and acquired a fresh LIVE lock at the same pathname (the
-    // interleaving that made unconditional unlink destroy the live lock).
-    const liveToken = `${process.pid}:live-owner-uuid`;
-    await fsPromises.writeFile(lockPath, liveToken, { encoding: "utf-8", flag: "wx" });
-
-    // A's reclaim re-reads under the guard, detects the token mismatch, and
-    // must abort without ever touching the canonical path (the rename-aside
-    // design displaced B's live lock here, letting a third wx-create enter
-    // the critical section alongside B).
-    let threw: unknown = null;
-    try {
-      await reclaimStaleRollbackLock(lockPath, deadToken, `${process.pid}:reclaimer-a-uuid`);
-    } catch (error) {
-      threw = error;
-    }
-    expect(String(threw)).toContain("changed owners mid-reclaim");
-    // B's live lock is untouched at the canonical pathname, byte-identical...
-    expect(await fsPromises.readFile(lockPath, "utf-8")).toBe(liveToken);
-    // ...with no guard or renamed-aside residue left behind.
-    const residue = (await fsPromises.readdir(fixture.sessionDir)).filter((name) =>
-      name.includes(".reclaim")
-    );
-    expect(residue).toEqual([]);
-
-    // The restored live lock (live PID) still refuses a full rollback.
-    const refused = await rollbackRefinement({
+    const result = await rollbackRefinement({
       sessionDir: fixture.sessionDir,
       id: editRow.id,
       evidence: EVIDENCE,
     });
-    expect(refused.success).toBe(false);
-    if (refused.success) throw new Error("unreachable");
-    expect(refused.error).toContain("Another rollback is in progress");
+    expect(result.success).toBe(true);
+    expect(await pathExists(lockPath)).toBe(false);
   });
 
   it("release leaves the lockfile alone when its token no longer matches", async () => {
@@ -479,22 +458,6 @@ describe("refinementRollback", () => {
     expect(await pathExists(lockPath)).toBe(false);
   });
 
-  it("reclaims a plain stale lock under the guard and claims it atomically", async () => {
-    using fixture = await createFixture();
-    await fsPromises.mkdir(fixture.sessionDir, { recursive: true });
-    const lockPath = path.join(fixture.sessionDir, "refinement-rollback.lock");
-
-    const child = spawnSync(process.execPath, ["--version"]);
-    const deadToken = `${child.pid}:dead-owner-uuid`;
-    await fsPromises.writeFile(lockPath, deadToken, { encoding: "utf-8", flag: "wx" });
-
-    const myToken = `${process.pid}:reclaimer-uuid`;
-    expect(await reclaimStaleRollbackLock(lockPath, deadToken, myToken)).toBe(true);
-    // The canonical lock now carries the reclaimer's token; the guard is gone.
-    expect(await fsPromises.readFile(lockPath, "utf-8")).toBe(myToken);
-    expect(await pathExists(`${lockPath}.reclaim-guard`)).toBe(false);
-  });
-
   it("a crash-remnant reclaim guard (dead PID) does not deadlock reclamation", async () => {
     using fixture = await createFixture();
     await fixture.service.create(fixture.ctx, "/memories/global/guard.md", "v1\n", "agent");
@@ -510,7 +473,7 @@ describe("refinementRollback", () => {
       encoding: "utf-8",
       flag: "wx",
     });
-    await fsPromises.writeFile(`${lockPath}.reclaim-guard`, `${child.pid}:dead-guard-uuid`, {
+    await fsPromises.writeFile(`${lockPath}.reclaim`, `${child.pid}:dead-guard-uuid`, {
       encoding: "utf-8",
       flag: "wx",
     });
@@ -523,34 +486,7 @@ describe("refinementRollback", () => {
     expect(result.success).toBe(true);
     // Both remnants were cleaned up by the successful acquisition + release.
     expect(await pathExists(lockPath)).toBe(false);
-    expect(await pathExists(`${lockPath}.reclaim-guard`)).toBe(false);
-  });
-
-  it("a live reclaim guard fails reclamation conservatively", async () => {
-    using fixture = await createFixture();
-    await fsPromises.mkdir(fixture.sessionDir, { recursive: true });
-    const lockPath = path.join(fixture.sessionDir, "refinement-rollback.lock");
-
-    const child = spawnSync(process.execPath, ["--version"]);
-    const deadToken = `${child.pid}:dead-owner-uuid`;
-    await fsPromises.writeFile(lockPath, deadToken, { encoding: "utf-8", flag: "wx" });
-    // Another process's reclamation is in flight (live guard owner).
-    const liveGuardToken = `${process.pid}:live-guard-uuid`;
-    await fsPromises.writeFile(`${lockPath}.reclaim-guard`, liveGuardToken, {
-      encoding: "utf-8",
-      flag: "wx",
-    });
-
-    let threw: unknown = null;
-    try {
-      await reclaimStaleRollbackLock(lockPath, deadToken, `${process.pid}:reclaimer-uuid`);
-    } catch (error) {
-      threw = error;
-    }
-    expect(String(threw)).toContain("reclamation is in progress");
-    // Neither the canonical lock nor the live guard was touched.
-    expect(await fsPromises.readFile(lockPath, "utf-8")).toBe(deadToken);
-    expect(await fsPromises.readFile(`${lockPath}.reclaim-guard`, "utf-8")).toBe(liveGuardToken);
+    expect(await pathExists(`${lockPath}.reclaim`)).toBe(false);
   });
 
   it("commit-point ownership loss aborts, compensates mutations, and appends no row", async () => {
