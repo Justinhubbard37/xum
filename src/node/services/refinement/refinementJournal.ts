@@ -19,8 +19,8 @@ import { createHash } from "node:crypto";
 
 import assert from "@/common/utils/assert";
 import {
-  REFINEMENT_INLINE_MAX_CHARS,
   REFINEMENT_INVERSE_BLOB_QUOTA_BYTES,
+  REFINEMENT_INVERSE_QUOTA_MIN_CHARGE_BYTES,
   RefinementInverseSchema,
   type MemoryRefinementAction,
   type RefinementEvidence,
@@ -80,11 +80,26 @@ export function sha256Hex(text: string): string {
 }
 
 /**
- * Offload large captured contents to the blob store; small ones stay inline.
+ * Quota charge for one inverse payload: real bytes, floored at one
+ * filesystem allocation unit so the horizon also bounds retained blob COUNT
+ * (see REFINEMENT_INVERSE_QUOTA_MIN_CHARGE_BYTES).
+ */
+function inverseQuotaCharge(sizeBytes: number): number {
+  return Math.max(sizeBytes, REFINEMENT_INVERSE_QUOTA_MIN_CHARGE_BYTES);
+}
+
+/**
+ * Offload EVERY captured content to the blob store — no inline fast path.
+ * Inline copies would live in the append-only durable-events.jsonl where
+ * they can neither be reclaimed nor quota-counted, so a loop of small
+ * unique versions would grow the session without bound (Codex round 8);
+ * uniform offloading makes horizon eviction cover all payloads. Legacy rows
+ * written by older binaries still carry inline `text` and stay rollbackable.
  * Exported so the rollback service (refinementRollback.ts) resolves the
  * inverses of its own rollback rows through the identical offload policy.
- * `publishedBlobs` reports every offloaded payload so callers can feed the
- * inverse-blob quota (reclaimExcessRefinementInverseBlobs) incrementally.
+ * `publishedBlobs` reports every payload (at its quota charge) so callers
+ * feed the inverse-blob quota (reclaimExcessRefinementInverseBlobs)
+ * incrementally.
  */
 export async function resolveRefinementInverse(
   blobs: BlobStore,
@@ -96,11 +111,8 @@ export async function resolveRefinementInverse(
   const publishedBlobs: BlobQuotaEntry[] = [];
   const files = await Promise.all(
     draft.files.map(async (file) => {
-      if (file.content.length <= REFINEMENT_INLINE_MAX_CHARS) {
-        return { path: file.path, text: file.content };
-      }
       const { ref, size } = await blobs.put(file.content);
-      publishedBlobs.push({ ref, size });
+      publishedBlobs.push({ ref, size: inverseQuotaCharge(size) });
       return { path: file.path, blobRef: ref };
     })
   );
@@ -162,7 +174,9 @@ export async function reclaimExcessRefinementInverseBlobs(
           if (file.blobRef === undefined) continue;
           const size = await journal.blobs.size(file.blobRef);
           if (size === null) continue;
-          entries.push({ ref: file.blobRef, size });
+          // Same floor as publish-time accounting, or the sweep would
+          // under-charge small payloads relative to the incremental path.
+          entries.push({ ref: file.blobRef, size: inverseQuotaCharge(size) });
         }
       }
     }

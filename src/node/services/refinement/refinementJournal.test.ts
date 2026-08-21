@@ -1,6 +1,9 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import type { BlobRef } from "@/common/types/durableEvent";
-import { REFINEMENT_INVERSE_BLOB_QUOTA_BYTES } from "@/common/types/refinement";
+import {
+  REFINEMENT_INVERSE_BLOB_QUOTA_BYTES,
+  REFINEMENT_INVERSE_QUOTA_MIN_CHARGE_BYTES,
+} from "@/common/types/refinement";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import {
   DurableEventJournal,
@@ -108,6 +111,58 @@ describe("reclaimExcessRefinementInverseBlobs", () => {
     expect(await journal.blobs.has(refOf(rows[0]))).toBe(false);
     expect(await journal.blobs.has(refOf(rows[1]))).toBe(true);
     expect(await journal.blobs.has(refOf(rows[2]))).toBe(true);
+  });
+
+  test("small captures are blob-backed too, so every inverse payload is quota-managed", async () => {
+    using tmp = new DisposableTempDir("refinement-journal-test");
+    const journal = sharedDurableEventJournal(tmp.path);
+    // Well under the old 4KiB inline cap: an RLM guest looping over a small
+    // file must not grow durable-events.jsonl with unmanaged inline copies.
+    await appendRefinementEvent({
+      sessionDir: tmp.path,
+      workspaceId: "ws-refine",
+      kind: "memory",
+      action: { op: "str_replace", path: "/memories/global/small.md" },
+      inverse: { op: "restore-files", files: [{ path: "/m/small.md", content: "tiny prior" }] },
+      evidence: { toolName: "test" },
+    });
+    const rows = (await journal.read()).filter((e) => e.kind === "refinement");
+    expect(rows).toHaveLength(1);
+    const file = (rows[0].data.inverse as { files: Array<{ text?: string; blobRef?: BlobRef }> })
+      .files[0];
+    expect(file.text).toBeUndefined();
+    expect(file.blobRef).toBeDefined();
+    expect(await journal.blobs.getText(file.blobRef!)).toBe("tiny prior");
+  });
+
+  test("small payloads count toward the horizon at the minimum quota charge", async () => {
+    using tmp = new DisposableTempDir("refinement-journal-test");
+    const journal = sharedDurableEventJournal(tmp.path);
+    await reclaimExcessRefinementInverseBlobs(journal, []); // init state
+    await appendRefinementEvent({
+      sessionDir: tmp.path,
+      workspaceId: "ws-refine",
+      kind: "memory",
+      action: { op: "str_replace", path: "/memories/global/small.md" },
+      inverse: { op: "restore-files", files: [{ path: "/m/small.md", content: "tiny prior" }] },
+      evidence: { toolName: "test" },
+    });
+    const rows = (await journal.read()).filter((e) => e.kind === "refinement");
+    const ref = (rows[0].data.inverse as { files: Array<{ blobRef: BlobRef }> }).files[0].blobRef;
+    expect(await journal.blobs.has(ref)).toBe(true);
+
+    // Quota pressure leaving LESS than one minimum charge of headroom: the
+    // tiny payload must be evicted because it is charged at the floor (raw
+    // bytes would still fit — the floor is what bounds retained blob count).
+    await reclaimExcessRefinementInverseBlobs(journal, [
+      {
+        ref: `sha256:${"f".repeat(64)}`,
+        size:
+          REFINEMENT_INVERSE_BLOB_QUOTA_BYTES -
+          Math.floor(REFINEMENT_INVERSE_QUOTA_MIN_CHARGE_BYTES / 2),
+      },
+    ]);
+    expect(await journal.blobs.has(ref)).toBe(false);
   });
 
   test("recovery sweep after a restart evicts over-quota payloads by real blob size", async () => {

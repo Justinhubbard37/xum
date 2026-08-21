@@ -3,10 +3,7 @@ import { describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
-import {
-  REFINEMENT_INLINE_MAX_CHARS,
-  REFINEMENT_INVERSE_BLOB_QUOTA_BYTES,
-} from "@/common/types/refinement";
+import { REFINEMENT_INVERSE_BLOB_QUOTA_BYTES } from "@/common/types/refinement";
 import { Config } from "@/node/config";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
@@ -99,8 +96,9 @@ describe("refinementRollback", () => {
 
   it("restores blob-backed prior content byte-identically and journals rollbackOf", async () => {
     using fixture = await createFixture();
-    // Above the inline cap → the r2 inverse offloads prior content to a blob.
-    const prior = `start\n${"x".repeat(REFINEMENT_INLINE_MAX_CHARS + 100)}\nend\n`;
+    // Multi-KB prior content — the r2 inverse offloads it to a blob (as it
+    // does every capture; see resolveRefinementInverse).
+    const prior = `start\n${"x".repeat(4_196)}\nend\n`;
     await fixture.service.create(fixture.ctx, "/memories/global/big.md", prior, "agent");
     await fixture.service.strReplace(fixture.ctx, "/memories/global/big.md", "start", "s", "agent");
     const editRow = await lastRow(fixture.sessionDir);
@@ -131,7 +129,7 @@ describe("refinementRollback", () => {
     // a-small.md first, so a sequential apply would restore it before the
     // blob failure.
     await fixture.service.create(fixture.ctx, "/memories/global/notes/a-small.md", "sm\n", "agent");
-    const big = "x".repeat(REFINEMENT_INLINE_MAX_CHARS + 100);
+    const big = "x".repeat(4_196);
     await fixture.service.create(fixture.ctx, "/memories/global/notes/z-big.md", big, "agent");
     await fixture.service.deletePath(fixture.ctx, "/memories/global/notes", "agent");
     const deleteRow = await lastRow(fixture.sessionDir);
@@ -164,9 +162,42 @@ describe("refinementRollback", () => {
     expect(rows.some((row) => row.data.rollbackOf === deleteRow.id)).toBe(false);
   });
 
+  it("refuses rollback of a SMALL-capture row whose payload was evicted (no inline immunity)", async () => {
+    using fixture = await createFixture();
+    // Small prior content (well under one quota charge): it must be
+    // blob-backed and horizon-managed exactly like large captures.
+    await fixture.service.create(fixture.ctx, "/memories/global/tiny.md", "prior\n", "agent");
+    await fixture.service.strReplace(
+      fixture.ctx,
+      "/memories/global/tiny.md",
+      "prior",
+      "now",
+      "agent"
+    );
+    const editRow = await lastRow(fixture.sessionDir);
+    const inverse = editRow.data.inverse as { files: Array<{ blobRef?: string }> };
+    const blobRef = inverse.files[0].blobRef;
+    expect(blobRef).toBeDefined();
+
+    const journal = sharedDurableEventJournal(fixture.sessionDir);
+    await reclaimExcessRefinementInverseBlobs(journal, [
+      { ref: `sha256:${"e".repeat(64)}`, size: REFINEMENT_INVERSE_BLOB_QUOTA_BYTES },
+    ]);
+    expect(await journal.blobs.has(blobRef as never)).toBe(false);
+
+    const result = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: editRow.id,
+      evidence: EVIDENCE,
+    });
+    expect(result.success).toBe(false);
+    if (result.success) throw new Error("unreachable");
+    expect(result.error).toContain(blobRef!);
+  });
+
   it("refuses rollback of a row whose inverse payload was evicted beyond the horizon", async () => {
     using fixture = await createFixture();
-    const big = `start\n${"y".repeat(REFINEMENT_INLINE_MAX_CHARS + 100)}\n`;
+    const big = `start\n${"y".repeat(4_196)}\n`;
     await fixture.service.create(fixture.ctx, "/memories/global/evicted.md", big, "agent");
     await fixture.service.strReplace(
       fixture.ctx,

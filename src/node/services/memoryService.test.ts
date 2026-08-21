@@ -19,7 +19,6 @@ import { MemoryMetaService } from "./memoryMeta";
 import {
   MemoryRefinementActionSchema,
   REFINEMENT_CAPTURE_MAX_FILES,
-  REFINEMENT_INLINE_MAX_CHARS,
   RefinementEvidenceSchema,
   RefinementInverseSchema,
 } from "@/common/types/refinement";
@@ -1226,8 +1225,8 @@ describe("MemoryService refinement journal", () => {
 
   it("journals file delete with a blob-backed restore inverse for large contents", async () => {
     using fixture = await createFixture();
-    // Over the inline cap so the inverse must round-trip through the blob store.
-    const content = "x".repeat(REFINEMENT_INLINE_MAX_CHARS + 1000);
+    // Multi-KB content: the inverse must round-trip through the blob store.
+    const content = "x".repeat(5_096);
     await fixture.service.create(fixture.ctx, "/memories/global/big.md", content, "agent");
     const result = await fixture.service.deletePath(
       fixture.ctx,

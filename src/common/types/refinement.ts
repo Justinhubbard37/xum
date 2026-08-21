@@ -13,11 +13,16 @@ import { z } from "zod";
 import { BlobRefSchema } from "./durableEvent";
 
 /**
- * Inline cap for prior-content payloads in refinement inverses; larger
- * contents go to the session blob store and are referenced by BlobRef
- * (mirrors the hook-context inline cap).
+ * Minimum quota charge for one refinement-inverse payload blob. Captured
+ * contents are ALWAYS offloaded to the blob store (never inlined into the
+ * append-only durable-events.jsonl, where they could neither be reclaimed
+ * nor quota-counted), so the horizon quota below governs every payload
+ * uniformly. Charging at least one filesystem allocation unit per payload
+ * bounds the retained blob COUNT (quota/charge), not just logical bytes —
+ * without a floor, a loop of tiny unique versions could retain millions of
+ * blob files whose block usage dwarfs their content.
  */
-export const REFINEMENT_INLINE_MAX_CHARS = 4_096;
+export const REFINEMENT_INVERSE_QUOTA_MIN_CHARGE_BYTES = 4_096;
 
 /**
  * Budgets for pre-delete inverse capture (agent_skill_delete). Skill content
@@ -46,7 +51,9 @@ export const REFINEMENT_CAPTURE_MAX_FILES = 200;
  */
 export const REFINEMENT_INVERSE_BLOB_QUOTA_BYTES = 16 * 1024 * 1024;
 
-/** One file to restore: exactly one of `text` (small) or `blobRef` (large). */
+/** One file to restore: exactly one of `text` (legacy inline rows written by
+ * older binaries — new rows always use `blobRef`, see resolveRefinementInverse)
+ * or `blobRef` (content-addressed, quota-managed payload). */
 export const RefinementFileSchema = z
   .object({
     /**
