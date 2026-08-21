@@ -696,12 +696,21 @@ export function startAbandonedBranchSummaryInBackground(
  */
 export async function awaitPendingBranchSummary(workspaceId: string): Promise<MuxMessage | null> {
   const entry = pendingBranchSummaries.get(workspaceId);
-  if (!entry || entry.consumed) {
+  if (!entry) {
+    return null;
+  }
+  if (entry.consumed) {
+    // Consumption is gated, WAITING is not: a concurrent second send must
+    // still block until the writer settles, or it could append its user
+    // message first — advancing the guarded tail so the summary drops as a
+    // mismatch and NEITHER request gets the abandoned-branch context. It
+    // returns null (never rejects), so only the consumer emits the row.
+    await entry.promise.catch(() => undefined);
     return null;
   }
   // Check-and-set is synchronous, so exactly one send observes (and emits)
-  // the row; concurrent sends resolve null immediately. The entry itself is
-  // NOT removed until the promise settles: workspace removal racing this
+  // the row; concurrent sends wait above without consuming. The entry itself
+  // is NOT removed until the promise settles: workspace removal racing this
   // await must still find the cancellation handle to abort/drain the writer
   // (a cancelled writer resolves null here, so nothing is emitted after
   // removal).

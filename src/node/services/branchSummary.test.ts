@@ -761,6 +761,78 @@ describe("branch summary placement on fork/truncate flows", () => {
     }
   });
 
+  test("concurrent first sends both wait so the summary lands before either appends", async () => {
+    const { historyService, cleanup } = await createTestHistoryService();
+    try {
+      const ws = "ws-concurrent-sends";
+      const branchPoint = createMuxMessage("cc-1", "assistant", "branch point", { timestamp: 1 });
+      expect((await historyService.appendToHistory(ws, branchPoint)).success).toBe(true);
+
+      // Gate generation so both sends reach their await while the writer is
+      // still running.
+      let releaseModel: () => void = () => undefined;
+      const modelGate = new Promise<void>((resolve) => {
+        releaseModel = resolve;
+      });
+      const model = summaryModel("The abandoned branch context both requests need.");
+      const gatedAiService: BranchSummaryAiService = {
+        createModelWithPinnedMetadata: (async (...createArgs) => {
+          await modelGate;
+          return fakeAiService(model).createModelWithPinnedMetadata(...createArgs);
+        }) as BranchSummaryAiService["createModelWithPinnedMetadata"],
+        getWorkspaceMetadata: fakeAiService(model).getWorkspaceMetadata,
+      };
+      startAbandonedBranchSummaryInBackground({
+        historyService,
+        aiService: gatedAiService,
+        workspaceId: ws,
+        abandonedMessages: meatyExchange("concurrent"),
+        experiments: RLM_ON,
+        guardTailMessageId: "cc-1",
+      });
+
+      // Two sends race to the fresh fork. Each appends its user message as
+      // soon as its await resolves (mirroring AgentSession.sendMessage).
+      const sendUser = async (id: string) => {
+        await awaitPendingBranchSummary(ws);
+        const append = await historyService.appendToHistory(
+          ws,
+          createMuxMessage(id, "user", `send ${id}`, { timestamp: Date.now() })
+        );
+        expect(append.success).toBe(true);
+      };
+      const firstSend = sendUser("u-first");
+      const secondSend = sendUser("u-second");
+
+      // Neither send may append while generation is gated: a user message
+      // landing now would advance the guarded tail and the summary would
+      // drop as a mismatch, losing the context for BOTH requests.
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      const midHistory = await historyService.getHistoryFromLatestBoundary(ws);
+      expect(midHistory.success && midHistory.data.map((m) => m.id)).toEqual(["cc-1"]);
+
+      releaseModel();
+      await Promise.all([firstSend, secondSend]);
+
+      // The summary row landed at the branch point, BEFORE both user sends.
+      const history = await historyService.getHistoryFromLatestBoundary(ws);
+      expect(history.success).toBe(true);
+      if (!history.success) return;
+      expect(history.data[0].id).toBe("cc-1");
+      expect(history.data[1].metadata?.muxMetadata?.type).toBe("branch-summary");
+      // Both sends landed after the summary (order between them is racy).
+      expect(
+        history.data
+          .slice(2)
+          .map((m) => m.id)
+          .sort()
+      ).toEqual(["u-first", "u-second"]);
+      expect(history.data).toHaveLength(4);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("clearPendingBranchSummary drops a registration a removed workspace never consumed", async () => {
     const { historyService, cleanup } = await createTestHistoryService();
     try {
@@ -868,11 +940,12 @@ describe("branch summary placement on fork/truncate flows", () => {
         guardTailMessageId: "ar-1",
       });
 
-      // The fork's first send starts waiting BEFORE generation settles...
+      // The fork's first send starts waiting BEFORE generation settles, and a
+      // concurrent second send waits on the same writer without consuming
+      // (it must not resolve while generation is gated — see the concurrent
+      // first-sends test — so it is only awaited after release below).
       const firstSend = awaitPendingBranchSummary(ws);
-      // ...and exactly-once holds even mid-await: a concurrent second send
-      // resolves null immediately.
-      expect(await awaitPendingBranchSummary(ws)).toBeNull();
+      const secondSend = awaitPendingBranchSummary(ws);
 
       // Removal races in during the await window. Consumption must not have
       // removed the cancellation handle, or this finds nothing to abort and
@@ -881,9 +954,10 @@ describe("branch summary placement on fork/truncate flows", () => {
       releaseModel();
       await clearPromise;
 
-      // The cancelled writer never appended, the waiting send observed the
-      // cancellation (null, so it emits nothing), and the entry is gone.
+      // The cancelled writer never appended, the waiting sends observed the
+      // cancellation (null, so nothing is emitted), and the entry is gone.
       expect(await firstSend).toBeNull();
+      expect(await secondSend).toBeNull();
       expect(appendSpy).not.toHaveBeenCalled();
       const history = await historyService.getHistoryFromLatestBoundary(ws);
       expect(history.success && history.data.map((m) => m.id)).toEqual(["ar-1"]);
