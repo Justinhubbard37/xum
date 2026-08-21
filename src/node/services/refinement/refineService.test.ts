@@ -137,6 +137,8 @@ async function createFixture(options?: {
   timeoutMs?: number;
   /** Captures recordHeadlessUsage calls (usage accounting tests). */
   onHeadlessUsage?: (usage: { inputTokens?: number; outputTokens?: number }) => void;
+  /** Crash-injection seam for apply-recovery tests (throw to simulate death). */
+  onStagedEditAttempted?: (toolCallId: string) => void;
 }): Promise<Fixture> {
   const tempDir = new TestTempDir("test-refine-service");
   const muxHome = path.join(tempDir.path, "mux-home");
@@ -194,6 +196,9 @@ async function createFixture(options?: {
         emittedMessages.push(message);
       },
       ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+      ...(options?.onStagedEditAttempted !== undefined
+        ? { onStagedEditAttempted: options.onStagedEditAttempted }
+        : {}),
       ...(options?.onHeadlessUsage !== undefined
         ? {
             sessionUsageService: {
@@ -555,6 +560,144 @@ describe("RefineService", () => {
       "refine-lessons.md"
     );
     expect(await pathExists(lessonFile)).toBe(false);
+  });
+
+  it("a crash between apply edits resumes without replaying completed edits", async () => {
+    // Codex round 18: a crash after edit 1 but before clearStagedRefineSet
+    // left the staged file intact; restart + /refine apply passed the same
+    // hash and REPLAYED every edit (duplicate non-idempotent memory inserts).
+    // The durable consume-before-mutate journal must skip completed edits and
+    // resume the remainder with a correct audit row.
+    const secondLesson = "/memories/workspace/crash-second-lesson.md";
+    let crashOnce = true;
+    using fixture = await createFixture({
+      modelFactory: () =>
+        toolCallModel(
+          [
+            {
+              toolCallId: "crash-edit-1",
+              toolName: "memory",
+              input: {
+                command: "create",
+                path: LESSON_PATH,
+                file_text: "First lesson, applied before the crash.\n",
+              },
+            },
+            {
+              toolCallId: "crash-edit-2",
+              toolName: "memory",
+              input: {
+                command: "create",
+                path: secondLesson,
+                file_text: "Second lesson, applied after recovery.\n",
+              },
+            },
+          ],
+          "two lessons staged"
+        ),
+      // Crash seam: process dies right after edit 1's mutation + progress
+      // journal are durable, before edit 2 starts.
+      onStagedEditAttempted: (toolCallId) => {
+        if (crashOnce && toolCallId === "crash-edit-1") {
+          crashOnce = false;
+          throw new Error("simulated crash between apply edits");
+        }
+      },
+    });
+    await fixture.seedTrajectory();
+    expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
+
+    const realCreate = fixture.memoryService.create.bind(fixture.memoryService);
+    const createSpy = spyOn(fixture.memoryService, "create").mockImplementation(realCreate);
+    try {
+      // First apply "crashes" after edit 1.
+      try {
+        await fixture.service.apply(WORKSPACE_ID);
+        expect.unreachable("apply should have crashed");
+      } catch (error) {
+        expect(String(error)).toContain("simulated crash");
+      }
+      expect(createSpy).toHaveBeenCalledTimes(1);
+      expect(await listRefinements(fixture.sessionDir)).toHaveLength(1);
+
+      // Restart + re-apply: edit 1 is NOT replayed, edit 2 applies.
+      const result = await fixture.service.apply(WORKSPACE_ID);
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(createSpy).toHaveBeenCalledTimes(2);
+      const rows = await listRefinements(fixture.sessionDir);
+      expect(rows).toHaveLength(2);
+      // The audit row covers BOTH edits (persisted baseline spans the crash).
+      expect(result.data.applied).toHaveLength(2);
+      const chat = await fixture.readChat();
+      const auditRow = chat[chat.length - 1];
+      expect(auditRow.metadata?.muxMetadata?.type).toBe("refine-summary");
+      const auditText = auditRow.parts
+        .map((part) => (part.type === "text" ? part.text : ""))
+        .join("");
+      for (const row of rows) {
+        expect(auditText).toContain(row.id);
+      }
+      // Consumed: nothing left to apply.
+      const reapply = await fixture.service.apply(WORKSPACE_ID);
+      expect(reapply.success).toBe(false);
+    } finally {
+      createSpy.mockRestore();
+    }
+  });
+
+  it("a crash after the last edit reports already-applied instead of replaying", async () => {
+    let crashOnce = true;
+    using fixture = await createFixture({
+      modelFactory: () =>
+        toolCallModel(
+          [
+            {
+              toolCallId: "crash-final-1",
+              toolName: "memory",
+              input: {
+                command: "create",
+                path: LESSON_PATH,
+                file_text: "Only lesson, applied before the crash.\n",
+              },
+            },
+          ],
+          "one lesson staged"
+        ),
+      // Crash after the LAST edit's progress journal write, before
+      // clearStagedRefineSet — the set is fully attempted but uncleared.
+      onStagedEditAttempted: () => {
+        if (crashOnce) {
+          crashOnce = false;
+          throw new Error("simulated crash before staged-set cleanup");
+        }
+      },
+    });
+    await fixture.seedTrajectory();
+    expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
+
+    const realCreate = fixture.memoryService.create.bind(fixture.memoryService);
+    const createSpy = spyOn(fixture.memoryService, "create").mockImplementation(realCreate);
+    try {
+      try {
+        await fixture.service.apply(WORKSPACE_ID);
+        expect.unreachable("apply should have crashed");
+      } catch (error) {
+        expect(String(error)).toContain("simulated crash");
+      }
+      expect(createSpy).toHaveBeenCalledTimes(1);
+
+      // Re-apply replays NOTHING and reports the already-applied edit with a
+      // correct audit row (crash also lost the original audit append).
+      const result = await fixture.service.apply(WORKSPACE_ID);
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(createSpy).toHaveBeenCalledTimes(1);
+      expect(await listRefinements(fixture.sessionDir)).toHaveLength(1);
+      expect(result.data.applied).toHaveLength(1);
+    } finally {
+      createSpy.mockRestore();
+    }
   });
 
   it("an admitted apply runs to completion when removal races in", async () => {

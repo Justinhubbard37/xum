@@ -51,6 +51,18 @@ export const StagedRefineSetSchema = z.object({
   /** The staging pass's closing model summary, reused in the apply record. */
   summary: z.string(),
   edits: z.array(StagedRefineEditSchema).min(1),
+  /**
+   * CRASH-SAFETY apply journal (consume-before-mutate). Both fields are
+   * written durably BEFORE the first mutation and after EVERY edit's
+   * execution settles, so a crash mid-apply cannot replay non-idempotent
+   * edits: recovery skips attempted tool-call IDs and resumes the remainder,
+   * and a fully-attempted set reports already-applied instead of replaying.
+   * Absent until an apply is admitted (plain staged proposal). Deliberately
+   * OUTSIDE the approval hash (which covers `edits` only) so the applying
+   * transition keeps the hash binding intact.
+   */
+  applyBaselineSeq: z.number().optional(),
+  attemptedToolCallIds: z.array(z.string()).optional(),
 });
 export type StagedRefineSet = z.infer<typeof StagedRefineSetSchema>;
 
@@ -60,7 +72,14 @@ function stagedFilePath(sessionDir: string): string {
 
 export async function saveStagedRefineSet(sessionDir: string, set: StagedRefineSet): Promise<void> {
   await fsPromises.mkdir(sessionDir, { recursive: true });
-  await fsPromises.writeFile(stagedFilePath(sessionDir), JSON.stringify(set, null, 2));
+  // Atomic write (temp + rename): the apply journal is rewritten after every
+  // mutation, and a crash mid-write must never leave a torn file — the
+  // self-healing loader would treat it as corrupt/nothing-staged, losing
+  // track of which non-idempotent edits already ran.
+  const finalPath = stagedFilePath(sessionDir);
+  const tempPath = `${finalPath}.tmp-${process.pid}-${Date.now()}`;
+  await fsPromises.writeFile(tempPath, JSON.stringify(set, null, 2));
+  await fsPromises.rename(tempPath, finalPath);
 }
 
 export async function loadStagedRefineSet(sessionDir: string): Promise<StagedRefineSet | null> {

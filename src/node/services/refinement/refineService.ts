@@ -107,6 +107,13 @@ interface RefineServiceOptions {
   emitChatMessage?: (workspaceId: string, message: MuxMessage) => void;
   /** Test seam: overrides REFINE_TIMEOUT_MS as the pass deadline. */
   timeoutMs?: number;
+  /**
+   * Test seam: invoked after each staged edit's apply-progress journal write
+   * settles. Crash-recovery tests throw from here to simulate process death
+   * between edits (the mutation + its journal entry are durable; nothing
+   * after runs).
+   */
+  onStagedEditAttempted?: (toolCallId: string) => void;
 }
 
 /** Human-readable action line for a refinement journal row. */
@@ -357,7 +364,9 @@ export class RefineService {
     // baseline. Correlation additionally requires the row's
     // evidence.toolCallId to be one of the staged tool calls, so concurrent
     // main-agent self-edits in the same journal can never be misattributed.
-    const baselineSeq = await this.readMaxJournalSeq(sessionDir);
+    // A crash-resumed apply reuses the ORIGINAL run's persisted baseline so
+    // the audit row also covers edits applied before the crash.
+    const baselineSeq = staged.applyBaselineSeq ?? (await this.readMaxJournalSeq(sessionDir));
 
     const projectPath = resolveConsolidationProjectPath(workspace);
     const ctx: MemoryScopeContext = {
@@ -388,8 +397,27 @@ export class RefineService {
       return Err("refine apply cancelled (workspace removed)");
     }
 
+    // CRASH SAFETY (consume-before-mutate): transition the staged file into
+    // its applying state — persisted baseline + attempted list — BEFORE the
+    // first mutation, and mark each edit attempted (atomic rewrite) right
+    // after its execution settles. A crash mid-apply then cannot replay
+    // non-idempotent edits on the next /refine apply: recovery skips
+    // attempted IDs and resumes the remainder, and a fully-attempted set
+    // applies nothing new while still producing the correct audit row (via
+    // the persisted baseline) instead of replaying everything.
+    const attempted = new Set(staged.attemptedToolCallIds ?? []);
+    if (staged.applyBaselineSeq === undefined) {
+      await saveStagedRefineSet(sessionDir, {
+        ...staged,
+        applyBaselineSeq: baselineSeq,
+        attemptedToolCallIds: [...attempted],
+      });
+    }
+
     let succeeded = 0;
     for (const edit of staged.edits) {
+      // Applied (or at least attempted) before a crash: never replay.
+      if (attempted.has(edit.toolCallId)) continue;
       try {
         const tool = edit.tool === "memory" ? memoryTool : skillWriteTool;
         if (tool === undefined || typeof tool.execute !== "function") {
@@ -435,6 +463,26 @@ export class RefineService {
           tool: edit.tool,
           error: getErrorMessage(error),
         });
+      } finally {
+        // Durable per-edit journal entry AFTER the execution settled
+        // (success or clean failure — a failed edit must not replay either,
+        // since its handler may have partially observable effects). Best
+        // effort: a journal-write failure must not fail the admitted apply,
+        // it only weakens crash recovery for this edit.
+        attempted.add(edit.toolCallId);
+        try {
+          await saveStagedRefineSet(sessionDir, {
+            ...staged,
+            applyBaselineSeq: baselineSeq,
+            attemptedToolCallIds: [...attempted],
+          });
+        } catch (error) {
+          log.warn("[Refine] failed to persist apply progress", {
+            workspaceId,
+            error: getErrorMessage(error),
+          });
+        }
+        this.options.onStagedEditAttempted?.(edit.toolCallId);
       }
     }
     // Consume the staged set regardless of per-edit outcomes so a re-run of
