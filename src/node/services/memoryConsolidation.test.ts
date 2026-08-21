@@ -4,7 +4,11 @@ import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import type { Tool } from "ai";
 
-import { MEMORY_CONSOLIDATION_OP_BUDGET, MEMORY_MAX_FILE_BYTES } from "@/common/constants/memory";
+import {
+  MEMORY_CONSOLIDATION_OP_BUDGET,
+  MEMORY_MAX_FILE_BYTES,
+  MEMORY_MAX_FILES_PER_SCOPE,
+} from "@/common/constants/memory";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { Config } from "@/node/config";
 import { createConsolidationMemoryTool, type MemoryConsolidationOp } from "./memoryConsolidation";
@@ -412,6 +416,27 @@ describe("consolidation memory tool rails", () => {
       "utf-8"
     );
     expect(onDisk).toBe(nearCap);
+  });
+
+  it("dry-run rejects a create into a full memory scope", async () => {
+    // Codex round 20: validateMutation accepted a create whenever the target
+    // was free, but the real create() also rejects when the scope already
+    // holds MEMORY_MAX_FILES_PER_SCOPE files — the proposal staged, rendered
+    // approvable, then apply rejected it and consumed the set.
+    using fixture = await createFixture({ dryRun: true });
+    await Promise.all(
+      Array.from({ length: MEMORY_MAX_FILES_PER_SCOPE }, (_, i) =>
+        fsPromises.writeFile(path.join(fixture.globalMemoryDir, `filler-${i}.md`), "x\n")
+      )
+    );
+
+    const intoFull = await execute(fixture.tool, {
+      command: "create",
+      path: "/memories/global/one-more.md",
+      file_text: "must not stage\n",
+    });
+    expect(intoFull.success).toBe(false);
+    if (!intoFull.success) expect(intoFull.error).toContain("full");
   });
 
   it("dry-run rejects delete/rename proposals the real handlers would reject", async () => {

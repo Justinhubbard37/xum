@@ -1024,6 +1024,14 @@ export class MemoryService extends EventEmitter {
               `A ${existing === "dir" ? "directory" : "file"} already exists at ${command.path}. To overwrite a file, delete it first, then create it.`
             );
           }
+          // Mirrors create(): a full scope rejects new files (same listFiles
+          // source; listFiles tolerates a missing root by returning []).
+          const files = await store.listFiles();
+          if (files.length >= MEMORY_MAX_FILES_PER_SCOPE) {
+            throw new MemoryCommandError(
+              `The ${scope} memory scope is full (${MEMORY_MAX_FILES_PER_SCOPE} files); delete unused files first`
+            );
+          }
           break;
         }
         case "str_replace": {
