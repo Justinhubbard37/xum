@@ -60,7 +60,10 @@ endif
 
 # Issue #3831: macOS may SIGKILL the copied esbuild inode while the platform binary still execs.
 # ESBUILD_BINARY_PATH is not used because only esbuild's JS API honors it, not the Go CLI.
-ESBUILD_BIN = $(firstword $(wildcard node_modules/@esbuild/*/bin/esbuild) node_modules/esbuild/bin/esbuild)
+# Prefer the host platform package: ensure-mac-sharp-runtime-deps adds darwin packages on any
+# host, and a bare wildcard would sort @esbuild/darwin-arm64 first (issue #3338).
+ESBUILD_HOST_PLATFORM := $(subst Linux,linux,$(subst Darwin,darwin,$(shell uname -s)))-$(subst x86_64,x64,$(subst aarch64,arm64,$(shell uname -m)))
+ESBUILD_BIN = $(firstword $(wildcard node_modules/@esbuild/$(ESBUILD_HOST_PLATFORM)/bin/esbuild) $(wildcard node_modules/@esbuild/*/bin/esbuild) node_modules/esbuild/bin/esbuild)
 
 # Common esbuild flags for CLI API bundle (ESM format for trpc-cli)
 ESBUILD_CLI_FLAGS := --bundle --format=esm --platform=node --target=node20 --outfile=dist/cli/api.mjs --external:zod --external:commander --external:jsonc-parser --external:@trpc/server --external:ssh2 --external:cpu-features --banner:js="import{createRequire}from'module';globalThis.require=createRequire(import.meta.url);"
@@ -80,7 +83,7 @@ include fmt.mk
 .PHONY: build-renderer version build-icons build-static build-docker-runtime verify-docker-runtime-artifacts
 .PHONY: lint lint-fix typecheck static-check static-check-full
 .PHONY: test test-unit test-integration test-watch test-coverage test-e2e test-e2e-perf smoke-test
-.PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 check-appimage-icons check-mac-attach-file-runtime
+.PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 ensure-mac-sharp-runtime-deps check-appimage-icons check-mac-attach-file-runtime
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
 .PHONY: storybook storybook-run storybook-build test-storybook
@@ -467,7 +470,27 @@ test-e2e-perf: ## Run automated performance profiling scenarios
 dist: build ## Build distributable packages
 	@bun x electron-builder --publish never
 
+# Issue #3338: bun installs host-only optional deps, but electron-builder packages both mac
+# architectures from one node_modules tree, which otherwise omits the x64 sharp runtime.
+ensure-mac-sharp-runtime-deps: node_modules/.installed
+	@bun install --frozen-lockfile --os=darwin --cpu=x64
+	@bun install --frozen-lockfile --os=darwin --cpu=arm64
+	@# Cross-arch installs repoint node_modules/.bin at the last-installed platform; a
+	@# host-native install restores them and keeps the darwin packages added above.
+	@bun install --frozen-lockfile
+	@for dir in \
+		node_modules/@img/sharp-darwin-x64 \
+		node_modules/@img/sharp-libvips-darwin-x64 \
+		node_modules/@img/sharp-darwin-arm64 \
+		node_modules/@img/sharp-libvips-darwin-arm64; do \
+		if [ ! -d "$$dir" ]; then \
+			echo "Missing $$dir after platform installs. bun >= 1.3 is required because older versions silently ignore --os/--cpu." >&2; \
+			exit 1; \
+		fi; \
+	done
+
 dist-mac: build ## Build macOS distributables (x64 + arm64)
+	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
 	@if [ -n "$$CSC_LINK" ]; then \
 		echo "🔐 Code signing enabled - using unified build for correct yml..."; \
 		bun x electron-builder --mac --x64 --arm64 --publish never; \
@@ -480,15 +503,18 @@ dist-mac: build ## Build macOS distributables (x64 + arm64)
 	@echo "✅ Both architectures built successfully"
 
 dist-mac-release: build ## Build and publish macOS distributables (x64 + arm64)
+	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
 	@echo "🔐 Building macOS x64 + arm64 (unified for correct yml)..."
 	@bun x electron-builder --mac --x64 --arm64 --publish always
 	@echo "✅ Both architectures built and published successfully"
 
 dist-mac-x64: build ## Build macOS x64 distributable only
+	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
 	@echo "Building macOS x64..."
 	@bun x electron-builder --mac --x64 --publish never
 
 dist-mac-arm64: build ## Build macOS arm64 distributable only
+	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
 	@echo "Building macOS arm64..."
 	@bun x electron-builder --mac --arm64 --publish never
 
