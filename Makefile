@@ -219,6 +219,20 @@ start: node_modules/.installed build-main build-preload build-static ## Build an
 ## Build targets (can run in parallel)
 build: node_modules/.installed src/version.ts build-renderer build-main build-preload build-icons build-static ## Build all targets
 
+.PHONY: update-models
+update-models: node_modules/.installed ## Fetch latest LiteLLM model data, validate it, update models.json if changed
+	@bun scripts/update_models.ts
+
+# #3727: `make build UPDATE_MODELS=1` refreshes the vendored models.json before
+# building; plain `make build` stays network-free and reproducible. The refresh
+# must be a prerequisite of every catalog-consuming bundle (not just `build`) so
+# parallel make cannot bundle the old catalog, and the phony prerequisite forces
+# those bundles stale because models.json is not part of $(TS_SOURCES).
+ifeq ($(UPDATE_MODELS),1)
+build: update-models
+build-renderer dist/cli/index.js dist/cli/api.mjs: update-models
+endif
+
 build-main: node_modules/.installed dist/cli/index.js dist/cli/api.mjs ## Build main process
 
 BUILTIN_AGENTS_GENERATED := src/node/services/agentDefinitions/builtInAgentContent.generated.ts
@@ -235,7 +249,9 @@ $(BUILTIN_SKILLS_GENERATED): $(BUILTIN_SKILL_SOURCES) $(DOCS_SOURCES) scripts/ge
 $(WORKFLOW_RUNTIME_SOURCES_GENERATED): $(WORKFLOW_RUNTIME_SOURCES) scripts/gen_workflow_runtime_sources.ts
 	@bun scripts/gen_workflow_runtime_sources.ts
 
-dist/cli/index.js: src/cli/index.ts src/desktop/main.ts src/cli/server.ts src/version.ts tsconfig.main.json tsconfig.json $(TS_SOURCES) $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED)
+# models.json is bundled but not in $(TS_SOURCES); without this prerequisite a
+# catalog-only refresh would leave a stale main bundle (#3727).
+dist/cli/index.js: src/cli/index.ts src/desktop/main.ts src/cli/server.ts src/version.ts tsconfig.main.json tsconfig.json $(TS_SOURCES) src/common/utils/tokens/models.json $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED)
 	@echo "Building main process..."
 	@NODE_ENV=production $(TSGO) -p tsconfig.main.json
 	@NODE_ENV=production bun x tsc-alias -p tsconfig.main.json
