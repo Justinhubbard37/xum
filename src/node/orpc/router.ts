@@ -13,6 +13,11 @@ import { Err, Ok } from "@/common/types/result";
 import { resolveProviderCredentials } from "@/node/utils/providerRequirements";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import { isPathInsideDir, stripTrailingSlashes } from "@/node/utils/pathUtils";
+import {
+  CODE_WORKSPACE_EXTENSION,
+  managedRootsByProject,
+  syncProjectCodeWorkspace,
+} from "@/node/worktree/codeWorkspaceSync";
 import { generateWorkspaceIdentity } from "@/node/services/workspaceTitleGenerator";
 import {
   WorkspaceGoalChildWorkspaceError,
@@ -3508,6 +3513,51 @@ export const router = (authToken?: string) => {
             return config;
           });
         }),
+      setCodeWorkspaceSyncPath: t
+        .input(schemas.projects.setCodeWorkspaceSyncPath.input)
+        .output(schemas.projects.setCodeWorkspaceSyncPath.output)
+        .handler(async ({ context, input }) => {
+          const normalizedPath = stripTrailingSlashes(input.projectPath);
+          const trimmed = input.codeWorkspaceSyncPath?.trim() ?? "";
+          if (trimmed && !trimmed.endsWith(CODE_WORKSPACE_EXTENSION)) {
+            // The sync read-modify-writes this file, so refuse arbitrary targets.
+            // ORPCError so the message reaches the UI instead of "Internal server error".
+            throw new ORPCError("BAD_REQUEST", {
+              message: `Path must end with ${CODE_WORKSPACE_EXTENSION}`,
+            });
+          }
+          let previousValue: string | undefined;
+          await context.config.editConfig((config) => {
+            const project = config.projects.get(normalizedPath);
+            if (!project) {
+              throw new Error(`Project not found: ${normalizedPath}`);
+            }
+            previousValue = project.codeWorkspaceSyncPath;
+            // Store undefined for blank input to keep config.json minimal.
+            project.codeWorkspaceSyncPath = trimmed ? trimmed : undefined;
+            return config;
+          });
+          // Sync immediately so enabling takes effect without waiting for the
+          // next workspace lifecycle event. Clearing or changing the path never
+          // deletes previously written files (they belong to the user).
+          if (trimmed) {
+            const result = await syncProjectCodeWorkspace(context.config, normalizedPath);
+            if (!result.ok) {
+              // Roll back so a broken integration is not retried on every
+              // later lifecycle event, and surface the reason to the user.
+              // Guarded: a concurrent save may have stored a newer value that
+              // this failing request must not discard.
+              await context.config.editConfig((config) => {
+                const project = config.projects.get(normalizedPath);
+                if (project?.codeWorkspaceSyncPath === trimmed) {
+                  project.codeWorkspaceSyncPath = previousValue;
+                }
+                return config;
+              });
+              throw new ORPCError("BAD_REQUEST", { message: result.error });
+            }
+          }
+        }),
       remove: t
         .input(schemas.projects.remove.input)
         .output(schemas.projects.remove.output)
@@ -3943,6 +3993,14 @@ export const router = (authToken?: string) => {
           .input(schemas.projects.subProjects.assignWorkspace.input)
           .output(schemas.projects.subProjects.assignWorkspace.output)
           .handler(async ({ context, input }) => {
+            // Reassignment moves the workspace between sub-project workspace
+            // files. Capture the previous assignment (and the managed roots
+            // the workspace contributed to it) before it changes: afterwards
+            // the old file could no longer remove the entry, for the same
+            // reason workspace removal captures managedRootsByProject.
+            const previousMetadata = (await context.config.getAllWorkspaceMetadata()).find(
+              (m) => m.id === input.workspaceId
+            );
             const result = await context.projectService.assignWorkspaceToSubProject(
               input.projectPath,
               input.workspaceId,
@@ -3950,6 +4008,28 @@ export const router = (authToken?: string) => {
             );
             if (result.success) {
               await context.workspaceService.refreshAndEmitMetadata(input.workspaceId);
+              // Best-effort (results logged inside): reconcile both sides of
+              // the reassignment so the old file drops the entry and the new
+              // one gains it without waiting for the next lifecycle event.
+              if (input.subProjectPath !== null) {
+                await syncProjectCodeWorkspace(context.config, input.subProjectPath);
+              }
+              const previousSubProjectPath =
+                previousMetadata?.subProjectPath != null
+                  ? stripTrailingSlashes(previousMetadata.subProjectPath)
+                  : null;
+              const newSubProjectPath =
+                input.subProjectPath !== null ? stripTrailingSlashes(input.subProjectPath) : null;
+              if (
+                previousMetadata &&
+                previousSubProjectPath !== null &&
+                previousSubProjectPath !== newSubProjectPath
+              ) {
+                await syncProjectCodeWorkspace(context.config, previousSubProjectPath, {
+                  extraManagedRootDirs:
+                    managedRootsByProject(previousMetadata).get(previousSubProjectPath),
+                });
+              }
             }
             return result;
           }),
