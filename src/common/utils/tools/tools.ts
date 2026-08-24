@@ -37,6 +37,8 @@ import { createTaskTool } from "@/node/services/tools/task";
 import { createTaskApplyGitPatchTool } from "@/node/services/tools/task_apply_git_patch";
 import { createTaskAwaitTool } from "@/node/services/tools/task_await";
 import { createTaskSendMessageTool } from "@/node/services/tools/task_send_message";
+import { createTaskMessageParentTool } from "@/node/services/tools/task_message_parent";
+import { createTaskMessageSiblingTool } from "@/node/services/tools/task_message_sibling";
 import { createTaskRetitleTool } from "@/node/services/tools/task_retitle";
 import { createTaskStopTool } from "@/node/services/tools/task_stop";
 import { createTaskRemoveTool } from "@/node/services/tools/task_remove";
@@ -267,10 +269,18 @@ export interface ToolConfiguration {
   allowLegacyInvalidWorkflowAgentOutputSchema?: boolean;
   /** Enable agent_report tool (only valid for child task workspaces) */
   enableAgentReport?: boolean;
+  /**
+   * Enable RLM family messaging tools (task_message_parent / task_message_sibling).
+   * Only valid for child task workspaces whose task record was stamped with the rlm
+   * experiment at spawn.
+   */
+  enableFamilyMessaging?: boolean;
   /** Experiments inherited from parent (for subagent spawning) */
   experiments?: {
     programmaticToolCalling?: boolean;
     programmaticToolCallingExclusive?: boolean;
+    /** RLM mode: inherited to subagent spawns so children are stamped at spawn time. */
+    rlm?: boolean;
     advisorTool?: boolean;
     dynamicWorkflows?: boolean;
     memory?: boolean;
@@ -460,6 +470,37 @@ function wrapToolsWithModelOnlyNotifications(
 }
 
 /**
+ * Derive the hook config every hook-wrapped tool runs with, or null when
+ * hooks must not run. Shared with the kernel file loader (mux.load) so the
+ * bulk-ingestion path can never drift from the tool trust gate: hooks are
+ * repo-controlled scripts, so they run only for trusted projects, and mux.load
+ * must be hook-gated exactly when file_read is.
+ */
+export function deriveToolHookConfig(config: ToolConfiguration): HookConfig | null {
+  // Skip hooks for untrusted projects — repo-controlled scripts must not run
+  if (config.trusted !== true) {
+    return null;
+  }
+
+  // Hooks require workspaceId, cwd, and runtime
+  if (!config.workspaceId || !config.cwd || !config.runtime) {
+    return null;
+  }
+
+  return {
+    runtime: config.runtime,
+    cwd: config.cwd,
+    runtimeTempDir: config.runtimeTempDir,
+    workspaceId: config.workspaceId,
+    // Match bash tool behavior: xumEnv is present and secrets override it.
+    env: {
+      ...(config.xumEnv ?? {}),
+      ...(config.secrets ?? {}),
+    },
+  };
+}
+
+/**
  * Wrap tools with hook support.
  *
  * If any of these exist, each tool execution is wrapped:
@@ -471,27 +512,10 @@ function wrapToolsWithHooks(
   tools: Record<string, Tool>,
   config: ToolConfiguration
 ): Record<string, Tool> {
-  // Skip hooks for untrusted projects — repo-controlled scripts must not run
-  if (config.trusted !== true) {
+  const hookConfig = deriveToolHookConfig(config);
+  if (hookConfig === null) {
     return tools;
   }
-
-  // Hooks require workspaceId, cwd, and runtime
-  if (!config.workspaceId || !config.cwd || !config.runtime) {
-    return tools;
-  }
-
-  const hookConfig: HookConfig = {
-    runtime: config.runtime,
-    cwd: config.cwd,
-    runtimeTempDir: config.runtimeTempDir,
-    workspaceId: config.workspaceId,
-    // Match bash tool behavior: xumEnv is present and secrets override it.
-    env: {
-      ...(config.xumEnv ?? {}),
-      ...(config.secrets ?? {}),
-    },
-  };
 
   const wrappedTools: Record<string, Tool> = {};
   for (const [toolName, tool] of Object.entries(tools)) {
@@ -829,6 +853,14 @@ export async function getToolsForModel(
         }
       : {}),
     ...(config.enableAgentReport ? { agent_report: createAgentReportTool(config) } : {}),
+    // RLM family messaging: children talk back to their parent and coordinate with
+    // same-parent siblings. Absent unless the child was spawned under the rlm experiment.
+    ...(config.enableFamilyMessaging
+      ? {
+          task_message_parent: createTaskMessageParentTool(config),
+          task_message_sibling: createTaskMessageSiblingTool(config),
+        }
+      : {}),
     ...(shouldExposeHeartbeatTool ? { heartbeat: createHeartbeatTool(config) } : {}),
     ...(config.goalService && config.enableGoalTools?.setGoal
       ? { set_goal: createSetGoalTool(config) }
@@ -967,6 +999,7 @@ export async function getToolsForModel(
   const allowlistedToolNames = new Set(
     getAvailableTools(capabilityModelString, {
       enableAgentReport: config.enableAgentReport,
+      enableFamilyMessaging: config.enableFamilyMessaging,
       enableAnalyticsQuery: Boolean(config.analyticsService),
       enableDynamicWorkflows: Boolean(
         config.workflowService && config.experiments?.dynamicWorkflows

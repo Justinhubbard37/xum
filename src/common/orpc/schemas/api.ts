@@ -51,6 +51,7 @@ import {
 import { SecretSchema } from "./secrets";
 import {
   CompletedMessagePartSchema,
+  ExperimentsSchema,
   HeartbeatEventSchema,
   OnChatModeSchema,
   SendMessageOptionsSchema,
@@ -1177,6 +1178,75 @@ export const memory = {
   consolidate: {
     input: z.object({ workspaceId: z.string() }),
     output: ResultSchema(MemoryConsolidationRecordSchema, z.string()),
+  },
+};
+
+/** /refine (RLM r11): one applied self-modification, correlated to its r2 journal row. */
+export const RefineAppliedEditSchema = z.object({
+  /** Envelope id of the refinement journal row (rollback address for r6). */
+  refinementId: z.string(),
+  /** Human-readable action, e.g. "memory str_replace /memories/project/x.md". */
+  description: z.string(),
+});
+
+export const RefineRecordSchema = z.object({
+  applied: z.array(RefineAppliedEditSchema),
+  /** Model's closing text (per-edit rationales, or the no-op statement). */
+  summary: z.string(),
+  /** True when the pass finished cleanly without applying any edit. */
+  noOp: z.boolean(),
+  /**
+   * Edits the tools reported as applied but whose r2 journal row never landed
+   * (journal/blob failures are swallowed by design so user writes stay
+   * self-healing). Files changed with no rollback id — surfaced instead of
+   * silently classifying the pass as a no-op.
+   */
+  untrackedApplied: z.number().optional(),
+  /**
+   * Edits a /refine run STAGED for explicit approval (security: the pass
+   * never auto-applies model output). Present only on staging results;
+   * applied via refinements.apply.
+   */
+  staged: z.array(z.object({ description: z.string() })).optional(),
+  /**
+   * Approved staged edits that failed to apply (tool unavailable, input
+   * rejected by the tool schema, tool failure). Surfaced instead of folding
+   * an all-failed apply into a successful no-op.
+   */
+  failed: z.array(z.object({ description: z.string(), reason: z.string() })).optional(),
+  usage: z.object({ inputTokens: z.number(), outputTokens: z.number() }).optional(),
+});
+
+// Node-side types derive from these schemas (z.infer single source) so fields
+// can never silently be stripped by output validation.
+export type RefineAppliedEditPayload = z.infer<typeof RefineAppliedEditSchema>;
+export type RefineRecordPayload = z.infer<typeof RefineRecordSchema>;
+
+export const refinements = {
+  /** Manual /refine trajectory-distillation pass (RLM mode only; the backend refuses otherwise). Stages edits; nothing is applied until `apply`. */
+  run: {
+    // experiments: the renderer's effective flags ride the request (same
+    // authority as send options.experiments) because persisting overrides to
+    // the backend is asynchronous/best-effort — a backend-only gate could
+    // refuse /refine while the workspace already runs with the RLM kernel.
+    input: z.object({ workspaceId: z.string(), experiments: ExperimentsSchema.optional() }),
+    output: ResultSchema(RefineRecordSchema, z.string()),
+  },
+  /** Apply the staged edits from the last run (explicit user approval step). */
+  apply: {
+    input: z.object({
+      workspaceId: z.string(),
+      /**
+       * Hash of the newest staged proposal this renderer DISPLAYED (r64).
+       * Required: with XUM_ALLOW_MULTIPLE_INSTANCES=1 the shared transcript
+       * can hold a newer foreign proposal this window never rendered, so the
+       * backend cannot infer the displayed proposal from the transcript
+       * alone; apply refuses when this hash no longer matches the staged set.
+       */
+      approvedProposalHash: z.string().min(1),
+      experiments: ExperimentsSchema.optional(),
+    }),
+    output: ResultSchema(RefineRecordSchema, z.string()),
   },
 };
 
