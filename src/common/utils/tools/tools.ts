@@ -2,6 +2,7 @@ import { xai } from "@ai-sdk/xai";
 import { type LanguageModel, type Tool } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { isGrokFrontierModel } from "@/common/types/thinking";
 import type { BackgroundWorkAttentionPolicy } from "@/common/types/backgroundWorkAttention";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
@@ -332,9 +333,17 @@ export interface ToolConfiguration {
      * the wrong (or no) provider namespace for custom-named or cross-typed
      * instances.
      */
-    createModel: (
-      modelString: string
-    ) => Promise<{ model: LanguageModel; optionsModelString: string }>;
+    createModel: (modelString: string) => Promise<{
+      model: LanguageModel;
+      optionsModelString: string;
+      /**
+       * Providers snapshot captured at model-creation time for option
+       * construction. Required so buildProviderOptions can remap
+       * custom-provider wire namespaces while still resolving mappedToModel
+       * alias metadata from the raw custom identity.
+       */
+      optionsProvidersConfig: ProvidersConfigMap | null;
+    }>;
     /** The abort signal from the parent stream */
     abortSignal: AbortSignal;
   };
@@ -768,6 +777,10 @@ export async function getToolsForModel(
 ): Promise<Record<string, Tool>> {
   const capabilityModelString = config.capabilityModelString ?? modelString;
   const [provider, modelId] = modelString.split(":");
+  // Provider-native tool availability keys on the RESOLVED capability
+  // identity so mappedToModel aliases inherit their base model's native
+  // tools (web_search/web_fetch); the raw alias id says nothing about them.
+  const capabilityModelId = capabilityModelString.split(":")[1] ?? modelId;
 
   // Helper to reduce repetition when wrapping runtime tools
   const wrap = <TParameters, TResult>(tool: Tool<TParameters, TResult>) =>
@@ -909,7 +922,7 @@ export async function getToolsForModel(
         // - Not bridgeable in the PTC sandbox (no execute()); see BridgeableToolName comment.
         // - Tool hooks (.xum/tool_pre/.xum/tool_post) are skipped because withHooks() returns
         //   early when execute() is absent — same limitation as web_search (provider-native).
-        if (supportsAnthropicNativeWebFetch(modelId)) {
+        if (supportsAnthropicNativeWebFetch(capabilityModelId)) {
           allTools = {
             ...baseTools,
             ...(mcpTools ?? {}),
@@ -937,7 +950,10 @@ export async function getToolsForModel(
         const useResponsesTools = config.openaiWireFormat !== "chatCompletions";
 
         // Only add web search for models that support it
-        if (useResponsesTools && (modelId.includes("gpt-5") || modelId.includes("gpt-4"))) {
+        if (
+          useResponsesTools &&
+          (capabilityModelId.includes("gpt-5") || capabilityModelId.includes("gpt-4"))
+        ) {
           const { openai } = await import("@ai-sdk/openai");
           allTools = {
             ...baseTools,
