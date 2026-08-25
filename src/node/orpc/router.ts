@@ -142,6 +142,7 @@ import {
   DEFAULT_WORKFLOW_AGENT_ID,
   WorkflowTaskServiceAdapter,
 } from "@/node/services/workflows/WorkflowTaskServiceAdapter";
+import { acquireWorkflowArchiveAdmission } from "@/node/services/workflows/workflowArchiveAdmission";
 import { WorkflowArgsValidationError } from "@/node/services/workflows/workflowArgs";
 import { resolveWorkflowScript } from "@/node/services/workflows/workflowScriptResolver";
 import { isProjectTrusted, isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
@@ -1989,6 +1990,12 @@ export const router = (authToken?: string) => {
         .input(schemas.workflows.resume.input)
         .output(schemas.workflows.resume.output)
         .handler(async ({ context, input }) => {
+          // Acquired before any await: resolveWorkflowContext suspends, and an
+          // interrupt_active archive entering during that window would see neither an
+          // admission nor a durable active run — it could destroy the delegated turns and
+          // archive the workspace before this request reaches the service-level admission.
+          // The service re-acquires its own admission; the counters stack.
+          using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
           const { service, projectTrusted } = await resolveWorkflowContext(
             context,
             input.workspaceId
@@ -2005,6 +2012,8 @@ export const router = (authToken?: string) => {
         .input(schemas.workflows.retryFromCheckpoint.input)
         .output(schemas.workflows.retryFromCheckpoint.output)
         .handler(async ({ context, input }) => {
+          // Entry-level admission; see workflows.resume above.
+          using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
           const { service, projectTrusted } = await resolveWorkflowContext(
             context,
             input.workspaceId,
@@ -2030,6 +2039,10 @@ export const router = (authToken?: string) => {
         .output(schemas.workflows.start.output)
         .handler(async ({ context, input, signal }) => {
           assertDynamicWorkflowsEnabled(context);
+          // Entry-level admission; see workflows.resume above. start additionally awaits
+          // workspace idleness and script resolution before reaching the service, widening
+          // the window an unguarded interrupt_active archive could slip through.
+          using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
           let invocationMessagePersisted: boolean | undefined;
           let resolveInvocationPersistence: (persisted: boolean) => void = () => undefined;
           const invocationPersistence = new Promise<boolean>((resolve) => {
@@ -2822,10 +2835,44 @@ export const router = (authToken?: string) => {
         .input(schemas.general.openInEditor.input)
         .output(schemas.general.openInEditor.output)
         .handler(async ({ context, input }) => {
-          return context.editorService.openInEditor(
+          // Custom editors spawn detached and untrackable; record the open (refusing while
+          // the workspace is archiving) before launching. See recordExternalEditorOpen.
+          const recorded = await context.workspaceService.recordExternalEditorOpenForLaunch(
+            input.workspaceId
+          );
+          if (!recorded.success) {
+            return recorded;
+          }
+          const result = await context.editorService.openInEditor(
             input.workspaceId,
             input.targetPath,
             input.editorConfig
+          );
+          if (!result.success) {
+            // EditorService errors occur only before its detached spawn (missing/invalid
+            // command, unsupported runtime), so no editor launched — roll back a marker this
+            // call created, or it would stick and permanently refuse future model-driven
+            // snapshot/Coder-stop archives of the workspace.
+            await recorded.data.rollbackAfterFailedLaunch();
+          }
+          return result;
+        }),
+      recordEditorOpen: t
+        .input(schemas.general.recordEditorOpen.input)
+        .output(schemas.general.recordEditorOpen.output)
+        .handler(async ({ context, input }) => {
+          return context.workspaceService.recordExternalEditorOpen(
+            input.workspaceId,
+            input.launchToken
+          );
+        }),
+      rollbackEditorOpen: t
+        .input(schemas.general.rollbackEditorOpen.input)
+        .output(schemas.general.rollbackEditorOpen.output)
+        .handler(async ({ context, input }) => {
+          return context.workspaceService.rollbackRecordedEditorOpen(
+            input.workspaceId,
+            input.launchToken
           );
         }),
     },
