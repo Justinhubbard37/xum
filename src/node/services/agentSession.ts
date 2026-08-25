@@ -37,7 +37,7 @@ import {
   type GoalSyntheticMessageKind,
 } from "@/constants/goals";
 import type { SendMessageError } from "@/common/types/errors";
-import { AgentIdSchema, SkillNameSchema } from "@/common/orpc/schemas";
+import { AgentIdSchema, SendMessageOptionsSchema, SkillNameSchema } from "@/common/orpc/schemas";
 import { normalizeAgentId, resolvePersistedAgentIdCandidates } from "@/common/utils/agentIds";
 import {
   buildStreamErrorEventData,
@@ -1899,6 +1899,24 @@ export class AgentSession {
     }
     if (typeof persistedDisableWorkspaceAgents === "boolean") {
       retryRequest.disableWorkspaceAgents = persistedDisableWorkspaceAgents;
+    }
+    // Explicit-agent delegated turns must stay loud across restart recovery: without
+    // this, a replay after the agent was removed/disabled would silently run exec.
+    // History stores retrySendOptions as an untyped blob, so the persisted value is
+    // re-validated against the canonical schema first — a malformed provenance pin
+    // must be discarded (lenient replay) rather than failing every recovered attempt
+    // with a false mismatch. A valid pin is copied verbatim (keeps expectedScope/
+    // expectedSource).
+    const persistedStrictAgentResolution =
+      SendMessageOptionsSchema.shape.strictAgentResolution.safeParse(
+        persistedRetrySendOptions?.strictAgentResolution
+      );
+    if (
+      persistedStrictAgentResolution.success &&
+      persistedStrictAgentResolution.data != null &&
+      persistedStrictAgentResolution.data !== false
+    ) {
+      retryRequest.strictAgentResolution = persistedStrictAgentResolution.data;
     }
 
     if (persistedRetrySendOptions?.agentInitiated === true) {
@@ -4338,6 +4356,10 @@ export class AgentSession {
     const sendOptions: SendMessageOptions = {
       ...params.baseOptions,
       agentId: "compact",
+      // This internal request intentionally runs the hidden compact agent, so the
+      // caller's strict explicit-agent gate must not apply to it. The post-compaction
+      // follow-up re-arms strictness via pickPreservedSendOptions.
+      strictAgentResolution: undefined,
       skipAiSettingsPersistence: true,
       model: resolved.selected.model,
       // Effective (clamped) thinking: this internal request skips persistence,
@@ -4773,6 +4795,7 @@ export class AgentSession {
       workspaceGoalService: this.workspaceGoalService,
       experiments: options?.experiments,
       disableWorkspaceAgents: options?.disableWorkspaceAgents,
+      strictAgentResolution: options?.strictAgentResolution,
       hasQueuedMessages: this.hasQueuedMessages.bind(this),
       openaiTruncationModeOverride,
       // Mid-turn thinking overrides clamp against the same floor as the
@@ -6794,6 +6817,9 @@ export class AgentSession {
       experiments: followUp.experiments,
       allowAgentSetGoal: followUp.allowAgentSetGoal,
       disableWorkspaceAgents: followUp.disableWorkspaceAgents,
+      // Explicit-agent turns stay loud on the resumed turn too: the requested agent
+      // may have been removed/hidden/disabled while compaction ran.
+      strictAgentResolution: followUp.strictAgentResolution,
       skipAiSettingsPersistence: followUp.skipAiSettingsPersistence,
     };
 

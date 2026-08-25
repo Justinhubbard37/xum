@@ -34,6 +34,7 @@ import {
   AgentSession,
   clearProviderConfigFixableAbandonMarkers,
   CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE,
+  inheritOpenWorkspaceTurnMetadata,
   type StreamErrorRecoveryOutcome,
 } from "@/node/services/agentSession";
 import type { HistoryService } from "@/node/services/historyService";
@@ -268,6 +269,7 @@ import type {
   WorkspaceGoalDefaultsOverrideSchema,
   WorkspaceHeartbeatSettingsSchema,
 } from "@/common/orpc/schemas";
+import { SendMessageOptionsSchema } from "@/common/orpc/schemas";
 import type {
   ArchiveLossyUntrackedFilesConfirmation,
   ArchivePreflightResult,
@@ -1822,6 +1824,29 @@ function extractUserPromptText(message: MuxMessage): string {
   return stripStagedAttachmentNotice(partsText).trim();
 }
 
+/**
+ * Canonical whitelist for options replayed from a persisted delegated-turn row
+ * (see getDelegatedTurnContinuationSendOptions). History metadata stores
+ * retrySendOptions as an untyped blob, so a malformed or tampered row must be
+ * rejected (parse failure) or stripped to exactly these fields — never spread
+ * verbatim into an internal send where extras like editMessageId would trigger
+ * the edit/truncation flow.
+ */
+const DELEGATED_TURN_CONTINUATION_OPTIONS_SCHEMA = SendMessageOptionsSchema.pick({
+  model: true,
+  agentId: true,
+  thinkingLevel: true,
+  reasoningMode: true,
+  toolPolicy: true,
+  additionalSystemInstructions: true,
+  maxOutputTokens: true,
+  providerOptions: true,
+  experiments: true,
+  disableWorkspaceAgents: true,
+  strictAgentResolution: true,
+  allowAgentSetGoal: true,
+});
+
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
 export class WorkspaceService extends EventEmitter {
   private readonly sessions = new Map<string, AgentSession>();
@@ -2614,7 +2639,11 @@ export class WorkspaceService extends EventEmitter {
       return;
     }
 
-    const sendOptions = await this.getWorkflowContinuationSendOptions(ownerWorkspaceId);
+    // An in-flight delegated workspace turn continues under its own send options
+    // (per-turn agent/model overrides are not in the workspace's persisted defaults).
+    const sendOptions =
+      (await this.getDelegatedTurnContinuationSendOptions(ownerWorkspaceId)) ??
+      (await this.getWorkflowContinuationSendOptions(ownerWorkspaceId));
     if (sendOptions == null) {
       log.debug("Bash monitor wake has no send options; leaving pending", { ownerWorkspaceId });
       return;
@@ -13402,6 +13431,80 @@ export class WorkspaceService extends EventEmitter {
 
   getWorkflowContinuationSendOptions(workspaceId: string): Promise<SendMessageOptions | null> {
     return this.getGoalContinuationKickoffSendOptions(workspaceId);
+  }
+
+  /**
+   * Send options for continuing a STILL-OPEN delegated workspace turn (bash-monitor
+   * wakes cut turns at tool boundaries). The delegated prompt's persisted
+   * retrySendOptions carry the turn's own settings — including per-turn overrides
+   * (agentId, model, strictAgentResolution) that are deliberately NOT in the
+   * workspace's persisted defaults when the launch used skipAiSettingsPersistence —
+   * so resolving from workspace defaults would continue the turn under the wrong
+   * agent. Openness is decided by the same rule as workspace-turn correlation
+   * (inheritOpenWorkspaceTurnMetadata): only a correlated assistant cut with
+   * finishReason "tool-calls" leaves the turn open. Once a terminal assistant
+   * response closed the turn (or any other user send took over the conversation),
+   * a late monitor match is a NEW synthetic turn and resolves from the target's
+   * persisted defaults instead of resurrecting stale per-turn overrides.
+   *
+   * Carrier rows for the open turn's options, newest first: the correlated
+   * workspace-turn user row itself, and this mechanism's own wake continuations
+   * (their sends were dispatched with the delegated options and re-stamped them) —
+   * after an on-send compaction consumed a wake, the follow-up wake-typed row is
+   * the only carrier left inside the boundary while the summary still proves the
+   * turn is open. Persisted options are rebuilt through a canonical schema
+   * whitelist (history is untrusted at rest; a tampered row must not inject fields
+   * like editMessageId into an internal send). Continuations never persist these
+   * options as workspace defaults.
+   */
+  private async getDelegatedTurnContinuationSendOptions(
+    workspaceId: string
+  ): Promise<SendMessageOptions | null> {
+    // Tests construct WorkspaceService with partial HistoryService mocks (same
+    // defensive pattern as the iterateFullHistory caller above).
+    if (typeof this.historyService.getHistoryFromLatestBoundary !== "function") {
+      return null;
+    }
+    const history = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!history.success) {
+      return null;
+    }
+    const openTurn = inheritOpenWorkspaceTurnMetadata(history.data);
+    if (openTurn == null) {
+      return null;
+    }
+    for (let i = history.data.length - 1; i >= 0; i--) {
+      const message = history.data[i];
+      if (message.role !== "user") {
+        continue;
+      }
+      const muxMetadata = message.metadata?.muxMetadata;
+      const isOpenTurnRow =
+        muxMetadata?.type === "workspace-turn-task" &&
+        muxMetadata.taskHandleId === openTurn.taskHandleId &&
+        muxMetadata.turnId === openTurn.turnId;
+      const isWakeContinuationRow = muxMetadata?.type === "bash-monitor-wake";
+      if (!isOpenTurnRow && !isWakeContinuationRow) {
+        continue;
+      }
+      const parsed = DELEGATED_TURN_CONTINUATION_OPTIONS_SCHEMA.safeParse(
+        message.metadata?.retrySendOptions
+      );
+      if (parsed.success) {
+        return {
+          ...parsed.data,
+          // Per-turn continuation settings must not become workspace defaults.
+          skipAiSettingsPersistence: true,
+        };
+      }
+      if (isOpenTurnRow) {
+        // The anchor row itself has no usable options; nothing older can be more
+        // authoritative for this turn.
+        return null;
+      }
+      // A wake row without valid options: keep walking toward the anchor row.
+    }
+    return null;
   }
 
   /**
