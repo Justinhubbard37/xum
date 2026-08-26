@@ -172,7 +172,11 @@ import {
   SKILL_DYNAMIC_COMMAND_TIMEOUT_MS,
   SKILL_DYNAMIC_OUTPUT_CAP_BYTES,
 } from "@/node/services/agentSkills/skillDynamicContext";
-import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
+import {
+  aliasLegacyPtcExclusive,
+  EXPERIMENT_IDS,
+  type ExperimentId,
+} from "@/common/constants/experiments";
 import {
   awaitPendingBranchSummary,
   isRlmModeEnabled,
@@ -1949,7 +1953,10 @@ export class AgentSession {
         : undefined;
     const persistedAllowAgentSetGoal = persistedRetrySendOptions?.allowAgentSetGoal;
     const persistedProviderOptions = persistedRetrySendOptions?.providerOptions;
-    const persistedExperiments = persistedRetrySendOptions?.experiments;
+    // History rows load as raw JSON (no schema parse), so the legacy exclusive
+    // alias must be applied here: an old snapshot may carry only the exclusive
+    // flag, which activates exactly the posture merged PTC now provides.
+    const persistedExperiments = aliasLegacyPtcExclusive(persistedRetrySendOptions?.experiments);
 
     const lastUserMuxMetadata = lastUserMessage?.metadata?.muxMetadata;
     if (isCompactionRequestMetadata(lastUserMuxMetadata)) {
@@ -7182,7 +7189,13 @@ export class AgentSession {
       reasoningMode: followUp.reasoningMode,
       additionalSystemInstructions: followUp.additionalSystemInstructions,
       providerOptions: followUp.providerOptions,
-      experiments: followUp.experiments,
+      // Raw JSON boundary (same as the startup-retry snapshot read above): an
+      // older build may have persisted {programmaticToolCalling: false,
+      // programmaticToolCallingExclusive: true}, and the explicit false would
+      // otherwise win over backend overrides while the removed legacy field
+      // is ignored — silently downgrading the crash-safe follow-up to
+      // PTC-off (and making its rlm flag inert).
+      experiments: aliasLegacyPtcExclusive(followUp.experiments),
       allowAgentSetGoal: followUp.allowAgentSetGoal,
       disableWorkspaceAgents: followUp.disableWorkspaceAgents,
       // Explicit-agent turns stay loud on the resumed turn too: the requested agent

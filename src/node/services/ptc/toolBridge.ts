@@ -20,6 +20,11 @@ import {
   isBridgeToolGranted,
   type CapabilityGrants,
 } from "@/common/types/capabilityGrants";
+import {
+  retainExemptKernelRecordResult,
+  retainPersistenceCriticalArgsFields,
+  sanitizeMediaRecordCapture,
+} from "./types";
 
 /**
  * Result shape of an AI SDK Schema's optional custom validator
@@ -134,6 +139,21 @@ const EXCLUDED_TOOLS = new Set([
   "todo_read", // UI-specific
   "status_set", // UI-specific
   "agent_report", // Must be top-level for taskService to read args from history
+  // Context-coupled tools: AIService keys system-prompt context off their
+  // top-level presence (memory index / hot-set block for `memory`, proactive
+  // guidance for `advisor`). Bridging them would silently drop that context
+  // in the exclusive posture.
+  "memory",
+  "advisor",
+  // Media-producing built-ins: these exist solely to put media in front of
+  // the model, so keep them top-level where their content-container output
+  // feeds extractToolMediaAsUserMessages directly. Bridged MCP tools that
+  // return media are still covered without this static list: kernel capture
+  // bounding and compaction exempt media containers (see
+  // isKernelRecordResultExempt), so nested media survives to request-time
+  // extraction in classic AND kernel modes.
+  "attach_file",
+  "desktop_screenshot",
 ]);
 
 /**
@@ -220,16 +240,27 @@ export class ToolBridge {
   register(runtime: IJSRuntime, kernel?: KernelBridgeOptions): void {
     // Kernel mode bounds record/event capture at creation (host memory and
     // streamed-to-history events); ephemeral registrations keep full records
-    // (the byte-identical supplement contract). Post-eval compaction still
-    // bounds the model-visible set.
+    // (the non-RLM inline-results contract). Post-eval compaction still
+    // bounds the model-visible set. Exempt records (persistence-critical
+    // tools, media containers) keep full results through BOTH stages — see
+    // isKernelRecordResultExempt.
     runtime.setKernelRecordBounds(
       kernel !== undefined
         ? {
             argsCapBytes: KERNEL_COMPACT_ARGS_CAP_BYTES,
             resultCapBytes: RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES,
+            captureRetained: retainExemptKernelRecordResult,
+            captureArgsRetained: retainPersistenceCriticalArgsFields,
           }
         : undefined
     );
+    // Media containers are budgeted at capture in BOTH modes: classic records
+    // keep full inline results by contract, but exclusive PTC makes the
+    // bridge the only route to executable MCP tools, and request-time
+    // attachment extraction rewrites only the provider copy — records/events
+    // persisted into partial.json/chat.jsonl need the budget regardless of
+    // kernel mode.
+    runtime.setCaptureResultSanitizer(sanitizeMediaRecordCapture);
     const xumObj: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
 
     // Grant-denied tools get an explicit stub: the guest sees a clear
@@ -489,7 +520,11 @@ export class ToolBridge {
 
   private serializeResult(result: unknown): unknown {
     try {
-      // Round-trip through JSON to ensure QuickJS can handle the value
+      // Round-trip through JSON to ensure QuickJS can handle the value.
+      // Media returned by bridged MCP tools passes through intact: the guest
+      // may legitimately process the bytes, and the classic (non-RLM) record
+      // keeps the full result so extractAttachmentsFromToolOutput can lift
+      // nested media into model-visible multimodal parts at request time.
       return JSON.parse(JSON.stringify(result));
     } catch {
       return { error: "Result not JSON-serializable" };
