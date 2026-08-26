@@ -3850,6 +3850,64 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     return { aiService, config, historyService, workspaceService, goalService, cleanup };
   }
 
+  test("requireIdle sends carry a live idle-admission probe re-evaluated at session gates", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cJ6NI): the preflight count check at
+    // sendMessage entry is a one-shot snapshot — a manual send can enter
+    // preflight during the later admission awaits, before the continuation
+    // makes the session busy. The forwarded admissionStale probe must sample
+    // the LIVE preflight count so AgentSession's admission gates (re-evaluated
+    // up to the last gate before the pre-turn batch becomes irrevocable) can
+    // refuse the continuation.
+    const { config, workspaceService, cleanup } = await createServices();
+    const workspaceId = "require-idle-admission-probe";
+    const internalAccess = workspaceService as unknown as {
+      sessions: Map<string, AgentSession>;
+      preflightSendCounts: Map<string, number>;
+    };
+    try {
+      await config.addWorkspace("/tmp/require-idle-probe-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "require-idle-probe-project",
+        projectPath: "/tmp/require-idle-probe-project",
+        runtimeConfig: { type: "local" },
+      });
+      let capturedProbe: (() => boolean) | undefined;
+      const fakeSession = {
+        isBusy: mock(() => false),
+        emitMetadata: mock(() => undefined),
+        sendMessage: mock(
+          (_msg: string, _opts: unknown, internal?: { admissionStale?: () => boolean }) => {
+            capturedProbe = internal?.admissionStale;
+            return Promise.resolve(Ok(undefined));
+          }
+        ),
+      } as unknown as AgentSession;
+      internalAccess.sessions.set(workspaceId, fakeSession);
+
+      const result = await workspaceService.sendMessage(
+        workspaceId,
+        "Continue working on the goal.",
+        { model: "openai:gpt-4o", agentId: "exec" },
+        { synthetic: true, agentInitiated: true, requireIdle: true, goalContinuation: true }
+      );
+      expect(result.success).toBe(true);
+      expect(typeof capturedProbe).toBe("function");
+
+      // Live sampling: idle (only the continuation itself would hold a slot).
+      expect(capturedProbe?.()).toBe(false);
+      // A manual send entering preflight while the continuation is still in
+      // its admission awaits (continuation slot + manual slot) flips the
+      // probe stale — even though the entry snapshot passed.
+      internalAccess.preflightSendCounts.set(workspaceId, 2);
+      expect(capturedProbe?.()).toBe(true);
+      internalAccess.preflightSendCounts.delete(workspaceId);
+    } finally {
+      internalAccess.sessions.delete(workspaceId);
+      await cleanup();
+    }
+  });
+
   test("idle wait follows auto-retry startup into the resumed stream", async () => {
     const { workspaceService, cleanup } = await createServices();
     const workspaceId = "idle-wait-auto-retry-starting";
@@ -6264,6 +6322,168 @@ describe("WorkspaceService sendMessage status clearing", () => {
       expect.objectContaining({ model: "custom:unpriced-model", agentId: "exec" }),
       expect.objectContaining({ synthetic: undefined })
     );
+  });
+
+  test("the follow-up idle probe excludes the originating send after its session handoff", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cRi_J): preflightSendCounts stays positive
+    // until the outer service call returns, so a probe reading it would let a
+    // continuation's on-send compaction completion veto the continuation's
+    // OWN saved follow-up. The probe must see unrelated preflights (round-37
+    // semantics) but release the originating send at its session handoff.
+    fakeSession.isBusy.mockReturnValue(false);
+    const realSession = (
+      workspaceService as unknown as { createSession: (workspaceId: string) => AgentSession }
+    ).createSession("test-workspace");
+    // The shared fixture aiService omits stopStream; disposal needs it.
+    (
+      realSession as unknown as { aiService: { stopStream?: () => Promise<unknown> } }
+    ).aiService.stopStream = () => Promise.resolve(Ok(undefined));
+    const probe = (realSession as unknown as { hasExternalSendPreflight?: () => boolean })
+      .hasExternalSendPreflight;
+    expect(probe).toBeDefined();
+    try {
+      expect(probe!()).toBe(false);
+
+      // A send stalled in its pricing preflight is visible to the probe.
+      let releasePricing!: () => void;
+      const pricingGate = new Promise<void>((resolve) => {
+        releasePricing = resolve;
+      });
+      let pricingStarted = false;
+      workspaceService.setWorkspaceGoalService({
+        assertPricedModelForBudgetedGoal: mock(async () => {
+          pricingStarted = true;
+          await pricingGate;
+          return Ok(undefined);
+        }),
+        getPendingGoalSnapshot: mock(() => null),
+      } as unknown as WorkspaceGoalService);
+      // Ref objects: closure assignments to a `let` are invisible to TS
+      // control-flow narrowing at the later assertion sites.
+      const probeBeforeAdmission: { value: boolean | null } = { value: null };
+      const probeAfterAdmission: { value: boolean | null } = { value: null };
+      fakeSession.sendMessage.mockImplementationOnce(
+        (
+          _message: unknown,
+          _options: unknown,
+          internal?: { onTurnAdmissionCommitted?: () => void }
+        ) => {
+          // Codex P2 (PRRT_kwDOPxxmWM6cSRkH): the reservation must survive the
+          // session's admission awaits (the idle gap before the busy claim)...
+          probeBeforeAdmission.value = probe!();
+          internal?.onTurnAdmissionCommitted?.();
+          // ...and release the moment the turn synchronously claims PREPARING,
+          // so a follow-up redispatched from within this very turn (on-send
+          // compaction completion) does not veto itself.
+          probeAfterAdmission.value = probe!();
+          return Promise.resolve(Ok(undefined));
+        }
+      );
+
+      const sendPromise = workspaceService.sendMessage("test-workspace", "manual message", {
+        model: "openai:gpt-4o-mini",
+        agentId: "exec",
+      });
+      await waitForCondition(() => pricingStarted);
+      expect(probe!()).toBe(true);
+
+      releasePricing();
+      const result = await sendPromise;
+      expect(result.success).toBe(true);
+      expect(probeBeforeAdmission.value).toBe(true);
+      expect(probeAfterAdmission.value).toBe(false);
+      // Fully settled: no residual reservation leaks.
+      expect(probe!()).toBe(false);
+    } finally {
+      realSession.dispose();
+    }
+  });
+
+  test("holds the preflight reservation through resumeStream session admission", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cSREO): AgentSession.resumeStream runs its own
+    // async admission (a second pricing gate) during which the session still
+    // reports idle. Releasing the reservation before that await let follow-up
+    // recovery admit a recovered synthetic turn that then ran concurrently
+    // with the resumed stream — the reservation must survive until the session
+    // call settles.
+    fakeSession.isBusy.mockReturnValue(false);
+    const realSession = (
+      workspaceService as unknown as { createSession: (workspaceId: string) => AgentSession }
+    ).createSession("test-workspace");
+    // The shared fixture aiService omits stopStream; disposal needs it.
+    (
+      realSession as unknown as { aiService: { stopStream?: () => Promise<unknown> } }
+    ).aiService.stopStream = () => Promise.resolve(Ok(undefined));
+    const probe = (realSession as unknown as { hasExternalSendPreflight?: () => boolean })
+      .hasExternalSendPreflight;
+    expect(probe).toBeDefined();
+    try {
+      workspaceService.setWorkspaceGoalService({
+        assertPricedModelForBudgetedGoal: mock(() => Promise.resolve(Ok(undefined))),
+        getPendingGoalSnapshot: mock(() => null),
+      } as unknown as WorkspaceGoalService);
+      const probeDuringResume: { value: boolean | null } = { value: null };
+      fakeSession.resumeStream.mockImplementationOnce(() => {
+        probeDuringResume.value = probe!();
+        return Promise.resolve(Ok({ started: true }));
+      });
+
+      const result = await workspaceService.resumeStream("test-workspace", {
+        model: "openai:gpt-4o-mini",
+        agentId: "exec",
+      });
+      expect(result.success).toBe(true);
+      expect(probeDuringResume.value).toBe(true);
+      // Fully settled: no residual reservation leaks.
+      expect(probe!()).toBe(false);
+    } finally {
+      realSession.dispose();
+    }
+  });
+
+  test("holds the preflight reservation through the rejected-send fallback", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cSCjs): a manual send rejected by the pricing
+    // gate delegates into AgentSession to persist the user row and apply goal
+    // safety, but it never streams and cannot produce its own compaction
+    // follow-up. Releasing the reservation before that fallback let a
+    // completing goal-scoped follow-up be admitted ahead of the user's
+    // intervention; the reservation must survive until the fallback settles.
+    fakeSession.isBusy.mockReturnValue(false);
+    const realSession = (
+      workspaceService as unknown as { createSession: (workspaceId: string) => AgentSession }
+    ).createSession("test-workspace");
+    // The shared fixture aiService omits stopStream; disposal needs it.
+    (
+      realSession as unknown as { aiService: { stopStream?: () => Promise<unknown> } }
+    ).aiService.stopStream = () => Promise.resolve(Ok(undefined));
+    const probe = (realSession as unknown as { hasExternalSendPreflight?: () => boolean })
+      .hasExternalSendPreflight;
+    expect(probe).toBeDefined();
+    try {
+      const pricingError: SendMessageError = { type: "unknown", raw: "unpriced model" };
+      workspaceService.setWorkspaceGoalService({
+        assertPricedModelForBudgetedGoal: mock(() => Promise.resolve(Err(pricingError))),
+        getPendingGoalSnapshot: mock(() => null),
+      } as unknown as WorkspaceGoalService);
+      const probeDuringFallback: { value: boolean | null } = { value: null };
+      fakeSession.sendMessage.mockImplementationOnce(() => {
+        probeDuringFallback.value = probe!();
+        return Promise.resolve(Err(pricingError));
+      });
+
+      const result = await workspaceService.sendMessage("test-workspace", "please stop", {
+        model: "custom:unpriced-model",
+        agentId: "exec",
+      });
+      expect(result.success).toBe(false);
+      // The fallback persists the rejected row and applies goal safety while
+      // other dispatchers may probe idleness — it must still see this send.
+      expect(probeDuringFallback.value).toBe(true);
+      // Fully settled: no residual reservation leaks.
+      expect(probe!()).toBe(false);
+    } finally {
+      realSession.dispose();
+    }
   });
 
   test("does not clear persisted agent status directly for non-synthetic sends", async () => {
@@ -15212,6 +15432,24 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
       endTime: null,
     });
     expect(service.getGoalContinuationRuntimeState("ws-1").isInitializing).toBe(true);
+  });
+
+  test("in-preflight direct sends report the workspace busy for goal continuations", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cECpR): a direct send does not set PREPARING
+    // until late in AgentSession.sendMessage, so a kickoff candidate restored
+    // while the send is mid-preflight (manual row already durable, session
+    // still phase-idle) could otherwise be consumed by goal-continuation
+    // eligibility and dispatched ahead of the user's turn. The runtime busy
+    // predicate must include sendMessage's preflight counter.
+    const service = await makeService(undefined);
+    expect(service.getGoalContinuationRuntimeState("ws-1").isBusy).toBe(false);
+
+    const counts = (service as unknown as { preflightSendCounts: Map<string, number> })
+      .preflightSendCounts;
+    counts.set("ws-1", 1);
+    expect(service.getGoalContinuationRuntimeState("ws-1").isBusy).toBe(true);
+    counts.delete("ws-1");
+    expect(service.getGoalContinuationRuntimeState("ws-1").isBusy).toBe(false);
   });
 
   test("kickoff continuation fires on a freshly-init'd workspace", async () => {
