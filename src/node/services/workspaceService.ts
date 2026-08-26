@@ -297,6 +297,7 @@ import {
   BashMonitorWakeStore,
   buildBashMonitorWakeMetadata,
   buildBashMonitorWakePrompt,
+  type BashMonitorWakePromptContext,
   type BashMonitorWakeRecord,
 } from "@/node/services/bashMonitorWakeStore";
 import type { WorkspaceLifecycleHooks } from "@/node/services/workspaceLifecycleHooks";
@@ -737,12 +738,45 @@ const BASH_MONITOR_CANCELED_QUEUE_REASON =
   "Background bash monitor was explicitly canceled before its wake dispatched.";
 const BASH_MONITOR_SHOWN_QUEUE_REASON =
   "Background bash monitor output was already shown before its wake dispatched.";
+// Re-arm retraction rebuilds rather than consumes: the store row was rewritten (stale terminal
+// cleared), so the queued prompt is stale but the wake itself must redeliver from the row.
+const BASH_MONITOR_REARMED_QUEUE_REASON =
+  "Background bash monitor was re-armed before its queued settlement wake dispatched.";
+
+/**
+ * Parse a persisted generation marker (ISO timestamp) into an `originNotAfterMs` bound. A
+ * malformed value degrades to NEGATIVE_INFINITY -- the fail-open bound under which every live
+ * process counts as a newer generation, so its read state can neither supersede the durable wake
+ * nor retract its queued turn. Raw Date.parse would instead yield NaN, which disables the
+ * generation check (`startTime > NaN` and `startTime <= NaN` are both false) and poisons the
+ * min/max bound accumulation across coalesced records.
+ */
+function parseGenerationMarkerMs(value: string): number {
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? Number.NEGATIVE_INFINITY : parsed;
+}
 
 interface QueuedBashMonitorWakeCancellation {
   abortController: AbortController;
   dispatchState: { canceledBeforeAcceptance: boolean };
   invalidatedProcessKeys: Set<string>;
-  matchedOutputByProcess: Map<string, { matchedThroughOffset: number; originNotAfterMs: number }>;
+  /**
+   * Per-process signals a queued wake carries. A wake is retracted only when a shown event covers
+   * every present signal: matched output via the shown offset (absent on terminal-only wakes,
+   * vacuously covered), and settlement via the explicit terminal-shown flag (a filtered or
+   * zero-output post-exit read never advances the offset). Each signal carries its own
+   * generation bound: matched output binds to the record's originating createdAt while the
+   * terminal binds to the settling generation's terminalOriginAt, mirroring the drain gate.
+   */
+  matchedOutputByProcess: Map<
+    string,
+    {
+      matchedThroughOffset?: number;
+      matchedOriginNotAfterMs: number;
+      hasTerminal: boolean;
+      terminalOriginNotAfterMs: number;
+    }
+  >;
 }
 
 async function waitForAgentSessionIdle(session: AgentSession, signal?: AbortSignal): Promise<void> {
@@ -1900,6 +1934,10 @@ export class WorkspaceService extends EventEmitter {
   // Explicit cancellation is a tombstone for late monitor-match handlers and queued wakes. It is
   // cleared when the same process ID is re-armed, which can happen after workspace cleanup.
   private readonly canceledBashMonitorKeys = new Set<string>();
+  // Settlement wakes whose wake-store write failed: the stopped listener consumes this to retain
+  // the armed-registry row as the restart-recovery breadcrumb (see handleBashMonitorMatch).
+  // Cleared on re-arm so a stale flag cannot retain a later generation's registry row.
+  private readonly failedBashSettlementPersistKeys = new Set<string>();
   private readonly queuedBashMonitorWakeKeysByProcess = new Map<
     string,
     Map<string, QueuedBashMonitorWakeCancellation>
@@ -1913,14 +1951,23 @@ export class WorkspaceService extends EventEmitter {
     for (const [queueKey, cancellation] of this.queuedBashMonitorWakeKeysByProcess.get(
       processKey
     ) ?? []) {
-      // Process IDs are reusable across restarts. Match the existing delivery gate's createdAt
-      // generation bound so output from a newer process cannot supersede an older pending wake.
       const matchedOutput = cancellation.matchedOutputByProcess.get(processKey);
-      if (
-        matchedOutput == null ||
-        payload.processStartTime > matchedOutput.originNotAfterMs ||
-        payload.shownThroughOffset < matchedOutput.matchedThroughOffset
-      ) {
+      if (matchedOutput == null) {
+        continue;
+      }
+      // Two-signal coverage with per-signal generation bounds (process IDs are reusable across
+      // restarts, mirroring the drain gate): a newer instance's shown frontier cannot cover an
+      // older instance's matched output, while the terminal is covered only by a read of the
+      // settling generation itself.
+      const matchedCovered =
+        matchedOutput.matchedThroughOffset == null ||
+        (payload.processStartTime <= matchedOutput.matchedOriginNotAfterMs &&
+          payload.shownThroughOffset >= matchedOutput.matchedThroughOffset);
+      const terminalCovered =
+        !matchedOutput.hasTerminal ||
+        (payload.processStartTime <= matchedOutput.terminalOriginNotAfterMs &&
+          payload.terminalStatusShown);
+      if (!matchedCovered || !terminalCovered) {
         continue;
       }
       cancellation.invalidatedProcessKeys.add(processKey);
@@ -1962,11 +2009,35 @@ export class WorkspaceService extends EventEmitter {
             this.canceledBashMonitorKeys.delete(
               this.bashMonitorProcessKey(payload.workspaceId, payload.processId)
             );
+            this.failedBashSettlementPersistKeys.delete(
+              this.bashMonitorProcessKey(payload.workspaceId, payload.processId)
+            );
             await this.bashMonitorRegistryStore.upsert(payload);
             await this.bashMonitorWakeStore.supersedePendingMonitorLost(
               payload.workspaceId,
               payload.processId
             );
+            // A re-armed ID also invalidates an undelivered settlement wake's terminal metadata:
+            // the record must not render/gate the now-live task as already settled while the new
+            // generation has not matched yet (the match-merge path only covers the first match).
+            await this.bashMonitorWakeStore.clearStaleTerminalOnRearm(
+              payload.workspaceId,
+              payload.processId
+            );
+            // A wake already QUEUED behind an active owner stream embeds the pre-re-arm prompt
+            // (settled claim + terminal metadata). Retract it so the drain rebuilds from the
+            // rewritten row; only settled-claiming wakes are stale — a live process cannot have
+            // settled, so any queued terminal for this ID belongs to a dead prior generation.
+            const processKey = this.bashMonitorProcessKey(payload.workspaceId, payload.processId);
+            for (const [queueKey, cancellation] of this.queuedBashMonitorWakeKeysByProcess.get(
+              processKey
+            ) ?? []) {
+              if (!cancellation.matchedOutputByProcess.get(processKey)?.hasTerminal) continue;
+              cancellation.abortController.abort(BASH_MONITOR_REARMED_QUEUE_REASON);
+              this.removeQueuedMessagesByDedupeKeyPrefix(payload.workspaceId, queueKey, {
+                cancelReason: BASH_MONITOR_REARMED_QUEUE_REASON,
+              });
+            }
           }
         )
       )
@@ -1999,6 +2070,17 @@ export class WorkspaceService extends EventEmitter {
     this.bashMonitorHistoryLocks
       .withLock(workspaceId, () =>
         this.bashMonitorRegistryLocks.withLock(`${workspaceId}:${payload.processId}`, async () => {
+          // Consume the persist-failure flag under the lock (it is set inside the match
+          // handler's locked block, which this block queues behind). When the settlement wake
+          // failed to persist, the armed-registry row is the only remaining breadcrumb: retain
+          // it so restart recovery converts it into a monitor-lost wake instead of the
+          // settlement vanishing with neither a pending wake nor a registry record.
+          const settlementPersistFailed = this.failedBashSettlementPersistKeys.delete(
+            this.bashMonitorProcessKey(workspaceId, payload.processId)
+          );
+          if (settlementPersistFailed && payload.reason === "completed") {
+            return;
+          }
           await this.bashMonitorRegistryStore.remove(workspaceId, payload.processId);
           if (payload.reason === "canceled" && (trackedWakeCancellations?.size ?? 0) === 0) {
             // With no queued/preparing dispatch, cancellation can retire the wake directly.
@@ -2440,16 +2522,30 @@ export class WorkspaceService extends EventEmitter {
     };
     for (const record of records) {
       const processKey = this.bashMonitorProcessKey(ownerWorkspaceId, record.processId);
-      if (record.kind === "match" && record.matchedThroughOffset != null) {
+      if (
+        record.kind === "match" &&
+        (record.matchedThroughOffset != null || record.terminal != null)
+      ) {
         const previous = cancellation.matchedOutputByProcess.get(processKey);
+        // matchedThroughOffset stays absent for terminal-only wakes so retraction never applies
+        // an offset condition the wake does not carry (see two-signal coverage in the listener).
+        const matchedThroughOffset =
+          record.matchedThroughOffset != null || previous?.matchedThroughOffset != null
+            ? Math.max(previous?.matchedThroughOffset ?? 0, record.matchedThroughOffset ?? 0)
+            : undefined;
         cancellation.matchedOutputByProcess.set(processKey, {
-          matchedThroughOffset: Math.max(
-            previous?.matchedThroughOffset ?? 0,
-            record.matchedThroughOffset
+          ...(matchedThroughOffset != null ? { matchedThroughOffset } : {}),
+          hasTerminal: (previous?.hasTerminal ?? false) || record.terminal != null,
+          // Matched output keeps the OLDEST originating marker (fail-open: an older bound only
+          // rejects newer generations' reads); the terminal takes the NEWEST settling-generation
+          // marker so the live settling process's own read can cover it.
+          matchedOriginNotAfterMs: Math.min(
+            previous?.matchedOriginNotAfterMs ?? Number.POSITIVE_INFINITY,
+            parseGenerationMarkerMs(record.createdAt)
           ),
-          originNotAfterMs: Math.min(
-            previous?.originNotAfterMs ?? Number.POSITIVE_INFINITY,
-            Date.parse(record.createdAt)
+          terminalOriginNotAfterMs: Math.max(
+            previous?.terminalOriginNotAfterMs ?? Number.NEGATIVE_INFINITY,
+            parseGenerationMarkerMs(record.terminalOriginAt ?? record.createdAt)
           ),
         });
       }
@@ -2484,7 +2580,20 @@ export class WorkspaceService extends EventEmitter {
         this.bashMonitorRegistryLocks.withLock(processKey, async () => {
           if (this.canceledBashMonitorKeys.has(processKey)) return;
 
-          await this.bashMonitorWakeStore.enqueueOrMergePending(payload);
+          try {
+            await this.bashMonitorWakeStore.enqueueOrMergePending(payload);
+          } catch (error) {
+            if (payload.terminal != null) {
+              // The settlement wake was never persisted, and the monitor's retirement (queued
+              // behind this handler on the same locks) is about to delete the armed-registry
+              // row — losing BOTH the durable wake and the restart-recovery breadcrumb. Flag
+              // the failure INSIDE the locked block so the stopped listener reliably sees it
+              // and retains the registry row; startup recovery then converts that row into a
+              // monitor-lost wake instead of silence.
+              this.failedBashSettlementPersistKeys.add(processKey);
+            }
+            throw error;
+          }
           this.scheduleBashMonitorWakeDrain(payload.workspaceId);
         })
       );
@@ -2735,28 +2844,93 @@ export class WorkspaceService extends EventEmitter {
       const canQueryShownFrontier =
         typeof this.backgroundProcessManager.getSettledShownThroughOffset === "function";
       const supersededByShown: BashMonitorWakeRecord[] = [];
+      const promptContext = new Map<string, BashMonitorWakePromptContext>();
       for (const record of pending) {
-        let shownThroughOffset: number | undefined;
-        if (record.kind === "match" && record.matchedThroughOffset != null) {
+        // A match record carries up to two independent signals, each with its own shown-condition:
+        // matched output (matchedThroughOffset; shown when the offset frontier covers it) and
+        // settlement (terminal; shown only when the agent was returned the terminal status —
+        // NEVER via offsets alone, because a zero-output process has EOF = 0 = shown offset).
+        // Supersede only when every present signal is shown (vacuous for absent signals). Records
+        // with neither signal (legacy rows, or terminal stripped by a downgraded build's rewrite)
+        // fail open and deliver.
+        if (
+          record.kind === "match" &&
+          (record.matchedThroughOffset != null || record.terminal != null)
+        ) {
           if (canQueryDeliveryState) {
             const state = await this.backgroundProcessManager.getMonitorWakeDeliveryState(
               record.processId,
-              Date.parse(record.createdAt)
+              parseGenerationMarkerMs(record.createdAt)
             );
+            // The terminal signal binds to its own generation marker (terminalOriginAt): a
+            // re-armed generation's settlement is gated against the live settling process, while
+            // the matched signal stays bound to the originating createdAt — offsets from
+            // different generations' output files are never comparable, so a dead generation's
+            // undelivered match must fail open and deliver rather than be superseded by a newer
+            // instance's shown frontier.
+            const terminalMarker = record.terminalOriginAt ?? record.createdAt;
+            const terminalState =
+              record.terminal == null
+                ? undefined
+                : terminalMarker === record.createdAt
+                  ? state
+                  : await this.backgroundProcessManager.getMonitorWakeDeliveryState(
+                      record.processId,
+                      parseGenerationMarkerMs(terminalMarker)
+                    );
             if (state?.status === "blocked") {
               this.scheduleBashMonitorWakeDrainAfterRead(ownerWorkspaceId, state.readSettled);
               continue;
             }
-            shownThroughOffset = state?.shownThroughOffset;
-          } else if (canQueryShownFrontier) {
-            shownThroughOffset = await this.backgroundProcessManager.getSettledShownThroughOffset(
-              record.processId,
-              Date.parse(record.createdAt)
-            );
-          }
-          if (shownThroughOffset != null && shownThroughOffset >= record.matchedThroughOffset) {
-            supersededByShown.push(record);
-            continue;
+            if (terminalState?.status === "blocked") {
+              this.scheduleBashMonitorWakeDrainAfterRead(
+                ownerWorkspaceId,
+                terminalState.readSettled
+              );
+              continue;
+            }
+            const matchedShown =
+              record.matchedThroughOffset == null ||
+              (state?.status === "settled" &&
+                state.shownThroughOffset >= record.matchedThroughOffset);
+            // Partial manager stubs may omit terminalStatusShown; undefined fails open.
+            const terminalShown =
+              record.terminal == null ||
+              (terminalState?.status === "settled" && terminalState.terminalStatusShown === true);
+            if (matchedShown && terminalShown) {
+              supersededByShown.push(record);
+              continue;
+            }
+            // Deliverable for its settlement signal only: the matched lines were already
+            // returned by an owner read, so the prompt flags them as consumed instead of
+            // presenting them as a fresh match condition.
+            if (record.terminal != null && record.matchedThroughOffset != null && matchedShown) {
+              promptContext.set(record.id, { matchedOutputAlreadyShown: true });
+            }
+            // A null terminal-marker state means the settling process instance is no longer
+            // registered (Xum restarted after the settlement persisted, or the ID was reclaimed
+            // by a newer generation): task_await on this record's task ID cannot return its
+            // report.
+            if (record.terminal != null && terminalState == null) {
+              promptContext.set(record.id, { taskAwaitable: false });
+            }
+          } else if (canQueryShownFrontier && record.matchedThroughOffset != null) {
+            // Legacy fallback without the non-blocking query: offset-only suppression, applied
+            // strictly to records that carry no terminal signal (a terminal wake must never be
+            // offset-suppressed).
+            const shownThroughOffset =
+              await this.backgroundProcessManager.getSettledShownThroughOffset(
+                record.processId,
+                parseGenerationMarkerMs(record.createdAt)
+              );
+            if (
+              record.terminal == null &&
+              shownThroughOffset != null &&
+              shownThroughOffset >= record.matchedThroughOffset
+            ) {
+              supersededByShown.push(record);
+              continue;
+            }
           }
         }
         deliverable.push(record);
@@ -2806,7 +2980,7 @@ export class WorkspaceService extends EventEmitter {
         return;
       }
 
-      prompt = buildBashMonitorWakePrompt(deliverable);
+      prompt = buildBashMonitorWakePrompt(deliverable, promptContext);
     } catch (error) {
       unregisterQueueKey();
       throw error;
@@ -2898,6 +3072,12 @@ export class WorkspaceService extends EventEmitter {
           cancellationCallbackHandled = true;
           unregisterQueueKey();
           if (delivered) return;
+          if (reason === BASH_MONITOR_REARMED_QUEUE_REASON) {
+            // Retraction-for-rebuild, not consumption: every record stays pending (the re-arm
+            // already rewrote the settled row) and the next drain re-delivers with fresh prompts.
+            this.scheduleBashMonitorWakeDrain(ownerWorkspaceId);
+            return;
+          }
           const wakeInvalidated =
             reason === BASH_MONITOR_CANCELED_QUEUE_REASON ||
             reason === BASH_MONITOR_SHOWN_QUEUE_REASON;
