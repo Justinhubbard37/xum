@@ -768,6 +768,12 @@ export class WorkspaceStore {
   // (useChatViewDataReady) waits on this so cross-workspace decorations like
   // the concurrent-local warning can't pop in after the transcript reveals.
   private activityHydrated = false;
+  private activityAuthoritative = false;
+  // Workspace ids that received a live subscription delta while a bootstrap-retry
+  // list() read was in flight (null while no retry read is pending). Those deltas
+  // are newer than the pending list response, which must not overwrite or clear
+  // them (see retryActivityBootstrapList).
+  private activityDeltaTouchesDuringRetry: Set<string> | null = null;
   private activityHydratedListeners = new Set<() => void>();
   // Workspaces whose persisted session usage fetch has settled (success or
   // failure). Distinguishes "usage unknown" from "no usage" for the same
@@ -3308,25 +3314,25 @@ export class WorkspaceStore {
     }
   }
 
-  private applyWorkspaceActivityList(snapshots: Record<string, WorkspaceActivitySnapshot>): void {
-    const snapshotEntries = Object.entries(snapshots);
-
-    // Defensive fallback: workspace.activity.list returns {} on backend read failures.
-    // Preserve last-known snapshots instead of wiping sidebar activity state for all
-    // workspaces during a transient metadata read error.
-    if (snapshotEntries.length === 0) {
-      return;
-    }
-
+  /** skipWorkspaceIds: ids whose live state is newer than this list (never overwritten or cleared). */
+  private applyWorkspaceActivityList(
+    snapshots: Record<string, WorkspaceActivitySnapshot>,
+    skipWorkspaceIds?: ReadonlySet<string>
+  ): void {
     const seenWorkspaceIds = new Set<string>();
 
-    for (const [workspaceId, snapshot] of snapshotEntries) {
+    for (const [workspaceId, snapshot] of Object.entries(snapshots)) {
       seenWorkspaceIds.add(workspaceId);
+      if (skipWorkspaceIds?.has(workspaceId)) {
+        continue;
+      }
       this.applyWorkspaceActivitySnapshot(workspaceId, snapshot);
     }
 
+    // An empty list is a valid all-idle result (backend read failures arrive as null
+    // and never reach this method), so clear any cached snapshots it no longer lists.
     for (const workspaceId of Array.from(this.workspaceActivity.keys())) {
-      if (seenWorkspaceIds.has(workspaceId)) {
+      if (seenWorkspaceIds.has(workspaceId) || skipWorkspaceIds?.has(workspaceId)) {
         continue;
       }
       this.applyWorkspaceActivitySnapshot(workspaceId, null);
@@ -3579,17 +3585,32 @@ export class WorkspaceStore {
     }
   }
 
-  private markActivityHydrated(): void {
-    if (this.activityHydrated) {
+  /**
+   * Hydrated means the first-paint barrier may release — including the bootstrap
+   * FAILURE path, which self-heals without activity data. Authoritative is set only
+   * when a real activity snapshot list was applied ({} from an all-idle backend
+   * counts; the null read-failure signal does not), so consumers that must not
+   * mistake failure-path state for "no activity" (e.g. the Workflows tab
+   * auto-activation baseline) gate on it instead.
+   */
+  private markActivityHydrated(authoritative: boolean): void {
+    const hydratedChanged = !this.activityHydrated;
+    const authoritativeChanged = authoritative && !this.activityAuthoritative;
+    if (!hydratedChanged && !authoritativeChanged) {
       return;
     }
     this.activityHydrated = true;
+    if (authoritative) {
+      this.activityAuthoritative = true;
+    }
     for (const listener of this.activityHydratedListeners) {
       listener();
     }
   }
 
   isActivityHydrated = (): boolean => this.activityHydrated;
+
+  isActivityAuthoritative = (): boolean => this.activityAuthoritative;
 
   subscribeActivityHydrated = (listener: () => void): (() => void) => {
     this.activityHydratedListeners.add(listener);
@@ -3646,9 +3667,24 @@ export class WorkspaceStore {
           if (signal.aborted || attemptController.signal.aborted) {
             return;
           }
-          this.applyWorkspaceActivityList(snapshots);
-          this.markActivityHydrated();
+          // null is the backend's read-failure signal: keep last-known snapshots and
+          // stay non-authoritative (the background retry below delivers the real
+          // list later). A non-null list — including {} on an all-idle deployment —
+          // is authoritative.
+          if (snapshots != null) {
+            this.applyWorkspaceActivityList(snapshots);
+          }
+          this.markActivityHydrated(snapshots != null);
         });
+
+        // A transiently-null bootstrap must not stay non-authoritative for the
+        // life of an otherwise healthy subscription: heartbeats keep the iterator
+        // alive indefinitely and events never confer authority, so another list
+        // read may never happen. Retry in the background (attempt-scoped) instead
+        // of blocking here, so live events keep flowing while the read heals.
+        if (snapshots == null) {
+          void this.retryActivityBootstrapList(client, signal, attemptController.signal);
+        }
 
         // Start watchdog after bootstrap so slow list() doesn't trigger
         // false-positive reconnects.
@@ -3672,6 +3708,7 @@ export class WorkspaceStore {
             if (signal.aborted || attemptController.signal.aborted) {
               return;
             }
+            this.activityDeltaTouchesDuringRetry?.add(event.workspaceId);
             this.applyWorkspaceActivitySnapshot(event.workspaceId, event.activity);
           });
         }
@@ -3698,7 +3735,8 @@ export class WorkspaceStore {
           // Self-heal: a failing activity subscription must not hold the chat
           // view's first-paint barrier. Treat the (empty) activity map as
           // known; the retry loop will deliver real data when it recovers.
-          this.markActivityHydrated();
+          // Not authoritative: baseline consumers must not read this as "no activity".
+          this.markActivityHydrated(false);
         }
       } finally {
         releaseAttemptListeners();
@@ -3712,6 +3750,70 @@ export class WorkspaceStore {
       if (signal.aborted) {
         return;
       }
+    }
+  }
+
+  /**
+   * Bootstrap repair for a null (read-failure) activity list: retries list()
+   * with the subscription backoff until a real list applies for this attempt or
+   * the owning attempt/store aborts. Deliberately NOT gated on the store-lifetime
+   * activityAuthoritative latch: after a reconnect, the fresh subscription does
+   * not replay state that changed while disconnected, so the reconnect attempt's
+   * failed bootstrap still needs its own successful list to resync (a stale
+   * attempt's retry is stopped by its attemptSignal instead). Runs concurrently
+   * with the live delta stream, so workspaces that receive a delta while a read
+   * is in flight are skipped when the (older) response applies. Never throws, so
+   * callers may fire-and-forget.
+   */
+  private async retryActivityBootstrapList(
+    client: RouterClient<AppRouter>,
+    signal: AbortSignal,
+    attemptSignal: AbortSignal
+  ): Promise<void> {
+    let attempt = 0;
+    while (!signal.aborted && !attemptSignal.aborted) {
+      await this.sleepWithAbort(calculateSubscriptionBackoffMs(attempt), signal);
+      attempt++;
+      if (signal.aborted || attemptSignal.aborted) {
+        return;
+      }
+      // Live deltas that land while this read is in flight are newer than the
+      // response and must win: record them so the apply below skips their ids.
+      const deltaTracker = new Set<string>();
+      this.activityDeltaTouchesDuringRetry = deltaTracker;
+      // Identity-guarded: a newer attempt's retry may have installed its own
+      // tracker while this stale read was still pending — never clear that one.
+      const releaseTracker = () => {
+        if (this.activityDeltaTouchesDuringRetry === deltaTracker) {
+          this.activityDeltaTouchesDuringRetry = null;
+        }
+      };
+      let snapshots: Record<string, WorkspaceActivitySnapshot> | null = null;
+      try {
+        snapshots = await client.workspace.activity.list();
+      } catch {
+        // Transient transport failure: keep retrying; terminal subscription
+        // failures are owned by the outer attempt loop.
+        releaseTracker();
+        continue;
+      }
+      if (snapshots == null) {
+        releaseTracker();
+        continue;
+      }
+      const appliedSnapshots = snapshots;
+      queueMicrotask(() => {
+        // Released inside the microtask so delta microtasks already queued ahead
+        // of it still register; deltas queued after it run later and overwrite
+        // the list values anyway (newest wins in both directions).
+        releaseTracker();
+        if (signal.aborted || attemptSignal.aborted) {
+          return;
+        }
+        this.applyWorkspaceActivityList(appliedSnapshots, deltaTracker);
+        this.markActivityHydrated(true);
+      });
+      return;
     }
   }
 
@@ -5410,6 +5512,16 @@ export function useSessionUsageKnown(workspaceId: string): boolean {
 export function useWorkspaceActivityHydrated(): boolean {
   const store = getStoreInstance();
   return useSyncExternalStore(store.subscribeActivityHydrated, store.isActivityHydrated);
+}
+
+/**
+ * True only after a REAL activity snapshot list was applied — never via the
+ * failure-path self-heal. Gate logic that must not misread the empty failure-path
+ * map as "no activity" (e.g. auto-activation baselines) on this, not on hydrated.
+ */
+export function useWorkspaceActivityAuthoritative(): boolean {
+  const store = getStoreInstance();
+  return useSyncExternalStore(store.subscribeActivityHydrated, store.isActivityAuthoritative);
 }
 
 /** Rounded chrome value: identical raw-stat updates keep the snapshot primitive stable. */
