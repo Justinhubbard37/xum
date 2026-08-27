@@ -3,6 +3,7 @@ import {
   isDisplayOnlyFilePart,
   type DisplayOnlyFilePart,
 } from "@/common/utils/attachments/displayOnlyFileParts";
+import { isMediaPart, type AISDKMediaPart } from "@/common/utils/attachments/toolAttachmentParts";
 import {
   MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST,
   MAX_SVG_TEXT_CHARS,
@@ -21,16 +22,6 @@ export interface ExtractedToolAttachment {
   data: string;
   mediaType: string;
   filename?: string;
-}
-
-interface AISDKMediaPart {
-  type: "media";
-  data: string;
-  mediaType: string;
-  /** Untrusted optional metadata: persisted rows may carry any shape here —
-   * recognition ignores it (r24) and normalizeOptionalFilename drops
-   * non-strings (r25). */
-  filename?: unknown;
 }
 
 interface AISDKTextPart {
@@ -69,24 +60,6 @@ function isContentContainer(value: unknown): value is AISDKContentContainer {
     value !== null &&
     (value as Record<string, unknown>).type === "content" &&
     Array.isArray((value as Record<string, unknown>).value)
-  );
-}
-
-function isMediaPart(value: unknown): value is AISDKMediaPart {
-  if (typeof value !== "object" || value === null) {
-    return false;
-  }
-
-  const record = value as Record<string, unknown>;
-  // Optional metadata must not gate recognition (r24): capture retains a
-  // leaf with e.g. filename:null (asMediaPart ignores filename), so a
-  // stricter predicate here would leave that retained base64 in
-  // provider-visible JSON. Malformed filenames are dropped downstream by
-  // normalizeOptionalFilename (null/non-string → no filename).
-  return (
-    record.type === "media" &&
-    typeof record.data === "string" &&
-    typeof record.mediaType === "string"
   );
 }
 
@@ -135,7 +108,7 @@ function buildUnsupportedMediaPlaceholder(item: AISDKMediaPart): AISDKTextPart {
 }
 
 function buildDisplayOnlyFilePlaceholder(item: DisplayOnlyFilePart): AISDKTextPart {
-  const normalizedMediaType = normalizeAttachmentMediaType(item.mediaType);
+  const normalizedMediaType = boundMetadataLabel(normalizeAttachmentMediaType(item.mediaType), 100);
   const filename = normalizeOptionalFilename(item.filename);
   const label = filename != null ? `${filename} (${normalizedMediaType})` : normalizedMediaType;
   const sizeValue = getDisplayOnlyFileMetadata(item.providerOptions)?.size;
@@ -191,7 +164,7 @@ export function extractAttachmentsFromToolOutput(
   }
 
   if (!isContentContainer(output)) {
-    // Standalone media leaf (r23): sandbox code can pluck a part out of a
+    // Standalone attachment leaf (r23): sandbox code can pluck a part out of a
     // container (`const part = image.value[0]`) and return it or pass it as
     // another tool's argument; capture retains it under the shared budget,
     // so the provider copy must rewrite it like containered parts.
@@ -211,6 +184,9 @@ export function extractAttachmentsFromToolOutput(
         };
       }
       return { newOutput: buildUnsupportedMediaPlaceholder(output), attachments: [] };
+    }
+    if (isDisplayOnlyFilePart(output)) {
+      return { newOutput: buildDisplayOnlyFilePlaceholder(output), attachments: [] };
     }
     const nested = extractAttachmentsFromNestedToolCalls(output, depth + 1);
     if (nested != null) {
@@ -512,9 +488,11 @@ function extractAttachmentsFromWrapperValue(
       for (const child of children) {
         if (typeof child !== "object" || child === null) continue;
         if (processed.has(child) || visiting.has(child)) continue;
-        // Media leaves and tool-output shapes are handled at the parent's
+        // Attachment leaves and tool-output shapes are handled at the parent's
         // exit phase via the recursive shape handlers, not span descent.
-        if (isMediaPart(child) || isToolOutputShaped(child)) continue;
+        if (isMediaPart(child) || isDisplayOnlyFilePart(child) || isToolOutputShaped(child)) {
+          continue;
+        }
         stack.push({ node: child, entered: false });
       }
       continue;
@@ -527,7 +505,7 @@ function extractAttachmentsFromWrapperValue(
       if (typeof child !== "object" || child === null) {
         return child;
       }
-      if (isMediaPart(child) || isToolOutputShaped(child)) {
+      if (isMediaPart(child) || isDisplayOnlyFilePart(child) || isToolOutputShaped(child)) {
         const extracted = extractAttachmentsFromToolOutput(child, depth + 1);
         if (extracted == null) {
           return child;

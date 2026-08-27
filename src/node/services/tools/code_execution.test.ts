@@ -6,6 +6,8 @@ import { describe, it, expect, mock } from "bun:test";
 import { createCodeExecutionTool, clearTypeCaches, type MountRunner } from "./code_execution";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { ToolBridge } from "@/node/services/ptc/toolBridge";
+import { extractAttachmentsFromToolOutput } from "@/node/utils/messages/toolResultAttachments";
+import { DISPLAY_DATA_STUB, MEDIA_DATA_STUB } from "@/common/utils/attachments/toolAttachmentParts";
 import type { Tool, ToolExecutionOptions } from "ai";
 import type { PTCEvent, PTCExecutionResult } from "@/node/services/ptc/types";
 import { z } from "zod";
@@ -940,12 +942,10 @@ describe("createCodeExecutionTool", () => {
       await host.disposeScope("ws-persist-records");
     });
 
-    it("keeps oversized persistence results and media containers through capture bounding", async () => {
+    it("keeps oversized persistence results while carrying media separately", async () => {
       // Creation-time bounding replaces results over the 16KB threshold with
-      // a __kernelBounded marker BEFORE compaction runs, so the compaction
-      // exemption alone cannot save an oversized diff (repo caps allow up to
-      // ~50k chars) — and media containers must survive both stages or RLM
-      // users never see bridged MCP screenshots as attachments.
+      // a __kernelBounded marker before compaction runs, so the persistence
+      // exemption must preserve the diff while media rides only the carrier.
       using tmp = new DisposableTempDir("code-exec-exempt-bounds");
       const host = new SandboxHostService();
       const bigDiff = `@@ -0,0 +1 @@\n+${"x".repeat(20_000)}`;
@@ -983,8 +983,13 @@ describe("createCodeExecutionTool", () => {
       expect((editRecord?.result as { diff?: string })?.diff).toBe(bigDiff);
 
       const shotRecord = result.toolCalls.find((r) => r.toolName === "mcp__shots__take");
-      const shotValue = (shotRecord?.result as { value?: Array<{ data?: string }> })?.value;
-      expect(shotValue?.[1]?.data).toBe(mediaData);
+      expect(shotRecord?.result).toBeUndefined();
+      expect(shotRecord?.ok).toBe(true);
+      expect(shotRecord?.bytes).toBeGreaterThan(0);
+      // The raw bytes ride the attachments carrier for request-time extraction.
+      expect(result.attachments).toEqual([
+        { type: "media", mediaType: "image/png", data: mediaData },
+      ]);
       await host.disposeScope("ws-exempt-bounds");
     });
 
@@ -1076,15 +1081,20 @@ describe("createCodeExecutionTool", () => {
       // tools even without RLM, and records/events persist into session
       // history in every mode while request-time extraction rewrites only
       // the provider copy — so the aggregate media budget must apply to
-      // ephemeral registrations as well (round 8).
+      // ephemeral registrations as well (round 8). Top-level {type:"content"}
+      // carriers are stripped by the bridge before guests or records see them,
+      // so the budget's remaining job is media under WRAPPER shapes the
+      // attachments carrier does not handle.
       const bigImage = "A".repeat(2 * 1024 * 1024);
       const tools: Record<string, Tool> = {
         mcp__shots__take: createMockTool("mcp__shots__take", z.object({}), () => ({
-          type: "content",
-          value: [
-            { type: "media", mediaType: "image/png", data: bigImage },
-            { type: "media", mediaType: "image/png", data: bigImage },
-          ],
+          shot: {
+            type: "content",
+            value: [
+              { type: "media", mediaType: "image/png", data: bigImage },
+              { type: "media", mediaType: "image/png", data: bigImage },
+            ],
+          },
         })),
       };
       const tool = await createCodeExecutionTool(runtimeFactory, new ToolBridge(tools));
@@ -1092,15 +1102,17 @@ describe("createCodeExecutionTool", () => {
       const result = (await tool.execute!(
         // The guest still receives the full container: only the RECORD is
         // sanitized.
-        { code: "const r = mux.mcp__shots__take({}); return r.value[1].data.length;" },
+        { code: "const r = mux.mcp__shots__take({}); return r.shot.value[1].data.length;" },
         mockToolCallOptions
       )) as PTCExecutionResult;
       expect(result.success).toBe(true);
       expect(result.result).toBe(bigImage.length);
       const record = result.toolCalls.find((r) => r.toolName === "mcp__shots__take");
       const value = (
-        record?.result as { value?: Array<{ type?: string; data?: string; text?: string }> }
-      )?.value;
+        record?.result as {
+          shot?: { value?: Array<{ type?: string; data?: string; text?: string }> };
+        }
+      )?.shot?.value;
       expect(value?.[0]?.data).toBe(bigImage);
       expect(value?.[1]?.type).toBe("text");
       expect(value?.[1]?.text).toContain("aggregate media budget exceeded");
@@ -1111,12 +1123,15 @@ describe("createCodeExecutionTool", () => {
       // fresh per-call media allowance would let a model-authored loop of
       // bridged media calls persist unbounded multi-megabyte records (r19).
       // One shared per-execution budget bounds the sum: later calls' media
-      // degrade to placeholders.
+      // degrade to placeholders. Wrapped containers bypass the bridge's
+      // carrier strip, so the raw payloads reach capture.
       const image = "A".repeat(1_300_000);
       const tools: Record<string, Tool> = {
         mcp__shots__take: createMockTool("mcp__shots__take", z.object({}), () => ({
-          type: "content",
-          value: [{ type: "media", mediaType: "image/png", data: image }],
+          shot: {
+            type: "content",
+            value: [{ type: "media", mediaType: "image/png", data: image }],
+          },
         })),
       };
       const tool = await createCodeExecutionTool(runtimeFactory, new ToolBridge(tools));
@@ -1129,8 +1144,11 @@ describe("createCodeExecutionTool", () => {
       const records = result.toolCalls.filter((r) => r.toolName === "mcp__shots__take");
       expect(records).toHaveLength(3);
       const partOf = (record: (typeof records)[number]) =>
-        (record.result as { value?: Array<{ type?: string; data?: string; text?: string }> })
-          ?.value?.[0];
+        (
+          record.result as {
+            shot?: { value?: Array<{ type?: string; data?: string; text?: string }> };
+          }
+        )?.shot?.value?.[0];
       // Two ~1.3MB images fit the shared 3MiB budget; the third exceeds it.
       expect(partOf(records[0])?.data).toBe(image);
       expect(partOf(records[1])?.data).toBe(image);
@@ -1143,11 +1161,15 @@ describe("createCodeExecutionTool", () => {
       // copies the container into the consumer record's ARGS and start/end
       // events; without bounding, repeated passes persist unbudgeted base64
       // (r22). Args share the same per-execution capture budget as results.
+      // The wrapped container bypasses the bridge's carrier strip, so the
+      // guest holds RAW media to copy into the consumer's args.
       const image = "A".repeat(1_300_000);
       const tools: Record<string, Tool> = {
         mcp__shots__take: createMockTool("mcp__shots__take", z.object({}), () => ({
-          type: "content",
-          value: [{ type: "media", mediaType: "image/png", data: image }],
+          shot: {
+            type: "content",
+            value: [{ type: "media", mediaType: "image/png", data: image }],
+          },
         })),
         mcp__sink__send: createMockTool("mcp__sink__send", z.object({}).passthrough(), () => ({
           ok: true,
@@ -1170,9 +1192,11 @@ describe("createCodeExecutionTool", () => {
       const argPart = (record: (typeof sinkRecords)[number]) =>
         (
           record.args as {
-            payload?: { value?: Array<{ type?: string; data?: string; text?: string }> };
+            payload?: {
+              shot?: { value?: Array<{ type?: string; data?: string; text?: string }> };
+            };
           }
-        )?.payload?.value?.[0];
+        )?.payload?.shot?.value?.[0];
       // Result (1.3MB) + first args copy (1.3MB) fit the shared 3MiB budget;
       // the second args copy exceeds it and degrades to a placeholder.
       expect(argPart(sinkRecords[0])?.data).toBe(image);
@@ -1191,9 +1215,13 @@ describe("createCodeExecutionTool", () => {
       const imageData = "A".repeat(KERNEL_RETAINED_MEDIA_BUDGET_BYTES - 1024);
       const bigDiff = `@@ -1,0 +1,1 @@\n+${"d".repeat(30_000)}\n@@ -9,0 +10,1 @@\n+${"e".repeat(30_000)}\n`;
       const tools: Record<string, Tool> = {
+        // Wrapped so the raw payload reaches capture instead of the bridge's
+        // carrier strip.
         mcp__shots__take: createMockTool("mcp__shots__take", z.object({}), () => ({
-          type: "content",
-          value: [{ type: "media", mediaType: "image/png", data: imageData }],
+          shot: {
+            type: "content",
+            value: [{ type: "media", mediaType: "image/png", data: imageData }],
+          },
         })),
         file_edit_insert: createMockTool(
           "file_edit_insert",
@@ -1232,7 +1260,8 @@ describe("createCodeExecutionTool", () => {
       // retained; the fifth exceeds it, gets normally bounded at capture, and
       // compaction drops the non-exempt marker while reporting the true size.
       for (const record of records.slice(0, 4)) {
-        const value = (record.result as { value?: Array<{ data?: string }> })?.value;
+        const value = (record.result as { shot?: { value?: Array<{ data?: string }> } })?.shot
+          ?.value;
         expect(value?.[0]?.data).toBe(imageData);
       }
       const overflow = records[4];
@@ -1267,12 +1296,17 @@ describe("createCodeExecutionTool", () => {
       const bigImage = "A".repeat(2 * 1024 * 1024);
       const audioData = "d2F2".repeat(50);
       const tools: Record<string, Tool> = {
+        // Wrapped: raw media reaches the guest/records. The rec tool below
+        // stays a top-level carrier; the bridge stubs its audio data, and
+        // capture still bounds the stubbed unsupported part to a placeholder.
         mcp__shots__take: createMockTool("mcp__shots__take", z.object({}), () => ({
-          type: "content",
-          value: [
-            { type: "media", mediaType: "image/png", data: bigImage },
-            { type: "media", mediaType: "image/png", data: bigImage },
-          ],
+          shot: {
+            type: "content",
+            value: [
+              { type: "media", mediaType: "image/png", data: bigImage },
+              { type: "media", mediaType: "image/png", data: bigImage },
+            ],
+          },
         })),
         mcp__rec__capture: createMockTool("mcp__rec__capture", z.object({}), () => ({
           type: "content",
@@ -1293,9 +1327,11 @@ describe("createCodeExecutionTool", () => {
 
       const outer = (
         result.result as {
-          wrapped?: { value?: Array<{ type?: string; data?: string; text?: string }> };
+          wrapped?: {
+            shot?: { value?: Array<{ type?: string; data?: string; text?: string }> };
+          };
         }
-      )?.wrapped?.value;
+      )?.wrapped?.shot?.value;
       // The outer return draws from the SAME execution allowance as the
       // nested record (r29): the record capture already retained the first
       // ~2MiB image out of the 3MiB budget, so the returned copy of the same
@@ -1307,7 +1343,8 @@ describe("createCodeExecutionTool", () => {
       expect(outer?.[1]?.text).toContain("aggregate media budget exceeded");
       // The payload itself is not lost: the nested record retains it.
       const shotsRecord = result.toolCalls.find((r) => r.toolName === "mcp__shots__take");
-      const recordValue = (shotsRecord?.result as { value?: Array<{ data?: string }> })?.value;
+      const recordValue = (shotsRecord?.result as { shot?: { value?: Array<{ data?: string }> } })
+        ?.shot?.value;
       expect(recordValue?.[0]?.data).toBe(bigImage);
 
       const consoleArg = (
@@ -1328,12 +1365,16 @@ describe("createCodeExecutionTool", () => {
       const bigImage = "A".repeat(KERNEL_RETAINED_MEDIA_BUDGET_BYTES - 100);
       const secondImage = "B".repeat(500);
       const tools: Record<string, Tool> = {
+        // Wrapped so the raw payload reaches capture instead of the bridge's
+        // carrier strip.
         mcp__shots__take: createMockTool("mcp__shots__take", z.object({}), () => ({
-          type: "content",
-          value: [
-            { type: "media", mediaType: "image/png", data: bigImage },
-            { type: "media", mediaType: "image/png", data: secondImage },
-          ],
+          shot: {
+            type: "content",
+            value: [
+              { type: "media", mediaType: "image/png", data: bigImage },
+              { type: "media", mediaType: "image/png", data: secondImage },
+            ],
+          },
         })),
       };
       const tool = await createCodeExecutionTool(
@@ -1350,8 +1391,10 @@ describe("createCodeExecutionTool", () => {
       expect(result.success).toBe(true);
       const record = result.toolCalls.find((r) => r.toolName === "mcp__shots__take");
       const value = (
-        record?.result as { value?: Array<{ type?: string; data?: string; text?: string }> }
-      )?.value;
+        record?.result as {
+          shot?: { value?: Array<{ type?: string; data?: string; text?: string }> };
+        }
+      )?.shot?.value;
       expect(value?.[0]?.data).toBe(bigImage);
       expect(value?.[1]?.type).toBe("text");
       expect(value?.[1]?.text).toContain("aggregate media budget exceeded");
@@ -1368,10 +1411,16 @@ describe("createCodeExecutionTool", () => {
       const host = new SandboxHostService();
       const image = "A".repeat(500);
       const tools: Record<string, Tool> = {
+        // Wrapped: a top-level carrier would be rebuilt as a bare {type,value}
+        // by the bridge's strip, silently dropping the spoofed field; the
+        // wrapper keeps the spoof adjacent to RAW retained media (the r27
+        // marker-vs-media compaction race this test exists for).
         mcp__shots__take: createMockTool("mcp__shots__take", z.object({}), () => ({
           __kernelBounded: true,
-          type: "content",
-          value: [{ type: "media", mediaType: "image/png", data: image }],
+          shot: {
+            type: "content",
+            value: [{ type: "media", mediaType: "image/png", data: image }],
+          },
         })),
       };
       const tool = await createCodeExecutionTool(
@@ -1387,16 +1436,18 @@ describe("createCodeExecutionTool", () => {
       )) as PTCExecutionResult;
       expect(result.success).toBe(true);
       const record = result.toolCalls.find((r) => r.toolName === "mcp__shots__take");
-      const value = (record?.result as { value?: Array<{ data?: string }> })?.value;
+      const value = (record?.result as { shot?: { value?: Array<{ data?: string }> } })?.shot
+        ?.value;
       expect(value?.[0]?.data).toBe(image);
       await host.disposeScope("ws-marker-spoof");
     });
 
     it("bounds unsupported parts of mixed media containers at capture", async () => {
-      // A mixed container (image + audio) is retained for request-time image
-      // extraction, but the unsupported audio payload (up to 8 MiB per part)
-      // must not persist raw into the record/chat.jsonl — it is replaced with
-      // a bounded placeholder BEFORE retention.
+      // A mixed top-level container is stripped by the bridge: the image's
+      // bytes ride the attachments carrier while the unsupported audio payload
+      // (up to 8 MiB per part) is discarded; neither may persist raw into the
+      // record/chat.jsonl, and capture still bounds the stubbed audio part to
+      // a placeholder.
       using tmp = new DisposableTempDir("code-exec-mixed-media");
       const host = new SandboxHostService();
       const audioData = "d2F2".repeat(50);
@@ -1422,13 +1473,13 @@ describe("createCodeExecutionTool", () => {
       )) as PTCExecutionResult;
       expect(result.success).toBe(true);
       const record = result.toolCalls.find((r) => r.toolName === "mcp__shots__take");
-      const value = (
-        record?.result as { value?: Array<{ type?: string; data?: string; text?: string }> }
-      )?.value;
-      expect(value?.[0]?.data).toBe("aGVsbG8=");
-      expect(value?.[1]?.type).toBe("text");
-      expect(value?.[1]?.text).toContain("media bounded at capture: audio/wav");
+      expect(record?.result).toBeUndefined();
+      expect(record?.ok).toBe(true);
+      expect(record?.bytes).toBeGreaterThan(0);
       expect(JSON.stringify(record)).not.toContain(audioData);
+      expect(result.attachments).toEqual([
+        { type: "media", mediaType: "image/png", data: "aGVsbG8=" },
+      ]);
       await host.disposeScope("ws-mixed-media");
     });
 
@@ -2715,5 +2766,101 @@ describe("createCodeExecutionTool", () => {
       expect(withoutFileRead.description).not.toContain("function load(");
       await host.disposeScope("ws-load-types");
     });
+  });
+});
+
+describe("nested attachment delivery", () => {
+  const runtimeFactory = new QuickJSRuntimeFactory();
+  const mediaPart = {
+    type: "media" as const,
+    data: "QkFTRTY0REFUQQ==",
+    mediaType: "image/png",
+    filename: "board.png",
+  };
+
+  function attachFileTool(): Tool {
+    return createMockTool("attach_file", z.object({ path: z.string() }), () => ({
+      type: "content",
+      value: [{ type: "text", text: "[Attachment prepared: board.png]" }, mediaPart],
+    }));
+  }
+
+  it("re-attaches media stripped from nested tool results onto the execution result", async () => {
+    const tool = await createCodeExecutionTool(
+      runtimeFactory,
+      new ToolBridge({ attach_file: attachFileTool() })
+    );
+
+    const result = (await tool.execute!(
+      { code: 'return xum.attach_file({ path: "/board.png" });', timeout_secs: null },
+      mockToolCallOptions
+    )) as PTCExecutionResult;
+
+    expect(result.success).toBe(true);
+    // Original media rides the top-level result for the request-path lift
+    expect(result.attachments).toEqual([mediaPart]);
+    const sandboxVisible = JSON.stringify({ result: result.result, toolCalls: result.toolCalls });
+    expect(sandboxVisible).not.toContain(mediaPart.data);
+    const extracted = extractAttachmentsFromToolOutput(result);
+    expect(extracted?.attachments).toEqual([
+      { data: mediaPart.data, mediaType: mediaPart.mediaType, filename: mediaPart.filename },
+    ]);
+
+    const returned = result.result as { value: Array<{ type: string; text?: string }> };
+    expect(returned.value[1]).toEqual({ type: "text", text: MEDIA_DATA_STUB });
+  });
+
+  it("re-attaches display-only files stripped from nested tool results", async () => {
+    const displayPart = {
+      type: "display_file" as const,
+      data: "RElTUExBWQ==",
+      mediaType: "text/markdown",
+      filename: "notes.md",
+      providerOptions: { mux: { displayOnly: true as const, size: 7 } },
+    };
+    const tool = await createCodeExecutionTool(
+      runtimeFactory,
+      new ToolBridge({
+        attach_file: createMockTool("attach_file", z.object({ path: z.string() }), () => ({
+          type: "content",
+          value: [displayPart],
+        })),
+      })
+    );
+
+    const result = (await tool.execute!(
+      { code: 'return xum.attach_file({ path: "/notes.md" });', timeout_secs: null },
+      mockToolCallOptions
+    )) as PTCExecutionResult;
+
+    expect(result.success).toBe(true);
+    // Display bytes ride the carrier for UI rendering; sandbox-visible values
+    // only carry the stubbed shape so host-side records stay bounded.
+    expect(result.attachments).toEqual([displayPart]);
+    const sandboxVisible = JSON.stringify({ result: result.result, toolCalls: result.toolCalls });
+    expect(sandboxVisible).not.toContain(displayPart.data);
+    const returned = result.result as { value: Array<{ type: string; data?: string }> };
+    expect(returned.value[0].type).toBe("display_file");
+    expect(returned.value[0].data).toBe(DISPLAY_DATA_STUB);
+  });
+
+  it("omits attachments when no nested tool produced media", async () => {
+    const tool = await createCodeExecutionTool(
+      runtimeFactory,
+      new ToolBridge({
+        bash: createMockTool("bash", z.object({ script: z.string() }), () => ({
+          success: true,
+          output: "ok",
+        })),
+      })
+    );
+
+    const result = (await tool.execute!(
+      { code: 'return xum.bash({ script: "true" });', timeout_secs: null },
+      mockToolCallOptions
+    )) as PTCExecutionResult;
+
+    expect(result.success).toBe(true);
+    expect(result.attachments).toBeUndefined();
   });
 });
