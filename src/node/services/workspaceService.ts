@@ -274,6 +274,7 @@ import type {
   ArchiveLossyUntrackedFilesConfirmation,
   ArchivePreflightResult,
   ArchiveWorkspaceResult,
+  BackgroundProcessInfo,
 } from "@/common/orpc/schemas/api";
 import type { SessionTimingService } from "@/node/services/sessionTimingService";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
@@ -297,6 +298,7 @@ import {
   BashMonitorWakeStore,
   buildBashMonitorWakeMetadata,
   buildBashMonitorWakePrompt,
+  type BashMonitorClearToken,
   type BashMonitorWakePromptContext,
   type BashMonitorWakeRecord,
 } from "@/node/services/bashMonitorWakeStore";
@@ -2038,6 +2040,11 @@ export class WorkspaceService extends EventEmitter {
                 cancelReason: BASH_MONITOR_REARMED_QUEUE_REASON,
               });
             }
+            // A re-armed process ID must not inherit its prior generation's pending
+            // monitor-lost wake in the background-bash listing. spawn() emits its change
+            // before this locked supersession runs, so subscribers need a fresh read now
+            // that the stale record is durably superseded.
+            this.notifyBashMonitorWakeStateChanged(payload.workspaceId);
           }
         )
       )
@@ -2089,6 +2096,10 @@ export class WorkspaceService extends EventEmitter {
               workspaceId,
               BashMonitorWakeStore.wakeId(payload.processId)
             );
+            // The manager's process-change emit can precede this disk transition, and an
+            // already-exited process produces no later change event, so subscribers need a
+            // nudge after the supersession is durable or the pending-wake label lingers.
+            this.notifyBashMonitorWakeStateChanged(workspaceId);
           }
         })
       )
@@ -2346,6 +2357,14 @@ export class WorkspaceService extends EventEmitter {
   ) {
     super();
     this.bashMonitorWakeStore = new BashMonitorWakeStore(config);
+    // A crash-orphaned temp write deferred by the store's live-writer freshness gate
+    // has no natural later trigger (startup discovery already ran and saw nothing
+    // pending). When the gate elapses, re-drive delivery: the drain's scan places the
+    // recovered wake and delivers it, and the notify refreshes the banner row.
+    this.bashMonitorWakeStore.onDeferredTempRecoveryDue = (ownerWorkspaceId) => {
+      this.notifyBashMonitorWakeStateChanged(ownerWorkspaceId);
+      this.scheduleBashMonitorWakeDrain(ownerWorkspaceId);
+    };
     this.bashMonitorRegistryStore = new BashMonitorRegistryStore(config);
     if (typeof this.backgroundProcessManager.on === "function") {
       this.backgroundProcessManager.on("output:shown", this.bashOutputShownListener);
@@ -2594,6 +2613,9 @@ export class WorkspaceService extends EventEmitter {
             }
             throw error;
           }
+          // Surface "match found — waking agent" immediately: a one-shot watcher that
+          // matched and exited would otherwise look like a lost wake until delivery.
+          this.notifyBashMonitorWakeStateChanged(payload.workspaceId);
           this.scheduleBashMonitorWakeDrain(payload.workspaceId);
         })
       );
@@ -2610,6 +2632,11 @@ export class WorkspaceService extends EventEmitter {
       .then(() => this.drainBashMonitorWakes(ownerWorkspaceId))
       .catch((error: unknown) => {
         log.error("Bash monitor wake drain failed", { ownerWorkspaceId, error });
+        // A failed drain may be the LAST trigger a persisted wake ever gets: startup
+        // recovery runs once, and with no open UI and no later process event nothing
+        // else re-drives delivery. Retry on a delay until a drain pass succeeds; the
+        // timer dedupes per owner, so persistent failure retries at a bounded rate.
+        this.scheduleBashMonitorWakeDrainRetry(ownerWorkspaceId);
       })
       .finally(() => {
         this.pendingBashMonitorWakeDrains.delete(promise);
@@ -2619,6 +2646,20 @@ export class WorkspaceService extends EventEmitter {
       });
     this.pendingBashMonitorWakeDrainsByOwner.set(ownerWorkspaceId, promise);
     this.pendingBashMonitorWakeDrains.add(promise);
+  }
+
+  // One retry timer per owner after a failed drain (see the catch above).
+  private readonly bashMonitorWakeDrainRetryTimers = new Map<string, NodeJS.Timeout>();
+
+  private scheduleBashMonitorWakeDrainRetry(ownerWorkspaceId: string): void {
+    if (this.bashMonitorWakeDrainRetryTimers.has(ownerWorkspaceId)) return;
+    const timer = setTimeout(() => {
+      this.bashMonitorWakeDrainRetryTimers.delete(ownerWorkspaceId);
+      this.scheduleBashMonitorWakeDrain(ownerWorkspaceId);
+    }, 1_000);
+    // Never hold process shutdown open for a delivery retry.
+    timer.unref();
+    this.bashMonitorWakeDrainRetryTimers.set(ownerWorkspaceId, timer);
   }
 
   private scheduleBashMonitorWakeDrainAfterRead(
@@ -2705,7 +2746,12 @@ export class WorkspaceService extends EventEmitter {
     // converting stale registry records.
     return this.bashMonitorRecoveryPromise.then(() =>
       this.bashMonitorHistoryLocks.withLock(ownerWorkspaceId, () =>
-        this.drainBashMonitorWakesUnlocked(ownerWorkspaceId)
+        this.drainBashMonitorWakesUnlocked(ownerWorkspaceId).finally(() => {
+          // Safety-net emit after every drain pass. Prompt transitions notify inline
+          // (reconcile loop, resolveWakeSnapshots), but the drain has many exit and
+          // error paths; a trailing no-op emit is cheaper than auditing each of them.
+          this.notifyBashMonitorWakeStateChanged(ownerWorkspaceId);
+        })
       )
     );
   }
@@ -2715,10 +2761,28 @@ export class WorkspaceService extends EventEmitter {
       (record) =>
         !this.cancelingBashMonitorWakeKeys.has(this.bashMonitorWakeKey(ownerWorkspaceId, record.id))
     );
-    const acceptedSnapshots =
-      (await this.findAcceptedBashMonitorWakeSnapshots(ownerWorkspaceId, pendingSnapshot)) ??
-      new Set<string>();
+    const acceptedSnapshots = await this.findAcceptedBashMonitorWakeSnapshots(
+      ownerWorkspaceId,
+      pendingSnapshot
+    );
+    if (acceptedSnapshots == null) {
+      // Verification FAILURE is not "not accepted": the synthetic turn may already
+      // sit in history with only its delivered transition missing (crash window, or
+      // a failed transition), and treating a transient history-read failure as an
+      // empty accepted set would append the same turn again — duplicating the agent
+      // turn and any actions it takes. Leave every record pending and retry the
+      // scan on the deduped drain retry timer.
+      if (pendingSnapshot.length === 0) return;
+      log.debug("Accepted-wake verification failed; deferring bash monitor wake drain", {
+        ownerWorkspaceId,
+      });
+      this.scheduleBashMonitorWakeDrainRetry(ownerWorkspaceId);
+      return;
+    }
     const pending: BashMonitorWakeRecord[] = [];
+    // The drain can block on a full sendMessage turn below, so transitions applied in
+    // this reconcile loop must notify before that await — not from the drain's finally.
+    let reconciledTransition = false;
     for (const record of pendingSnapshot) {
       const snapshotKey = this.bashMonitorWakeSnapshotKey(record.processId, record.updatedAt);
       if (acceptedSnapshots.has(snapshotKey)) {
@@ -2727,6 +2791,7 @@ export class WorkspaceService extends EventEmitter {
             ownerWorkspaceId,
             record
           );
+          reconciledTransition = true;
           if (!deliveredSnapshot) {
             // New matches merged after the accepted snapshot. Keep the remainder pending for its own
             // wake rather than marking those unseen lines delivered with the older accepted turn.
@@ -2749,9 +2814,13 @@ export class WorkspaceService extends EventEmitter {
         )
       ) {
         await this.bashMonitorWakeStore.markSuperseded(ownerWorkspaceId, record.id);
+        reconciledTransition = true;
       } else {
         pending.push(record);
       }
+    }
+    if (reconciledTransition) {
+      this.notifyBashMonitorWakeStateChanged(ownerWorkspaceId);
     }
     if (pending.length === 0) return;
 
@@ -2801,10 +2870,20 @@ export class WorkspaceService extends EventEmitter {
       resolve: (record: BashMonitorWakeRecord) => Promise<boolean>
     ): Promise<void> => {
       let hasUnresolvedMergedMatches = false;
-      for (const record of records) {
-        if (!(await resolve(record))) {
-          hasUnresolvedMergedMatches = true;
+      try {
+        for (const record of records) {
+          if (!(await resolve(record))) {
+            hasUnresolvedMergedMatches = true;
+          }
         }
+      } finally {
+        // Notify as soon as durable transitions land — even when a later record's
+        // transition throws after an earlier one already succeeded (observers must track
+        // partial durable updates). The accepted-send path runs this while the drain is
+        // still awaiting the full sendMessage turn, so deferring to the drain's finally
+        // would keep "waking agent…" on screen for the whole wake-triggered stream even
+        // though the wake was already delivered.
+        this.notifyBashMonitorWakeStateChanged(ownerWorkspaceId);
       }
       if (hasUnresolvedMergedMatches) {
         this.scheduleBashMonitorWakeDrainAfterIdle(ownerWorkspaceId);
@@ -4040,6 +4119,42 @@ export class WorkspaceService extends EventEmitter {
       return 0;
     }
     return this.backgroundProcessManager.getActiveMonitorCount(workspaceId);
+  }
+
+  // Last successfully read pending-wake set per workspace. On a transient wake-store read
+  // failure, listBackgroundProcesses republishes this instead of an (authoritative-looking)
+  // empty set that would clear pending-wake UI state with no later event to restore it.
+  private readonly lastGoodPendingWakesByWorkspace = new Map<
+    string,
+    readonly BashMonitorWakeRecord[]
+  >();
+
+  // One retry timer per workspace after a failed pending-wake read. The fallback above
+  // makes listBackgroundProcesses RESOLVE, so the subscription's failure-retry path never
+  // sees the error — and with no live process there may be no later change event either.
+  // Re-emitting a change re-drives a read; if that read fails again its own catch
+  // reschedules, giving the same bounded once-per-delay retry loop as the subscription,
+  // and the chain stops as soon as a read succeeds or no subscriber re-reads.
+  private readonly pendingWakeReadRetryTimers = new Map<string, NodeJS.Timeout>();
+
+  private schedulePendingWakeReadRetry(workspaceId: string): void {
+    if (this.pendingWakeReadRetryTimers.has(workspaceId)) return;
+    const timer = setTimeout(() => {
+      this.pendingWakeReadRetryTimers.delete(workspaceId);
+      this.notifyBashMonitorWakeStateChanged(workspaceId);
+    }, 1_000);
+    // Never hold process shutdown open for a UI refresh nudge.
+    timer.unref();
+    this.pendingWakeReadRetryTimers.set(workspaceId, timer);
+  }
+
+  private notifyBashMonitorWakeStateChanged(workspaceId: string): void {
+    // Tests may construct WorkspaceService with a partial BackgroundProcessManager stub
+    // (same reason the constructor guards the event subscriptions).
+    if (typeof this.backgroundProcessManager.notifyMonitorWakeStateChanged !== "function") {
+      return;
+    }
+    this.backgroundProcessManager.notifyMonitorWakeStateChanged(workspaceId);
   }
 
   private mergeCurrentActiveBashMonitorCount(
@@ -5875,6 +5990,15 @@ export class WorkspaceService extends EventEmitter {
       return Ok(undefined);
     }
     this.removingWorkspaces.add(workspaceId);
+    // Cancel pending clear-promotion retries before any session data is deleted:
+    // their commitClear would otherwise recreate the session directory (mkdir in the
+    // tombstone mutation) after removal deletes it.
+    for (const [key, timer] of this.bashMonitorClearCommitRetryTimers) {
+      if (key.startsWith(`${workspaceId}:`)) {
+        clearTimeout(timer);
+        this.bashMonitorClearCommitRetryTimers.delete(key);
+      }
+    }
     let timelineClosed = false;
     let removedFromConfig = false;
 
@@ -6385,6 +6509,21 @@ export class WorkspaceService extends EventEmitter {
           error: getErrorMessage(error),
         });
       }
+
+      // Wait out any in-flight bash-monitor history clear, then disarm surviving
+      // clear writers BEFORE deleting the session directory. A commit-failed clear
+      // intentionally keeps its staged heartbeat armed for cross-instance liveness,
+      // and both that heartbeat and a late tombstone promotion drive
+      // mutateClearedAt, whose mkdir would recreate the directory after deletion.
+      // New clears are refused by the removingWorkspaces guard (set above), and
+      // promotion retries both re-check it and run their commitClear under this
+      // same lock — so the barrier waits out the in-flight clear transaction AND
+      // any already-fired retry.
+      await this.bashMonitorHistoryLocks.withLock(workspaceId, () => Promise.resolve());
+      // Awaited: abandon also DRAINS heartbeat ticks that already fired, whose
+      // mutateClearedAt (queued outside the history lock) would otherwise mkdir the
+      // directory back after the deletion below.
+      await this.bashMonitorWakeStore.abandonWorkspaceClears(workspaceId);
 
       // Remove session data
       const sessionDir = this.config.getSessionDir(workspaceId);
@@ -12241,7 +12380,7 @@ export class WorkspaceService extends EventEmitter {
 
   private async retirePendingBashMonitorWakesBeforeHistoryClear(
     workspaceId: string
-  ): Promise<Result<BashMonitorWakeRecord[]>> {
+  ): Promise<Result<{ snapshots: BashMonitorWakeRecord[] } & BashMonitorClearToken>> {
     try {
       return Ok(await this.bashMonitorWakeStore.supersedeAllPending(workspaceId));
     } catch (error) {
@@ -12270,6 +12409,14 @@ export class WorkspaceService extends EventEmitter {
     clear: () => Promise<Result<T>>,
     options?: { discardUnacceptedOnSuccess?: boolean }
   ): Promise<Result<T>> {
+    // Removal deletes the session directory: a clear admitted after removal begins
+    // would stage a tombstone and stamp records — writes whose mkdir can recreate
+    // the deleted directory and leak a cleared-at file into a future workspace
+    // reusing the ID. removeUnlocked sets the flag before its history-lock barrier,
+    // so checking under this lock is race-free.
+    if (this.removingWorkspaces.has(workspaceId)) {
+      return Err("Cannot clear history while the workspace is being removed.");
+    }
     const pending = await this.bashMonitorWakeStore.listPending(workspaceId);
     const acceptedBefore = await this.findAcceptedBashMonitorWakeSnapshots(workspaceId, pending);
     if (acceptedBefore == null) {
@@ -12277,7 +12424,15 @@ export class WorkspaceService extends EventEmitter {
     }
     const retireResult = await this.retirePendingBashMonitorWakesBeforeHistoryClear(workspaceId);
     if (!retireResult.success) return retireResult;
-    const staged = retireResult.data;
+    // History clears retire pending wakes without any process-state change, so
+    // background-bash subscribers need explicit nudges to drop (and, after a restore,
+    // re-show) pending-wake rows; nothing else re-emits for already-exited processes.
+    this.notifyBashMonitorWakeStateChanged(workspaceId);
+    const staged = retireResult.data.snapshots;
+    const clearToken = {
+      clearId: retireResult.data.clearId,
+      clearedAt: retireResult.data.clearedAt,
+    };
     const restoreSnapshots = async (includeUnaccepted: boolean): Promise<void> => {
       const acceptedAfter = await this.findAcceptedBashMonitorWakeSnapshots(workspaceId, staged);
       const restorable = staged.filter((record) => {
@@ -12287,18 +12442,22 @@ export class WorkspaceService extends EventEmitter {
           (acceptedBefore.has(key) && acceptedAfter?.has(key) === true)
         );
       });
-      await this.bashMonitorWakeStore.restorePendingSnapshots(workspaceId, restorable);
-    };
-    try {
-      const clearResult = await clear();
-      if (clearResult.success) {
-        if (options?.discardUnacceptedOnSuccess !== true) {
-          await restoreSnapshots(true);
-        }
-        return clearResult;
+      try {
+        await this.bashMonitorWakeStore.restorePendingSnapshots(
+          workspaceId,
+          restorable,
+          clearToken
+        );
+      } finally {
+        // Notify even when restoration throws partway: earlier records in the pass are
+        // already durably pending again, and without a nudge subscribers would keep the
+        // post-retirement snapshot (hiding those wakes) until unrelated activity.
+        this.notifyBashMonitorWakeStateChanged(workspaceId);
       }
-      await restoreSnapshots(true);
-      return clearResult;
+    };
+    let clearResult: Result<T>;
+    try {
+      clearResult = await clear();
     } catch (error) {
       try {
         await restoreSnapshots(true);
@@ -12310,6 +12469,77 @@ export class WorkspaceService extends EventEmitter {
       }
       throw error;
     }
+    if (!clearResult.success) {
+      await restoreSnapshots(true);
+      return clearResult;
+    }
+    if (options?.discardUnacceptedOnSuccess !== true) {
+      await restoreSnapshots(true);
+      return clearResult;
+    }
+    // Full clear committed: promote the staged tombstone so pre-clear deferred
+    // temps stop being held and become condemned. Without this, a crash-scan
+    // would eventually treat the staging as failed and resurrect them. The
+    // transcript is durably cleared at this point, so a failed promotion must
+    // NOT reach any restore path (that would resurrect retired wakes straight
+    // into the cleared transcript) nor fail the caller's successful clear —
+    // leave the staging standing (it keeps holding pre-clear temps) and retry
+    // the promotion in the background until it lands.
+    try {
+      await this.bashMonitorWakeStore.commitClear(workspaceId, clearToken);
+    } catch (commitError) {
+      log.error("Failed to promote bash monitor clear tombstone; will retry", {
+        workspaceId,
+        error: commitError,
+      });
+      this.scheduleBashMonitorClearCommitRetry(workspaceId, clearToken);
+    }
+    return clearResult;
+  }
+
+  // One retry timer per clear transaction for a tombstone promotion that failed AFTER
+  // the history clear durably succeeded (see above): nothing else re-drives the
+  // promotion, and an unpromoted staging would eventually be rolled back as crashed —
+  // resurrecting retired wakes into the cleared transcript.
+  private readonly bashMonitorClearCommitRetryTimers = new Map<string, NodeJS.Timeout>();
+
+  private scheduleBashMonitorClearCommitRetry(
+    workspaceId: string,
+    clearToken: BashMonitorClearToken
+  ): void {
+    const key = `${workspaceId}:${clearToken.clearId}`;
+    if (this.bashMonitorClearCommitRetryTimers.has(key)) return;
+    const timer = setTimeout(() => {
+      this.bashMonitorClearCommitRetryTimers.delete(key);
+      // Serialized through the history lock so removal's pre-deletion barrier also
+      // waits out an ALREADY-FIRED retry: a retry that passed the guard below just
+      // before removal began would otherwise run commitClear (whose tombstone
+      // mutation mkdirs the wake directory) concurrently with — or after — session
+      // deletion. Holding the lock also makes the removingWorkspaces re-check
+      // race-free: removal sets the flag before its barrier acquires this lock.
+      void this.bashMonitorHistoryLocks
+        .withLock(workspaceId, async () => {
+          // A removed (or mid-removal) workspace must never have its session
+          // directory recreated by a late promotion: the tombstone mutation's mkdir
+          // would resurrect deleted session data and could leak a cleared-at file
+          // into a future workspace reusing the ID.
+          if (
+            this.removingWorkspaces.has(workspaceId) ||
+            this.config.findWorkspace(workspaceId) == null
+          ) {
+            return;
+          }
+          await this.bashMonitorWakeStore.commitClear(workspaceId, clearToken);
+        })
+        .catch((error: unknown) => {
+          log.debug("Bash monitor clear tombstone promotion retry failed", { workspaceId, error });
+          this.scheduleBashMonitorClearCommitRetry(workspaceId, clearToken);
+        });
+    }, 1_000);
+    // Never hold process shutdown open for a promotion retry: a staging orphaned by
+    // shutdown is reconciled by the staged-clear grace scan on the next start.
+    timer.unref();
+    this.bashMonitorClearCommitRetryTimers.set(key, timer);
   }
 
   async truncateHistory(workspaceId: string, percentage?: number): Promise<Result<void>> {
@@ -13592,31 +13822,86 @@ export class WorkspaceService extends EventEmitter {
   /**
    * List background processes for a workspace.
    * Returns process info suitable for UI display (excludes handle).
+   * Typed against the shared IPC schema so the service and schema cannot drift.
    */
-  async listBackgroundProcesses(workspaceId: string): Promise<
-    Array<{
-      id: string;
-      pid: number;
-      script: string;
-      displayName?: string;
-      startTime: number;
-      status: "running" | "exited" | "killed" | "failed";
-      monitor?: {
-        filter: string;
-        filter_exclude: boolean;
-        cooldown_ms: number;
-        max_events?: number;
-        totalMatches: number;
-        droppedLines: number;
-        lastLines: string[];
-        stopped: boolean;
-      };
-      exitCode?: number;
-    }>
-  > {
+  async listBackgroundProcesses(workspaceId: string): Promise<BackgroundProcessInfo[]> {
     const processes = await this.backgroundProcessManager.list(workspaceId);
-    return processes.map((p) => {
+    // Surface durably-pending monitor wakes (matched but not yet delivered as a synthetic
+    // turn), so a one-shot watcher that matched and exited does not look like a lost wake.
+    // Wake ids equal process ids (BashMonitorWakeStore.wakeId). The indicator must never
+    // break process listing, so a wake-store read failure degrades to "no pending wakes".
+    let pendingWakes: readonly BashMonitorWakeRecord[];
+    try {
+      pendingWakes = await this.bashMonitorWakeStore.listPending(workspaceId);
+      this.lastGoodPendingWakesByWorkspace.set(workspaceId, pendingWakes);
+    } catch (error) {
+      // Publishing an empty set here would authoritatively clear durable pending-wake
+      // state on a transient I/O failure — and an already-exited process may never emit
+      // another change event to restore it. Fail to the last good snapshot instead, and
+      // schedule a retry: serving the fallback makes this call resolve, so the
+      // subscription's own failure retry never engages, and the fallback may be empty
+      // (no seed yet) or stale (wakes retired since) with no later event to correct it.
+      log.debug("Failed to read pending bash monitor wakes for process listing", {
+        workspaceId,
+        error,
+      });
+      pendingWakes = this.lastGoodPendingWakesByWorkspace.get(workspaceId) ?? [];
+      this.schedulePendingWakeReadRetry(workspaceId);
+    }
+    // A wake whose only event is process settlement (terminal-only wakeOnExit, or an
+    // earlier run's preserved settlement) still has kind "match" in the durable
+    // record; labeling it "match" in the UI would report a match the filter never
+    // produced. Coalesced records with real UNDELIVERED matches keep the match label
+    // — judged by the matched frontier (matchedThroughOffset), mirroring the prompt
+    // builder's terminal-only test: totalMatches is the monitor's CUMULATIVE counter,
+    // so a settlement enqueued after an earlier match wake was already delivered
+    // carries a nonzero count while only settlement is actually pending.
+    const pendingWakeKindOf = (
+      record: BashMonitorWakeRecord
+    ): "match" | "monitor-lost" | "settled" =>
+      record.kind === "monitor-lost"
+        ? "monitor-lost"
+        : (record.terminal != null || record.staleTerminal != null) &&
+            record.matchedThroughOffset == null
+          ? "settled"
+          : "match";
+    // Present monitor state derived purely from a durable wake record, for rows (or reused
+    // process IDs) that have no live monitor snapshot to decorate.
+    const monitorFromWakeRecord = (record: BashMonitorWakeRecord) => ({
+      filter: record.filter,
+      filter_exclude: record.filterExclude,
+      cooldown_ms: 0,
+      totalMatches: record.totalMatches,
+      droppedLines: record.droppedLines,
+      lastLines: record.lines,
+      stopped: true,
+      pendingWakeKind: pendingWakeKindOf(record),
+    });
+    const liveProcessById = new Map(processes.map((p) => [p.id, p] as const));
+    // A pending wake decorates the live row only when it belongs to that process
+    // generation (created at/after spawn). An older wake merely shares a reused
+    // display-name-derived ID; overlaying it onto the new process's monitor would mix
+    // another generation's wake with the live filter/match counts and point its output
+    // action at the wrong process, so such wakes get their own synthesized row below.
+    const wakeOnLiveRow = new Map<string, BashMonitorWakeRecord>();
+    for (const record of pendingWakes) {
+      const live = liveProcessById.get(record.processId);
+      if (live != null && Date.parse(record.createdAt) >= live.startTime) {
+        wakeOnLiveRow.set(record.processId, record);
+      }
+    }
+    const rows: BackgroundProcessInfo[] = processes.map((p) => {
       const monitor = this.backgroundProcessManager.getMonitorSnapshot(p);
+      const pendingWake = wakeOnLiveRow.get(p.id);
+      // Same-generation wake on a monitorless row (e.g. the monitor was stopped after the
+      // match): fall back to a record-derived snapshot so the wake stays visible.
+      const monitorPayload =
+        pendingWake != null
+          ? {
+              ...(monitor ?? monitorFromWakeRecord(pendingWake)),
+              pendingWakeKind: pendingWakeKindOf(pendingWake),
+            }
+          : monitor;
       return {
         id: p.id,
         pid: p.pid,
@@ -13624,10 +13909,42 @@ export class WorkspaceService extends EventEmitter {
         displayName: p.displayName,
         startTime: p.startTime,
         status: p.status,
-        ...(monitor != null ? { monitor } : {}),
+        ...(monitorPayload != null ? { monitor: monitorPayload } : {}),
         exitCode: p.exitCode,
       };
     });
+    // Durable pending wakes can outlive the in-memory process table (app restart wipes the
+    // manager while the wake store persists, and startup delivery can lag). Synthesize a row
+    // from the wake record so the pending-delivery state stays visible — that restart window
+    // is exactly the state this listing is meant to expose.
+    // Row ids double as React keys. Process ids derive from arbitrary display names, so
+    // any fixed suffix for prior-generation wake rows can collide with a real live id
+    // (a process may literally be named "foo#pending-wake"); extend until unique instead.
+    // Nothing dereferences synthesized ids (no output/terminate actions).
+    const usedRowIds = new Set(rows.map((row) => row.id));
+    for (const record of pendingWakes) {
+      if (wakeOnLiveRow.has(record.processId)) continue;
+      const startTime = Date.parse(record.createdAt);
+      let rowId = record.processId;
+      while (usedRowIds.has(rowId)) rowId = `${rowId}#pending-wake`;
+      usedRowIds.add(rowId);
+      rows.push({
+        id: rowId,
+        // No live process behind this row; `synthesized` (not the pid) tells the renderer
+        // that output/terminate actions cannot work.
+        pid: 0,
+        script: record.script ?? "",
+        // Match records may carry neither displayName nor script; fall back to the
+        // processId (itself display-name derived) so the banner row is never blank.
+        displayName: record.displayName ?? record.processId,
+        synthesized: true,
+        startTime: Number.isNaN(startTime) ? Date.now() : startTime,
+        status: "exited",
+        monitor: monitorFromWakeRecord(record),
+        exitCode: undefined,
+      });
+    }
+    return rows;
   }
 
   /**
