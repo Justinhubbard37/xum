@@ -552,6 +552,8 @@ export interface DisplayStatus {
   message: string;
 }
 
+export type BashMonitorFailedOperation = "readOutput" | "getExitCode";
+
 /**
  * Compact per-record summary attached to bash monitor wake turns so the
  * transcript can render a small card (process + filter) while keeping the full
@@ -563,6 +565,8 @@ export interface BashMonitorWakeDisplayRecord {
   /** Persisted wake snapshot version; paired with processId for accepted-delivery recovery. */
   wakeUpdatedAt?: string;
   kind: "match" | "monitor-lost";
+  /** Missing on legacy monitor-lost records, which represent restart losses. */
+  lostReason?: "restart" | "runtime-failure";
   displayName: string;
   filter: string;
   filterExclude: boolean;

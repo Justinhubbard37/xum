@@ -12,7 +12,12 @@
  * Works identically for local and SSH runtimes.
  */
 
-import type { Runtime, BackgroundHandle, ExecStream } from "@/node/runtime/Runtime";
+import type {
+  Runtime,
+  BackgroundHandle,
+  BackgroundMonitorProbeResult,
+  ExecStream,
+} from "@/node/runtime/Runtime";
 import * as fs from "fs/promises";
 import * as path from "path";
 import { log } from "./log";
@@ -306,23 +311,60 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
     private readonly quotePath: (p: string) => string
   ) {}
 
+  private assertMonitorProbeSucceeded(operation: string, exitCode: number): void {
+    if (exitCode !== 0) {
+      throw new Error(`${operation} exited with code ${exitCode}`);
+    }
+  }
+
+  private async probeForMonitor<T>(
+    probe: () => Promise<T>
+  ): Promise<BackgroundMonitorProbeResult<T>> {
+    try {
+      return { success: true, value: await probe() };
+    } catch (error) {
+      return { success: false, error: errorMsg(error) };
+    }
+  }
+
+  private async getExitCodeStrict(): Promise<number | null> {
+    const exitCodePath = this.quotePath(`${this.outputDir}/${EXIT_CODE_FILENAME}`);
+    // Absent marker means still running (exit 0, empty). File operators other than -h/-L
+    // follow symlinks, so a dangling-symlink marker reads as absent to -e; require -L to
+    // also fail before declaring absence, letting cat surface the dangling link (like any
+    // other unreadable/replaced marker) as a probe failure instead of "running" forever.
+    const result = await execBuffered(
+      this.runtime,
+      `{ [ ! -e ${exitCodePath} ] && [ ! -L ${exitCodePath} ]; } || cat ${exitCodePath} 2>/dev/null`,
+      {
+        cwd: FALLBACK_CWD,
+        timeout: 10,
+      }
+    );
+    this.assertMonitorProbeSucceeded("getExitCode", result.exitCode);
+    const parsed = parseExitCode(result.stdout);
+    // A nonempty marker that fails to parse is a corrupted write, not a still-running process.
+    if (parsed == null && result.stdout.trim().length > 0) {
+      throw new Error(`getExitCode marker is not a number: ${result.stdout.trim().slice(0, 32)}`);
+    }
+    return parsed;
+  }
+
   /**
    * Get the exit code from the exit_code file.
    * Returns null if process is still running (file doesn't exist yet).
    */
   async getExitCode(): Promise<number | null> {
     try {
-      const exitCodePath = this.quotePath(`${this.outputDir}/${EXIT_CODE_FILENAME}`);
-      const result = await execBuffered(
-        this.runtime,
-        `cat ${exitCodePath} 2>/dev/null || echo ""`,
-        { cwd: FALLBACK_CWD, timeout: 10 }
-      );
-      return parseExitCode(result.stdout);
+      return await this.getExitCodeStrict();
     } catch (error) {
       log.debug(`RuntimeBackgroundHandle.getExitCode: Error: ${errorMsg(error)}`);
       return null;
     }
+  }
+
+  getExitCodeForMonitor(): Promise<BackgroundMonitorProbeResult<number | null>> {
+    return this.probeForMonitor(() => this.getExitCodeStrict());
   }
 
   /**
@@ -377,20 +419,48 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
     }
   }
 
+  private async readOutputFileSize(): Promise<number> {
+    const filePath = this.quotePath(`${this.outputDir}/${OUTPUT_FILENAME}`);
+    // No || fallback: a deleted or unreadable output file must fail the strict probe so the
+    // monitor's failure policy can retire it instead of parsing the miss as an empty file.
+    const sizeResult = await execBuffered(this.runtime, `wc -c < ${filePath} 2>/dev/null`, {
+      cwd: FALLBACK_CWD,
+      timeout: 10,
+    });
+    this.assertMonitorProbeSucceeded("readOutput file-size probe", sizeResult.exitCode);
+    return parseInt(sizeResult.stdout.trim(), 10) || 0;
+  }
+
   async getOutputFileSize(): Promise<number> {
     try {
-      const filePath = this.quotePath(`${this.outputDir}/${OUTPUT_FILENAME}`);
-      const sizeResult = await execBuffered(
-        this.runtime,
-        `wc -c < ${filePath} 2>/dev/null || echo 0`,
-        { cwd: FALLBACK_CWD, timeout: 10 }
-      );
-
-      return parseInt(sizeResult.stdout.trim(), 10) || 0;
+      return await this.readOutputFileSize();
     } catch (error) {
       log.debug(`RuntimeBackgroundHandle.getOutputFileSize: Error: ${errorMsg(error)}`);
       return 0;
     }
+  }
+
+  private async readOutputStrict(offset: number): Promise<{ content: string; newOffset: number }> {
+    const filePath = this.quotePath(`${this.outputDir}/${OUTPUT_FILENAME}`);
+    const fileSize = await this.readOutputFileSize();
+
+    if (offset >= fileSize) {
+      return { content: "", newOffset: offset };
+    }
+
+    // Read from offset to end of file using tail -c (faster than dd bs=1)
+    // tail -c +N means "start at byte N" (1-indexed)
+    const readResult = await execBuffered(
+      this.runtime,
+      `tail -c +${offset + 1} ${filePath} 2>/dev/null`,
+      { cwd: FALLBACK_CWD, timeout: 30 }
+    );
+    this.assertMonitorProbeSucceeded("readOutput tail probe", readResult.exitCode);
+
+    return {
+      content: readResult.stdout,
+      newOffset: offset + Buffer.byteLength(readResult.stdout),
+    };
   }
 
   /**
@@ -399,29 +469,17 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
    */
   async readOutput(offset: number): Promise<{ content: string; newOffset: number }> {
     try {
-      const filePath = this.quotePath(`${this.outputDir}/${OUTPUT_FILENAME}`);
-      const fileSize = await this.getOutputFileSize();
-
-      if (offset >= fileSize) {
-        return { content: "", newOffset: offset };
-      }
-
-      // Read from offset to end of file using tail -c (faster than dd bs=1)
-      // tail -c +N means "start at byte N" (1-indexed)
-      const readResult = await execBuffered(
-        this.runtime,
-        `tail -c +${offset + 1} ${filePath} 2>/dev/null`,
-        { cwd: FALLBACK_CWD, timeout: 30 }
-      );
-
-      return {
-        content: readResult.stdout,
-        newOffset: offset + Buffer.byteLength(readResult.stdout),
-      };
+      return await this.readOutputStrict(offset);
     } catch (error) {
       log.debug(`RuntimeBackgroundHandle.readOutput: Error: ${errorMsg(error)}`);
       return { content: "", newOffset: offset };
     }
+  }
+
+  readOutputForMonitor(
+    offset: number
+  ): Promise<BackgroundMonitorProbeResult<{ content: string; newOffset: number }>> {
+    return this.probeForMonitor(() => this.readOutputStrict(offset));
   }
 }
 

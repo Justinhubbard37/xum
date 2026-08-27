@@ -1,7 +1,11 @@
 import type { Dirent } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as nodePath from "node:path";
-import type { Runtime, BackgroundHandle } from "@/node/runtime/Runtime";
+import type {
+  Runtime,
+  BackgroundHandle,
+  BackgroundMonitorProbeResult,
+} from "@/node/runtime/Runtime";
 import {
   spawnProcess,
   localBgWorkspaceDir,
@@ -20,6 +24,7 @@ import { log } from "./log";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import { BASH_MAX_LINE_BYTES } from "@/common/constants/toolLimits";
 import { stripAnsiControlChars } from "@/node/utils/ansi";
+import type { BashMonitorFailedOperation } from "@/common/types/message";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 
@@ -210,14 +215,44 @@ export interface MonitorArmedPayload {
   createdAt: string;
 }
 
-/** Emitted when a monitor retires normally (not during shutdown); deletes its registry record. */
+/** Matched output that must survive failed monitor retirement. */
+export interface MonitorFailedMatchPayload {
+  lines: string[];
+  totalMatches: number;
+  droppedLines: number;
+  matchedThroughOffset?: number;
+}
+
 export interface MonitorStoppedPayload {
   processId: string;
-  /** Explicit cancellation discards pending matches; missing/normal retirement preserves them. */
-  reason?: "completed" | "canceled";
+  /** Explicit cancellation discards pending matches; failed retirement needs a durable lost wake. */
+  reason?: "completed" | "canceled" | "failed";
+  failureMessage?: string;
+  failedOperations?: BashMonitorFailedOperation[];
+  armMetadata?: MonitorArmedPayload;
+  failedMatch?: MonitorFailedMatchPayload;
+}
+
+// One or two misses can be transient; three means that capability cannot serve the monitor.
+const MAX_CONSECUTIVE_MONITOR_PROBE_FAILURES = 3;
+
+interface MonitorProbeFailureState {
+  consecutiveFailures: number;
+  message: string;
+}
+
+class MonitorPollingFailure extends Error {
+  constructor(
+    message: string,
+    readonly failedOperations: readonly BashMonitorFailedOperation[]
+  ) {
+    super(message);
+    this.name = "MonitorPollingFailure";
+  }
 }
 
 export interface BackgroundProcessMonitorState extends BackgroundProcessMonitorConfig {
+  armMetadata: MonitorArmedPayload;
   /** Resolved settlement-wake policy (config default: true). */
   wakeOnExit: boolean;
   matchesCount: number;
@@ -237,6 +272,7 @@ export interface BackgroundProcessMonitorState extends BackgroundProcessMonitorC
   pollIntervalMs: number;
   incompleteLineBuffer: string;
   stopped: boolean;
+  probeFailures: Partial<Record<BashMonitorFailedOperation, MonitorProbeFailureState>>;
   /**
    * Settlement claim latch. Set synchronously (single-threaded event loop makes the plain flag
    * race-safe) by claimMonitorSettlement; once held, normal flush/stop triggers are suspended
@@ -425,13 +461,14 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
 
   private createMonitorState(
     config: BackgroundProcessMonitorConfig,
-    options: { pollIntervalMs: number }
+    options: { pollIntervalMs: number; armMetadata: MonitorArmedPayload }
   ): BackgroundProcessMonitorState {
     assert(config.filter.length > 0, "BackgroundProcessMonitorConfig requires a filter");
     assert(config.cooldownMs >= 0, "BackgroundProcessMonitorConfig cooldown must be non-negative");
     assert(options.pollIntervalMs > 0, "monitor poll interval must be positive");
     return {
       ...config,
+      armMetadata: options.armMetadata,
       wakeOnExit: config.wakeOnExit ?? true,
       matchesCount: 0,
       pendingLines: [],
@@ -442,6 +479,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       matchedThroughOffset: 0,
       incompleteLineBuffer: "",
       stopped: false,
+      probeFailures: {},
       settled: false,
       pollIntervalMs: options.pollIntervalMs,
     };
@@ -567,11 +605,27 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   private stopMonitor(
     proc: BackgroundProcess,
     flushPending: boolean,
-    reason: NonNullable<MonitorStoppedPayload["reason"]> = "completed"
+    reason: NonNullable<MonitorStoppedPayload["reason"]> = "completed",
+    failure?: { message: string; failedOperations?: BashMonitorFailedOperation[] }
   ): void {
     const monitor = proc.monitor;
     if (!monitor || monitor.stopped) return;
 
+    // Same shown-frontier gate as the normal flush: matches an unfiltered read already delivered
+    // must not resurface as fresh output through the failure wake.
+    const failedMatchHasUnshownLines =
+      monitor.pendingLines.length > 0 && proc.shownThroughOffset < monitor.matchedThroughOffset;
+    const failedMatch: MonitorFailedMatchPayload | undefined =
+      failure != null
+        ? {
+            lines: failedMatchHasUnshownLines ? [...monitor.pendingLines] : [],
+            totalMatches: monitor.matchesCount,
+            droppedLines: failedMatchHasUnshownLines ? monitor.droppedLines : 0,
+            ...(failedMatchHasUnshownLines
+              ? { matchedThroughOffset: monitor.matchedThroughOffset }
+              : {}),
+          }
+        : undefined;
     monitor.stopped = true;
     if (monitor.flushTimer) {
       clearTimeout(monitor.flushTimer);
@@ -589,7 +643,20 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // this process, so its armed-registry record must go. During shutdown the record must
     // survive so the next startup can deliver the "monitor lost" notice.
     if (!this.shuttingDown) {
-      this.emit("monitor:stopped", proc.workspaceId, { processId: proc.id, reason });
+      this.emit("monitor:stopped", proc.workspaceId, {
+        processId: proc.id,
+        reason,
+        ...(failure != null
+          ? {
+              failureMessage: failure.message,
+              ...(failure.failedOperations != null
+                ? { failedOperations: failure.failedOperations }
+                : {}),
+              armMetadata: monitor.armMetadata,
+              ...(failedMatch != null ? { failedMatch } : {}),
+            }
+          : {}),
+      });
     }
     // Armed -> stopped is workspace-visible state (sidebar "watching" indicator), and not
     // every stop path also changes process status or flushes a match (e.g. maxEvents
@@ -983,16 +1050,130 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     }
   }
 
+  private recordMonitorProbeSuccess(
+    monitor: BackgroundProcessMonitorState,
+    operation: BashMonitorFailedOperation
+  ): void {
+    delete monitor.probeFailures[operation];
+  }
+
+  private recordMonitorProbeFailure(
+    monitor: BackgroundProcessMonitorState,
+    operation: BashMonitorFailedOperation,
+    message: string
+  ): MonitorPollingFailure | null {
+    const previous = monitor.probeFailures[operation];
+    const current: MonitorProbeFailureState = {
+      consecutiveFailures: (previous?.consecutiveFailures ?? 0) + 1,
+      message,
+    };
+    monitor.probeFailures[operation] = current;
+
+    const otherOperation: BashMonitorFailedOperation =
+      operation === "readOutput" ? "getExitCode" : "readOutput";
+    const otherFailure = monitor.probeFailures[otherOperation];
+    if (otherFailure != null) {
+      return new MonitorPollingFailure(
+        `Background process monitor probes failed (${operation}: ${message}; ${otherOperation}: ${otherFailure.message})`,
+        [operation, otherOperation]
+      );
+    }
+    if (current.consecutiveFailures >= MAX_CONSECUTIVE_MONITOR_PROBE_FAILURES) {
+      return new MonitorPollingFailure(
+        `Background process monitor probe failed ${current.consecutiveFailures} consecutive times (${operation}: ${message})`,
+        [operation]
+      );
+    }
+    return null;
+  }
+
+  private async runMonitorProbe<T>(
+    monitor: BackgroundProcessMonitorState,
+    operation: BashMonitorFailedOperation,
+    probe: () => Promise<BackgroundMonitorProbeResult<T>>,
+    fallback: T
+  ): Promise<T> {
+    let result: BackgroundMonitorProbeResult<T>;
+    try {
+      result = await probe();
+    } catch (error) {
+      result = { success: false, error: getErrorMessage(error) };
+    }
+    if (result.success) {
+      this.recordMonitorProbeSuccess(monitor, operation);
+      return result.value;
+    }
+    const failure = this.recordMonitorProbeFailure(monitor, operation, result.error);
+    if (failure != null) throw failure;
+    return fallback;
+  }
+
+  private readOutputForMonitor(
+    proc: BackgroundProcess,
+    monitor: BackgroundProcessMonitorState,
+    offset: number
+  ): Promise<{ content: string; newOffset: number }> {
+    const probe = proc.handle.readOutputForMonitor?.bind(proc.handle);
+    return this.runMonitorProbe(
+      monitor,
+      "readOutput",
+      probe != null
+        ? () => probe(offset)
+        : async () => {
+            try {
+              return { success: true, value: await proc.handle.readOutput(offset) };
+            } catch (error) {
+              return { success: false, error: getErrorMessage(error) };
+            }
+          },
+      { content: "", newOffset: offset }
+    );
+  }
+
+  private getExitCodeForMonitor(
+    proc: BackgroundProcess,
+    monitor: BackgroundProcessMonitorState
+  ): Promise<number | null> {
+    const probe = proc.handle.getExitCodeForMonitor?.bind(proc.handle);
+    return this.runMonitorProbe(
+      monitor,
+      "getExitCode",
+      probe != null
+        ? () => probe()
+        : async () => {
+            try {
+              return { success: true, value: await proc.handle.getExitCode() };
+            } catch (error) {
+              return { success: false, error: getErrorMessage(error) };
+            }
+          },
+      null
+    );
+  }
+
   private startMonitorTail(proc: BackgroundProcess): void {
     void this.monitorTailLoop(proc.id).catch((error: unknown) => {
       const current = this.processes.get(proc.id);
-      if (current?.monitor && !current.monitor.stopped) {
-        // Route through stopMonitor so the retirement also clears any pending flush timer,
-        // emits "monitor:stopped" (registry cleanup), and broadcasts the change event so
-        // activity consumers see the armed-monitor count drop. No flush: the loop failed.
-        this.stopMonitor(current, false);
+      // Identity check: a stale tail from a removed generation must not retire the monitor of a
+      // newer process that reused this display-name-derived ID. A claimed settlement also wins:
+      // its owner emits the deterministic terminal wake, so a late probe rejection must not
+      // convert a settling monitor into a runtime failure.
+      if (
+        current === proc &&
+        current.monitor &&
+        !current.monitor.stopped &&
+        !current.monitor.settled
+      ) {
+        // No observer remains after this loop rejects. Stopping also makes later settlement claims
+        // no-op, so this failure wake is the only lifecycle notice even if the process exits later.
+        this.stopMonitor(current, true, "failed", {
+          message: getErrorMessage(error),
+          ...(error instanceof MonitorPollingFailure
+            ? { failedOperations: [...error.failedOperations] }
+            : {}),
+        });
       }
-      log.debug(
+      log.warn(
         `BackgroundProcessManager: monitor tail for ${proc.id} failed: ${getErrorMessage(error)}`
       );
     });
@@ -1005,7 +1186,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       if (!proc || !monitor || monitor.stopped || monitor.settled) return;
 
       const chunkStartOffset = monitor.lastReadOffset;
-      const read = await proc.handle.readOutput(chunkStartOffset);
+      const read = await this.readOutputForMonitor(proc, monitor, chunkStartOffset);
       // A settlement claim (e.g. a timeout terminate) during the await owns every remaining
       // byte; leave lastReadOffset untouched so its final scan re-reads this chunk.
       if (monitor.stopped || monitor.settled) return;
@@ -1018,7 +1199,20 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       // Check for exit BEFORE processing the just-read chunk: a matching line in the very chunk
       // that accompanies the exit must coalesce into the single settlement payload instead of
       // triggering a cooldown_ms=0 emit or maxEvents retirement ahead of it.
-      const exitCode = await proc.handle.getExitCode();
+      let exitCode: number | null;
+      try {
+        exitCode = await this.getExitCodeForMonitor(proc, monitor);
+      } catch (error) {
+        // The exit-probe escalation retires the monitor through the tail catch, but the read
+        // above already succeeded: fold its chunk into monitor state first, or the matched
+        // lines would vanish from the failure payload (unrecoverable if the process
+        // generation dies before the suggested task_await).
+        if (!monitor.stopped && !monitor.settled) {
+          monitor.lastReadOffset = read.newOffset;
+          this.processMonitorContent(proc, read.content, { chunkStartOffset });
+        }
+        throw error;
+      }
       if (monitor.stopped || monitor.settled) return;
 
       if (exitCode !== null) {
@@ -1293,20 +1487,21 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         runtime instanceof LocalBaseRuntime
           ? MONITOR_POLL_INTERVAL_MS_LOCAL
           : MONITOR_POLL_INTERVAL_MS_REMOTE;
-      proc.monitor = this.createMonitorState(config.monitor, { pollIntervalMs });
-      this.startMonitorTail(proc);
-      // spawn() is the only place monitors are ever armed (registerMigratedProcess never
-      // sets one), so this single emit keeps the persisted armed-monitor registry complete.
-      this.emit("monitor:armed", workspaceId, {
+      const armMetadata: MonitorArmedPayload = {
         processId,
         taskId: `bash:${processId}`,
         workspaceId,
         displayName: config.displayName,
-        filter: proc.monitor.filter,
-        filterExclude: proc.monitor.exclude,
+        filter: config.monitor.filter,
+        filterExclude: config.monitor.exclude,
         script,
         createdAt: new Date().toISOString(),
-      });
+      };
+      proc.monitor = this.createMonitorState(config.monitor, { pollIntervalMs, armMetadata });
+      this.startMonitorTail(proc);
+      // spawn() is the only place monitors are ever armed (registerMigratedProcess never
+      // sets one), so this single emit keeps the persisted armed-monitor registry complete.
+      this.emit("monitor:armed", workspaceId, armMetadata);
     }
 
     log.debug(
@@ -1492,6 +1687,11 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     const metaJson = JSON.stringify(meta, null, 2);
 
     await proc.handle.writeMeta(metaJson);
+  }
+
+  /** Return the in-memory process without probing its runtime handle. */
+  peekProcess(processId: string): BackgroundProcess | null {
+    return this.processes.get(processId) ?? null;
   }
 
   /**
@@ -2348,10 +2548,10 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    */
   async terminate(
     processId: string,
-    options?: { monitorDisposition?: "discard" | "flush" }
+    options: { monitorDisposition: "discard" | "flush" }
   ): Promise<{ success: true } | { success: false; error: string }> {
     log.debug(`BackgroundProcessManager.terminate(${processId}) called`);
-    const shouldFlushMonitor = options?.monitorDisposition === "flush";
+    const shouldFlushMonitor = options.monitorDisposition === "flush";
 
     // Get process from Map
     const proc = this.processes.get(processId);
@@ -2478,7 +2678,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     );
 
     // Terminate all running processes
-    await Promise.all(matching.map((p) => this.terminate(p.id)));
+    await Promise.all(matching.map((p) => this.terminate(p.id, { monitorDisposition: "discard" })));
 
     // Remove from memory (output dirs left on disk for OS/workspace cleanup)
     // All per-process state (outputBytesRead, outputLock) is stored in the

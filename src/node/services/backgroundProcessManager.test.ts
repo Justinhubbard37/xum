@@ -12,7 +12,7 @@ import {
   type MonitorStoppedPayload,
   type OutputShownPayload,
 } from "./backgroundProcessManager";
-import { localBgWorkspaceDir } from "./backgroundProcessExecutor";
+import { localBgWorkspaceDir, spawnProcess } from "./backgroundProcessExecutor";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { BackgroundHandle, Runtime } from "@/node/runtime/Runtime";
 import { spawnSync } from "node:child_process";
@@ -24,22 +24,52 @@ import { createBashOutputTool } from "@/node/services/tools/bash_output";
 import { TestTempDir, createTestToolConfig } from "@/node/services/tools/testHelpers";
 import type { BashToolResult, BashOutputToolResult } from "@/common/types/tools";
 
+interface ProbeFailureControl {
+  value: boolean;
+  calls: number;
+  exitCode?: number;
+}
+
+interface RemoteLikeRuntimeOptions {
+  throwOnSpawn?: { value: boolean };
+  outputProbeFailure?: ProbeFailureControl;
+  exitProbeFailure?: ProbeFailureControl;
+}
+
 /**
  * Delegates to a real LocalRuntime but is NOT an instanceof LocalBaseRuntime, so the
  * manager treats it like a remote runtime (exec-based record-directory probing, name
  * reservation retention on failure). Optionally throws on the spawn command itself to
  * simulate a transport-level (SSH/Coder channel) error after dispatch.
  */
-function createRemoteLikeRuntime(
-  base: LocalRuntime,
-  options?: { throwOnSpawn?: { value: boolean } }
-): Runtime {
+function createRemoteLikeRuntime(base: LocalRuntime, options?: RemoteLikeRuntimeOptions): Runtime {
   return new Proxy({} as Runtime, {
     get(_target, prop) {
       if (prop === "exec") {
         return (command: string, opts: never) => {
           if (options?.throwOnSpawn?.value === true && command.includes("output.log")) {
             throw new Error("SSH channel error after dispatch");
+          }
+          if (
+            options?.outputProbeFailure?.value === true &&
+            (command.includes("wc -c <") || command.includes("tail -c +"))
+          ) {
+            options.outputProbeFailure.calls += 1;
+            if (options.outputProbeFailure.exitCode != null) {
+              return base.exec(`exit ${options.outputProbeFailure.exitCode}`, opts);
+            }
+            throw new Error("SSH output probe failed");
+          }
+          if (
+            options?.exitProbeFailure?.value === true &&
+            command.includes("cat ") &&
+            command.includes("exit_code")
+          ) {
+            options.exitProbeFailure.calls += 1;
+            if (options.exitProbeFailure.exitCode != null) {
+              return base.exec(`exit ${options.exitProbeFailure.exitCode}`, opts);
+            }
+            throw new Error("SSH exit probe failed");
           }
           return base.exec(command, opts);
         };
@@ -50,6 +80,19 @@ function createRemoteLikeRuntime(
         : value;
     },
   });
+}
+
+async function captureProbeError(action: () => Promise<unknown>): Promise<Error | null> {
+  try {
+    await action();
+    return null;
+  } catch (error) {
+    return error instanceof Error ? error : new Error(String(error));
+  }
+}
+
+async function expectProbeCallNotToThrow(action: () => Promise<unknown>): Promise<void> {
+  expect(await captureProbeError(action)).toBeNull();
 }
 
 function waitForMonitorMatch(
@@ -76,6 +119,7 @@ describe("BackgroundProcessManager", () => {
   let manager: BackgroundProcessManager;
   let runtime: Runtime;
   let bgOutputDir: string;
+  const probeHandles: BackgroundHandle[] = [];
   // Use unique workspace IDs per test run to avoid collisions
   const testRunId = Date.now().toString(36);
   const testWorkspaceId = `test-ws1-${testRunId}`;
@@ -89,6 +133,7 @@ describe("BackgroundProcessManager", () => {
   });
 
   afterEach(async () => {
+    await Promise.all(probeHandles.splice(0).map((handle) => handle.terminate()));
     // Cleanup: terminate all processes
     await manager.cleanup(testWorkspaceId);
     await manager.cleanup(testWorkspaceId2);
@@ -246,6 +291,64 @@ describe("BackgroundProcessManager", () => {
   });
 
   describe("monitor", () => {
+    async function spawnRuntimeProbeHandle(
+      options: RemoteLikeRuntimeOptions
+    ): Promise<BackgroundHandle> {
+      const result = await spawnProcess(
+        createRemoteLikeRuntime(new LocalRuntime(process.cwd()), options),
+        "sleep 10",
+        {
+          cwd: process.cwd(),
+          workspaceId: testWorkspaceId,
+          processId: "monitor-probe-matrix",
+        }
+      );
+      expect(result.success).toBe(true);
+      if (!result.success) throw new Error(result.error);
+      probeHandles.push(result.handle);
+      return result.handle;
+    }
+
+    it("keeps repeated readOutput transport failures fail-open outside monitor polling", async () => {
+      const outputProbeFailure = { value: true, calls: 0, exitCode: 255 };
+      const handle = await spawnRuntimeProbeHandle({ outputProbeFailure });
+
+      try {
+        for (let attempt = 0; attempt < 4; attempt++) {
+          await expectProbeCallNotToThrow(() => handle.readOutput(0));
+        }
+      } finally {
+        outputProbeFailure.value = false;
+      }
+    });
+
+    it("keeps repeated getExitCode transport failures fail-open outside monitor polling", async () => {
+      const exitProbeFailure = { value: true, calls: 0, exitCode: 255 };
+      const handle = await spawnRuntimeProbeHandle({ exitProbeFailure });
+
+      try {
+        for (let attempt = 0; attempt < 4; attempt++) {
+          expect(await handle.getExitCode()).toBeNull();
+        }
+      } finally {
+        exitProbeFailure.value = false;
+      }
+    });
+
+    it("keeps simultaneous transport failures fail-open outside monitor polling", async () => {
+      const outputProbeFailure = { value: true, calls: 0 };
+      const exitProbeFailure = { value: true, calls: 0 };
+      const handle = await spawnRuntimeProbeHandle({ outputProbeFailure, exitProbeFailure });
+
+      try {
+        await expectProbeCallNotToThrow(() => handle.readOutput(0));
+        expect(await handle.getExitCode()).toBeNull();
+      } finally {
+        outputProbeFailure.value = false;
+        exitProbeFailure.value = false;
+      }
+    });
+
     it("emits a match for a final unterminated line", async () => {
       const eventPromise = waitForMonitorMatch(manager);
       const result = await manager.spawn(runtime, testWorkspaceId, "printf 'READY'", {
@@ -375,12 +478,12 @@ describe("BackgroundProcessManager", () => {
       expect(manager.getActiveMonitorCount(testWorkspaceId)).toBe(1);
 
       const changedWorkspaceIds: string[] = [];
+      const stoppedEvents: MonitorStoppedPayload[] = [];
       manager.on("change", (wsId) => changedWorkspaceIds.push(wsId));
-      // Simulate a runtime read failure (e.g. dropped SSH connection) inside the tail loop.
-      // Reject per-call (not mockRejectedValue) so no eagerly-created rejected promise
-      // sits unhandled before the tail loop consumes it.
-      spyOn(proc.handle, "readOutput").mockImplementation(() =>
-        Promise.reject(new Error("read failure"))
+      manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
+      // Simulate a runtime read failure inside the monitor-only probe path.
+      spyOn(proc.handle, "readOutputForMonitor").mockImplementation(() =>
+        Promise.resolve({ success: false, error: "read failure" })
       );
 
       for (let attempt = 0; attempt < 40; attempt++) {
@@ -392,6 +495,460 @@ describe("BackgroundProcessManager", () => {
       // activity consumers (sidebar watching indicator) can clear.
       expect(manager.getActiveMonitorCount(testWorkspaceId)).toBe(0);
       expect(changedWorkspaceIds).toContain(testWorkspaceId);
+      const stoppedEvent = stoppedEvents.find(
+        (event) => event.processId === result.processId && event.reason === "failed"
+      );
+      expect(stoppedEvent?.failureMessage).toContain("3 consecutive times");
+      expect(stoppedEvent?.failureMessage).toContain("read failure");
+      expect(stoppedEvent?.armMetadata).toMatchObject({
+        processId: result.processId,
+        taskId: `bash:${result.processId}`,
+        filter: "NEVER_MATCHES",
+      });
+    });
+
+    it("folds a same-poll read chunk into the failure payload when the exit probe escalates", async () => {
+      const stoppedEvents: MonitorStoppedPayload[] = [];
+      manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
+
+      const result = await manager.spawn(runtime, testWorkspaceId, "sleep 5", {
+        cwd: process.cwd(),
+        displayName: "monitor-exit-probe-chunk",
+        monitor: {
+          filter: "READY",
+          pattern: /READY/,
+          exclude: false,
+          cooldownMs: 10_000,
+        },
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const proc = await manager.getProcess(result.processId);
+      expect(proc).not.toBeNull();
+      if (!proc) return;
+
+      // The matched chunk must arrive on the poll whose exit probe records the third (fatal)
+      // consecutive failure, so the escalation throw is the only step between the read chunk
+      // and the failure payload. Keying the chunk to two already-recorded exit failures makes
+      // the setup phase-independent: the spies may land mid-iteration (between a read and its
+      // exit probe), shifting which read precedes the fatal probe.
+      let exitProbes = 0;
+      spyOn(proc.handle, "readOutputForMonitor").mockImplementation(() =>
+        Promise.resolve(
+          exitProbes >= 2
+            ? { success: true as const, value: { content: "READY\n", newOffset: 6 } }
+            : { success: true as const, value: { content: "", newOffset: 0 } }
+        )
+      );
+      spyOn(proc.handle, "getExitCodeForMonitor").mockImplementation(() => {
+        exitProbes += 1;
+        return Promise.resolve({ success: false as const, error: "exit probe down" });
+      });
+
+      for (let attempt = 0; attempt < 60 && stoppedEvents.length === 0; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      const stoppedEvent = stoppedEvents.find(
+        (event) => event.processId === result.processId && event.reason === "failed"
+      );
+      expect(stoppedEvent?.failedOperations).toEqual(["getExitCode"]);
+      expect(stoppedEvent?.failedMatch).toMatchObject({ lines: ["READY"], totalMatches: 1 });
+    });
+
+    it("retires a monitor after repeated output failures while exit probes stay healthy", async () => {
+      const outputProbeFailure = { value: false, calls: 0 };
+      const remoteRuntime = createRemoteLikeRuntime(new LocalRuntime(process.cwd()), {
+        outputProbeFailure,
+      });
+      const stoppedEvents: MonitorStoppedPayload[] = [];
+      manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
+
+      const result = await manager.spawn(remoteRuntime, testWorkspaceId, "echo READY; sleep 10", {
+        cwd: process.cwd(),
+        displayName: "monitor-persistent-output-failure",
+        monitor: {
+          filter: "READY",
+          pattern: /READY/,
+          exclude: false,
+          cooldownMs: 10_000,
+        },
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      try {
+        for (let attempt = 0; attempt < 40; attempt++) {
+          const proc = manager.peekProcess(result.processId);
+          if (proc != null && manager.getMonitorSnapshot(proc)?.totalMatches === 1) break;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        outputProbeFailure.value = true;
+        for (let attempt = 0; attempt < 60 && stoppedEvents.length === 0; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        expect(outputProbeFailure.calls).toBeGreaterThanOrEqual(3);
+        expect(manager.getActiveMonitorCount(testWorkspaceId)).toBe(0);
+        const stoppedEvent = stoppedEvents.find(
+          (event) => event.processId === result.processId && event.reason === "failed"
+        );
+        expect(stoppedEvent).toBeDefined();
+        expect(stoppedEvent?.failureMessage).toContain("3 consecutive times");
+        expect(stoppedEvent?.failedOperations).toEqual(["readOutput"]);
+        expect(stoppedEvent?.armMetadata?.processId).toBe(result.processId);
+        expect(stoppedEvent?.failedMatch).toMatchObject({
+          lines: ["READY"],
+          totalMatches: 1,
+        });
+      } finally {
+        outputProbeFailure.value = false;
+      }
+    });
+
+    it("suppresses already-shown matches from the failed stop payload", async () => {
+      const stoppedEvents: MonitorStoppedPayload[] = [];
+      manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
+
+      const outputProbeFailure = { value: false, calls: 0 };
+      const remoteRuntime = createRemoteLikeRuntime(new LocalRuntime(process.cwd()), {
+        outputProbeFailure,
+      });
+      const result = await manager.spawn(remoteRuntime, testWorkspaceId, "echo READY; sleep 10", {
+        cwd: process.cwd(),
+        displayName: "monitor-shown-failed-match",
+        monitor: {
+          filter: "READY",
+          pattern: /READY/,
+          exclude: false,
+          cooldownMs: 10_000,
+        },
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      try {
+        for (let attempt = 0; attempt < 40; attempt++) {
+          const proc = manager.peekProcess(result.processId);
+          if (proc != null && manager.getMonitorSnapshot(proc)?.totalMatches === 1) break;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        // An unfiltered read advances the shown frontier past the matched line before the failure.
+        const output = await manager.getOutput(result.processId, undefined, false, 1);
+        expect(output.success).toBe(true);
+        outputProbeFailure.value = true;
+        for (let attempt = 0; attempt < 60 && stoppedEvents.length === 0; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        const stoppedEvent = stoppedEvents.find(
+          (event) => event.processId === result.processId && event.reason === "failed"
+        );
+        expect(stoppedEvent).toBeDefined();
+        expect(stoppedEvent?.failedMatch).toMatchObject({ lines: [], totalMatches: 1 });
+        expect(stoppedEvent?.failedMatch?.matchedThroughOffset).toBeUndefined();
+      } finally {
+        outputProbeFailure.value = false;
+      }
+    });
+
+    it("retires the monitor when the output file disappears mid-run", async () => {
+      const stoppedEvents: MonitorStoppedPayload[] = [];
+      manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
+
+      const remoteRuntime = createRemoteLikeRuntime(new LocalRuntime(process.cwd()));
+      const result = await manager.spawn(remoteRuntime, testWorkspaceId, "sleep 10", {
+        cwd: process.cwd(),
+        displayName: "monitor-output-file-gone",
+        monitor: {
+          filter: "NEVER",
+          pattern: /NEVER/,
+          exclude: false,
+          cooldownMs: 10_000,
+        },
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      try {
+        await fs.rm(path.join(result.outputDir, "output.log"), { force: true });
+        for (let attempt = 0; attempt < 120 && stoppedEvents.length === 0; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        const stoppedEvent = stoppedEvents.find(
+          (event) => event.processId === result.processId && event.reason === "failed"
+        );
+        expect(stoppedEvent).toBeDefined();
+        expect(stoppedEvent?.failedOperations).toEqual(["readOutput"]);
+      } finally {
+        await manager.terminate(result.processId, { monitorDisposition: "discard" });
+      }
+    });
+
+    it("retires the monitor when the exit marker is corrupted", async () => {
+      const stoppedEvents: MonitorStoppedPayload[] = [];
+      manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
+
+      const remoteRuntime = createRemoteLikeRuntime(new LocalRuntime(process.cwd()));
+      const result = await manager.spawn(remoteRuntime, testWorkspaceId, "sleep 10", {
+        cwd: process.cwd(),
+        displayName: "monitor-exit-marker-corrupt",
+        monitor: {
+          filter: "NEVER",
+          pattern: /NEVER/,
+          exclude: false,
+          cooldownMs: 10_000,
+        },
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      try {
+        await fs.writeFile(path.join(result.outputDir, "exit_code"), "garbage\n", "utf-8");
+        for (let attempt = 0; attempt < 120 && stoppedEvents.length === 0; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        const stoppedEvent = stoppedEvents.find(
+          (event) => event.processId === result.processId && event.reason === "failed"
+        );
+        expect(stoppedEvent).toBeDefined();
+        expect(stoppedEvent?.failedOperations).toEqual(["getExitCode"]);
+      } finally {
+        await manager.terminate(result.processId, { monitorDisposition: "discard" });
+      }
+    });
+
+    it("retires the monitor when the exit marker becomes unreadable", async () => {
+      const stoppedEvents: MonitorStoppedPayload[] = [];
+      manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
+
+      const remoteRuntime = createRemoteLikeRuntime(new LocalRuntime(process.cwd()));
+      const result = await manager.spawn(remoteRuntime, testWorkspaceId, "sleep 10", {
+        cwd: process.cwd(),
+        displayName: "monitor-exit-marker-unreadable",
+        monitor: {
+          filter: "NEVER",
+          pattern: /NEVER/,
+          exclude: false,
+          cooldownMs: 10_000,
+        },
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      try {
+        // A directory where the marker file should be makes cat fail without the marker
+        // reading as absent (running).
+        await fs.mkdir(path.join(result.outputDir, "exit_code"), { recursive: true });
+        for (let attempt = 0; attempt < 120 && stoppedEvents.length === 0; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        const stoppedEvent = stoppedEvents.find(
+          (event) => event.processId === result.processId && event.reason === "failed"
+        );
+        expect(stoppedEvent).toBeDefined();
+        expect(stoppedEvent?.failedOperations).toEqual(["getExitCode"]);
+      } finally {
+        await manager.terminate(result.processId, { monitorDisposition: "discard" });
+      }
+    });
+
+    it("resets consecutive output failures after an output probe succeeds", async () => {
+      const stoppedEvents: MonitorStoppedPayload[] = [];
+      manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
+
+      const result = await manager.spawn(runtime, testWorkspaceId, "sleep 10", {
+        cwd: process.cwd(),
+        displayName: "monitor-output-probe-recovery",
+        monitor: {
+          filter: "NEVER_MATCHES",
+          pattern: /NEVER_MATCHES/,
+          exclude: false,
+          cooldownMs: 0,
+        },
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      const proc = manager.peekProcess(result.processId);
+      expect(proc).not.toBeNull();
+      if (proc == null) return;
+
+      let probeCalls = 0;
+      let persistentlyFail = false;
+      spyOn(proc.handle, "readOutputForMonitor").mockImplementation((offset) => {
+        probeCalls++;
+        if (persistentlyFail || probeCalls <= 2 || (probeCalls >= 4 && probeCalls <= 5)) {
+          return Promise.resolve({ success: false, error: "read failure" });
+        }
+        return Promise.resolve({ success: true, value: { content: "", newOffset: offset } });
+      });
+
+      for (let attempt = 0; attempt < 40 && probeCalls < 6; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      expect(probeCalls).toBeGreaterThanOrEqual(6);
+      expect(manager.getActiveMonitorCount(testWorkspaceId)).toBe(1);
+
+      const callsBeforePersistentFailure = probeCalls;
+      persistentlyFail = true;
+      for (let attempt = 0; attempt < 40 && stoppedEvents.length === 0; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      expect(probeCalls - callsBeforePersistentFailure).toBeGreaterThanOrEqual(3);
+      expect(manager.getActiveMonitorCount(testWorkspaceId)).toBe(0);
+      expect(stoppedEvents[0]?.failedOperations).toEqual(["readOutput"]);
+    });
+
+    it("keeps task output readable after exit-probe failure retires the monitor", async () => {
+      const exitProbeFailure = { value: false, calls: 0 };
+      const remoteRuntime = createRemoteLikeRuntime(new LocalRuntime(process.cwd()), {
+        exitProbeFailure,
+      });
+      const stoppedEvents: MonitorStoppedPayload[] = [];
+      manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
+
+      const result = await manager.spawn(
+        remoteRuntime,
+        testWorkspaceId,
+        "echo readable-output; sleep 10",
+        {
+          cwd: process.cwd(),
+          displayName: "monitor-exit-probe-failure",
+          monitor: {
+            filter: "NEVER_MATCHES",
+            pattern: /NEVER_MATCHES/,
+            exclude: false,
+            cooldownMs: 0,
+          },
+        }
+      );
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      try {
+        exitProbeFailure.value = true;
+        for (let attempt = 0; attempt < 60 && stoppedEvents.length === 0; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        expect(manager.getActiveMonitorCount(testWorkspaceId)).toBe(0);
+        const stoppedEvent = stoppedEvents.find(
+          (event) => event.processId === result.processId && event.reason === "failed"
+        );
+        expect(stoppedEvent?.failedOperations).toEqual(["getExitCode"]);
+        expect((await manager.getProcess(result.processId))?.id).toBe(result.processId);
+        expect((await manager.list(testWorkspaceId)).map((proc) => proc.id)).toContain(
+          result.processId
+        );
+        expect(await manager.list(testWorkspaceId2)).toEqual([]);
+
+        const output = await manager.getOutput(result.processId, undefined, undefined, 0);
+        expect(output.success).toBe(true);
+        if (output.success) expect(output.output).toContain("readable-output");
+      } finally {
+        exitProbeFailure.value = false;
+      }
+    });
+
+    it("retires a real runtime monitor only after both transport probes fail", async () => {
+      const outputProbeFailure = { value: false, calls: 0 };
+      const exitProbeFailure = { value: false, calls: 0 };
+      const remoteRuntime = createRemoteLikeRuntime(new LocalRuntime(process.cwd()), {
+        outputProbeFailure,
+        exitProbeFailure,
+      });
+      const stoppedEvents: MonitorStoppedPayload[] = [];
+      manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
+
+      const result = await manager.spawn(remoteRuntime, testWorkspaceId, "sleep 10", {
+        cwd: process.cwd(),
+        displayName: "monitor-transport-failure",
+        monitor: {
+          filter: "NEVER_MATCHES",
+          pattern: /NEVER_MATCHES/,
+          exclude: false,
+          cooldownMs: 0,
+        },
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      try {
+        outputProbeFailure.value = true;
+        for (let attempt = 0; attempt < 40 && outputProbeFailure.calls === 0; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        expect(outputProbeFailure.calls).toBeGreaterThan(0);
+        expect(manager.getActiveMonitorCount(testWorkspaceId)).toBe(1);
+
+        exitProbeFailure.value = true;
+        for (let attempt = 0; attempt < 40 && stoppedEvents.length === 0; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        expect(exitProbeFailure.calls).toBeGreaterThan(0);
+        expect(manager.getActiveMonitorCount(testWorkspaceId)).toBe(0);
+        const stoppedEvent = stoppedEvents.find(
+          (event) => event.processId === result.processId && event.reason === "failed"
+        );
+        expect(stoppedEvent).toBeDefined();
+        expect(stoppedEvent?.failureMessage).toContain("Background process monitor probes failed");
+        expect([...(stoppedEvent?.failedOperations ?? [])].sort()).toEqual([
+          "getExitCode",
+          "readOutput",
+        ]);
+      } finally {
+        outputProbeFailure.value = false;
+        exitProbeFailure.value = false;
+      }
+    });
+
+    it("retires a real runtime monitor after both probes resolve nonzero", async () => {
+      const outputProbeFailure = { value: false, calls: 0, exitCode: 255 };
+      const exitProbeFailure = { value: false, calls: 0, exitCode: 255 };
+      const remoteRuntime = createRemoteLikeRuntime(new LocalRuntime(process.cwd()), {
+        outputProbeFailure,
+        exitProbeFailure,
+      });
+      const stoppedEvents: MonitorStoppedPayload[] = [];
+      manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
+
+      const result = await manager.spawn(remoteRuntime, testWorkspaceId, "sleep 10", {
+        cwd: process.cwd(),
+        displayName: "monitor-nonzero-transport-failure",
+        monitor: {
+          filter: "NEVER_MATCHES",
+          pattern: /NEVER_MATCHES/,
+          exclude: false,
+          cooldownMs: 0,
+        },
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      try {
+        outputProbeFailure.value = true;
+        for (let attempt = 0; attempt < 40 && outputProbeFailure.calls === 0; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        expect(outputProbeFailure.calls).toBeGreaterThan(0);
+        expect(manager.getActiveMonitorCount(testWorkspaceId)).toBe(1);
+
+        exitProbeFailure.value = true;
+        for (let attempt = 0; attempt < 40 && stoppedEvents.length === 0; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        expect(exitProbeFailure.calls).toBeGreaterThan(0);
+        expect(manager.getActiveMonitorCount(testWorkspaceId)).toBe(0);
+        const stoppedEvent = stoppedEvents.find(
+          (event) => event.processId === result.processId && event.reason === "failed"
+        );
+        expect(stoppedEvent).toBeDefined();
+        expect(stoppedEvent?.failureMessage).toContain("exited with code 255");
+        expect([...(stoppedEvent?.failedOperations ?? [])].sort()).toEqual([
+          "getExitCode",
+          "readOutput",
+        ]);
+      } finally {
+        outputProbeFailure.value = false;
+        exitProbeFailure.value = false;
+      }
     });
 
     describe("armed/stopped registry events", () => {
@@ -484,7 +1041,7 @@ describe("BackgroundProcessManager", () => {
         });
         expect(terminated.success).toBe(true);
         if (!terminated.success) return;
-        await manager.terminate(terminated.processId);
+        await manager.terminate(terminated.processId, { monitorDisposition: "discard" });
         expect(events.stopped).toContainEqual({
           workspaceId: testWorkspaceId,
           payload: { processId: terminated.processId, reason: "canceled" },
@@ -584,7 +1141,7 @@ describe("BackgroundProcessManager", () => {
       }
       expect(proc?.monitor?.pendingLines).toEqual(["FAILED pending"]);
 
-      await manager.terminate(result.processId);
+      await manager.terminate(result.processId, { monitorDisposition: "discard" });
       await new Promise((resolve) => setTimeout(resolve, 50));
 
       expect(matches).toHaveLength(0);
@@ -670,7 +1227,7 @@ describe("BackgroundProcessManager", () => {
       expect(proc?.outputBytesRead ?? 0).toBeGreaterThanOrEqual(proc?.monitor?.lastReadOffset ?? 0);
 
       // Force the deferred flush. The cursor has caught up, so it must drop instead of waking.
-      await manager.terminate(result.processId);
+      await manager.terminate(result.processId, { monitorDisposition: "discard" });
       expect(matchCount).toBe(0);
 
       manager.off("monitor:match", handler);
@@ -759,7 +1316,7 @@ describe("BackgroundProcessManager", () => {
       if (output.success) expect(output.output).toContain("ERR foo");
 
       // The agent has been shown through the matched line, so the deferred flush must drop.
-      await manager.terminate(result.processId);
+      await manager.terminate(result.processId, { monitorDisposition: "discard" });
       expect(matchCount).toBe(0);
 
       manager.off("monitor:match", handler);
@@ -891,7 +1448,7 @@ describe("BackgroundProcessManager", () => {
       // The delivery gate therefore still treats the filtered-out ERR line as unshown.
       expect(await manager.getSettledShownThroughOffset(result.processId)).toBe(0);
 
-      await manager.terminate(result.processId);
+      await manager.terminate(result.processId, { monitorDisposition: "discard" });
     });
 
     it("strips ANSI before matching and emitting matched lines", async () => {
@@ -1116,7 +1673,7 @@ describe("BackgroundProcessManager", () => {
         expect(result.success).toBe(true);
         if (!result.success) return;
 
-        await manager.terminate(result.processId);
+        await manager.terminate(result.processId, { monitorDisposition: "discard" });
         await new Promise((resolve) => setTimeout(resolve, 400));
 
         expect(matchEvents).toHaveLength(0);
@@ -1551,7 +2108,7 @@ describe("BackgroundProcessManager", () => {
 
         await tailReadStartedPromise;
         // Explicit cancel (task_stop path) while the settlement helper awaits the tail read.
-        await manager.terminate(result.processId);
+        await manager.terminate(result.processId, { monitorDisposition: "discard" });
         releaseTail();
         await new Promise((resolve) => setTimeout(resolve, 300));
 
@@ -1800,7 +2357,7 @@ describe("BackgroundProcessManager", () => {
       expect(Date.now() - start).toBeLessThan(500);
       expect(settled).toBe(0);
 
-      await manager.terminate(result.processId);
+      await manager.terminate(result.processId, { monitorDisposition: "discard" });
       await filteredRead;
     });
 
@@ -1856,7 +2413,7 @@ describe("BackgroundProcessManager", () => {
       // No origin bound -> unconditional frontier, preserving the legacy-record fail path.
       expect(await manager.getSettledShownThroughOffset(result.processId)).toBe(0);
 
-      await manager.terminate(result.processId);
+      await manager.terminate(result.processId, { monitorDisposition: "discard" });
     });
   });
 
@@ -1926,7 +2483,9 @@ describe("BackgroundProcessManager", () => {
       });
 
       if (spawnResult.success) {
-        const terminateResult = await manager.terminate(spawnResult.processId);
+        const terminateResult = await manager.terminate(spawnResult.processId, {
+          monitorDisposition: "discard",
+        });
         expect(terminateResult.success).toBe(true);
 
         const proc = await manager.getProcess(spawnResult.processId);
@@ -1935,7 +2494,7 @@ describe("BackgroundProcessManager", () => {
     });
 
     it("should return error for non-existent process", async () => {
-      const result = await manager.terminate("bg-nonexistent");
+      const result = await manager.terminate("bg-nonexistent", { monitorDisposition: "discard" });
       expect(result.success).toBe(false);
     });
 
@@ -1946,10 +2505,14 @@ describe("BackgroundProcessManager", () => {
       });
 
       if (spawnResult.success) {
-        const result1 = await manager.terminate(spawnResult.processId);
+        const result1 = await manager.terminate(spawnResult.processId, {
+          monitorDisposition: "discard",
+        });
         expect(result1.success).toBe(true);
 
-        const result2 = await manager.terminate(spawnResult.processId);
+        const result2 = await manager.terminate(spawnResult.processId, {
+          monitorDisposition: "discard",
+        });
         expect(result2.success).toBe(true);
       }
     });
@@ -1971,7 +2534,9 @@ describe("BackgroundProcessManager", () => {
       expect(spawnResult.success).toBe(true);
       if (!spawnResult.success) return;
 
-      const terminateResult = await manager.terminate(spawnResult.processId);
+      const terminateResult = await manager.terminate(spawnResult.processId, {
+        monitorDisposition: "discard",
+      });
       expect(terminateResult.success).toBe(true);
 
       // Wait briefly for the trap to write the sentinel file.
@@ -2114,7 +2679,7 @@ describe("BackgroundProcessManager", () => {
 
       if (result.success) {
         // Terminate it
-        await manager.terminate(result.processId);
+        await manager.terminate(result.processId, { monitorDisposition: "discard" });
 
         // Status should be "killed", not "exited"
         const proc = await manager.getProcess(result.processId);
@@ -2131,7 +2696,7 @@ describe("BackgroundProcessManager", () => {
 
       if (result.success) {
         // Terminate it (sends SIGTERM, then SIGKILL after 2s)
-        await manager.terminate(result.processId);
+        await manager.terminate(result.processId, { monitorDisposition: "discard" });
 
         const proc = await manager.getProcess(result.processId);
         expect(proc).not.toBeNull();
@@ -2166,7 +2731,7 @@ describe("BackgroundProcessManager", () => {
       expect(procBefore?.status).toBe("running");
 
       // Terminate - this should kill both parent and child via process group
-      await manager.terminate(result.processId);
+      await manager.terminate(result.processId, { monitorDisposition: "discard" });
 
       // Verify parent is killed
       const procAfter = await manager.getProcess(result.processId);
